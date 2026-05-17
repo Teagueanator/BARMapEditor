@@ -88,7 +88,7 @@ PA's in-game system designer is the cited gold standard. It does the following w
 ### 2.1 Pitfalls that will actually hurt
 
 1. **Texture pipeline memory.** A 16×16 map = 8192² diffuse. Holding it uncompressed (256 MB RGBA) + an 8192² normal (256 MB) + a 4096² splat distribution (64 MB) + an undo stack is trivially 2–4 GB resident. Use a **tiled copy-on-write 256×256 chunk model** with an LRU disk cache; never snapshot-undo a whole heightmap.
-2. **DXT1 compression is slow and lossy.** PyMapConv invokes `nvdxt.exe` (NVIDIA's legacy DXT compressor, Windows binary; runs under Wine on Linux). Quality-tuned compression of a 16×16 takes 1–10 minutes. Use **bc1 (texpresso, bcdec/bcenc, or ISPC Texture Compressor) in-process for live preview**, fall back to nvdxt for final-quality `.smt`. The SMT format mandates DXT1 specifically (`compressionType=1, tileSize=32`); BC7 is not an option.
+2. **DXT1 compression is slow and lossy.** PyMapConv invokes `nvdxt.exe` (NVIDIA's legacy DXT compressor, Windows binary; runs under Wine on Linux). Quality-tuned compression of a 16×16 takes 1–10 minutes. Use **bc1 (texpresso, bcdec/bcenc, or ISPC Texture Compressor) in-process for live preview**, fall back to nvdxt for final-quality `.smt`. The SMT format mandates DXT1 specifically (`compressionType=1, tileSize=32`); BC7 is not an option. — **STATUS UPDATE 2026-05-17 (ADR-004):** upstream PyMapConv now uses AMD Compressonator (native Linux binary, open-source) in place of `nvdxt.exe`. No Wine dependency on Linux. Live-preview BC1 still warranted for sub-second feedback, but the "fall back to nvdxt" leg of this pitfall collapses.
 3. **Tile deduplication.** The SMT format hash-deduplicates 32×32 tiles. Naïve output produces SMTs roughly 4× larger than tuned output. PyMapConv has the deduplicator; if you ever fork it, port the hash table verbatim.
 4. **Heightmap edge constraint.** Must be exactly `(64·N + 1)²` — **not** a power of two. Crop/pad logic for image import is the #1 silent failure mode (mapconv warns + resizes, producing visibly wrong terrain).
 5. **Coordinate sign flips.** Spring is Y-up, left-handed. Heightmap pixel `(x, y)` corresponds to world `(x·8, height, y·8)`. The `-i / --invert` mapconv flag exists because of historical row-order confusion. Lua features use `{x, z, rot}` in world elmos. Pick one convention internally and bake it in.
@@ -96,7 +96,7 @@ PA's in-game system designer is the cited gold standard. It does the following w
 7. **Pink-map trap on rename.** Historically the SMT filename was hardcoded into the SMF; modern Recoil allows override via `mapinfo.smf.smtFileName0`. The editor must rewrite mapinfo whenever the SMT is renamed.
 8. **DNTS + water + LOS bug** (Beherith, springrts forum t=35202): with `minHeight < 0` plus DNTS plus a Lua widget that touches LOS, you get animated TV-snow artifacts. Warn when DNTS is enabled on a water map.
 9. **`.sd7` solidity.** 7-Zip solid archives are silently rejected by SpringFiles indexing. The packager must emit **non-solid** archives.
-10. **License of the output stack.** Recoil is GPL-2.0; legacy mapconv binaries are GPL-2.0; **PyMapConv has no SPDX-declared license**. Redistributing PyMapConv inside your installer requires explicit written permission from Beherith. This is a hard prerequisite.
+10. **License of the output stack.** Recoil is GPL-2.0; legacy mapconv binaries are GPL-2.0; **PyMapConv has no SPDX-declared license**. Redistributing PyMapConv inside your installer requires explicit written permission from Beherith. This is a hard prerequisite. — **STATUS UPDATE 2026-05-17 (ADR-003):** upstream now carries an SPDX `CC0-1.0` LICENSE file. Redistribution is unrestricted; the "ask Beherith for written permission" workstream is removed (we still credit him in `CREDITS.md` out of courtesy).
 11. **3D preview ≠ in-game rendering.** Recoil's actual ground shader (DNTS + splats + PBR + atmospheric scatter + dynamic shadows) is non-trivial; the editor preview will be an approximation. Document this up front; do not pretend WYSIWYG.
 12. **Decompilation fidelity.** Round-tripping an existing `.sd7` loses information: the recovered diffuse PNG has been through DXT1 (color precision loss); heightmap, metal, and type maps are exact; mapinfo.lua is exact; auxiliary splat textures survive untouched. Reuse PyMapConv's decompile path.
 13. **GPU brush latency.** Spring/Recoil maps can theoretically reach 96×96 SMUs. Sub-millisecond brush response at 32×32+ requires the heightmap to live on the GPU as a storage texture, edited by compute shaders. Read-back to CPU happens only at save.
@@ -106,7 +106,7 @@ PA's in-game system designer is the cited gold standard. It does the following w
 | Risk | Likelihood | Impact | Mitigation |
 |---|---|---|---|
 | PyMapConv breaks on a new Recoil release | M | H | Vendor a pinned PyMapConv build; CI test against the latest Recoil release tag |
-| nvdxt.exe unavailable on Linux native / ARM | H | M | Bundle a native BC1 encoder (texpresso / bcdec) for in-tool preview & builds; keep nvdxt only for final-quality compile |
+| nvdxt.exe unavailable on Linux native / ARM | H | M | Bundle a native BC1 encoder (texpresso / bcdec) for in-tool preview & builds; keep nvdxt only for final-quality compile — **STATUS 2026-05-17 (ADR-004):** PyMapConv now uses AMD Compressonator (native Linux); risk collapses to L/L.** |
 | Beherith refuses redistribution of PyMapConv | L | H | Fallback: download PyMapConv at first launch (the Springboard model) |
 | Memory blow-out at 32×32+ map sizes | M | H | Tiled COW edit buffer, disk-backed undo |
 | Editor outputs invalid mapinfo.lua | H | M | Schema validator + headless test using Recoil `--isolation` pre-release |
@@ -260,7 +260,7 @@ If the wgpu compute curve is too steep, Godot 4 exports a single executable for 
 
 ## Caveats
 
-- **License clarity on PyMapConv is unresolved.** The repo carries no SPDX license file. Get explicit written permission from Beherith before redistribution; this is non-negotiable for a public release.
+- **License clarity on PyMapConv is unresolved.** The repo carries no SPDX license file. Get explicit written permission from Beherith before redistribution; this is non-negotiable for a public release. — **STATUS UPDATE 2026-05-17 (ADR-003):** resolved; upstream now carries `CC0-1.0`. Redistribution is unblocked.
 - **The "final look" in BAR will diverge from in-editor preview** because Recoil's actual ground shader (DNTS + PBR + atmospheric scatter + dynamic shadows) is far more complex than what a tool should reimplement. Document the gap up front; do not pretend WYSIWYG.
 - **No standalone GUI map editor for BAR is currently maintained.** The closest active artifact — `tebeer/BARMapEdit` — has 0 stars, no README, no license, 22 commits, and is invisible to the BAR mapping community. This is an opportunity, not a threat: every existing guide opens with Beherith's warning, *"THERE IS NO INGAME MAP EDITOR FOR BAR."*
 - **Recoil is an actively forking engine.** Pin against a Recoil release tag in CI and re-test on every release.
