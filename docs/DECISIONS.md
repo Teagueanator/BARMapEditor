@@ -88,6 +88,68 @@ gen-fixture` first, or call the generator function directly. The fixture
 *spec* (dims, ramp formula) lives in code, which is the part worth
 versioning.
 
+## ADR-008 — Coord system, world units, default height scale
+
+**Status:** Accepted (2026-05-17)
+**Context:** Stage 0 renderer needs a coordinate convention before any
+vertex math goes into the codebase. Three things to lock in: axis
+orientation, the world unit per heightmap pixel, and a default Y scale for
+the u16 sample. All three are load-bearing — flipping any later means
+re-doing camera, mesh, and (later) brush-pipeline math.
+**Decision:**
+  1. **Y-up, left-handed.** Matches Spring/Recoil's in-engine convention so
+     authors form mental models that survive the import-into-engine step.
+     +X east, +Z south. Use `glam::Mat4::look_at_lh` / `perspective_lh`.
+  2. **World unit = elmo.** Same unit as `MapSize::elmo_extents()`.
+  3. **8 elmos per heightmap pixel** on X/Z. Derived from Spring:
+     `1 SMU = 64 hm-pixels = 512 elmos` → `512 / 64 = 8`. A pre-compact
+     prompt mistakenly said "1 elmo per pixel" — that would make a 16×16
+     SMU map render 8× too small. Corrected here; the canonical source is
+     `MapSize::HEIGHTMAP_PER_SMU` vs `MapSize::ELMOS_PER_SMU`.
+  4. **Default max height = 256 elmos** (u16 sample `65535` → `y = 256`).
+     This is a Stage 0 visual default, not a Spring engine constant. It's
+     exposed in the side panel as a drag so an author can dial in plausible
+     mountains. Real maps set this in `mapinfo.lua` (`maxHeight`); we'll
+     wire that as the source of truth when the mapinfo editor lands.
+**Alternatives:**
+  - Right-handed Y-up (rejected: forces a sign flip every time we compare
+    coords to Spring docs / in-engine debug output).
+  - 1 hm-pixel = 1 world unit, dimensionless (rejected: would mean the
+    renderer can't share scalar fields like "height in elmos" with the rest
+    of the project model, and would surprise anyone reading the code who
+    knows the SMU math).
+**Consequence:** The render module's mesh builder uses `elmos_per_pixel =
+8.0` and `height_scale: f32 = 256.0` as defaults. Camera math goes through
+glam's `_lh` variants. If we ever swap to right-handed for tooling
+ergonomics, this ADR is what we supersede.
+
+## ADR-009 — egui/eframe/wgpu bumped from 0.32/26 to 0.33/27
+
+**Status:** Accepted (2026-05-17)
+**Context:** First `cargo check` with the Stage 0 renderer pulled `naga
+26.0.0`, which fails to compile against `codespan-reporting 0.12` because
+`naga::error::ShaderError::Display::fmt` passes `&mut String` where
+`term::emit` (with `termcolor` feature) requires `&mut dyn WriteColor`.
+The bug is fixed upstream in `naga 27` (the `DiagnosticBuffer` inner type
+is now `NoColor<Vec<u8>>` when `termcolor` is on). There is no `naga 26.0.x`
+patch release.
+**Alternatives:**
+  - Patch naga via `[patch.crates-io]` to a gfx-rs commit (rejected:
+    bespoke source pin, breaks reproducible builds).
+  - Vendor naga locally with the fix (rejected: maintenance tax for a
+    bug we don't own).
+  - Bump to `eframe 0.34 / wgpu 29` (rejected for now: eframe 0.34
+    splits `App::update` into `logic` + `ui`, which would mean rewriting
+    the panel layout. The renderer goal is Stage 0; we don't need that
+    churn yet).
+**Consequence:** Workspace pins are now `eframe 0.33`, `egui 0.33`,
+`wgpu 27`. The `App::update(ctx, frame)` API is unchanged from 0.32, and
+the wgpu 27 `PipelineLayoutDescriptor`/`RenderPipelineDescriptor` field
+names match what the renderer already wrote. CLAUDE.md "Stack at a glance"
+should be re-read with this in mind (it lists "wgpu" without a pin; no
+edit needed). Bumping again past 0.33 will require porting to the new
+eframe `App` trait.
+
 ---
 
 ## Template for new entries

@@ -1,9 +1,14 @@
+mod render;
+
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use barme_core::{Heightmap, MapSize};
 use eframe::egui;
+use eframe::egui_wgpu;
 use tracing::{info, warn};
+
+use crate::render::{OrbitCamera, TerrainCallback};
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -37,6 +42,9 @@ struct App {
     map_size_smu: u32,
     heightmap: Option<HeightmapState>,
     last_error: Option<String>,
+    render_state: Option<egui_wgpu::RenderState>,
+    camera: OrbitCamera,
+    height_scale: f32,
 }
 
 struct HeightmapState {
@@ -48,12 +56,22 @@ struct HeightmapState {
 }
 
 impl App {
-    fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        let render_state = cc.wgpu_render_state.clone();
+        if let Some(rs) = render_state.as_ref() {
+            render::install(rs);
+        } else {
+            warn!("no wgpu render state — terrain preview disabled");
+        }
+
         Self {
             project_name: "untitled".to_string(),
             map_size_smu: 16,
             heightmap: None,
             last_error: None,
+            render_state,
+            camera: OrbitCamera::framing(8192.0, 8192.0),
+            height_scale: 256.0,
         }
     }
 
@@ -75,6 +93,12 @@ impl App {
                         size.heightmap_dims(),
                     );
                 }
+                if let Some(rs) = self.render_state.as_ref() {
+                    render::upload_mesh(rs, &h, self.height_scale);
+                    let extent_x = (dims.0 - 1) as f32 * render::ELMOS_PER_PIXEL;
+                    let extent_z = (dims.1 - 1) as f32 * render::ELMOS_PER_PIXEL;
+                    self.camera = OrbitCamera::framing(extent_x, extent_z);
+                }
                 self.heightmap = Some(HeightmapState {
                     path,
                     dims,
@@ -89,11 +113,22 @@ impl App {
             }
         }
     }
+
+    fn rebuild_mesh(&mut self) {
+        let Some(rs) = self.render_state.as_ref() else {
+            return;
+        };
+        let Some(state) = self.heightmap.as_ref() else {
+            return;
+        };
+        match Heightmap::load_png(&state.path) {
+            Ok(h) => render::upload_mesh(rs, &h, self.height_scale),
+            Err(e) => warn!("rebuild_mesh: {e:#}"),
+        }
+    }
 }
 
 fn fixture_path(smu: u32) -> PathBuf {
-    // Two parents up from the binary's manifest dir; works in `cargo run` and
-    // `cargo run --release`. Fixtures live at <repo>/assets/fixtures/.
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let repo_root = manifest_dir.parent().and_then(|p| p.parent()).unwrap();
     let edge = smu * 64 + 1;
@@ -106,6 +141,7 @@ fn fixture_path(smu: u32) -> PathBuf {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let mut load_request: Option<PathBuf> = None;
+        let mut rebuild_mesh = false;
 
         egui::TopBottomPanel::top("menu").show(ctx, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
@@ -173,6 +209,24 @@ impl eframe::App for App {
                 }
             }
 
+            ui.separator();
+            ui.heading("Render");
+            let resp = ui.add(
+                egui::DragValue::new(&mut self.height_scale)
+                    .range(1.0..=4096.0)
+                    .speed(1.0)
+                    .prefix("Max height (elmos): "),
+            );
+            if resp.changed() {
+                rebuild_mesh = true;
+            }
+            ui.label(format!(
+                "Camera: yaw {:.0}° pitch {:.0}° dist {:.0}",
+                self.camera.yaw.to_degrees(),
+                self.camera.pitch.to_degrees(),
+                self.camera.distance,
+            ));
+
             if let Some(err) = &self.last_error {
                 ui.separator();
                 ui.colored_label(egui::Color32::RED, err);
@@ -180,13 +234,44 @@ impl eframe::App for App {
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.centered_and_justified(|ui| {
-                ui.label("3D preview viewport will live here.");
-            });
+            let (rect, response) =
+                ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
+
+            if response.dragged() {
+                let d = response.drag_delta();
+                self.camera.yaw -= d.x * 0.005;
+                self.camera.pitch = (self.camera.pitch + d.y * 0.005).clamp(
+                    -std::f32::consts::FRAC_PI_2 + 0.05,
+                    std::f32::consts::FRAC_PI_2 - 0.05,
+                );
+            }
+            if response.hovered() {
+                let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+                if scroll != 0.0 {
+                    let factor = (1.0 - scroll * 0.002).clamp(0.5, 2.0);
+                    self.camera.distance = (self.camera.distance * factor).clamp(100.0, 200000.0);
+                }
+            }
+
+            if self.heightmap.is_some() {
+                let cb = TerrainCallback::new(&self.camera, rect, self.height_scale);
+                ui.painter()
+                    .add(egui_wgpu::Callback::new_paint_callback(rect, cb));
+            } else {
+                ui.painter().text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "Load a heightmap to see the terrain.",
+                    egui::FontId::proportional(16.0),
+                    ui.visuals().weak_text_color(),
+                );
+            }
         });
 
         if let Some(path) = load_request {
             self.load_heightmap(path);
+        } else if rebuild_mesh {
+            self.rebuild_mesh();
         }
     }
 }

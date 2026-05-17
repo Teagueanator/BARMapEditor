@@ -14,10 +14,10 @@ repository = "https://github.com/teague/BARMapEditor"
 
 [workspace.dependencies]
 # UI / graphics
-eframe = { version = "0.32", default-features = false, features = ["default_fonts", "wgpu", "wayland", "x11"] }
-egui = "0.32"
-wgpu = "26"
-bytemuck = { version = "1.18", features = ["derive"] }
+eframe = { version = "0.33", default-features = false, features = ["default_fonts", "wgpu", "wayland", "x11"] }
+egui = "0.33"
+wgpu = "27"
+bytemuck = { version = "1.24", features = ["derive"] }
 glam = { version = "0.30", features = ["bytemuck"] }
 
 # Logging / errors
