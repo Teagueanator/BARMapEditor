@@ -123,6 +123,34 @@ re-doing camera, mesh, and (later) brush-pipeline math.
 glam's `_lh` variants. If we ever swap to right-handed for tooling
 ergonomics, this ADR is what we supersede.
 
+## ADR-010 — `rfd` for native file dialogs
+
+**Status:** Accepted (2026-05-17)
+**Context:** Stage 0 needs File → Open / Save dialogs to land project TOML
+round-trip. The choice is load-bearing because the dialog crate decides
+the *runtime* dependency story on Linux: pure-process vs system services
+vs shelling out to user-installed binaries.
+**Decision:** `rfd` (Rusty File Dialog) with default features. On Linux it
+prefers the xdg-portal backend (DBus to `xdg-desktop-portal`, which is
+already running under any modern Wayland/X11 session); on Windows it goes
+through the native Win32 dialog. Single API across OSes, no extra runtime
+binaries, no async required for our synchronous-blocking UI flow.
+**Alternatives:**
+  - Hand-rolling against xdg-portal via `ashpd` (rejected: cross-platform
+    story falls apart — would need separate code paths per OS).
+  - Shelling out to `zenity` / `kdialog` (rejected: not guaranteed to be
+    installed, ships a "user must `apt install zenity`" failure mode that
+    contradicts the single-binary distribution goal of ADR-001).
+  - Pure-egui in-app file picker (rejected: reinventing OS file UX is a
+    Stage 1+ scope explosion, and we lose every system feature — recents,
+    sidebar, network volumes, sandboxed-portal permission prompts).
+**Consequence:** `rfd` joins workspace deps with default features.
+`AsyncFileDialog` deliberately not used — Stage 0 UI is synchronous, and
+blocking the egui thread for the half-second a user spends in a dialog
+is fine. If we ever ship a Web build (SRS §3.5 throws this in as a
+"maybe"), `rfd` already has a `wasm32` backend, but that's not
+exercised yet.
+
 ## ADR-009 — egui/eframe/wgpu bumped from 0.32/26 to 0.33/27
 
 **Status:** Accepted (2026-05-17)

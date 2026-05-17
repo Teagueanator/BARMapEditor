@@ -10,13 +10,13 @@ description = "BAR map editor — project model, heightmap, undo, mapinfo"
 anyhow.workspace = true
 thiserror.workspace = true
 serde.workspace = true
+toml.workspace = true
 glam.workspace = true
 bytemuck.workspace = true
 tracing.workspace = true
 image.workspace = true
 
 [dev-dependencies]
-toml.workspace = true
 tempfile = "3"
 
 [[example]]

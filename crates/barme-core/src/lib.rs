@@ -11,4 +11,4 @@ pub mod project;
 
 pub use heightmap::{DimMismatch, Heightmap};
 pub use map_size::MapSize;
-pub use project::Project;
+pub use project::{PROJECT_EXTENSION, Project, ProjectLoadError, ProjectSaveError};
