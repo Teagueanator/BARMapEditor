@@ -1,0 +1,18 @@
+[package]
+name = "barme-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "BAR map editor — project model, heightmap, undo, mapinfo"
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+glam.workspace = true
+bytemuck.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+toml.workspace = true

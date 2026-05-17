@@ -1,0 +1,19 @@
+[package]
+name = "barme-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Beyond All Reason map editor — desktop application"
+
+[[bin]]
+name = "barme"
+path = "src/main.rs"
+
+[dependencies]
+barme-core.workspace = true
+eframe.workspace = true
+egui.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

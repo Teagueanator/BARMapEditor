@@ -1,0 +1,33 @@
+# Rust
+/target/
+**/target/
+**/*.rs.bk
+Cargo.lock.bak
+
+# IDE / editor
+/.vscode/
+/.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Local Claude settings (user-specific permissions)
+/.claude/settings.local.json
+
+# Bundled sidecar binaries (large, downloaded by build script)
+/tools/pymapconv/
+/tools/compressonator/
+
+# Test/scratch outputs
+/scratch/
+/out/
+*.sd7
+*.sdz
+*.smt
+*.smf
+
+# Development log (personal working notes; never tracked)
+/devlog/
+
+# OS
+Thumbs.db

@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "permissions": {
+    "allow": [
+      "Bash(. \"$HOME/.cargo/env\"*)",
+      "Bash(cargo check*)",
+      "Bash(cargo build*)",
+      "Bash(cargo test*)",
+      "Bash(cargo run*)",
+      "Bash(cargo fmt*)",
+      "Bash(cargo clippy*)",
+      "Bash(cargo tree*)",
+      "Bash(cargo doc*)",
+      "Bash(cargo add*)",
+      "Bash(cargo update*)",
+      "Bash(rustc --version)",
+      "Bash(rustup *)",
+      "Bash(git status*)",
+      "Bash(git diff*)",
+      "Bash(git log*)",
+      "Bash(git show*)",
+      "Bash(git branch*)",
+      "Bash(git add*)",
+      "Bash(ls*)",
+      "Bash(cat /home/teague/code/BARMapEditor/**)",
+      "Bash(find /home/teague/code/BARMapEditor*)",
+      "Bash(rg *)",
+      "Bash(grep *)",
+      "Bash(file *)",
+      "Bash(wc *)",
+      "Bash(which *)",
+      "Bash(echo *)",
+      "Bash(test *)",
+      "Bash(mkdir -p /home/teague/code/BARMapEditor/**)",
+      "Bash(curl --max-time * -fsSL -o /tmp/*)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:crates.io)",
+      "WebFetch(domain:docs.rs)",
+      "WebFetch(domain:beyondallreason.info)",
+      "WebFetch(domain:springrts.com)",
+      "WebFetch(domain:wiki.beyondallreason.dev)"
+    ],
+    "deny": [
+      "Bash(rm -rf*)",
+      "Bash(git push --force*)",
+      "Bash(git reset --hard*)",
+      "Bash(sudo *)"
+    ]
+  }
+}
