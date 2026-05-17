@@ -20,30 +20,48 @@ impl MapSize {
     pub const GRASS_PER_SMU: u32 = 16;
 
     pub const fn square(smu: u32) -> Self {
-        Self { smu_x: smu, smu_z: smu }
+        Self {
+            smu_x: smu,
+            smu_z: smu,
+        }
     }
 
     /// Heightmap edge length in pixels: `64·N + 1`.
     pub const fn heightmap_dims(&self) -> (u32, u32) {
-        (self.smu_x * Self::HEIGHTMAP_PER_SMU + 1, self.smu_z * Self::HEIGHTMAP_PER_SMU + 1)
+        (
+            self.smu_x * Self::HEIGHTMAP_PER_SMU + 1,
+            self.smu_z * Self::HEIGHTMAP_PER_SMU + 1,
+        )
     }
 
     /// Diffuse texture dimensions in pixels: `512·N`.
     pub const fn texture_dims(&self) -> (u32, u32) {
-        (self.smu_x * Self::TEXTURE_PER_SMU, self.smu_z * Self::TEXTURE_PER_SMU)
+        (
+            self.smu_x * Self::TEXTURE_PER_SMU,
+            self.smu_z * Self::TEXTURE_PER_SMU,
+        )
     }
 
     /// Metal / type map dimensions: `32·N`.
     pub const fn metal_dims(&self) -> (u32, u32) {
-        (self.smu_x * Self::METAL_PER_SMU, self.smu_z * Self::METAL_PER_SMU)
+        (
+            self.smu_x * Self::METAL_PER_SMU,
+            self.smu_z * Self::METAL_PER_SMU,
+        )
     }
 
     pub const fn grass_dims(&self) -> (u32, u32) {
-        (self.smu_x * Self::GRASS_PER_SMU, self.smu_z * Self::GRASS_PER_SMU)
+        (
+            self.smu_x * Self::GRASS_PER_SMU,
+            self.smu_z * Self::GRASS_PER_SMU,
+        )
     }
 
     pub const fn elmo_extents(&self) -> (u32, u32) {
-        (self.smu_x * Self::ELMOS_PER_SMU, self.smu_z * Self::ELMOS_PER_SMU)
+        (
+            self.smu_x * Self::ELMOS_PER_SMU,
+            self.smu_z * Self::ELMOS_PER_SMU,
+        )
     }
 }
 

@@ -13,6 +13,12 @@ serde.workspace = true
 glam.workspace = true
 bytemuck.workspace = true
 tracing.workspace = true
+image.workspace = true
 
 [dev-dependencies]
 toml.workspace = true
+tempfile = "3"
+
+[[example]]
+name = "gen-fixture"
+path = "examples/gen_fixture.rs"

@@ -26,6 +26,11 @@ Cargo.lock.bak
 *.smt
 *.smf
 
+# Generated fixtures — regen with `cargo run -p barme-core --example gen-fixture`
+# (see docs/DECISIONS.md ADR-007). README.md stays tracked.
+/assets/fixtures/*.png
+/assets/fixtures/*.tga
+
 # Development log (personal working notes; never tracked)
 /devlog/
 

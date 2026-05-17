@@ -69,6 +69,25 @@ room.
 **Consequence:** No 1.95-only features in `barme-core`. CI matrix should test
 both 1.90 and stable.
 
+## ADR-007 — Test fixtures are generated, not committed
+
+**Status:** Accepted (2026-05-17)
+**Context:** Stage 0 needs a 1025² 16-bit grayscale PNG (~2 MB) as a load
+target, and later stages will need diffuse splats (8192² RGBA ≈ 80 MB
+uncompressed), metal/type maps, etc. Committing these binaries bloats the
+repo, makes diffs noisy, and ties tests to a specific blob.
+**Alternatives:**
+  - Commit fixtures (rejected: scales badly, git LFS is a separate setup tax).
+  - Download fixtures from a release URL (rejected: tests need network).
+  - Synthesize in test bodies (rejected: I/O round-trip is part of what we
+    want to verify; in-memory only doesn't exercise the PNG decoder).
+**Consequence:** Fixtures live under `assets/fixtures/` (gitignored). A
+`gen-fixture` example binary in `barme-core` produces them deterministically
+from constants. Tests that need a real on-disk PNG `cargo run --example
+gen-fixture` first, or call the generator function directly. The fixture
+*spec* (dims, ramp formula) lives in code, which is the part worth
+versioning.
+
 ---
 
 ## Template for new entries
