@@ -5,10 +5,11 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use barme_core::{
-    BrushRegistry, BrushStamp, DirtyRect, Heightmap, History, MapSize, PROJECT_EXTENSION, Project,
-    StampSnapshot, StartPosition, SymmetryAxis, UndoEntry,
+    BIOMES, BrushRegistry, BrushStamp, DirtyRect, Heightmap, History, MapSize, PROJECT_EXTENSION,
+    Project, StampSnapshot, StartPosition, SymmetryAxis, UndoEntry,
     brushes::pixel_bbox,
     procgen::{Domain, PRESETS, generate as procgen_generate},
+    project::sanitize_name,
     start_pos::assign_team_ids,
 };
 use barme_pipeline::PyMapConvDriver;
@@ -51,7 +52,10 @@ fn main() -> Result<()> {
 
 struct App {
     project_name: String,
-    map_size_smu: u32,
+    /// Authoritative project map size. Supports rectangular (smu_x ≠ smu_z) —
+    /// real BAR maps such as `gecko_isle_remake` are 16×18 SMU. Side panel
+    /// edits the two axes independently; the F1 wizard sets both on confirm.
+    map_size: MapSize,
     heightmap: Option<HeightmapState>,
     last_error: Option<String>,
     render_state: Option<egui_wgpu::RenderState>,
@@ -85,6 +89,44 @@ struct App {
     /// While LMB is held in `StartPositions` mode on an existing marker,
     /// holds that team's id so the drag re-positions it. Cleared on release.
     dragging_start_pos: Option<u8>,
+    /// F1 new-project wizard (ADR-024). Open on app launch (replaces the
+    /// pre-F1 in-memory "untitled" auto-start) and via File → New project.
+    wizard_open: bool,
+    wizard: WizardState,
+}
+
+/// Mutable form state for the F1 wizard. Held independently of App state
+/// so dismissing the wizard mid-edit doesn't disturb whatever project is
+/// already loaded. Sized to a single contiguous struct so we can swap it
+/// out wholesale on apply.
+#[derive(Debug, Clone)]
+struct WizardState {
+    project_name: String,
+    smu_x: u32,
+    smu_z: u32,
+    symmetry: SymmetryAxis,
+    rotational_fold: u8,
+    biome_index: usize,
+    max_height: f32,
+    /// True until the user manually edits `max_height`. While true, picking
+    /// a different biome resets the field to the new biome's hint; once the
+    /// user touches the field directly the hint stops overriding.
+    height_from_biome: bool,
+}
+
+impl WizardState {
+    fn default_for_new_project() -> Self {
+        Self {
+            project_name: "untitled".to_string(),
+            smu_x: 16,
+            smu_z: 16,
+            symmetry: SymmetryAxis::None,
+            rotational_fold: 2,
+            biome_index: 0,
+            max_height: BIOMES[0].max_height_hint,
+            height_from_biome: true,
+        }
+    }
 }
 
 /// Central-rect interaction mode. Stays in `Sculpt` for the existing brush
@@ -127,7 +169,7 @@ impl App {
 
         Self {
             project_name: "untitled".to_string(),
-            map_size_smu: 16,
+            map_size: MapSize::square(16),
             heightmap: None,
             last_error: None,
             render_state,
@@ -149,6 +191,9 @@ impl App {
             tool_mode: ToolMode::Sculpt,
             start_positions: Vec::new(),
             dragging_start_pos: None,
+            // Open on first launch — the F1 wizard *is* the entry point now.
+            wizard_open: true,
+            wizard: WizardState::default_for_new_project(),
         }
     }
 
@@ -162,14 +207,15 @@ impl App {
             Ok(h) => {
                 let dims = h.dims();
                 let (min, max) = h.min_max();
-                let size = MapSize::square(self.map_size_smu);
+                let size = self.map_size;
                 let validated_against = h.validate_against(size).ok().map(|_| size);
                 if validated_against.is_none() {
                     warn!(
                         path = %path.display(),
                         loaded_dims = ?dims,
                         expected_dims = ?size.heightmap_dims(),
-                        smu = self.map_size_smu,
+                        smu_x = size.smu_x,
+                        smu_z = size.smu_z,
                         "heightmap dims do not match project SMU; rendering anyway"
                     );
                 }
@@ -207,7 +253,7 @@ impl App {
     fn new_project(&mut self) {
         info!("new project (in-memory, untitled, 16×16 SMU)");
         self.project_name = "untitled".to_string();
-        self.map_size_smu = 16;
+        self.map_size = MapSize::square(16);
         self.heightmap = None;
         self.current_project_path = None;
         self.height_scale = 256.0;
@@ -223,7 +269,7 @@ impl App {
     fn snapshot_project(&self) -> Project {
         Project {
             name: self.project_name.clone(),
-            size: MapSize::square(self.map_size_smu),
+            size: self.map_size,
             min_height: 0.0,
             max_height: self.height_scale,
             heightmap: self.heightmap.as_ref().map(|h| h.path.clone()),
@@ -277,13 +323,14 @@ impl App {
         // try to walk across a wholesale swap. ADR-022.
         self.end_stroke();
         self.history.barrier();
-        let size = MapSize::square(self.map_size_smu);
+        let size = self.map_size;
         let expr = self.procgen_expr.clone();
         let domain = self.procgen_domain;
         info!(
             expr = %expr,
             domain = ?domain,
-            smu = self.map_size_smu,
+            smu_x = size.smu_x,
+            smu_z = size.smu_z,
             "procgen: applying expression"
         );
         let t0 = std::time::Instant::now();
@@ -475,6 +522,47 @@ impl App {
         hm_state.max = mx;
     }
 
+    /// Commit the wizard form: reset app state, apply size + symmetry +
+    /// max height, run the chosen biome's procgen preset to seed the
+    /// heightmap. Idempotent if called twice — `new_project()` clears
+    /// per-project state first. ADR-024.
+    fn apply_wizard(&mut self) {
+        let w = self.wizard.clone();
+        let sanitized = sanitize_name(&w.project_name);
+        self.new_project();
+        self.project_name = sanitized;
+        self.map_size = MapSize {
+            smu_x: w.smu_x.max(1),
+            smu_z: w.smu_z.max(1),
+        };
+        self.symmetry = match w.symmetry {
+            SymmetryAxis::Rotational { .. } => SymmetryAxis::Rotational {
+                fold: w.rotational_fold.max(2),
+            },
+            other => other,
+        };
+        self.rotational_fold = w.rotational_fold.max(2);
+        self.height_scale = w.max_height.max(1.0);
+        let (ex, ez) = self.map_size.elmo_extents();
+        self.camera = OrbitCamera::framing(ex as f32, ez as f32);
+
+        // Seed terrain with the chosen biome's procgen preset.
+        let biome = &BIOMES[w.biome_index.min(BIOMES.len() - 1)];
+        self.procgen_expr = biome.expression.to_string();
+        self.procgen_domain = biome.domain;
+        info!(
+            name = %self.project_name,
+            smu_x = self.map_size.smu_x,
+            smu_z = self.map_size.smu_z,
+            symmetry = self.symmetry.id(),
+            biome = biome.label,
+            max_height = self.height_scale,
+            "F1 wizard: applying"
+        );
+        self.apply_procgen();
+        self.wizard_open = false;
+    }
+
     /// World-space extents (elmos) currently active. Derived from the
     /// loaded heightmap dims when present, falling back to the project's
     /// declared SMU. Used by symmetry replication + start-position
@@ -486,7 +574,7 @@ impl App {
                 (hm.dims.1 - 1) as f32 * render::ELMOS_PER_PIXEL,
             )
         } else {
-            let (ex, ez) = MapSize::square(self.map_size_smu).elmo_extents();
+            let (ex, ez) = self.map_size.elmo_extents();
             (ex as f32, ez as f32)
         }
     }
@@ -651,7 +739,8 @@ impl App {
         let project = self.snapshot_project();
         info!(
             name = %project.name,
-            smu = self.map_size_smu,
+            smu_x = self.map_size.smu_x,
+            smu_z = self.map_size.smu_z,
             max_height = self.height_scale,
             heightmap = %hm_path.display(),
             dst = %dst_dir.display(),
@@ -693,12 +782,12 @@ impl App {
                 );
                 let hm_resolved = p.resolve_heightmap(&path);
                 self.project_name = p.name;
-                self.map_size_smu = p.size.smu_x;
+                self.map_size = p.size;
                 self.height_scale = p.max_height.max(1.0);
                 self.heightmap = None;
                 self.current_project_path = Some(path);
                 self.last_error = None;
-                let (ex, ez) = MapSize::square(self.map_size_smu).elmo_extents();
+                let (ex, ez) = self.map_size.elmo_extents();
                 self.camera = OrbitCamera::framing(ex as f32, ez as f32);
 
                 self.start_positions = p.start_positions;
@@ -722,6 +811,135 @@ impl App {
                 self.last_error = Some(format!("open: {e:#}"));
             }
         }
+    }
+}
+
+/// One-frame outcome of the F1 wizard. Returned from the wizard render so
+/// the actual project mutation happens outside the egui closure (so
+/// `apply_wizard` can borrow `self` mutably).
+enum WizardAction {
+    Apply,
+    Cancel,
+}
+
+impl App {
+    /// Render the F1 new-project wizard as a centered modal-style window.
+    /// Returns the user's outcome on the click-frame, or `None` while the
+    /// form is still being edited. ADR-024.
+    fn render_wizard(&mut self, ctx: &egui::Context) -> Option<WizardAction> {
+        let mut action: Option<WizardAction> = None;
+        let mut open = true;
+        egui::Window::new("New project")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .default_width(360.0)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Name:");
+                    ui.text_edit_singleline(&mut self.wizard.project_name);
+                });
+                let sanitized_preview = sanitize_name(&self.wizard.project_name);
+                ui.label(
+                    egui::RichText::new(format!("(saves as: {sanitized_preview})"))
+                        .small()
+                        .weak(),
+                );
+
+                ui.separator();
+                ui.label("Map size (SMU)");
+                ui.horizontal(|ui| {
+                    ui.add(egui::DragValue::new(&mut self.wizard.smu_x).range(2u32..=64));
+                    ui.label("×");
+                    ui.add(egui::DragValue::new(&mut self.wizard.smu_z).range(2u32..=64));
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "= {} × {} px",
+                            self.wizard.smu_x * 64 + 1,
+                            self.wizard.smu_z * 64 + 1,
+                        ))
+                        .small()
+                        .weak(),
+                    );
+                });
+
+                ui.separator();
+                egui::ComboBox::from_label("Symmetry")
+                    .selected_text(self.wizard.symmetry.label())
+                    .show_ui(ui, |ui| {
+                        let options = [
+                            SymmetryAxis::None,
+                            SymmetryAxis::Horizontal,
+                            SymmetryAxis::Vertical,
+                            SymmetryAxis::Quad,
+                            SymmetryAxis::DiagonalMain,
+                            SymmetryAxis::DiagonalAnti,
+                            SymmetryAxis::Rotational {
+                                fold: self.wizard.rotational_fold,
+                            },
+                        ];
+                        for opt in options {
+                            let label = opt.label();
+                            ui.selectable_value(&mut self.wizard.symmetry, opt, label);
+                        }
+                    });
+                if matches!(self.wizard.symmetry, SymmetryAxis::Rotational { .. }) {
+                    let resp = ui.add(
+                        egui::DragValue::new(&mut self.wizard.rotational_fold)
+                            .range(2u8..=12u8)
+                            .speed(0.1)
+                            .prefix("Fold (players): "),
+                    );
+                    if resp.changed() {
+                        self.wizard.symmetry = SymmetryAxis::Rotational {
+                            fold: self.wizard.rotational_fold,
+                        };
+                    }
+                }
+
+                ui.separator();
+                egui::ComboBox::from_label("Biome preset")
+                    .selected_text(BIOMES[self.wizard.biome_index].label)
+                    .show_ui(ui, |ui| {
+                        for (i, biome) in BIOMES.iter().enumerate() {
+                            if ui
+                                .selectable_label(self.wizard.biome_index == i, biome.label)
+                                .clicked()
+                            {
+                                self.wizard.biome_index = i;
+                                if self.wizard.height_from_biome {
+                                    self.wizard.max_height = biome.max_height_hint;
+                                }
+                            }
+                        }
+                    });
+
+                let resp = ui.add(
+                    egui::DragValue::new(&mut self.wizard.max_height)
+                        .range(64.0f32..=4096.0)
+                        .speed(1.0)
+                        .prefix("Max height (elmos): "),
+                );
+                if resp.changed() {
+                    self.wizard.height_from_biome = false;
+                }
+
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("Create").clicked() {
+                        action = Some(WizardAction::Apply);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        action = Some(WizardAction::Cancel);
+                    }
+                });
+            });
+        // egui's Window `open` flag flips false when the user clicks the X.
+        if !open && action.is_none() {
+            action = Some(WizardAction::Cancel);
+        }
+        action
     }
 }
 
@@ -777,7 +995,9 @@ fn fixture_path(smu: u32) -> PathBuf {
 /// checking stays simple.
 enum FileAction {
     LoadHeightmap(PathBuf),
-    NewProject,
+    /// Open the F1 new-project wizard (ADR-024). Creating happens on the
+    /// wizard's "Create" button via `apply_wizard`.
+    OpenWizard,
     Save,
     SaveAs,
     Open,
@@ -809,8 +1029,8 @@ impl eframe::App for App {
         egui::TopBottomPanel::top("menu").show(ctx, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
                 ui.menu_button("File", |ui| {
-                    if ui.button("New project").clicked() {
-                        action = Some(FileAction::NewProject);
+                    if ui.button("New project…").clicked() {
+                        action = Some(FileAction::OpenWizard);
                         ui.close();
                     }
                     if ui.button("Open project…").clicked() {
@@ -876,7 +1096,9 @@ impl eframe::App for App {
             });
             ui.horizontal(|ui| {
                 ui.label("Size (SMU):");
-                ui.add(egui::DragValue::new(&mut self.map_size_smu).range(2..=96));
+                ui.add(egui::DragValue::new(&mut self.map_size.smu_x).range(2..=96));
+                ui.label("×");
+                ui.add(egui::DragValue::new(&mut self.map_size.smu_z).range(2..=96));
             });
             match &self.current_project_path {
                 Some(p) => ui.label(format!(
@@ -909,9 +1131,9 @@ impl eframe::App for App {
                             egui::Color32::YELLOW,
                             format!(
                                 "Dims do not match {}×{} SMU; expected {:?}",
-                                self.map_size_smu,
-                                self.map_size_smu,
-                                MapSize::square(self.map_size_smu).heightmap_dims(),
+                                self.map_size.smu_x,
+                                self.map_size.smu_z,
+                                self.map_size.heightmap_dims(),
                             ),
                         ),
                     };
@@ -1266,7 +1488,10 @@ impl eframe::App for App {
 
         match action {
             Some(FileAction::LoadHeightmap(p)) => self.load_heightmap(p),
-            Some(FileAction::NewProject) => self.new_project(),
+            Some(FileAction::OpenWizard) => {
+                self.wizard = WizardState::default_for_new_project();
+                self.wizard_open = true;
+            }
             Some(FileAction::Save) => {
                 let target = self
                     .current_project_path
@@ -1291,6 +1516,16 @@ impl eframe::App for App {
             Some(FileAction::Undo) => self.undo_one(),
             Some(FileAction::Redo) => self.redo_one(),
             None => {}
+        }
+
+        // Wizard renders on top, after all other panels. Drains to
+        // `apply_wizard` / close depending on the user's choice. ADR-024.
+        if self.wizard_open {
+            match self.render_wizard(ctx) {
+                Some(WizardAction::Apply) => self.apply_wizard(),
+                Some(WizardAction::Cancel) => self.wizard_open = false,
+                None => {}
+            }
         }
     }
 }

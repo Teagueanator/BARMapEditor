@@ -74,6 +74,36 @@ pub enum ProjectSaveError {
     },
 }
 
+/// Sanitize a user-entered project name into a form safe for the
+/// downstream pipeline (filenames, `mapinfo.lua` strings, `.sd7` archive
+/// names). Allowed characters: ASCII alphanumeric, `_`, `-`. Anything
+/// else is collapsed into a single `_`. Leading/trailing `_` are trimmed.
+/// Empty input maps to `"untitled"`.
+///
+/// The pipeline already escapes `"` and `\` in Lua emit (`lua_string`),
+/// but a name like `"my map: 1.0"` would otherwise produce an `.sd7` with
+/// a colon in its filename and trigger PITFALL #7 (pink-map on rename)
+/// in subtle ways. Sanitizing at the project boundary is defence-in-depth.
+pub fn sanitize_name(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut last_was_underscore = false;
+    for c in s.chars() {
+        if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+            out.push(c);
+            last_was_underscore = c == '_';
+        } else if !last_was_underscore && !out.is_empty() {
+            out.push('_');
+            last_was_underscore = true;
+        }
+    }
+    let trimmed = out.trim_matches('_').to_string();
+    if trimmed.is_empty() {
+        "untitled".to_string()
+    } else {
+        trimmed
+    }
+}
+
 impl Project {
     pub fn new(name: impl Into<String>, smu: u32) -> Self {
         Self {
@@ -210,6 +240,39 @@ smu_z = 4
         let p2 = Project::load_from_file(&path).unwrap();
         assert_eq!(p.name, p2.name);
         assert_eq!(p.size, p2.size);
+    }
+
+    #[test]
+    fn sanitize_name_passes_alphanumeric_through() {
+        assert_eq!(sanitize_name("apophis-clone-1"), "apophis-clone-1");
+        assert_eq!(sanitize_name("my_map_v2"), "my_map_v2");
+    }
+
+    #[test]
+    fn sanitize_name_collapses_disallowed_into_underscore() {
+        assert_eq!(sanitize_name("my map: 1.0"), "my_map_1_0");
+        assert_eq!(sanitize_name("hello!!!world"), "hello_world");
+    }
+
+    #[test]
+    fn sanitize_name_trims_edges_and_handles_empty() {
+        assert_eq!(sanitize_name("   "), "untitled");
+        assert_eq!(sanitize_name(""), "untitled");
+        assert_eq!(sanitize_name("___"), "untitled");
+        assert_eq!(sanitize_name(" foo "), "foo");
+    }
+
+    #[test]
+    fn sanitize_name_creates_safe_filenames() {
+        // Anything sanitize produces must be a legal portable filename
+        // (no path separators, no colons, no spaces).
+        for input in ["maps/foo", "C:\\Users\\me", "a b c", "x/y\\z"] {
+            let s = sanitize_name(input);
+            assert!(!s.contains('/'));
+            assert!(!s.contains('\\'));
+            assert!(!s.contains(':'));
+            assert!(!s.contains(' '));
+        }
     }
 
     #[test]

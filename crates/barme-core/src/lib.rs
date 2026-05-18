@@ -17,7 +17,11 @@ pub mod undo;
 pub use brushes::{Brush, BrushRegistry, BrushStamp, DirtyRect};
 pub use heightmap::{DimMismatch, Heightmap};
 pub use map_size::MapSize;
-pub use procgen::{Domain, PRESETS, ProcGenError, ProcGenPreset, generate as procgen_generate};
-pub use project::{PROJECT_EXTENSION, Project, ProjectLoadError, ProjectSaveError, StartPosition};
+pub use procgen::{
+    BIOMES, BiomePreset, Domain, PRESETS, ProcGenError, ProcGenPreset, generate as procgen_generate,
+};
+pub use project::{
+    PROJECT_EXTENSION, Project, ProjectLoadError, ProjectSaveError, StartPosition, sanitize_name,
+};
 pub use symmetry::SymmetryAxis;
 pub use undo::{History, StampSnapshot, UndoEntry};

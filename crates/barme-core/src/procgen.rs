@@ -188,6 +188,44 @@ pub const PRESETS: &[ProcGenPreset] = &[
     },
 ];
 
+/// Biome preset for the F1 new-project wizard (ADR-024). A thin wrapper
+/// around [`ProcGenPreset`] that also recommends a `max_height` so the
+/// wizard can pick reasonable defaults — a "flat plain" biome shouldn't
+/// land with a 4096-elmo height scale.
+pub struct BiomePreset {
+    pub label: &'static str,
+    pub expression: &'static str,
+    pub domain: Domain,
+    pub max_height_hint: f32,
+}
+
+pub const BIOMES: &[BiomePreset] = &[
+    BiomePreset {
+        label: "Flat plain",
+        expression: "0.0",
+        domain: Domain::Unit,
+        max_height_hint: 64.0,
+    },
+    BiomePreset {
+        label: "Parabolic bowl",
+        expression: "1 - (x*x + z*z)",
+        domain: Domain::Centered,
+        max_height_hint: 256.0,
+    },
+    BiomePreset {
+        label: "Cone peak",
+        expression: "max(0, 1 - math::sqrt(x*x + z*z))",
+        domain: Domain::Centered,
+        max_height_hint: 384.0,
+    },
+    BiomePreset {
+        label: "Diagonal ramp",
+        expression: "x",
+        domain: Domain::Unit,
+        max_height_hint: 192.0,
+    },
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -244,6 +282,21 @@ mod tests {
 
     #[test]
     fn presets_all_parse_and_run() {
+        for p in BIOMES {
+            generate(
+                p.expression,
+                p.domain,
+                MapSize::square(2),
+                0.0,
+                p.max_height_hint,
+            )
+            .unwrap_or_else(|e| panic!("biome preset {:?} failed to parse / run: {e:#}", p.label));
+            assert!(
+                p.max_height_hint > 0.0,
+                "biome {:?} has non-positive max_height",
+                p.label
+            );
+        }
         for p in PRESETS {
             generate(p.expression, p.domain, MapSize::square(2), 0.0, 1.0)
                 .unwrap_or_else(|e| panic!("preset {} failed: {e:?}", p.label));

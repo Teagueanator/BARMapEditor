@@ -1248,6 +1248,103 @@ convention is visually reinforced.
   consistency, off-screen rejection, camera-target sanity).
 - 8-colour `team_color` palette in the app (warm = even, cool = odd).
 
+## ADR-024 — F1 new-project wizard + rectangular MapSize refactor
+
+**Status:** Accepted (2026-05-17).
+**Context:** Stage 0 ships with a hardcoded "untitled 16×16 SMU"
+in-memory project that auto-loads on every launch. That's adequate for
+internal testing; it's the wrong entry point for users. Real BAR maps
+are rarely square — `gecko_isle_remake_v1.2.1` is 16×18, `Quicksilver`
+is 12×8 — so the wizard has to default to rectangular-capable size from
+the start, not "square with optional resize later." A wizard is also
+the natural surface for seeding terrain via a biome preset (the user
+gets a non-empty heightmap on first click of the brush, not a wall of
+"now load a fixture" hints).
+
+The refactor of `App.map_size_smu: u32 → App.map_size: MapSize` is a
+prerequisite, not the goal. Most call sites already funnelled through
+`MapSize::square(self.map_size_smu)`; swapping in `self.map_size` is a
+one-token edit per site. The side panel grows from a single DragValue
+to two (`smu_x` × `smu_z`) and the validation messages in the Heightmap
+panel use both axes. `Project.size: MapSize` already supports
+rectangular — the wire format didn't change at all, this is purely an
+internal representation tidy.
+
+**Biome presets vs procgen presets.** ADR-020 already has a `PRESETS`
+table for the free-form procgen UI ("pick one to fill the expression").
+The F1 wizard reuses that infrastructure with a parallel `BIOMES`
+table: same `expression` + `domain` fields, plus a `max_height_hint`
+so a "flat plain" biome doesn't ship with a 4096-elmo height scale.
+The wizard's max-height field defaults to the hint until the user
+edits it directly, after which the field stops snapping to biome
+defaults (`height_from_biome: bool` flag). Four biomes ship: flat
+plain, parabolic bowl, cone peak, diagonal ramp. Adding new biomes is
+one struct-literal entry.
+
+**Name sanitization.** PITFALL #7 (pink-map on rename) attaches to the
+project name: every downstream consumer — the `.sd7` archive name,
+`mapinfo.lua` `name` / `mapfile` / `smtFileName0` fields, the SMT
+filename inside the archive — must derive from the same string. The
+wizard accepts free-form input but the persisted name routes through
+`barme-core::project::sanitize_name(s) -> String`. Allowed characters:
+ASCII alphanumeric, `_`, `-`. Anything else collapses to a single `_`
+(runs are merged), and empty results map to `"untitled"`. The wizard
+previews the sanitized form live below the text field so users see
+what they're actually creating.
+
+**Modal vs panel.** The wizard is an `egui::Window` anchored to screen
+center with `collapsible = false`, `resizable = false`, and an X-close
+that maps to Cancel. We don't use `egui::Modal` — it's available in
+0.33 but blocks all input below; for the on-launch case that prevents
+the user from getting to File → Open if they want to skip the wizard
+and resume work on an existing project. Soft-modal (window on top,
+underlying menus still clickable) is the right ergonomics.
+
+**Auto-open at launch.** `wizard_open = true` in `App::new`. First-time
+users see the wizard immediately; Cancel dismisses it and the rest of
+the app behaves as before (the underlying state was the same
+hardcoded "untitled 16×16" — nothing changes for users who hit Cancel
+out of habit). File → New project re-opens it with fresh defaults
+(`WizardState::default_for_new_project()`).
+
+**Apply path.** `App::apply_wizard` calls `new_project()` first (which
+already handles undo-history barrier + start-position clear + camera
+reset), then writes `project_name` / `map_size` / `symmetry` /
+`height_scale`, then runs `apply_procgen()` to materialise the biome's
+expression. `apply_procgen` already calls `history.barrier()` so undo
+state stays consistent. The procgen call is what populates the GPU
+heightmap texture — after `apply_wizard` returns, the central rect is
+showing terrain immediately.
+
+**Alternatives considered:**
+- **Inline wizard fields directly in the side panel.** Cheaper to ship,
+  but conflicts with "this is a one-shot setup decision, not an
+  always-visible control." Symmetry / biome live in the wizard *and* in
+  the side panel — biome via the existing "Generate from formula"
+  section (free-form), symmetry as a permanent sculpt control. The
+  wizard is the curated subset for first-launch.
+- **Skipping the rectangular refactor and only supporting it in the
+  wizard.** Would leave the side-panel size control square-only, which
+  is surprising once a user has loaded a rectangular project — they
+  could see `16 × 18` in the heightmap dims but only edit `16`. Doing
+  the refactor *with* the wizard, rather than after, keeps the model
+  consistent.
+
+**Consequence:**
+- `App.map_size_smu: u32 → App.map_size: MapSize`. All 16 call sites
+  refactored; clippy + tests green.
+- `WizardState` (form fields) + `WizardAction { Apply, Cancel }`
+  (one-frame outcome) in the app.
+- `barme-core::project::sanitize_name` exposed publicly with 4 unit
+  tests covering pass-through, disallowed-char collapse, edge trim, and
+  filename safety against `/ \ : space`.
+- `barme-core::procgen::BIOMES` table (4 presets) with a
+  `max_height_hint` field. Existing `presets_all_parse_and_run` test
+  extended to cover BIOMES too.
+- Side panel now exposes both `smu_x` and `smu_z` DragValues.
+- `FileAction::NewProject` renamed to `OpenWizard` — File → New project
+  is now wizard-first.
+
 ## Template for new entries
 
 ```
