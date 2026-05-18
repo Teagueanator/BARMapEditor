@@ -264,6 +264,33 @@ A single-window, single-executable desktop app that produces a *playable* BAR ma
 > `mapinfo_overrides`) follow the same pattern when each F-feature
 > lands.
 
+> **STATUS UPDATE 2026-05-18 (Canvas affordances — Sprint 3 / B2 B3 B4):**
+> The B1 layout shell now has canvas-side feedback for every editor
+> session:
+> - **B2 / ADR-031** — Symmetry overlay paints dashed mirror axes /
+>   rotational spokes through the map centre whenever
+>   `symmetry != None`. Sculpt + mirror mode renders mirror-brush
+>   ghost rings at every symmetry-derived centre (50% alpha) so the
+>   user can predict where the stroke will land. F3 surface.
+> - **B3** — Primary brush ring at the cursor (Raise green / Lower
+>   red / Smooth blue), nav-gizmo top-right of the viewport (6 axis
+>   snaps + drag-orbit), first-launch hint Window persisted via a
+>   new `EditorConfig` (TOML at the OS config dir, version-keyed
+>   so a major release replays once), and a `?` cheat-sheet modal
+>   auto-generated from `Tool::ALL` + a `CAMERA_BINDINGS` table.
+>   F2 / F3 / F14 surface; new module `crates/barme-app/src/config.rs`.
+> - **B4** — Build & Install promoted from a plain side-panel
+>   button to a primary-coloured top-bar Button + `ComboBox` variant
+>   selector. Button fill comes from `Visuals::widgets::active.bg_fill`
+>   so the future F21 theme toggle stays correct. Bottom status
+>   strip now requests a 1 Hz repaint so camera coords keep ticking
+>   when nothing else is animating. F11 surface; F12 Launch variant
+>   permanently greyed until F12 ships.
+> Test counts: `barme-app` 18 → 112 (94 new across overlay / gizmo
+> / cheat_sheet / intro / config / app-level). `barme-core` /
+> `barme-pipeline` unchanged. No NFR regressions; no new ADRs
+> beyond ADR-031.
+
 > **STATUS UPDATE 2026-05-18 (Editor layout shell — ADR-030, F2/F3/F8/F14
 > UI surfaces re-homed):** The pre-Phase-3 stacked-side-panel UI is gone.
 > The editor now uses a five-zone shell: top action bar (File/Edit/Build

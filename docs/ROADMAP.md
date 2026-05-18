@@ -69,6 +69,18 @@ Implements SRS F1–F12. Ships a Windows `.exe` and a Linux AppImage.
       (persistent header + exhaustive `match self.tool` on tool params),
       CentralPanel last. Drag threshold bumped to 8 px. All F2 / F3 /
       F8 / F14 UI surfaces re-homed; nothing functional removed.
+- [x] **Canvas affordances (Phase 3 / Sprint 3 = B2 + B3 + B4)** —
+      symmetry canvas overlay (dashed axes / rotational spokes +
+      mirror-brush ghost rings, ADR-031), primary brush ring at
+      cursor (colour by brush), nav-gizmo top-right of viewport
+      with 6 axis snaps + drag-orbit, first-launch hint Window
+      persisted in a new per-user `EditorConfig` TOML keyed by
+      editor version, `?` cheat-sheet modal auto-generated from
+      `Tool::ALL` + camera bindings, top-bar primary Build button
+      with variant `ComboBox` (Launch greyed pre-F12), 1 Hz status
+      strip repaint. New module `crates/barme-app/src/config.rs`
+      + `crates/barme-app/src/ui/{overlay,gizmo,cheat_sheet,intro}.rs`.
+      `barme-app` test count 18 → 112.
 - [ ] Beherith (or active mapper) reviews `.sd7` byte-for-byte against PyMapConv
       reference output on three test maps
 - [ ] Listed on `beyondallreason.info/guide/mapmaking-resources` as beta
