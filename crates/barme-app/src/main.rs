@@ -4,7 +4,10 @@ mod render;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
-use barme_core::{BrushRegistry, BrushStamp, Heightmap, MapSize, PROJECT_EXTENSION, Project};
+use barme_core::{
+    BrushRegistry, BrushStamp, DirtyRect, Heightmap, MapSize, PROJECT_EXTENSION, Project,
+    SymmetryAxis,
+};
 use barme_pipeline::PyMapConvDriver;
 use eframe::egui;
 use eframe::egui_wgpu;
@@ -57,6 +60,11 @@ struct App {
     brush_id: Option<String>,
     brush_radius: f32,
     brush_strength: f32,
+    symmetry: SymmetryAxis,
+    /// Rotational symmetry fold value, kept separately so the UI dropdown
+    /// can preserve the user's last choice when toggling between rotational
+    /// and non-rotational modes.
+    rotational_fold: u8,
 }
 
 struct HeightmapState {
@@ -93,6 +101,8 @@ impl App {
             brush_id: None, // Off
             brush_radius: 256.0,
             brush_strength: 0.5,
+            symmetry: SymmetryAxis::None,
+            rotational_fold: 2,
         }
     }
 
@@ -221,17 +231,34 @@ impl App {
         let Some(world) = render::screen_to_world_y0(cursor_in, rect_size, &self.camera) else {
             return;
         };
-        let stamp = BrushStamp {
-            world_x: world.x,
-            world_z: world.z,
-            radius: self.brush_radius,
-            strength: self.brush_strength,
-        };
-        let Some(rect_dirty) = brush.apply(&mut hm_state.data, stamp) else {
+        let dims = hm_state.dims;
+        let extents = (
+            (dims.0 - 1) as f32 * render::ELMOS_PER_PIXEL,
+            (dims.1 - 1) as f32 * render::ELMOS_PER_PIXEL,
+        );
+        // Symmetry replicates the stamp through all derived centers; one
+        // brush.apply per center, dirty rects unioned for a single GPU
+        // upload (ADR-019).
+        let centers = self.symmetry.replicate((world.x, world.z), extents);
+        let mut union: Option<DirtyRect> = None;
+        for (cx, cz) in centers {
+            let stamp = BrushStamp {
+                world_x: cx,
+                world_z: cz,
+                radius: self.brush_radius,
+                strength: self.brush_strength,
+            };
+            if let Some(r) = brush.apply(&mut hm_state.data, stamp) {
+                union = Some(match union {
+                    Some(u) => u.union(r),
+                    None => r,
+                });
+            }
+        }
+        let Some(rect_dirty) = union else {
             return;
         };
-        let dims = hm_state.dims;
-        // Sub-upload the dirty rect (one queue.write_texture call).
+        // Sub-upload the union of all symmetric edits (one queue.write_texture call).
         render::write_heightmap_rect(rs, dims, hm_state.data.data(), rect_dirty);
         // Keep min/max display fresh.
         let (mn, mx) = hm_state.data.min_max();
@@ -536,6 +563,49 @@ impl eframe::App for App {
                     .text("Strength")
                     .clamping(egui::SliderClamping::Always),
             );
+            // Symmetry — one stroke produces N mirrored / rotated stamps
+            // (ADR-019). Lock rotational fold to {2,3,4,6,8}.
+            egui::ComboBox::from_label("Symmetry")
+                .selected_text(self.symmetry.label())
+                .show_ui(ui, |ui| {
+                    let options = [
+                        SymmetryAxis::None,
+                        SymmetryAxis::Horizontal,
+                        SymmetryAxis::Vertical,
+                        SymmetryAxis::Quad,
+                        SymmetryAxis::DiagonalMain,
+                        SymmetryAxis::DiagonalAnti,
+                        SymmetryAxis::Rotational {
+                            fold: self.rotational_fold,
+                        },
+                    ];
+                    for opt in options {
+                        let label = opt.label();
+                        ui.selectable_value(&mut self.symmetry, opt, label);
+                    }
+                });
+            if matches!(self.symmetry, SymmetryAxis::Rotational { .. }) {
+                // Free-form fold count — 3 for 3-player maps, 4 for 4-player,
+                // 5/6/7/8 for FFA. 2..=12 covers everything BAR supports;
+                // larger folds quickly become indistinguishable from radial
+                // symmetry.
+                let resp = ui.add(
+                    egui::DragValue::new(&mut self.rotational_fold)
+                        .range(2u8..=12u8)
+                        .speed(0.1)
+                        .prefix("Fold (players): "),
+                );
+                if resp.changed() {
+                    self.symmetry = SymmetryAxis::Rotational {
+                        fold: self.rotational_fold,
+                    };
+                }
+                ui.label(
+                    egui::RichText::new("Tip: 3 = three-player map, 4 = quad-player, etc.")
+                        .small()
+                        .weak(),
+                );
+            }
 
             ui.label(format!(
                 "Camera: yaw {:.0}° pitch {:.0}° dist {:.0}",

@@ -836,6 +836,80 @@ orthogonal choices:
     replicating `BrushStamp` centers; each rect-result unions into one
     upload via `DirtyRect::union`.
 
+## ADR-019 — Symmetry enforcement (mirror axes + N-fold rotational)
+
+**Status:** Accepted (2026-05-17).
+**Context:** SRS F3 (symmetry enforcement) is core to BAR mapmaking —
+most competitive maps are mirror-symmetric or rotationally symmetric so
+that no spawn position has a structural advantage. The natural shape:
+one brush stamp produces N derived stamps that the kernel applies in
+turn, with their dirty rects unioned for a single GPU upload. Two
+orthogonal choices:
+  1. **Geometric coverage.** Mirror across each map centerline,
+     both diagonals, both centerlines together (quad), and N-fold
+     rotational. The set is small; enum encoding is right.
+  2. **Rotational fold values.** User mid-session: "if it's a three
+     player map it's symmetrical in 3 quadrants from the center; if
+     it's 4 then quad". So fold is a free-form integer keyed to
+     player count, not a fixed list. Range 2..=12 covers FFA up to
+     the point where adjacent stamps overlap into radial blur.
+**Decision:**
+  - **`barme_core::symmetry::SymmetryAxis` enum** with variants
+    `None / Horizontal / Vertical / Quad / DiagonalMain / DiagonalAnti
+    / Rotational { fold: u8 }`. Serde-serializable for project save/load.
+  - **`replicate(center, extents) -> Vec<(f32, f32)>`** returns all
+    derived centers including the original. World-space coords
+    (elmos). Off-map results filtered out (mirror past a map edge);
+    duplicates within 0.5 elmos (sub-pixel) deduplicated — handles
+    the rotational-at-map-center degenerate case.
+  - **Rotational math:** rotate around map center by `2π · k / fold`
+    for `k = 1..fold`. `fold = 1` → identity. `fold > 1` covers all
+    practical N-player layouts.
+  - **UI:** symmetry dropdown in the Sculpt panel. When `Rotational`
+    is selected, a `DragValue<u8>` (range 2..=12) appears for fold
+    selection with a "3 = three-player, 4 = quad-player, etc." tip.
+    The fold value is stashed in `App.rotational_fold` so it persists
+    across toggles between rotational and non-rotational modes.
+  - **Stroke integration:** `apply_brush_at` calls
+    `symmetry.replicate(...)`, runs the brush at each center, folds
+    dirty rects into one via `DirtyRect::union`, then one
+    `write_heightmap_rect` upload covers them all.
+  - **Diagonals are geometric-only.** They produce sensible output on
+    square maps; on rectangular ones the reflected point may land
+    off-map, in which case the `replicate` filter drops it. No
+    aspect-ratio warning surfaced to the user — the UI behaviour
+    (stamps just don't appear in expected places) is self-documenting.
+**Alternatives considered:**
+  - **Fixed `{2, 3, 4, 6, 8}` fold dropdown.** Was the initial
+    implementation; user pushed back mid-commit asking for editable
+    fold. Replaced with `DragValue<u8>` covering 2..=12. The original
+    dropdown's "lock to N" justification (BAR maps are mostly 2/4-fold)
+    doesn't outweigh the cost of being wrong for 3/5/6-player layouts.
+  - **Pre-bake symmetric strokes into the heightmap on commit.**
+    Rejected: hides the symmetry state from undo; doesn't survive
+    a brush change mid-stroke; can't be turned off later.
+  - **Per-brush symmetry override.** Rejected as YAGNI — there's no
+    realistic workflow where a smooth brush wants different symmetry
+    from a raise brush within the same project.
+  - **Reflection across an arbitrary axis (line picker).** Rejected
+    for v0: the four diagonals + horizontal/vertical cover 99% of
+    real maps, and an arbitrary-axis picker is a UX rabbit hole
+    (drag endpoints? type coords?) better deferred until a real
+    user asks for it.
+**Consequence:**
+  - `barme-core` gains `symmetry.rs` with 8 unit tests covering all
+    variants + the rotational-at-center degeneracy + the off-map
+    filter. `SymmetryAxis` re-exported from the crate root.
+  - `App` state grows `symmetry: SymmetryAxis` + `rotational_fold: u8`.
+    `apply_brush_at` is now N-fold per stamp; `DirtyRect::union`
+    earns its keep.
+  - **F3 status:** SRS gets a STATUS UPDATE noting v1 is shipped with
+    the axes + N-fold list above; arbitrary-axis lines are Stage 2.
+  - **Future:** when the project file gets a symmetry field, it
+    serializes the user's chosen `SymmetryAxis` directly (the
+    Serde derive is already in place). New-project wizard (F1) can
+    surface symmetry as a first-class choice.
+
 ---
 
 ## Template for new entries
