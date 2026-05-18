@@ -264,6 +264,33 @@ A single-window, single-executable desktop app that produces a *playable* BAR ma
 > `mapinfo_overrides`) follow the same pattern when each F-feature
 > lands.
 
+> **STATUS UPDATE 2026-05-18 (F9 — schema shipped; form editor pending):**
+> Sprint 4 / C1 / ADR-028 lands the typed `mapinfo.lua` schema at
+> `crates/barme-core/src/mapinfo_schema.rs` (`MapInfo` + 9 sub-blocks).
+> `MapInfo::bar_default()` populates BAR conventions (modtype 3,
+> gravity 130, extractor_radius 80, depend `["Map Helper v1"]`,
+> atmosphere fog_start 0.1 / fog_end 1.0, splats tex_scales
+> `[0.02; 4]` / tex_mults `[1.0; 4]`, lighting sun_dir as
+> `[f32; 4]`). `impl From<&Project> for MapInfo` produces a schema
+> instance from the current project, ready to feed the Lua emitter.
+> `Project` gained `mapinfo_overrides: HashMap<String, toml::Value>`
+> for F9's eventual form-edit bag. **F9 itself (form editor + raw Lua
+> tab) is still pending — C7 will wire the UI on top of this schema.**
+> The current `barme-pipeline::mapinfo` string emitter is unchanged;
+> swapping it for a Lua-AST emitter is Sprint 6 / ADR-029 / C2.
+
+> **STATUS UPDATE 2026-05-18 (Undo for non-heightmap state — B5):**
+> Sprint 4 / B5 lands a unified
+> `enum HistoryEntry { Heightmap(HeightmapEntry), Project(ProjectDiff) }`
+> stack so F8 start-position edits and F1 wizard applies are
+> undoable on the same Ctrl-Z that walks back brush strokes.
+> `ProjectDiff` covers `PlaceStartPosition`, `MoveStartPosition`,
+> `DeleteStartPosition`, `ApplyWizard(WizardSnapshot)`. Eviction is
+> largest-first across both channels so a single long stroke can't
+> evict 20 recent F8 placements. Undo/redo gated on
+> `!is_dragging_anything()` so the user can't peel back state
+> mid-gesture. No new ADR — extends ADR-033's per-stroke COW.
+
 > **STATUS UPDATE 2026-05-18 (Canvas affordances — Sprint 3 / B2 B3 B4):**
 > The B1 layout shell now has canvas-side feedback for every editor
 > session:

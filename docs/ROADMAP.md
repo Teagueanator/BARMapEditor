@@ -81,6 +81,20 @@ Implements SRS F1–F12. Ships a Windows `.exe` and a Linux AppImage.
       strip repaint. New module `crates/barme-app/src/config.rs`
       + `crates/barme-app/src/ui/{overlay,gizmo,cheat_sheet,intro}.rs`.
       `barme-app` test count 18 → 112.
+- [x] **Data-model foundations (Phase 3 / Sprint 4 = B5 + C1)** —
+      unified undo channel for non-heightmap edits
+      (`enum HistoryEntry { Heightmap, Project(ProjectDiff) }`,
+      no new ADR; extends ADR-033) so F8 placements + F1 wizard
+      applies are undoable on the same Ctrl-Z stack as brush
+      strokes; largest-first eviction keeps long strokes from
+      evicting kilobyte-sized diffs. Typed `mapinfo.lua` schema
+      (`MapInfo` + 9 sub-blocks + `MapInfo::bar_default()` +
+      `From<&Project>`) at `crates/barme-core/src/mapinfo_schema.rs`,
+      ADR-028, supersedes ADR-013's "minimum-viable" data-shape
+      half. `Project.mapinfo_overrides: HashMap<String, toml::Value>`
+      added (F9 / C7 will populate). Foundational only — B6 (F8
+      allyteam redesign) and C2 (three-file emission) consume these
+      next sprint.
 - [ ] Beherith (or active mapper) reviews `.sd7` byte-for-byte against PyMapConv
       reference output on three test maps
 - [ ] Listed on `beyondallreason.info/guide/mapmaking-resources` as beta
