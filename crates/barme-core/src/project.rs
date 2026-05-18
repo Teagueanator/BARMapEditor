@@ -4,6 +4,7 @@
 //! raw asset PNGs (heightmap, metal, type, splat distribution, diffuse). The
 //! `.sd7` is build output, not source of truth.
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -32,6 +33,15 @@ pub struct Project {
     /// playable 1v1 map.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub start_positions: Vec<StartPosition>,
+    /// User-authored `mapinfo.lua` field overrides (C1 / ADR-028).
+    /// Populated by the F9 form editor (C7) on top of the
+    /// `MapInfo::bar_default()` baseline so unusual maps (skybox
+    /// changes, custom gadget `custom.*` blobs, etc.) can ship without
+    /// schema bumps. Keys are dotted Lua paths
+    /// (e.g. `"atmosphere.sky_box"`); values are TOML scalars / arrays
+    /// the emitter knows how to render. Default empty.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub mapinfo_overrides: HashMap<String, toml::Value>,
 }
 
 /// A single team start position in world coordinates (elmos).
@@ -113,6 +123,7 @@ impl Project {
             max_height: 256.0,
             heightmap: None,
             start_positions: Vec::new(),
+            mapinfo_overrides: HashMap::new(),
         }
     }
 
@@ -213,6 +224,45 @@ mod tests {
         let s = toml::to_string(&p).unwrap();
         let p2: Project = toml::from_str(&s).unwrap();
         assert_eq!(p.start_positions, p2.start_positions);
+    }
+
+    #[test]
+    fn mapinfo_overrides_omitted_when_empty() {
+        let p = Project::new("clean", 4);
+        let s = toml::to_string(&p).unwrap();
+        assert!(
+            !s.contains("mapinfo_overrides"),
+            "empty mapinfo_overrides must not serialise; got:\n{s}"
+        );
+    }
+
+    #[test]
+    fn mapinfo_overrides_round_trip() {
+        let mut p = Project::new("overrides", 4);
+        p.mapinfo_overrides
+            .insert("atmosphere.sky_box".to_string(), "clear_day.dds".into());
+        p.mapinfo_overrides
+            .insert("gravity".to_string(), toml::Value::Float(150.0));
+        let s = toml::to_string(&p).unwrap();
+        let p2: Project = toml::from_str(&s).unwrap();
+        assert_eq!(p.mapinfo_overrides, p2.mapinfo_overrides);
+    }
+
+    #[test]
+    fn legacy_project_without_mapinfo_overrides_loads_forward() {
+        // Pre-C1 projects don't carry the field. serde(default) seeds
+        // an empty map.
+        let toml_str = r#"
+name = "legacy"
+min_height = 0.0
+max_height = 256.0
+
+[size]
+smu_x = 4
+smu_z = 4
+"#;
+        let p: Project = toml::from_str(toml_str).unwrap();
+        assert!(p.mapinfo_overrides.is_empty());
     }
 
     #[test]

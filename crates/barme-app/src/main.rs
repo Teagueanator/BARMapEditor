@@ -146,6 +146,12 @@ struct App {
     /// User-selected build pipeline variant for the top-bar primary
     /// button (B4). Persists across button clicks within a session.
     build_variant: BuildVariant,
+    /// User-authored `mapinfo.lua` field overrides (C1 / ADR-028).
+    /// Mirrors `Project.mapinfo_overrides` so save/open preserves the
+    /// user's F9 edits across sessions. F9 (C7) will own the editor
+    /// surface; here we just round-trip the bag so data isn't lost
+    /// before that lands.
+    mapinfo_overrides: std::collections::HashMap<String, toml::Value>,
 }
 
 /// Mutable form state for the F1 wizard. Held independently of App state
@@ -386,6 +392,7 @@ impl App {
             show_cheat_sheet: false,
             nav_gizmo_drag_active: false,
             build_variant: BuildVariant::default(),
+            mapinfo_overrides: std::collections::HashMap::new(),
         }
     }
 
@@ -453,6 +460,7 @@ impl App {
         self.last_error = None;
         self.last_install = None;
         self.start_positions.clear();
+        self.mapinfo_overrides.clear();
         self.dragging_start_pos = None;
         self.dragging_start_pos_from = None;
         self.end_stroke();
@@ -467,6 +475,7 @@ impl App {
             max_height: self.height_scale,
             heightmap: self.heightmap.as_ref().map(|h| h.path.clone()),
             start_positions: self.start_positions.clone(),
+            mapinfo_overrides: self.mapinfo_overrides.clone(),
         }
     }
 
@@ -1160,6 +1169,7 @@ impl App {
                 self.camera = OrbitCamera::framing(ex as f32, ez as f32);
 
                 self.start_positions = p.start_positions;
+                self.mapinfo_overrides = p.mapinfo_overrides;
 
                 if let Some(hm_path) = hm_resolved {
                     if hm_path.exists() {
@@ -2381,6 +2391,7 @@ mod tests {
             show_cheat_sheet: false,
             nav_gizmo_drag_active: false,
             build_variant: BuildVariant::default(),
+            mapinfo_overrides: std::collections::HashMap::new(),
         }
     }
 

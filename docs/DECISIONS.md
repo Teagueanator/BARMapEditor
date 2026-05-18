@@ -325,7 +325,16 @@ model.
 
 ## ADR-013 — `mapinfo.lua` emit + `.sd7` packaging via system `7z`
 
-**Status:** Accepted (2026-05-17)
+**Status:** Accepted (2026-05-17). **STATUS UPDATE 2026-05-18 (C1 /
+ADR-028):** the "minimum-viable, hand-rolled string formatter"
+language is **superseded** by ADR-028 for the *data shape*. The
+typed schema now lives at `crates/barme-core/src/mapinfo_schema.rs`
+and is the canonical model F9 + C8 lint will consume. **The
+emitter** (this ADR's other half) is *unchanged* in C1 — Sprint 6 /
+ADR-029 will swap it for a Lua-AST emitter + three-file convention
+(`mapconfig/map_metal_layout.lua`, `mapconfig/map_startboxes.lua`,
+`mapconfig/featureplacer/features.lua`). Until ADR-029 lands, the
+hand-rolled string formatter in this ADR remains in force.
 **Context:** ADR-012 produces a `.smf` + `.smt`. Recoil needs them
 wrapped in a non-solid 7-Zip archive named `.sd7`, alongside a
 `mapinfo.lua` that names them. PITFALL #9 (SpringFiles silently rejects
@@ -1694,6 +1703,120 @@ keeps `App::central` from growing into a 500-line function.
   launch hint + `?` cheat-sheet land in the same `ui/overlay.rs` file
   (or sibling files under `crates/barme-app/src/ui/`).
 - Future B4 / B6 / B7 overlays drop into the same module.
+
+## ADR-028 — Typed `mapinfo.lua` schema in `barme-core`
+
+**Status:** Accepted (2026-05-18). Supersedes ADR-013's
+"minimum-viable string formatter" language for the **data shape**;
+the emitter half of ADR-013 stays in force until ADR-029 (C2) lands.
+
+**Context:** Phase 3's research session
+(`docs/research/mapinfo/claude-research-findings.md` +
+`gemini-bar-map-metadata-research-findings.md`) catalogued the full
+`mapinfo.lua` surface — 20+ top-level fields plus 12 named
+sub-tables. The current emitter at `crates/barme-pipeline/src/mapinfo.rs`
+fills < 10 % of the consumable surface. That's enough to *boot* a
+map but not enough to ship one without the "featureless / untextured"
+symptom, the "fog start equals fog end breaks build ETA" landmine,
+or the "extractor radius = 500 breaks mex snap" footgun documented
+in §7 of the digest.
+
+Three downstream consumers all need the schema:
+1. **C2 emitter** — three-file emission convention
+   (`mapinfo.lua` + `mapconfig/map_metal_layout.lua` +
+   `mapconfig/map_startboxes.lua` + `mapconfig/featureplacer/features.lua`)
+   needs a typed source so each file knows what it owns.
+2. **C7 F9 form editor** — every field needs a typed DragValue /
+   TextEdit / Checkbox / color picker; without a schema the form
+   is unmaintainable.
+3. **C8 lint pass** — silent-failure detection (digest §7) walks
+   the typed schema and flags issues like the splatDetailNormalTex
+   ↔ specularTex pairing requirement.
+
+Building the schema once and reusing it three times is the obvious
+shape. ADR-013's hand-rolled string formatter served Stage 0's
+"booting the engine"; it's not the right v1 for "edits any
+mapinfo field." Schema first, emitter swap next (C2 / ADR-029),
+form + lint after (C7 / C8).
+
+**Decision:** new module `crates/barme-core/src/mapinfo_schema.rs`
+holding `pub struct MapInfo` plus 9 sub-block structs (`SmfBlock`,
+`LightingBlock`, `AtmosphereBlock`, `WaterBlock`, `SplatsBlock`,
+`ResourcesBlock`, `TerrainTypeBlock`, `GrassBlock`, `TeamBlock` +
+`SoundBlock`, `GuiBlock`). `MapInfo::bar_default()` populates BAR
+conventions; `From<&Project> for MapInfo` reads project state on
+top of the defaults.
+
+**Pitfalls modelled at the type level** (digest §7 +
+phase-3-plan.md C1 callouts):
+
+- `lighting.sun_dir: [f32; 4]` — vec3 + sunStart distance, NOT
+  `[f32; 3]`. Easy mistake; pinned by `bar_default_lighting_sun_dir_is_four_floats`.
+- `TeamBlock` carries ONLY `start_pos`, NEVER `ally_team`. Both
+  research reports confirm allyteam membership lives in
+  `mapconfig/map_startboxes.lua` (separate file, C2's job). Pinned
+  by exhaustive destructure in `team_block_carries_only_start_pos`.
+- `extractor_radius: Some(80.0)` — BAR convention, NOT the engine
+  default 500. Engine default breaks mex snap. Pinned by
+  `bar_default_extractor_radius_is_80_not_engine_default_500`.
+- `atmosphere.fog_start: Some(0.1)`, `fog_end: Some(1.0)` —
+  distinct. Setting equal breaks the build-ETA grid renderer.
+  Pinned by `bar_default_atmosphere_fog_is_not_equal`.
+- `modtype: 3` — Chobby visibility gate. Pinned by
+  `bar_default_modtype_is_3`.
+- `depend` includes `"Map Helper v1"` — without it the engine
+  serves fallback textures (the "untextured" symptom). Pinned by
+  `bar_default_depend_includes_map_helper_v1`.
+- `splats.tex_scales: [0.02; 4]`, `tex_mults: [1.0; 4]` — BAR
+  defaults. Pinned.
+- `splat_detail_normal_tex` paired with `specular_tex` — both
+  modelled. C8 lint enforces.
+
+**Project model addition:** `Project.mapinfo_overrides:
+HashMap<String, toml::Value>` — F9 (C7) will populate this on
+top of `MapInfo::bar_default()`. Carries unusual per-project
+edits (custom skybox, dual-fog config, etc.) so the schema
+doesn't need a bump for every gadget. Empty by default;
+`#[serde(default, skip_serializing_if = "HashMap::is_empty")]`
+so legacy projects load forward.
+
+**Alternatives considered:**
+- **Promote to a `barme-mapinfo` sub-crate now.** CLAUDE.md
+  sketches this layout. Defer: today's schema is ~600 LOC + tests.
+  Pull out into a sub-crate when it exceeds ~500 LOC of pure
+  schema code (the form editor + lint will inflate it past that
+  point).
+- **Use `serde_json::Value` for `custom.*`.** Rejected: every
+  other on-disk type in `Project` is TOML; mixing serde formats
+  inside one struct surfaces awkwardly in the F9 form layer.
+  `toml::Value` is consistent and round-trips cleanly through the
+  project file.
+- **Model every field as `Option<T>`.** Rejected for the truly
+  required fields (`name`, `version`, `mapfile`, `modtype`, `smf`,
+  `lighting`, `atmosphere`, `splats`, `resources`). Making them
+  `Option` would let a load silently drop them and produce a
+  pink-map / untextured failure at emission time. Required-by-design
+  is enforced at the type level.
+
+**Out of scope:**
+- The Lua-text emitter — ADR-029 / C2.
+- The F9 form editor — C7.
+- The lint pass — C8.
+- `Project.metal_spots`, `Project.geo_vents`, `Project.features`,
+  `Project.ally_groups` — those land in C4 / C5 / C6 / B6. C1 only
+  adds `mapinfo_overrides`.
+
+**Consequence:**
+- New module `crates/barme-core/src/mapinfo_schema.rs` (~600 LOC
+  including tests).
+- New `Project.mapinfo_overrides` field with serde-default load.
+- `App.mapinfo_overrides` field mirrors `Project.mapinfo_overrides`
+  so save / open round-trip preserves user edits across sessions
+  even before F9 wires the editor surface.
+- 21 unit tests pin every BAR-default value and every digest §7
+  pitfall.
+- ADR-013 STATUS UPDATE annotates the supersession scope
+  (data-shape only; emitter unchanged until ADR-029).
 
 ## Template for new entries
 
