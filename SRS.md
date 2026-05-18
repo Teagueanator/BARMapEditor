@@ -153,6 +153,58 @@ A single-window, single-executable desktop app that produces a *playable* BAR ma
 | F18 | Heightmap import from real DEM (GeoTIFF) | | | ✅ |
 | F19 | Procedural feature scatter with rule sets | | | ✅ |
 | F20 | "Publish to BAR" — open a PR against `maps-metadata` with generated YAML row | | | ✅ |
+| F21 | Light/dark theme toggle (egui theme, persisted across launches) | | ✅ | |
+| F22 | Bottom status bar: live CPU% + resident memory of the editor process | | ✅ | |
+| F23 | User-asset library: importable terrain stamps + feature prefabs (PA-style "drop a bridge / mountain here") | | | ✅ |
+
+> **STATUS UPDATE 2026-05-17 (user request):** F21/F22 added after Stage 0
+> goal #7. F21 is straight egui (`ctx.set_visuals(Visuals::dark/light())`)
+> with a `serde`-persisted preference. F22 needs a per-platform process-stats
+> probe (`sysinfo` crate is the obvious choice — pure-Rust, cross-platform,
+> already used elsewhere in the wgpu/Rerun ecosystem). Refresh once per
+> second, render in an egui `TopBottomPanel::bottom` so it's always visible.
+> Memory should be RSS in MiB; CPU is process-local %, smoothed over the
+> sample window. Out of scope for Stage 0.
+
+> **STATUS UPDATE 2026-05-17 (user request, F23):** Planetary Annihilation's
+> system designer lets authors drag user-uploaded planetary set pieces
+> (mountains, biomes, structures) onto the map. The BAR-equivalent splits
+> into three orthogonal asset types, each with its own bundling
+> implications:
+>
+> 1. **Heightmap stamps** — small 16-bit PNG patches the user paints into
+>    the project's main heightmap. Pure CPU/GPU operation; no `.sd7`
+>    payload impact. Cheapest to ship.
+> 2. **Feature prefabs (trees, rocks, wreckage, bridges)** — these are
+>    3DO / S3O / OBJ models that BAR's mod gadgets place via
+>    `LuaGaia/featuredefs.lua` + a placement table. **Default features
+>    (trees, generic rocks) are owned by the BAR mod and referenced by
+>    name** — zero `.sd7` payload, but the user's choices are limited to
+>    what the mod ships. **Map-custom features** would need their model
+>    + texture files bundled into the `.sd7`, which inflates the archive
+>    fast (a single S3O bridge with diffuse/normal/specular at 1024² is
+>    ~3 MB). The library should distinguish "mod-provided" (free,
+>    portable) from "map-bundled" (heavy, locks the user into shipping).
+> 3. **Splat / DNTS material packs** — DDS-compressed splat textures the
+>    user drops in as DNTS layers. Heaviest individually
+>    (256–512 KB per BC1 splat at 1024²) but reused across the splat
+>    distribution map, so the marginal cost is bounded.
+>
+> Architectural note for whoever scopes this: the library belongs in
+> `barme-core` as a registry layer (asset metadata + on-disk paths), and
+> `barme-pipeline` is responsible for resolving "mod-provided" references
+> at build time (refuse to bundle, warn if the named feature isn't in
+> the BAR mod's default set) and bundling "map-bundled" assets into the
+> staging tree before 7-Zip. **Don't bake the asset library into the UI
+> shell** — both a "Browse community assets" panel and a CLI batch
+> stamper should be able to consume it.
+>
+> Reference: PA's system designer (`uberent/PlanetaryAnnihilation`) and
+> Spring's longtime feature-placement convention as documented in
+> Beherith's *Advanced SpringRTS Mapping Guide*. Implementation gated
+> on a v2 scope discussion — the file-format choices alone (do we share
+> a `.barme-assetpack` tarball convention? piggyback on `.sd7`?) need an
+> ADR before any code.
 
 ### 3.3 Non-functional requirements
 

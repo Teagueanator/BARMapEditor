@@ -1,12 +1,14 @@
+mod launcher;
 mod render;
 
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use barme_core::{Heightmap, MapSize, PROJECT_EXTENSION, Project};
+use barme_pipeline::PyMapConvDriver;
 use eframe::egui;
 use eframe::egui_wgpu;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::render::{OrbitCamera, TerrainCallback};
 
@@ -50,6 +52,7 @@ struct App {
     camera: OrbitCamera,
     height_scale: f32,
     current_project_path: Option<PathBuf>,
+    last_install: Option<Result<PathBuf, String>>,
 }
 
 struct HeightmapState {
@@ -78,6 +81,7 @@ impl App {
             camera: OrbitCamera::framing(8192.0, 8192.0),
             height_scale: 256.0,
             current_project_path: None,
+            last_install: None,
         }
     }
 
@@ -143,6 +147,7 @@ impl App {
         self.height_scale = 256.0;
         self.camera = OrbitCamera::framing(8192.0, 8192.0);
         self.last_error = None;
+        self.last_install = None;
     }
 
     fn snapshot_project(&self) -> Project {
@@ -187,6 +192,62 @@ impl App {
             Err(e) => {
                 warn!("save to {} failed: {e}", path.display());
                 self.last_error = Some(format!("save: {e}"));
+            }
+        }
+    }
+
+    /// Compile the current project to a `.sd7` and copy it into BAR's
+    /// user maps directory. v0 UX: heightmap must be loaded, texture is a
+    /// synthesised flat grey (Stage 1 will replace with real DNTS).
+    fn build_and_install(&mut self) {
+        self.last_install = None;
+        self.last_error = None;
+        let Some(hm) = self.heightmap.as_ref() else {
+            warn!("build & install requested with no heightmap loaded");
+            self.last_error = Some("load a heightmap first".into());
+            return;
+        };
+        let hm_path = hm.path.clone();
+        let Some(dst_dir) = launcher::bar_maps_dir() else {
+            let msg =
+                "could not locate BAR maps dir on this platform — pick one manually (Stage 1)";
+            warn!("{msg}");
+            self.last_install = Some(Err(msg.into()));
+            return;
+        };
+        let repo_root = repo_root();
+        let driver = match PyMapConvDriver::vendored(&repo_root) {
+            Ok(d) => d,
+            Err(e) => {
+                let msg = format!("{e:#}");
+                error!("pymapconv unavailable: {msg}");
+                self.last_install = Some(Err(msg));
+                return;
+            }
+        };
+        let project = self.snapshot_project();
+        info!(
+            name = %project.name,
+            smu = self.map_size_smu,
+            max_height = self.height_scale,
+            heightmap = %hm_path.display(),
+            dst = %dst_dir.display(),
+            "build & install requested"
+        );
+        match launcher::build_and_install(&driver, &project, &hm_path, None, &dst_dir) {
+            Ok(installed) => {
+                let bytes = std::fs::metadata(&installed).map(|m| m.len()).unwrap_or(0);
+                info!(
+                    path = %installed.display(),
+                    bytes,
+                    "build & install ok"
+                );
+                self.last_install = Some(Ok(installed));
+            }
+            Err(e) => {
+                let msg = format!("{e:#}");
+                error!(error = %msg, "build & install failed");
+                self.last_install = Some(Err(msg));
             }
         }
     }
@@ -250,11 +311,17 @@ fn pick_open_path() -> Option<PathBuf> {
         .pick_file()
 }
 
+fn repo_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("workspace root is two parents up from a member crate")
+        .to_path_buf()
+}
+
 fn fixture_path(smu: u32) -> PathBuf {
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let repo_root = manifest_dir.parent().and_then(|p| p.parent()).unwrap();
     let edge = smu * 64 + 1;
-    repo_root
+    repo_root()
         .join("assets")
         .join("fixtures")
         .join(format!("r16_ramp_{smu}x{smu}smu_{edge}px.png"))
@@ -269,6 +336,7 @@ enum FileAction {
     Save,
     SaveAs,
     Open,
+    BuildAndInstall,
 }
 
 impl eframe::App for App {
@@ -305,8 +373,16 @@ impl eframe::App for App {
                     }
                 });
                 ui.menu_button("Build", |ui| {
-                    if ui.button("Compile .sd7").clicked() {
+                    let enabled = self.heightmap.is_some();
+                    if ui
+                        .add_enabled(enabled, egui::Button::new("Build & Install to BAR"))
+                        .clicked()
+                    {
+                        action = Some(FileAction::BuildAndInstall);
                         ui.close();
+                    }
+                    if !enabled {
+                        ui.label("(load a heightmap first)");
                     }
                 });
             });
@@ -380,6 +456,37 @@ impl eframe::App for App {
                 self.camera.distance,
             ));
 
+            ui.separator();
+            ui.heading("Build & Install");
+            let can_install = self.heightmap.is_some();
+            let resp = ui.add_enabled(can_install, egui::Button::new("Build & Install to BAR"));
+            if resp.clicked() {
+                action = Some(FileAction::BuildAndInstall);
+            }
+            if !can_install {
+                ui.label("Load a heightmap to enable.");
+            }
+            match &self.last_install {
+                Some(Ok(p)) => {
+                    ui.colored_label(
+                        egui::Color32::GREEN,
+                        format!(
+                            "Installed: {}",
+                            p.file_name()
+                                .and_then(|s| s.to_str())
+                                .unwrap_or_else(|| p.to_str().unwrap_or("?"))
+                        ),
+                    );
+                    if let Some(parent) = p.parent() {
+                        ui.label(format!("Dir: {}", parent.display()));
+                    }
+                }
+                Some(Err(msg)) => {
+                    ui.colored_label(egui::Color32::RED, format!("Install failed: {msg}"));
+                }
+                None => {}
+            }
+
             if let Some(err) = &self.last_error {
                 ui.separator();
                 ui.colored_label(egui::Color32::RED, err);
@@ -443,6 +550,7 @@ impl eframe::App for App {
                     self.open_from(p);
                 }
             }
+            Some(FileAction::BuildAndInstall) => self.build_and_install(),
             None if rebuild_mesh => self.rebuild_mesh(),
             None => {}
         }

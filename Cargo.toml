@@ -37,6 +37,12 @@ rfd = "0.15"
 # Subprocess plumbing
 which = "8"
 
+# Cross-platform user directories (BAR maps-dir lookup; see ADR-015)
+directories = "6"
+
+# Scratch dirs (build_and_install uses a per-call tempdir)
+tempfile = "3"
+
 # Workspace-internal
 barme-core = { path = "crates/barme-core" }
 barme-pipeline = { path = "crates/barme-pipeline" }

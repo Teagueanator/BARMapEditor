@@ -485,6 +485,91 @@ the issue.
     and needs a different unzip target layout. Out of scope for
     Stage 0.
 
+## ADR-015 — `barme-app::launcher` module + "Build & Install" UI button
+
+**Status:** Accepted (2026-05-17)
+**Context:** Stage 0 goal #7 was validated via a hardcoded
+`barme-pipeline/examples/build_smoke.rs` that wrote straight into
+`/home/teague/.local/state/Beyond All Reason/maps/`. Stage 1 needs that
+same flow exposed through the editor UI, with a cross-platform path
+resolver instead of a baked-in Linux path. Three orthogonal choices:
+  1. **Module vs new crate.** ADR-005 prefers small crates, but the
+     launcher is ~150 LOC of `directories`-crate lookup + `std::fs::copy`,
+     with no consumer other than the UI. A new crate adds three
+     `Cargo.toml`s of overhead for negligible API surface.
+  2. **Path resolution source.** Re-implement from scratch, or mirror the
+     canonical reference. `beyond-all-reason/spring-launcher`'s
+     `src/write_path.js` is the Electron-side authority for where BAR
+     stores user-writable state — matching its behaviour exactly keeps the
+     editor drop-in compatible with whatever the lobby is using.
+  3. **Install semantics.** Copy vs symlink. Symlinks need Developer Mode
+     on Windows; BAR's archive scanner doesn't distinguish.
+**Decision:**
+  - **Module** at `crates/barme-app/src/launcher.rs`. Public surface:
+    `bar_maps_dir() -> Option<PathBuf>`,
+    `install_sd7(src, dst_dir) -> Result<PathBuf, LauncherError>`,
+    `build_and_install(driver, project, hm, tex_opt, dst)`.
+    `LauncherError` (thiserror): `Pipeline` (wraps
+    `barme_pipeline::BuildError`), `Io { path, source }`, `TextureSynth`.
+    Tracing throughout (info on lifecycle, error on unhappy paths).
+  - **Linux path lookup** mirrors `spring-launcher` precedence using
+    `directories::BaseDirs::state_dir()` + `UserDirs::document_dir()`:
+    1. `$XDG_STATE_HOME/Beyond All Reason/maps`
+    2. `$HOME/Documents/Beyond All Reason/maps` (legacy migration check)
+    3. `$HOME/.local/state/Beyond All Reason/maps` (belt-and-braces fallback)
+    Probes for the first existing candidate; falls through to the highest
+    priority one when none exist (created on first install).
+  - **Windows / macOS:** returns `None`. spring-launcher's Windows path
+    is `app.getAppPath()/../../data` — portable next to the install dir
+    with no fixed system anchor. The UI surfaces the `None` as
+    "could not locate BAR maps dir — pick one manually (Stage 1)" and a
+    user-pick file-dialog fallback is the Stage 1 polish.
+  - **Copy, not symlink.** Overwrite-in-place so re-running on the same
+    project is idempotent.
+  - **Texture fallback** in `build_and_install`: `texture_bmp = None` →
+    synthesise a flat grey `(128,128,128)` BMP at the project's texture
+    dimensions. Mirrors what `examples/build_smoke.rs` does so the UI can
+    ship before F4 (DNTS splat painting) lands.
+  - **UI:** "Build & Install to BAR" button in the side panel and a
+    sibling under the existing Build menu. Disabled until a heightmap is
+    loaded. Result rendered as a coloured status line under the button —
+    green with the installed path on success, red with the error on
+    failure. Verbose diagnostics go to stderr via the existing
+    `tracing_subscriber` setup.
+  - **`examples/build_smoke.rs` retained.** It's still the cleanest
+    headless smoke for `barme-pipeline` standing alone, and it
+    cross-checks `launcher::build_and_install` (different driver code
+    path, same pipeline + 7-Zip plumbing).
+**Alternatives:**
+  - **`barme-launcher` crate** — rejected (see Context #1).
+  - **Hand-rolled env-var lookup** — rejected: `directories` handles the
+    `$HOME` unset edge case correctly and the Linux-only `state_dir()`
+    API is exactly the primitive we need. The macOS `None` return is
+    honest where a hand-rolled `$HOME/Library/...` guess would be a lie.
+  - **Pre-bake the maps path into project config** — rejected: every
+    user would set it once, then the lobby moves and nothing works.
+    Probing matches the lobby's behaviour instead.
+  - **Symlinks** — rejected per Context #3.
+  - **Block install on Windows entirely** — rejected: the function-level
+    return-`None` is friendlier (UI can offer a pick-a-dir alternative)
+    than a compile-time `#[cfg]` gate.
+**Consequence:**
+  - `barme-app` gains `barme-pipeline`, `directories`, `image`,
+    `tempfile`, `thiserror` as direct deps (all previously in workspace
+    deps, just promoted to direct).
+  - `App` state grows `last_install: Option<Result<PathBuf, String>>` for
+    the side-panel status line.
+  - Three unit tests in `crates/barme-app/src/launcher.rs`:
+    Linux-candidate shape, install creates dir + copies, install
+    overwrites existing.
+  - The Stage-1-polish punt list grows by one: a "pick BAR maps
+    directory…" file dialog for non-Linux + the persisted preference
+    that goes with it.
+  - **Windows support (deferred to Stage 1):** the function still
+    compiles cleanly on Windows targets via `#[cfg(not(target_os =
+    "linux"))]`; it just returns no candidates. Cross-compilation/CI is
+    not blocked.
+
 ---
 
 ## Template for new entries
