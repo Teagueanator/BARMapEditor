@@ -23,3 +23,7 @@ tempfile = "3"
 [[example]]
 name = "gen-fixture"
 path = "examples/gen_fixture.rs"
+
+[[example]]
+name = "bench-brushes"
+path = "examples/bench_brushes.rs"

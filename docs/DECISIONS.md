@@ -1003,6 +1003,89 @@ makes the brush opener immediately useful on blank projects.
     field, the expression + domain + apply-order ride alongside
     brush strokes for true reproducibility.
 
+## ADR-021 — GPU compute brushes: DEFERRED (CPU is ~10× under budget)
+
+**Status:** Accepted (2026-05-17). Decision is *defer*, not implement.
+Re-evaluate when 32 SMU support lands (Stage 2 territory).
+**Context:** ADR-018 shipped the CPU brush kernels with a scope guardrail:
+"if Commit 2's CPU kernel measures ≤ 8 ms per stamp at 16 SMU (SRS
+NFR-Performance), land it as a marker for future work and skip the
+porting." Time to measure.
+
+`crates/barme-core/examples/bench_brushes.rs` was added to capture this
+empirically; SRS NFR-Performance is the bar.
+
+**Measured at 16 SMU (1025×1025 = ~1 M px, release profile, ryzen 5800X3D):**
+
+| radius (elmos) | raise   | lower   | smooth  |
+|----------------|---------|---------|---------|
+|            128 | 0.003ms | 0.004ms | 0.014ms |
+|            256 | 0.020ms | 0.016ms | 0.051ms |
+|            512 | 0.057ms | 0.065ms | 0.221ms |
+|           1024 | 0.248ms | 0.246ms | 0.787ms |
+
+The worst case is `smooth` at radius 1024 elmos (128 px radius = ~50k pixel
+area, plus the 3×3 neighbour kernel) — 0.79 ms per stamp. SRS budget is
+8 ms; we have **~10× headroom** even on the largest realistic brush. The
+GPU port would buy nothing in user-perceptible latency at 16 SMU and would
+cost:
+
+1. An adapter-feature check for `R16Uint` storage texture access (it's
+   under `TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES` in core wgpu, not
+   guaranteed on all GPUs). Fallback would be to bump the storage to
+   `R32Uint` (8 MB at 16 SMU, harmless but wasteful).
+2. A compute pipeline + bind group per brush kernel, all using the same
+   storage texture binding.
+3. CPU mirror sync on save/install via `copy_texture_to_buffer` + async
+   `buffer.map_async` — a non-trivial state machine.
+4. The CPU `Heightmap` becomes the *cached* representation rather than
+   the source of truth, which complicates the brush trait surface (would
+   need a `&mut HeightmapView` abstraction that hides CPU vs GPU).
+
+**Decision:** **Do not port now.** CPU kernels are the implementation
+through Stage 1. The bench example is committed so anyone can re-run
+the measurement, and the trigger condition for revisiting this ADR
+is written down below.
+
+**Re-evaluation triggers:**
+
+- 32 SMU map support (Stage 2 per SRS §3.2). Heightmap grows 4×; the
+  worst-case smooth stamp scales linearly with pixel area, so expected
+  worst case ≈ 3.2 ms — still under budget but tighter. If we add a
+  larger brush range (radius 2048+) or higher-order kernels (erosion,
+  hydraulic) at that size, GPU porting earns its keep.
+- A user-reported lag on a target hardware tier we haven't profiled
+  (low-power Intel iGPUs, ARM laptops).
+- A new brush whose CPU implementation is irreducibly slow (e.g.
+  iterative erosion simulating O(N) particle passes).
+
+**Alternatives considered:**
+
+- **Ship the WGSL skeleton + an unused compute pipeline now.** Rejected:
+  half-finished implementation, would have to be maintained against
+  wgpu API changes for no current benefit. Better to write it fresh when
+  the trigger condition fires.
+- **Use SIMD / `rayon` parallelism on the CPU.** Possible easy 4–8× win
+  if a future brush actually needs it. Cheaper than GPU porting; would
+  precede ADR-021 reactivation.
+
+**Consequence:**
+
+- **No code change to the brush pipeline.** Brushes stay CPU-only.
+- `Heightmap::data_mut()` (ADR-018) remains the brush write target;
+  `render::write_heightmap_rect` does the GPU sync per stroke.
+- `crates/barme-core/examples/bench_brushes.rs` is committed as the
+  evidence artifact. Run with
+  `cargo run --example bench-brushes --release -p barme-core`.
+  The numbers in the table above are the 2026-05-17 baseline; later
+  sessions should re-run before declaring "still under budget".
+- **Storage-binding flag NOT added to the heightmap texture yet.**
+  When ADR-021 is reactivated, that's the first patch — see ADR-017's
+  Consequences for the deferral note.
+- **F2 (SRS) reaches functional completeness for Stage 1** with
+  raise/lower/smooth CPU brushes. Further brushes plug into the same
+  trait without re-deciding any of this.
+
 ---
 
 ## Template for new entries
