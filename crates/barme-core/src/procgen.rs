@@ -127,8 +127,58 @@ pub enum ProcGenError {
     },
     #[error("expression must return a number, got: {got}")]
     NonNumeric { got: String },
+    #[error("expression too long: {actual} chars (max {max})")]
+    ExpressionTooLong { max: usize, actual: usize },
     #[error("heightmap build failed: {0}")]
     Heightmap(#[source] anyhow::Error),
+}
+
+/// Soft cap on expression length. Defensive — protects the live syntax
+/// check (A4) from pathological pasted input. `build_operator_tree` is
+/// fast on short expressions (~μs) but a degenerate 10 KB input could
+/// degrade typing latency.
+pub const MAX_EXPRESSION_LEN: usize = 1024;
+
+/// Validates an expression for the procgen UI's live "green ✓ / red ✗"
+/// chip. Three layers, each fast enough to run on every keystroke:
+///
+/// 1. **Length cap.** Bail before parsing if the input exceeds
+///    [`MAX_EXPRESSION_LEN`]. Protects typing latency against
+///    pathological pasted input.
+/// 2. **Parse.** `evalexpr::build_operator_tree` — catches syntactic
+///    junk like `1 + )` and dangling operators.
+/// 3. **Dry eval at (x=0, z=0).** Parse alone doesn't catch
+///    `x*2x` (evalexpr happily parses that as `x * 2 * <variable
+///    named "2x">`), nor does it catch type-mismatch shapes that bind
+///    correctly but won't yield a number. A single tree-walk against
+///    [`PixelContext`] surfaces both, mirroring what
+///    [`generate`] would hit at the first pixel.
+///
+/// The operator tree is **discarded** even on success — the live-typing
+/// UI re-parses on Apply (per plan A4: "avoids state-mismatch bugs if
+/// TextEdit and parsed tree drift"). Cost is ~μs for typical preset
+/// expressions, well under one frame.
+pub fn validate_expression(expr: &str) -> Result<(), ProcGenError> {
+    if expr.len() > MAX_EXPRESSION_LEN {
+        return Err(ProcGenError::ExpressionTooLong {
+            max: MAX_EXPRESSION_LEN,
+            actual: expr.len(),
+        });
+    }
+    let tree: Node<DefaultNumericTypes> = build_operator_tree(expr).map_err(ProcGenError::Parse)?;
+    let ctx = PixelContext::new(); // x = z = 0.0
+    let v = tree
+        .eval_with_context(&ctx)
+        .map_err(|source| ProcGenError::EvalFailed {
+            pixel: (0, 0),
+            source,
+        })?;
+    match v {
+        Value::Float(_) | Value::Int(_) => Ok(()),
+        other => Err(ProcGenError::NonNumeric {
+            got: format!("{other:?}"),
+        }),
+    }
 }
 
 /// Sample a math expression at every heightmap pixel and return a new
@@ -424,6 +474,89 @@ mod tests {
         assert_eq!(center, u16::MAX);
         // Corner: x = z = -1 → 1 - sqrt(2) ≈ -0.41 → clamped to 0.
         assert_eq!(a.data()[0], 0);
+    }
+
+    #[test]
+    fn validate_expression_accepts_all_presets() {
+        // Live-typing UI fires the validator on every keystroke; if any of
+        // the curated presets fails to parse, picking it from the preset
+        // dropdown would immediately gate the Apply button.
+        for p in PRESETS {
+            validate_expression(p.expression).unwrap_or_else(|e| {
+                panic!(
+                    "preset {:?} expression {:?} should parse, got: {e:#}",
+                    p.label, p.expression
+                )
+            });
+        }
+        for b in BIOMES {
+            validate_expression(b.expression).unwrap_or_else(|e| {
+                panic!(
+                    "biome {:?} expression {:?} should parse, got: {e:#}",
+                    b.label, b.expression
+                )
+            });
+        }
+    }
+
+    #[test]
+    fn validate_expression_rejects_user_typo_x2x() {
+        // The motivating case from phase-3-plan A4: user typed `x*2x`
+        // expecting `x*x*x` and got an unintelligible eval error.
+        // evalexpr's parser accepts `x*2x` as `x * 2 * <var "2x">`, so a
+        // parse-only check is not enough — the dry-eval surfaces the
+        // unbound "2x" identifier.
+        let err = validate_expression("x*2x").unwrap_err();
+        let chain = format!("{err:#}");
+        assert!(
+            matches!(err, ProcGenError::EvalFailed { .. }),
+            "expected EvalFailed (unbound identifier), got: {chain}"
+        );
+        assert!(
+            chain.contains("2x"),
+            "error message must mention the unbound identifier 2x; got: {chain}"
+        );
+    }
+
+    #[test]
+    fn validate_expression_accepts_well_formed_input() {
+        validate_expression("x*x*x").unwrap();
+        validate_expression("1 - (x*x + z*z)").unwrap();
+        validate_expression("0.5 + 0.25 * math::sin(8*x) * math::cos(8*z)").unwrap();
+    }
+
+    #[test]
+    fn validate_expression_rejects_empty_input() {
+        // Empty string is parseable as evalexpr's "empty expression" but
+        // evaluating it yields no value — fast-fail at the validator so
+        // the Apply button doesn't accept it.
+        let res = validate_expression("");
+        // evalexpr 13 treats empty as a parse error; if a future version
+        // changes that, the live-check UI still wants to flag empty as
+        // "no expression to apply." Accept either Parse-error today.
+        assert!(res.is_err(), "empty expression should not validate");
+    }
+
+    #[test]
+    fn validate_expression_rejects_input_longer_than_max() {
+        let huge = "x".repeat(MAX_EXPRESSION_LEN + 1);
+        let err = validate_expression(&huge).unwrap_err();
+        assert!(
+            matches!(err, ProcGenError::ExpressionTooLong { .. }),
+            "expected ExpressionTooLong, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_expression_at_max_length_is_attempted() {
+        // Inputs at the cap should still go through the parser. Use a
+        // string that's exactly MAX_EXPRESSION_LEN — pad a valid head
+        // with whitespace so it's still well-formed.
+        let prefix = "0.5";
+        let pad = " ".repeat(MAX_EXPRESSION_LEN - prefix.len());
+        let at_max = format!("{prefix}{pad}");
+        assert_eq!(at_max.len(), MAX_EXPRESSION_LEN);
+        validate_expression(&at_max).unwrap();
     }
 
     #[test]

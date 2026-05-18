@@ -8,7 +8,7 @@ use barme_core::{
     BIOMES, BrushRegistry, BrushStamp, DirtyRect, Heightmap, History, MapSize, PROJECT_EXTENSION,
     Project, StartPosition, SymmetryAxis,
     brushes::pixel_bbox,
-    procgen::{Domain, PRESETS, generate as procgen_generate},
+    procgen::{Domain, PRESETS, generate as procgen_generate, validate_expression},
     project::sanitize_name,
     start_pos::assign_team_ids,
 };
@@ -89,6 +89,12 @@ struct App {
     procgen_expr: String,
     procgen_domain: Domain,
     procgen_last_error: Option<String>,
+    /// Cached parse-and-dry-eval outcome for the current
+    /// `procgen_expr` (A4). `Ok(())` enables the Apply button +
+    /// renders the green chip; `Err(msg)` disables Apply + drives the
+    /// red chip with `msg` in the tooltip. Refreshed whenever
+    /// `procgen_expr` changes (typing, preset pick, biome apply).
+    procgen_validation: Result<(), String>,
     /// Persistent undo/redo across the session. Cleared on barrier events
     /// (procgen, heightmap load, new project) — see ADR-022. Stroke state
     /// (copy-on-first-write scratch + bitset) lives inside `History` since
@@ -199,6 +205,10 @@ impl App {
             procgen_expr: "1 - (x*x + z*z)".to_string(),
             procgen_domain: Domain::Centered,
             procgen_last_error: None,
+            // Default expression is the parabolic-bowl preset — known
+            // to validate. Anything that doesn't validate would render
+            // the chip red on first frame.
+            procgen_validation: Ok(()),
             history: History::default(),
             tool_mode: ToolMode::Sculpt,
             start_positions: Vec::new(),
@@ -323,6 +333,17 @@ impl App {
                 self.last_error = Some(format!("save: {e:#}"));
             }
         }
+    }
+
+    /// Refresh the cached parse-and-dry-eval outcome (ADR-…/A4). Stores
+    /// the formatted `#[source]` chain so the UI tooltip can render it
+    /// directly. Called whenever `procgen_expr` changes — keystroke, preset
+    /// pick, biome apply. Cost is ~μs for typical inputs, but the input is
+    /// capped at `procgen::MAX_EXPRESSION_LEN` chars by the validator
+    /// itself.
+    fn revalidate_procgen(&mut self) {
+        self.procgen_validation =
+            validate_expression(&self.procgen_expr).map_err(|e| format!("{e:#}"));
     }
 
     /// Generate a heightmap from the current procgen expression and
@@ -556,6 +577,7 @@ impl App {
         let biome = &BIOMES[w.biome_index.min(BIOMES.len() - 1)];
         self.procgen_expr = biome.expression.to_string();
         self.procgen_domain = biome.domain;
+        self.revalidate_procgen();
         info!(
             name = %self.project_name,
             smu_x = self.map_size.smu_x,
@@ -1297,7 +1319,10 @@ impl eframe::App for App {
                     .small()
                     .weak(),
             );
-            ui.text_edit_singleline(&mut self.procgen_expr);
+            let expr_resp = ui.text_edit_singleline(&mut self.procgen_expr);
+            if expr_resp.changed() {
+                self.revalidate_procgen();
+            }
             ui.horizontal(|ui| {
                 ui.label("Domain:");
                 ui.selectable_value(&mut self.procgen_domain, Domain::Unit, Domain::Unit.label());
@@ -1314,12 +1339,29 @@ impl eframe::App for App {
                         if ui.selectable_label(false, p.label).clicked() {
                             self.procgen_expr = p.expression.to_string();
                             self.procgen_domain = p.domain;
+                            self.revalidate_procgen();
                         }
                     }
                 });
-            if ui.button("Apply").clicked() {
-                action = Some(FileAction::ApplyProcGen);
-            }
+            // Apply row: button + live-validation chip. Apply is gated on
+            // parse-AND-dry-eval success; the chip tooltip shows the
+            // `#[source]` chain of the validator error.
+            ui.horizontal(|ui| {
+                let parse_ok = self.procgen_validation.is_ok();
+                let apply = ui.add_enabled(parse_ok, egui::Button::new("Apply"));
+                if apply.clicked() {
+                    action = Some(FileAction::ApplyProcGen);
+                }
+                match &self.procgen_validation {
+                    Ok(()) => {
+                        ui.colored_label(egui::Color32::GREEN, "✓")
+                            .on_hover_text("expression parses & evaluates");
+                    }
+                    Err(msg) => {
+                        ui.colored_label(egui::Color32::RED, "✗").on_hover_text(msg);
+                    }
+                }
+            });
             if let Some(err) = &self.procgen_last_error {
                 ui.colored_label(egui::Color32::RED, format!("Procgen: {err}"));
             }
