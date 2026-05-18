@@ -19,7 +19,9 @@ is not an option.
 **Rule:** In-process BC1 (texpresso/bcdec/ISPC) for live preview. PyMapConv +
 Compressonator for final-quality `.smt`. (Note: PyMapConv switched off
 nvdxt.exe to Compressonator some time before May 2026 — no Wine needed on
-Linux.)
+Linux.) **CompressonatorCLI is invoked by name** (no path override in
+upstream `src/pymapconv.py`); we vendor it under `tools/compressonator/`
+and prepend that dir to `PATH` for the subprocess (ADR-014).
 
 ## 3. SMT tile dedup
 
@@ -99,3 +101,22 @@ PyMapConv archive and that its SPDX identifier is permissive.
   Heightmap, metal, type, mapinfo are exact. Reuse PyMapConv's decompile path.
 - **GPU brush latency.** Heightmap lives on the GPU as an R16 storage texture,
   edited by compute shaders. Read-back to CPU only on save.
+
+## PyMapConv v0.6.3 Linux runtime quirks (found in Stage 0, ADR-014)
+
+- **Always pass `-q 1` on Linux.** Default `numthreads=4` triggers an
+  upstream read-back bug: tile compression writes flat into
+  `temp/temp{i}.dds`, but the read-back loop checks `numthreads > 1`
+  and tries `temp/thread{n}/temp{i}.dds` (the Windows multi-thread
+  layout that Linux never creates). Crash:
+  `FileNotFoundError: temp/thread0/temp0.dds`. Source: v0.6.3
+  `src/pymapconv.py` lines 960–986.
+  **Rule:** the driver passes `-q 1` unconditionally on Linux.
+
+- **Trust artifact presence, not exit code.** PyMapConv exits with
+  status 1 on Linux even after `All Done!` — the bundled Qt event loop
+  closes "abnormally" when no display is held open. The contract is
+  what's on disk (`.smf` + `.smt`).
+  **Rule:** treat artifact-presence as success and log non-zero exit
+  at `warn`. Only fail when artifacts are missing AND exit was
+  non-zero.
