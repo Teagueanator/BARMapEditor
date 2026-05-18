@@ -206,6 +206,32 @@ A single-window, single-executable desktop app that produces a *playable* BAR ma
 > a `.barme-assetpack` tarball convention? piggyback on `.sd7`?) need an
 > ADR before any code.
 
+> **STATUS UPDATE 2026-05-17 (Stage 1 opener, F2):** Raise / Lower / Smooth
+> shipped via the `barme_core::brushes` plugin-shaped trait + registry
+> (ADR-018). New brushes (flatten / erode / noise / terrace / ramp) plug in
+> as `impl Brush` + one line in `BrushRegistry::default_set` — no UI or
+> dispatch edits. Kernels are CPU; bench at 16 SMU shows ~10× headroom
+> against the NFR-Performance budget, so GPU compute port is formally
+> deferred (ADR-021).
+
+> **STATUS UPDATE 2026-05-17 (Stage 1 opener, F3):** Shipped via
+> `barme_core::symmetry::SymmetryAxis` (ADR-019). Covers `None`,
+> horizontal / vertical mirror, both (Quad), both diagonals, and
+> rotational with a user-editable fold value (`Rotational { fold: 2..=12 }`
+> via the side-panel DragValue — 3 for three-player maps, 4 for
+> quad-player, etc.). One brush stamp produces N derived stamps; their
+> dirty rects union into a single GPU upload. Arbitrary-axis line picker
+> is Stage 2.
+
+> **STATUS UPDATE 2026-05-17 (Stage 1 opener, F14 partial):** The
+> math-function subset shipped via `barme_core::procgen::generate`
+> (ADR-020). User enters `f(x, z) ∈ [0,1]` and the heightmap is
+> regenerated at the project's MapSize. Powered by `evalexpr` v13;
+> ships with seven presets (flat / parabolic bowl / dome / cone /
+> ridge / ramp / sine ripples). FBM, hydraulic erosion, and river-carve
+> remain Stage 2 — they need their own ADR (noise basis function,
+> erosion solver choice, river network seeding).
+
 ### 3.3 Non-functional requirements
 
 - **NFR-Performance:** Brush stroke latency ≤ 8 ms on a 16×16 map at 60 fps preview on a mid-range 2020 GPU.

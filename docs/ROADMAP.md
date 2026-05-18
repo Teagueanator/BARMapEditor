@@ -34,8 +34,12 @@ multiplayer browser (Skirmish-only).
 Implements SRS F1–F12. Ships a Windows `.exe` and a Linux AppImage.
 
 - [ ] **F1** New-project wizard (size, biome preset, symmetry mode)
-- [ ] **F2** Real-time heightmap sculpting (raise / lower / flatten / smooth / erode / ramp)
-- [ ] **F3** Symmetry enforcement (mirror H/V/diag/rot-N)
+- [x] **F2** Real-time heightmap sculpting — raise / lower / smooth shipped via
+      plugin-shaped `Brush` trait (ADR-018). Flatten / erode / ramp drop in
+      under the same trait as Stage 1.5+ work.
+- [x] **F3** Symmetry enforcement — mirror H / V / Quad / both diagonals +
+      rotational `fold ∈ 2..=12` (ADR-019). Arbitrary-axis line picker
+      remains Stage 2.
 - [ ] **F4** Texture painting via DNTS splat channels (4 RGBA, ≤4 splat textures)
 - [ ] **F5** Metal-spot placement (point + radius → red-channel density)
 - [ ] **F6** Geo-vent placement
@@ -54,7 +58,9 @@ Implements SRS F1–F12. Ships a Windows `.exe` and a Linux AppImage.
 SRS F13–F17 plus quality-of-life.
 
 - [ ] **F13** Decompile / import existing `.sd7`
-- [ ] **F14** Procedural terrain (FBM, hydraulic erosion, river carve)
+- [ ] **F14** Procedural terrain — **math-function subset shipped early in
+      Stage 1** via `barme_core::procgen` + `evalexpr` (ADR-020). Remaining:
+      FBM, hydraulic erosion, river carve (each needs its own ADR).
 - [ ] **F15** Type-map editor + per-terraintype gameplay params
 - [ ] **F16** Skybox picker / atmospheric preset library
 - [ ] **F17** Pathability overlay
