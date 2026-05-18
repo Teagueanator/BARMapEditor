@@ -271,17 +271,65 @@ pub fn paint_brush_ghosts(
         let Some(centre_screen) = render::world_to_screen(centre_world, rect_size, camera) else {
             continue;
         };
-        let tangent_world = glam::Vec3::new(cx + cursor.radius_world, 0.0, cz);
-        let radius_px = match render::world_to_screen(tangent_world, rect_size, camera) {
-            Some(t) => (t - centre_screen).length().max(2.0),
-            None => 8.0,
-        };
+        let radius_px = brush_screen_radius(camera, rect_size, centre_world, cursor.radius_world)
+            .unwrap_or(8.0);
         let p = egui::Pos2::new(rect.min.x + centre_screen.x, rect.min.y + centre_screen.y);
         painter.circle_stroke(p, radius_px, egui::Stroke::new(1.5, ghost));
-        // Inner falloff ring at radius × 0.5 — matches B3's primary
-        // visual so when both ship the rings look like a family.
+        // Inner falloff ring at radius × 0.5 — matches the primary
+        // ring's visual so the rings look like a family.
         painter.circle_stroke(p, radius_px * 0.5, egui::Stroke::new(1.0, ghost));
     }
+}
+
+/// Pure helper: compute the projected screen-pixel radius of a brush
+/// ring at world-space `centre` with `radius_world` elmos. Projects
+/// the centre and `centre + (radius_world, 0, 0)` and takes the screen
+/// distance between them. Returns `None` if either point projects
+/// off-screen (the caller substitutes a fallback fixed radius).
+///
+/// Used by both [`paint_brush_ghosts`] and [`paint_primary_brush_ring`].
+pub fn brush_screen_radius(
+    camera: &OrbitCamera,
+    rect_size: glam::Vec2,
+    centre: glam::Vec3,
+    radius_world: f32,
+) -> Option<f32> {
+    let centre_screen = render::world_to_screen(centre, rect_size, camera)?;
+    let tangent = centre + glam::Vec3::new(radius_world, 0.0, 0.0);
+    let tangent_screen = render::world_to_screen(tangent, rect_size, camera)?;
+    Some((tangent_screen - centre_screen).length().max(2.0))
+}
+
+/// Paint the primary brush ring (B3): outer ring at `radius_world`,
+/// inner falloff ring at `radius_world × 0.5`, centre dot. Full alpha;
+/// the centre dot uses a contrasting "shadow" outline so it reads
+/// against bright terrain. Mirrors are rendered by
+/// [`paint_brush_ghosts`].
+pub fn paint_primary_brush_ring(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    camera: &OrbitCamera,
+    cursor: BrushCursor<'_>,
+) {
+    let rect_size = glam::Vec2::new(rect.width(), rect.height());
+    let Some(centre_screen) = render::world_to_screen(cursor.world, rect_size, camera) else {
+        return;
+    };
+    let radius_px =
+        brush_screen_radius(camera, rect_size, cursor.world, cursor.radius_world).unwrap_or(12.0);
+    let p = egui::Pos2::new(rect.min.x + centre_screen.x, rect.min.y + centre_screen.y);
+
+    let base = cursor
+        .brush_id
+        .map(brush_ring_color)
+        .unwrap_or(egui::Color32::LIGHT_GRAY);
+
+    // Outer falloff ring + inner radius × 0.5 (the falloff visual).
+    painter.circle_stroke(p, radius_px, egui::Stroke::new(2.0, base));
+    painter.circle_stroke(p, radius_px * 0.5, egui::Stroke::new(1.0, base));
+    // Centre dot with a faint black halo so it reads on bright terrain.
+    painter.circle_filled(p, 3.0, egui::Color32::BLACK);
+    painter.circle_filled(p, 2.0, base);
 }
 
 #[cfg(test)]
@@ -714,5 +762,68 @@ mod tests {
         assert_eq!(cursor.world, world);
         assert!((cursor.radius_world - 99.0).abs() < 1e-3);
         assert_eq!(cursor.brush_id, Some("raise"));
+    }
+
+    // ------------------- brush_screen_radius (B3) -------------------
+
+    fn default_camera() -> OrbitCamera {
+        OrbitCamera::framing(8192.0, 8192.0)
+    }
+
+    #[test]
+    fn brush_screen_radius_returns_some_for_centre_world_at_origin() {
+        let cam = default_camera();
+        let rect_size = glam::Vec2::new(1024.0, 768.0);
+        let centre = cam.target;
+        let r = brush_screen_radius(&cam, rect_size, centre, 100.0);
+        assert!(r.is_some());
+        // Must be at least the 2 px floor.
+        assert!(r.unwrap() >= 2.0);
+    }
+
+    #[test]
+    fn brush_screen_radius_floor_is_two_pixels() {
+        let cam = default_camera();
+        let rect_size = glam::Vec2::new(1024.0, 768.0);
+        // Tiny world radius — projected screen distance would be sub-pixel,
+        // but the floor clamps to 2 px so the ring is visible.
+        let r = brush_screen_radius(&cam, rect_size, cam.target, 0.001);
+        assert!(r.unwrap() >= 2.0);
+    }
+
+    #[test]
+    fn brush_screen_radius_grows_with_world_radius() {
+        let cam = default_camera();
+        let rect_size = glam::Vec2::new(1024.0, 768.0);
+        let r_small = brush_screen_radius(&cam, rect_size, cam.target, 50.0).unwrap();
+        let r_large = brush_screen_radius(&cam, rect_size, cam.target, 500.0).unwrap();
+        assert!(
+            r_large > r_small,
+            "expected r_large ({r_large}) > r_small ({r_small})"
+        );
+    }
+
+    #[test]
+    fn brush_screen_radius_shrinks_with_camera_distance() {
+        let mut cam = default_camera();
+        let rect_size = glam::Vec2::new(1024.0, 768.0);
+        let r_near = brush_screen_radius(&cam, rect_size, cam.target, 100.0).unwrap();
+        cam.distance *= 4.0;
+        let r_far = brush_screen_radius(&cam, rect_size, cam.target, 100.0).unwrap();
+        assert!(
+            r_far < r_near,
+            "expected perspective: r_far ({r_far}) < r_near ({r_near})"
+        );
+    }
+
+    #[test]
+    fn brush_screen_radius_returns_none_when_centre_offscreen() {
+        // Push the centre wildly off-screen via a huge world coord —
+        // world_to_screen returns None and brush_screen_radius follows.
+        let cam = default_camera();
+        let rect_size = glam::Vec2::new(1024.0, 768.0);
+        let centre = glam::Vec3::new(1.0e10, 0.0, 1.0e10);
+        let r = brush_screen_radius(&cam, rect_size, centre, 100.0);
+        assert!(r.is_none());
     }
 }

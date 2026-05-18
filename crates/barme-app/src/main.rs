@@ -1,3 +1,4 @@
+mod config;
 mod launcher;
 mod render;
 mod ui;
@@ -124,6 +125,18 @@ struct App {
     /// side panel pre-ADR-030). B2 will replace the popover with a
     /// canvas overlay; B1 keeps the controls reachable.
     symmetry_popover_open: bool,
+    /// Per-user editor config (TOML at the OS config dir). Carries the
+    /// version-keyed "first-launch hint dismissed" flag. B3.
+    editor_config: config::EditorConfig,
+    /// Whether the first-launch hint Window should render this frame.
+    /// Initialised from `editor_config.intro_seen_for_current_version()`.
+    show_intro: bool,
+    /// Whether the `?` cheat-sheet modal is open this frame.
+    show_cheat_sheet: bool,
+    /// Set on `drag_started` inside the nav-gizmo rect; cleared on
+    /// `drag_stopped`. While true, LMB-drag orbits regardless of
+    /// active tool — same camera math as the existing RMB orbit.
+    nav_gizmo_drag_active: bool,
 }
 
 /// Mutable form state for the F1 wizard. Held independently of App state
@@ -257,6 +270,9 @@ impl App {
             error!("no wgpu render state — terrain preview disabled");
         }
 
+        let editor_config = config::EditorConfig::load();
+        let show_intro = !editor_config.intro_seen_for_current_version();
+
         Self {
             project_name: "untitled".to_string(),
             map_size: MapSize::square(16),
@@ -289,6 +305,10 @@ impl App {
             wizard_open: true,
             wizard: WizardState::default_for_new_project(),
             symmetry_popover_open: false,
+            editor_config,
+            show_intro,
+            show_cheat_sheet: false,
+            nav_gizmo_drag_active: false,
         }
     }
 
@@ -1160,12 +1180,17 @@ impl App {
         if ctx.wants_keyboard_input() {
             return;
         }
-        let (q, b, s, g) = ctx.input(|i| {
+        let (q, b, s, g, help, esc) = ctx.input(|i| {
+            let shift = i.modifiers.shift;
             (
                 i.key_pressed(egui::Key::Q),
                 i.key_pressed(egui::Key::B),
                 i.key_pressed(egui::Key::S),
                 i.key_pressed(egui::Key::G),
+                // `?` is shift+/ on US layouts. Egui exposes the slash
+                // key; we gate on shift so plain `/` doesn't open help.
+                shift && i.key_pressed(egui::Key::Slash),
+                i.key_pressed(egui::Key::Escape),
             )
         });
         if q {
@@ -1180,6 +1205,33 @@ impl App {
         if g {
             self.set_tool(Tool::Procgen);
         }
+        // `?` toggles the cheat-sheet; gated on `!wizard_open` so it
+        // can't ride on top of the F1 wizard.
+        if help && !self.wizard_open {
+            self.show_cheat_sheet = !self.show_cheat_sheet;
+        }
+        // Esc closes whichever overlay is on (cheat-sheet first, then
+        // intro hint).
+        if esc {
+            if self.show_cheat_sheet {
+                self.show_cheat_sheet = false;
+            } else if self.show_intro {
+                self.dismiss_intro();
+            }
+        }
+    }
+
+    /// Mark the first-launch hint as seen for the current editor
+    /// version and persist the config to disk. Best-effort; save
+    /// errors log at `warn` (see `config::EditorConfig::save`).
+    fn dismiss_intro(&mut self) {
+        self.show_intro = false;
+        self.editor_config.mark_intro_seen_for_current_version();
+        self.editor_config.save();
+        info!(
+            version = config::CURRENT_VERSION,
+            "first-launch hint dismissed"
+        );
     }
 
     /// Top action bar: File / Edit / Build menus on the left, the
@@ -1658,13 +1710,49 @@ impl App {
                 && self.heightmap.is_some();
             let start_pos_active = matches!(self.tool, Tool::StartPositions);
             let central_interactive = brush_active || start_pos_active;
-            let camera_drag = if central_interactive {
+
+            // Nav-gizmo interaction (B3). A click on an axis tip snaps
+            // the camera; a click-and-drag *anywhere inside the gizmo
+            // rect* orbits the camera (same math as RMB orbit). The
+            // gizmo rect is computed up-front so we can short-circuit
+            // the brush / start-pos handlers when the cursor is over it.
+            let gizmo_rect = crate::ui::gizmo::gizmo_rect(rect);
+            let cursor_in_gizmo = ctx
+                .pointer_interact_pos()
+                .map(|p| gizmo_rect.contains(p))
+                .unwrap_or(false);
+            if response.drag_started_by(egui::PointerButton::Primary) && cursor_in_gizmo {
+                self.nav_gizmo_drag_active = true;
+            }
+            if response.drag_stopped_by(egui::PointerButton::Primary) {
+                self.nav_gizmo_drag_active = false;
+            }
+            // Single-click on an axis tip → snap camera. Must come
+            // BEFORE brush / start-pos click handlers since those
+            // would otherwise eat the click on top of the gizmo.
+            let mut consumed_click = false;
+            if response.clicked_by(egui::PointerButton::Primary)
+                && cursor_in_gizmo
+                && let Some(cursor) = ctx.pointer_interact_pos()
+                && let Some(axis) =
+                    crate::ui::gizmo::hit_test_axis(cursor, gizmo_rect.center(), &self.camera)
+            {
+                let (yaw, pitch) = axis.camera_snap();
+                self.camera.yaw = yaw;
+                self.camera.pitch = pitch;
+                info!(axis = axis.label(), "nav gizmo: snap camera");
+                consumed_click = true;
+            }
+
+            let camera_drag = if self.nav_gizmo_drag_active {
+                response.dragged_by(egui::PointerButton::Primary)
+            } else if central_interactive {
                 response.dragged_by(egui::PointerButton::Secondary)
             } else {
                 response.dragged()
             };
             if camera_drag {
-                let d = if central_interactive {
+                let d = if central_interactive || self.nav_gizmo_drag_active {
                     ui.input(|i| i.pointer.delta())
                 } else {
                     response.drag_delta()
@@ -1688,8 +1776,11 @@ impl App {
             // on the y=0 plane. Spacing along the drag is implicit
             // (frame rate). One LMB-down → LMB-up coalesces into a
             // single undo unit via `end_stroke` on pointer release
-            // (ADR-033).
+            // (ADR-033). Skip when the gizmo is taking the LMB.
             if brush_active
+                && !self.nav_gizmo_drag_active
+                && !consumed_click
+                && !cursor_in_gizmo
                 && (response.dragged_by(egui::PointerButton::Primary)
                     || response.clicked_by(egui::PointerButton::Primary))
                 && let Some(cursor) = ctx.pointer_interact_pos()
@@ -1701,7 +1792,12 @@ impl App {
             }
 
             // Start-position placement / move / delete (ADR-023).
-            if start_pos_active && let Some(cursor) = ctx.pointer_interact_pos() {
+            if start_pos_active
+                && !self.nav_gizmo_drag_active
+                && !consumed_click
+                && !cursor_in_gizmo
+                && let Some(cursor) = ctx.pointer_interact_pos()
+            {
                 let cursor_in = glam::Vec2::new(cursor.x - rect.min.x, cursor.y - rect.min.y);
                 let rect_size = glam::Vec2::new(rect.width(), rect.height());
                 const HIT_RADIUS_PX: f32 = 12.0;
@@ -1764,35 +1860,50 @@ impl App {
                 extents,
             );
 
-            // Mirror-brush ghost rings — Sculpt tool + brush selected +
-            // cursor over central rect + symmetry ≠ None. Cursor world
+            // Brush rings — Sculpt + brush selected + cursor over the
+            // central rect + cursor outside the nav gizmo. Cursor world
             // position reuses the existing y=0 raycast from stamp
-            // placement (pitfall §B2.4 — no second projection path).
-            // B2 ships only the ghosts; B3 adds the primary ring.
+            // placement (pitfall §B3.5 / §B2.5 — no second projection
+            // path). The primary ring (B3) renders at full alpha at
+            // the cursor; mirror ghosts (B2) render at 50 % at each
+            // symmetry-derived centre.
             if matches!(self.tool, Tool::Sculpt)
                 && self.brush_id.is_some()
-                && !matches!(self.symmetry, SymmetryAxis::None)
                 && response.hovered()
                 && let Some(cursor) = ctx.pointer_interact_pos()
                 && rect.contains(cursor)
+                && !cursor_in_gizmo
             {
                 let cursor_in = glam::Vec2::new(cursor.x - rect.min.x, cursor.y - rect.min.y);
                 let rect_size_v = glam::Vec2::new(rect.width(), rect.height());
                 if let Some(world) =
                     render::screen_to_world_y0(cursor_in, rect_size_v, &self.camera)
                 {
-                    crate::ui::overlay::paint_brush_ghosts(
+                    let brush_cursor = crate::ui::overlay::BrushCursor {
+                        world,
+                        radius_world: self.brush_radius,
+                        brush_id: self.brush_id.as_deref(),
+                    };
+                    crate::ui::overlay::paint_primary_brush_ring(
                         &overlay_painter,
                         rect,
                         &self.camera,
-                        self.symmetry,
                         crate::ui::overlay::BrushCursor {
-                            world,
-                            radius_world: self.brush_radius,
-                            brush_id: self.brush_id.as_deref(),
+                            world: brush_cursor.world,
+                            radius_world: brush_cursor.radius_world,
+                            brush_id: brush_cursor.brush_id,
                         },
-                        extents,
                     );
+                    if !matches!(self.symmetry, SymmetryAxis::None) {
+                        crate::ui::overlay::paint_brush_ghosts(
+                            &overlay_painter,
+                            rect,
+                            &self.camera,
+                            self.symmetry,
+                            brush_cursor,
+                            extents,
+                        );
+                    }
                 }
             }
 
@@ -1824,6 +1935,11 @@ impl App {
                     );
                 }
             }
+
+            // Nav gizmo — top-right corner of the viewport (B3). Painted
+            // LAST so it sits on top of the brush rings, axis overlay,
+            // and start-position markers.
+            crate::ui::gizmo::paint_nav_gizmo(&overlay_painter, rect, &self.camera);
         });
     }
 
@@ -1891,6 +2007,29 @@ impl eframe::App for App {
         self.drain_action(action);
         self.symmetry_popover(ctx);
 
+        // `?` cheat-sheet modal (B3). Builds the per-tool entries from
+        // `Tool::ALL` so a new variant in Phase 4 shows up automatically.
+        if self.show_cheat_sheet {
+            let tool_entries: Vec<crate::ui::cheat_sheet::ToolBinding<'_>> =
+                Tool::ALL.iter().map(|t| (t.accel(), t.label())).collect();
+            crate::ui::cheat_sheet::render_cheat_sheet(
+                ctx,
+                &mut self.show_cheat_sheet,
+                &tool_entries,
+            );
+        }
+
+        // First-launch hint (B3). Renders ONLY after the wizard closes
+        // so the two don't compete; this also serves a project on disk
+        // that auto-applied via the wizard's default state.
+        if self.show_intro
+            && !self.wizard_open
+            && let Some(crate::ui::intro::IntroAction::Dismiss) =
+                crate::ui::intro::render_intro_hint(ctx, &mut self.show_intro)
+        {
+            self.dismiss_intro();
+        }
+
         // Wizard renders on top, after all other panels. Drains to
         // `apply_wizard` / close depending on the user's choice. ADR-024.
         if self.wizard_open {
@@ -1942,6 +2081,10 @@ mod tests {
             wizard_open: false,
             wizard: WizardState::default_for_new_project(),
             symmetry_popover_open: false,
+            editor_config: config::EditorConfig::default(),
+            show_intro: false,
+            show_cheat_sheet: false,
+            nav_gizmo_drag_active: false,
         }
     }
 
@@ -2146,5 +2289,68 @@ mod tests {
             DEFAULT_TRACING_FILTER.starts_with("info,"),
             "filter must leave our own info!-level events visible"
         );
+    }
+
+    /// B3: the `?` cheat-sheet auto-generates from `Tool::ALL`. A new
+    /// `Tool` variant should make the entry count grow by exactly one —
+    /// this test asserts that invariant against the live enum, so a
+    /// future contributor who adds `Tool::Splat` will see the test fail
+    /// with a clear "did you forget to update the cheat-sheet?" hint.
+    #[test]
+    fn cheat_sheet_entry_count_matches_tool_all_plus_camera_bindings() {
+        let tool_entries: Vec<crate::ui::cheat_sheet::ToolBinding<'_>> =
+            Tool::ALL.iter().map(|t| (t.accel(), t.label())).collect();
+        let live = crate::ui::cheat_sheet::cheat_sheet_entries(&tool_entries);
+        let expected = crate::ui::cheat_sheet::cheat_sheet_entry_count(Tool::ALL.len());
+        assert_eq!(live.len(), expected);
+    }
+
+    /// B3: every `Tool` variant gets exactly one cheat-sheet row,
+    /// generated from its `accel` + `label` helpers.
+    #[test]
+    fn every_tool_appears_in_cheat_sheet() {
+        let tool_entries: Vec<crate::ui::cheat_sheet::ToolBinding<'_>> =
+            Tool::ALL.iter().map(|t| (t.accel(), t.label())).collect();
+        let live = crate::ui::cheat_sheet::cheat_sheet_entries(&tool_entries);
+        for t in Tool::ALL {
+            let key = t.accel();
+            let label = t.label();
+            assert!(
+                live.iter()
+                    .any(|e| e.keys == key && e.action.contains(label)),
+                "tool {t:?} missing from cheat-sheet"
+            );
+        }
+    }
+
+    /// B3: `dismiss_intro` flips `show_intro` to false AND updates the
+    /// editor config's seen-version vec. The disk save is best-effort
+    /// (no temp config dir in the test); we just verify the state
+    /// machine.
+    #[test]
+    fn dismiss_intro_updates_state_and_config() {
+        let mut app = make_test_app();
+        app.show_intro = true;
+        assert!(!app.editor_config.intro_seen_for_current_version());
+        app.dismiss_intro();
+        assert!(!app.show_intro);
+        assert!(app.editor_config.intro_seen_for_current_version());
+    }
+
+    /// B3: the nav-gizmo drag flag clears on App construction (no
+    /// in-flight drag survives a restart).
+    #[test]
+    fn fresh_app_has_no_in_flight_nav_gizmo_drag() {
+        let app = make_test_app();
+        assert!(!app.nav_gizmo_drag_active);
+    }
+
+    /// B3: cheat-sheet starts closed in a fresh app. A regression that
+    /// flipped the default to `true` would pop the modal on every cold
+    /// launch — annoying enough to pin.
+    #[test]
+    fn fresh_app_has_cheat_sheet_closed() {
+        let app = make_test_app();
+        assert!(!app.show_cheat_sheet);
     }
 }

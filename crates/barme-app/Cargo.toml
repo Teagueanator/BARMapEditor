@@ -26,3 +26,5 @@ rfd.workspace = true
 image.workspace = true
 directories.workspace = true
 tempfile.workspace = true
+serde.workspace = true
+toml.workspace = true
