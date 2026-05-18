@@ -100,8 +100,13 @@ struct App {
     /// (copy-on-first-write scratch + bitset) lives inside `History` since
     /// ADR-033.
     history: History,
-    /// Active tool mode for the central preview rect (ADR-023).
-    tool_mode: ToolMode,
+    /// Active editor tool (ADR-030). Drives the Inspector's exhaustive
+    /// `match`, the central viewport's pointer interaction, and the
+    /// highlighted button in the left tool strip.
+    tool: Tool,
+    /// Last-seen value of `tool` — used by `set_tool` to emit a single
+    /// `tracing::info!` line per actual change, not on every frame.
+    previous_tool: Tool,
     /// Authored team start positions; round-trips through `Project`.
     /// Empty by default — the pipeline falls back to a 25/75 default pair.
     start_positions: Vec<StartPosition>,
@@ -112,6 +117,12 @@ struct App {
     /// pre-F1 in-memory "untitled" auto-start) and via File → New project.
     wizard_open: bool,
     wizard: WizardState,
+    /// Top-bar symmetry chip popover. Toggled by clicking the chip; the
+    /// popover holds the symmetry-axis combo + rotational fold spinner
+    /// (the controls that used to live in the Sculpt section of the
+    /// side panel pre-ADR-030). B2 will replace the popover with a
+    /// canvas overlay; B1 keeps the controls reachable.
+    symmetry_popover_open: bool,
 }
 
 /// Mutable form state for the F1 wizard. Held independently of App state
@@ -148,13 +159,72 @@ impl WizardState {
     }
 }
 
-/// Central-rect interaction mode. Stays in `Sculpt` for the existing brush
-/// flow; flips to `StartPositions` when F8 placement is active. Mode is
-/// exposed in the side panel as a radio.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ToolMode {
+/// Single-active-tool model (ADR-030). Exactly one tool is active at any
+/// time; the left tool strip selects it, the right Inspector swaps its
+/// contents via an exhaustive `match` on the active variant, and the
+/// central viewport's pointer interaction is driven by this enum.
+///
+/// Each variant has a one-letter accelerator. Phase 4 will add `Splat`,
+/// `Metal`, and `Feature` variants here — every match site is exhaustive
+/// so adding a variant produces a compile error at each dispatch
+/// location.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Tool {
+    /// Camera-only. LMB orbits; no central-rect editing.
+    Select,
+    /// Heightmap brush (F2 / ADR-018). LMB stamps the current brush.
     Sculpt,
+    /// F8 start-position placement (ADR-023). LMB places / drags
+    /// markers, RMB deletes.
     StartPositions,
+    /// Math-function terrain generator (F14 / ADR-020). No central-rect
+    /// editing; the formula is committed via Apply in the Inspector.
+    Procgen,
+}
+
+impl Tool {
+    /// All tool variants in display order. Single source of truth used
+    /// by the tool strip *and* the unit tests so adding a variant in
+    /// one place doesn't drift from the other. The exhaustive `match`
+    /// dispatches in the Inspector enforce the rest of the invariant.
+    const ALL: [Tool; 4] = [
+        Tool::Select,
+        Tool::Sculpt,
+        Tool::StartPositions,
+        Tool::Procgen,
+    ];
+
+    /// One-character glyph rendered in the left tool strip. Picked to be
+    /// present in egui's default proportional + monospace fonts so we
+    /// don't pull in an icon font dependency.
+    fn icon(self) -> &'static str {
+        match self {
+            Tool::Select => "↺",
+            Tool::Sculpt => "✎",
+            Tool::StartPositions => "⚑",
+            Tool::Procgen => "ƒ",
+        }
+    }
+
+    /// Single-letter accelerator key. Wired in `App::handle_keyboard`.
+    fn accel(self) -> &'static str {
+        match self {
+            Tool::Select => "Q",
+            Tool::Sculpt => "B",
+            Tool::StartPositions => "S",
+            Tool::Procgen => "G",
+        }
+    }
+
+    /// Long-form name for hover tooltips + tracing output.
+    fn label(self) -> &'static str {
+        match self {
+            Tool::Select => "Select / orbit",
+            Tool::Sculpt => "Sculpt",
+            Tool::StartPositions => "Start positions",
+            Tool::Procgen => "Procgen",
+        }
+    }
 }
 
 struct HeightmapState {
@@ -210,12 +280,14 @@ impl App {
             // the chip red on first frame.
             procgen_validation: Ok(()),
             history: History::default(),
-            tool_mode: ToolMode::Sculpt,
+            tool: Tool::Sculpt,
+            previous_tool: Tool::Sculpt,
             start_positions: Vec::new(),
             dragging_start_pos: None,
             // Open on first launch — the F1 wizard *is* the entry point now.
             wizard_open: true,
             wizard: WizardState::default_for_new_project(),
+            symmetry_popover_open: false,
         }
     }
 
@@ -1035,12 +1107,42 @@ enum FileAction {
     Redo,
 }
 
-impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        let mut action: Option<FileAction> = None;
+/// Layout-shell methods for the five-zone UI introduced in ADR-030. Each
+/// panel function takes `&mut self` + the egui `Context` (plus
+/// `&mut Option<FileAction>` where relevant) and writes exactly one
+/// panel. They're called from `eframe::App::update` in egui panel
+/// add-order: top → bottom → left → right → CentralPanel LAST.
+impl App {
+    /// Switch the active tool, emitting one `tracing::info!` line per
+    /// real change (no-op transitions are silent). Tracked via
+    /// `previous_tool` so the diff is observable in bug-report logs.
+    fn set_tool(&mut self, new: Tool) {
+        if self.tool == new {
+            return;
+        }
+        info!(
+            from = ?self.tool,
+            to = ?new,
+            "tool change"
+        );
+        self.previous_tool = self.tool;
+        self.tool = new;
+        // Drop any in-flight stroke when switching out of Sculpt so the
+        // user's last paint motion lands as a committed undo unit
+        // before the next tool can fire. Idempotent if no stroke open.
+        self.end_stroke();
+        // Cancel an in-flight start-position drag when leaving
+        // StartPositions — otherwise `dragging_start_pos` would linger
+        // and a re-entry to the tool would resume an invisible drag.
+        self.dragging_start_pos = None;
+    }
 
-        // Ctrl-Z / Ctrl-Shift-Z keybinds (Cmd on macOS via egui's `command`).
-        // Queued through `action` so we don't mutate state mid-frame.
+    /// Keyboard: Ctrl-Z / Ctrl-Shift-Z / Ctrl-Y for undo / redo,
+    /// Q / B / S / G for tool switch. Tool accelerators only fire when
+    /// no widget has keyboard focus so typing into the procgen
+    /// `TextEdit` doesn't eat keystrokes and bounce the user out of
+    /// Procgen mid-edit.
+    fn handle_keyboard(&mut self, ctx: &egui::Context, action: &mut Option<FileAction>) {
         let (key_undo, key_redo) = ctx.input(|i| {
             let cmd = i.modifiers.command;
             let shift = i.modifiers.shift;
@@ -1049,35 +1151,65 @@ impl eframe::App for App {
             (cmd && !shift && z, (cmd && shift && z) || (cmd && y))
         });
         if key_undo {
-            action = Some(FileAction::Undo);
+            *action = Some(FileAction::Undo);
         } else if key_redo {
-            action = Some(FileAction::Redo);
+            *action = Some(FileAction::Redo);
         }
 
-        egui::TopBottomPanel::top("menu").show(ctx, |ui| {
+        if ctx.wants_keyboard_input() {
+            return;
+        }
+        let (q, b, s, g) = ctx.input(|i| {
+            (
+                i.key_pressed(egui::Key::Q),
+                i.key_pressed(egui::Key::B),
+                i.key_pressed(egui::Key::S),
+                i.key_pressed(egui::Key::G),
+            )
+        });
+        if q {
+            self.set_tool(Tool::Select);
+        }
+        if b {
+            self.set_tool(Tool::Sculpt);
+        }
+        if s {
+            self.set_tool(Tool::StartPositions);
+        }
+        if g {
+            self.set_tool(Tool::Procgen);
+        }
+    }
+
+    /// Top action bar: File / Edit / Build menus on the left, the
+    /// symmetry chip in the middle, Build & Install right-aligned. B4
+    /// will style the Build button as a green primary + add the
+    /// variants ComboBox; B1 ships the plain `Button`.
+    fn top_bar(&mut self, ctx: &egui::Context, action: &mut Option<FileAction>) {
+        egui::TopBottomPanel::top("action_bar").show(ctx, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
                 ui.menu_button("File", |ui| {
                     if ui.button("New project…").clicked() {
-                        action = Some(FileAction::OpenWizard);
+                        *action = Some(FileAction::OpenWizard);
                         ui.close();
                     }
                     if ui.button("Open project…").clicked() {
-                        action = Some(FileAction::Open);
+                        *action = Some(FileAction::Open);
                         ui.close();
                     }
                     if ui.button("Save project").clicked() {
-                        action = Some(FileAction::Save);
+                        *action = Some(FileAction::Save);
                         ui.close();
                     }
                     if ui.button("Save project as…").clicked() {
-                        action = Some(FileAction::SaveAs);
+                        *action = Some(FileAction::SaveAs);
                         ui.close();
                     }
                     ui.separator();
                     ui.label("Load fixture heightmap");
                     for smu in [2u32, 4, 16] {
                         if ui.button(format!("{smu}×{smu} SMU")).clicked() {
-                            action = Some(FileAction::LoadHeightmap(fixture_path(smu)));
+                            *action = Some(FileAction::LoadHeightmap(fixture_path(smu)));
                             ui.close();
                         }
                     }
@@ -1089,14 +1221,14 @@ impl eframe::App for App {
                         .add_enabled(can_undo, egui::Button::new("Undo\tCtrl+Z"))
                         .clicked()
                     {
-                        action = Some(FileAction::Undo);
+                        *action = Some(FileAction::Undo);
                         ui.close();
                     }
                     if ui
                         .add_enabled(can_redo, egui::Button::new("Redo\tCtrl+Shift+Z"))
                         .clicked()
                     {
-                        action = Some(FileAction::Redo);
+                        *action = Some(FileAction::Redo);
                         ui.close();
                     }
                 });
@@ -1106,314 +1238,424 @@ impl eframe::App for App {
                         .add_enabled(enabled, egui::Button::new("Build & Install to BAR"))
                         .clicked()
                     {
-                        action = Some(FileAction::BuildAndInstall);
+                        *action = Some(FileAction::BuildAndInstall);
                         ui.close();
                     }
                     if !enabled {
                         ui.label("(load a heightmap first)");
                     }
                 });
+
+                ui.separator();
+                // Symmetry chip — toggles the popover Window with the
+                // existing axis combo + rotational fold spinner.
+                // ADR-031 (B2) replaces the popover with a canvas
+                // overlay; this commit only keeps the controls
+                // reachable after moving them out of the Inspector.
+                let sym_text = format!("Sym: {}", self.symmetry.label());
+                let resp = ui.selectable_label(self.symmetry_popover_open, sym_text);
+                if resp.clicked() {
+                    self.symmetry_popover_open = !self.symmetry_popover_open;
+                }
+
+                // Right-align the Build & Install button. B4 styles it.
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let can_install = self.heightmap.is_some();
+                    let resp = ui.add_enabled(can_install, egui::Button::new("Build & Install"));
+                    if resp.clicked() {
+                        *action = Some(FileAction::BuildAndInstall);
+                    }
+                });
             });
         });
+    }
 
-        egui::SidePanel::left("tools").show(ctx, |ui| {
-            ui.heading("Project");
+    /// Bottom status strip: live camera-orbit readout, project size,
+    /// validation-chip placeholder, last-install / last-error state.
+    /// C8 wires the validation chip to real lint output later.
+    fn status_strip(&mut self, ctx: &egui::Context) {
+        egui::TopBottomPanel::bottom("status_strip").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.label("Name:");
-                ui.text_edit_singleline(&mut self.project_name);
-            });
-            ui.horizontal(|ui| {
-                ui.label("Size (SMU):");
-                ui.add(egui::DragValue::new(&mut self.map_size.smu_x).range(2..=96));
-                ui.label("×");
-                ui.add(egui::DragValue::new(&mut self.map_size.smu_z).range(2..=96));
-            });
-            match &self.current_project_path {
-                Some(p) => ui.label(format!(
-                    "File: {}",
-                    p.file_name().and_then(|s| s.to_str()).unwrap_or("?")
-                )),
-                None => ui.label("File: (unsaved)"),
-            };
-            ui.separator();
-
-            ui.heading("Heightmap");
-            match &self.heightmap {
-                None => {
-                    ui.label("No heightmap loaded.");
-                    ui.label("Use File → Load fixture heightmap.");
-                }
-                Some(h) => {
-                    ui.label(format!(
-                        "Path: {}",
-                        h.path.file_name().and_then(|s| s.to_str()).unwrap_or("?")
-                    ));
-                    ui.label(format!("Dims: {} × {}", h.dims.0, h.dims.1));
-                    ui.label(format!("Min / max sample: {} / {}", h.min, h.max));
-                    match &h.validated_against {
-                        Some(size) => ui.colored_label(
+                let cam = &self.camera;
+                ui.label(format!(
+                    "Cam: yaw {:.0}° pitch {:.0}° dist {:.0}",
+                    cam.yaw.to_degrees(),
+                    cam.pitch.to_degrees(),
+                    cam.distance,
+                ));
+                ui.separator();
+                let (hpx_x, hpx_z) = self.map_size.heightmap_dims();
+                ui.label(format!(
+                    "Map: {}×{} SMU ({}×{} px)",
+                    self.map_size.smu_x, self.map_size.smu_z, hpx_x, hpx_z,
+                ));
+                ui.separator();
+                // Validation chip placeholder — wired in C8.
+                ui.label(egui::RichText::new("0 issues").weak());
+                ui.separator();
+                match &self.last_install {
+                    Some(Ok(p)) => {
+                        ui.colored_label(
                             egui::Color32::GREEN,
-                            format!("OK — matches {}×{} SMU (64·N+1)", size.smu_x, size.smu_z),
-                        ),
-                        None => ui.colored_label(
-                            egui::Color32::YELLOW,
                             format!(
-                                "Dims do not match {}×{} SMU; expected {:?}",
-                                self.map_size.smu_x,
-                                self.map_size.smu_z,
-                                self.map_size.heightmap_dims(),
+                                "Installed: {}",
+                                p.file_name()
+                                    .and_then(|s| s.to_str())
+                                    .unwrap_or_else(|| p.to_str().unwrap_or("?")),
                             ),
-                        ),
-                    };
+                        );
+                    }
+                    Some(Err(msg)) => {
+                        ui.colored_label(egui::Color32::RED, format!("Install failed: {msg}"));
+                    }
+                    None => {
+                        ui.label(egui::RichText::new("Build: idle").weak());
+                    }
                 }
-            }
-
-            ui.separator();
-            ui.heading("Render");
-            // Height scale flows through the per-frame uniform — no
-            // texture or grid rebuild needed when this changes (ADR-017).
-            ui.add(
-                egui::DragValue::new(&mut self.height_scale)
-                    .range(1.0..=4096.0)
-                    .speed(1.0)
-                    .prefix("Max height (elmos): "),
-            );
-
-            ui.separator();
-            ui.heading("Tool");
-            ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.tool_mode, ToolMode::Sculpt, "Sculpt");
-                ui.selectable_value(
-                    &mut self.tool_mode,
-                    ToolMode::StartPositions,
-                    "Start positions",
-                );
+                if let Some(err) = &self.last_error {
+                    ui.separator();
+                    ui.colored_label(egui::Color32::RED, err);
+                }
             });
+        });
+    }
 
-            ui.separator();
-            ui.heading("Sculpt");
-            let current_label = self
-                .brush_id
-                .as_deref()
-                .and_then(|id| self.brushes.get(id).map(|b| b.label()))
-                .unwrap_or("Off");
-            egui::ComboBox::from_label("Brush")
-                .selected_text(current_label)
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.brush_id, None, "Off");
-                    for b in self.brushes.iter() {
-                        let id_owned = b.id().to_string();
-                        ui.selectable_value(&mut self.brush_id, Some(id_owned), b.label());
+    /// Left tool strip: 40 px fixed-width column of one selectable
+    /// `Button` per `Tool`. Hover-tooltip carries the long name and
+    /// accelerator. Phase 4 grows this with Splat / Metal / Feature;
+    /// adding a variant to `Tool` adds a row here automatically as long
+    /// as it's listed in the array below (the per-site exhaustive
+    /// `match`es elsewhere catch a missing dispatch).
+    fn tool_strip(&mut self, ctx: &egui::Context) {
+        egui::SidePanel::left("tool_strip")
+            .resizable(false)
+            .exact_width(40.0)
+            .show(ctx, |ui| {
+                ui.add_space(4.0);
+                for &t in &Tool::ALL {
+                    let active = self.tool == t;
+                    let resp = ui
+                        .add_sized([32.0, 32.0], egui::Button::selectable(active, t.icon()))
+                        .on_hover_text(format!("{} ({})", t.label(), t.accel()));
+                    if resp.clicked() {
+                        self.set_tool(t);
                     }
-                });
-            ui.add(
-                egui::DragValue::new(&mut self.brush_radius)
-                    .range(8.0..=4096.0)
-                    .speed(2.0)
-                    .prefix("Radius (elmos): "),
-            );
-            ui.add(
-                egui::Slider::new(&mut self.brush_strength, 0.0..=1.0)
-                    .text("Strength")
-                    .clamping(egui::SliderClamping::Always),
-            );
-            // Symmetry — one stroke produces N mirrored / rotated stamps
-            // (ADR-019). Lock rotational fold to {2,3,4,6,8}.
-            egui::ComboBox::from_label("Symmetry")
-                .selected_text(self.symmetry.label())
-                .show_ui(ui, |ui| {
-                    let options = [
-                        SymmetryAxis::None,
-                        SymmetryAxis::Horizontal,
-                        SymmetryAxis::Vertical,
-                        SymmetryAxis::Quad,
-                        SymmetryAxis::DiagonalMain,
-                        SymmetryAxis::DiagonalAnti,
-                        SymmetryAxis::Rotational {
-                            fold: self.rotational_fold,
-                        },
-                    ];
-                    for opt in options {
-                        let label = opt.label();
-                        ui.selectable_value(&mut self.symmetry, opt, label);
-                    }
-                });
-            if matches!(self.symmetry, SymmetryAxis::Rotational { .. }) {
-                // Free-form fold count — 3 for 3-player maps, 4 for 4-player,
-                // 5/6/7/8 for FFA. 2..=12 covers everything BAR supports;
-                // larger folds quickly become indistinguishable from radial
-                // symmetry.
-                let resp = ui.add(
-                    egui::DragValue::new(&mut self.rotational_fold)
-                        .range(2u8..=12u8)
-                        .speed(0.1)
-                        .prefix("Fold (players): "),
-                );
-                if resp.changed() {
-                    self.symmetry = SymmetryAxis::Rotational {
-                        fold: self.rotational_fold,
-                    };
+                    ui.add_space(2.0);
                 }
-                ui.label(
-                    egui::RichText::new("Tip: 3 = three-player map, 4 = quad-player, etc.")
-                        .small()
-                        .weak(),
-                );
+            });
+    }
+
+    /// Right Inspector: persistent project / heightmap / height-scale
+    /// header always at the top, tool-specific controls underneath
+    /// dispatched by an exhaustive `match` on `self.tool`. Adding a
+    /// new `Tool` variant produces a compile error at this match site
+    /// — that's the safety property the enum buys us.
+    fn inspector(&mut self, ctx: &egui::Context, action: &mut Option<FileAction>) {
+        egui::SidePanel::right("inspector")
+            .resizable(true)
+            .default_width(300.0)
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("inspector_scroll")
+                    .show(ui, |ui| {
+                        self.inspector_header(ui);
+                        ui.separator();
+                        match self.tool {
+                            Tool::Select => Self::inspector_select(ui),
+                            Tool::Sculpt => self.inspector_sculpt(ui),
+                            Tool::StartPositions => self.inspector_start_positions(ui),
+                            Tool::Procgen => self.inspector_procgen(ui, action),
+                        }
+                    });
+            });
+    }
+
+    /// Persistent Inspector header. Project metadata, heightmap stats,
+    /// and the max-height field — all always visible regardless of
+    /// active tool because they're global session state, not tool
+    /// parameters.
+    fn inspector_header(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Project");
+        ui.horizontal(|ui| {
+            ui.label("Name:");
+            ui.text_edit_singleline(&mut self.project_name);
+        });
+        ui.horizontal(|ui| {
+            ui.label("Size (SMU):");
+            ui.add(egui::DragValue::new(&mut self.map_size.smu_x).range(2..=96));
+            ui.label("×");
+            ui.add(egui::DragValue::new(&mut self.map_size.smu_z).range(2..=96));
+        });
+        match &self.current_project_path {
+            Some(p) => ui.label(format!(
+                "File: {}",
+                p.file_name().and_then(|s| s.to_str()).unwrap_or("?")
+            )),
+            None => ui.label("File: (unsaved)"),
+        };
+
+        ui.separator();
+        ui.heading("Heightmap");
+        match &self.heightmap {
+            None => {
+                ui.label("No heightmap loaded.");
+                ui.label("Use File → Load fixture heightmap.");
             }
+            Some(h) => {
+                ui.label(format!(
+                    "Path: {}",
+                    h.path.file_name().and_then(|s| s.to_str()).unwrap_or("?")
+                ));
+                ui.label(format!("Dims: {} × {}", h.dims.0, h.dims.1));
+                ui.label(format!("Min / max sample: {} / {}", h.min, h.max));
+                match &h.validated_against {
+                    Some(size) => ui.colored_label(
+                        egui::Color32::GREEN,
+                        format!("OK — matches {}×{} SMU (64·N+1)", size.smu_x, size.smu_z),
+                    ),
+                    None => ui.colored_label(
+                        egui::Color32::YELLOW,
+                        format!(
+                            "Dims do not match {}×{} SMU; expected {:?}",
+                            self.map_size.smu_x,
+                            self.map_size.smu_z,
+                            self.map_size.heightmap_dims(),
+                        ),
+                    ),
+                };
+            }
+        }
 
-            ui.label(format!(
-                "Camera: yaw {:.0}° pitch {:.0}° dist {:.0}",
-                self.camera.yaw.to_degrees(),
-                self.camera.pitch.to_degrees(),
-                self.camera.distance,
-            ));
+        ui.separator();
+        // Height scale flows through the per-frame uniform — no
+        // texture or grid rebuild needed when this changes (ADR-017).
+        ui.add(
+            egui::DragValue::new(&mut self.height_scale)
+                .range(1.0..=4096.0)
+                .speed(1.0)
+                .prefix("Max height (elmos): "),
+        );
+    }
 
-            ui.separator();
-            ui.heading("Start positions");
-            ui.label(
-                egui::RichText::new(
-                    "Tool = Start positions: LMB to place, drag to move, RMB to delete.",
-                )
+    fn inspector_select(ui: &mut egui::Ui) {
+        ui.heading("Select / orbit");
+        ui.label(
+            egui::RichText::new(
+                "Camera-only mode. LMB orbits, scroll zooms.\n\
+                 Pick a tool on the left strip to start editing.",
+            )
+            .small()
+            .weak(),
+        );
+    }
+
+    fn inspector_sculpt(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Sculpt");
+        let current_label = self
+            .brush_id
+            .as_deref()
+            .and_then(|id| self.brushes.get(id).map(|b| b.label()))
+            .unwrap_or("Off");
+        egui::ComboBox::from_label("Brush")
+            .selected_text(current_label)
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut self.brush_id, None, "Off");
+                for b in self.brushes.iter() {
+                    let id_owned = b.id().to_string();
+                    ui.selectable_value(&mut self.brush_id, Some(id_owned), b.label());
+                }
+            });
+        ui.add(
+            egui::DragValue::new(&mut self.brush_radius)
+                .range(8.0..=4096.0)
+                .speed(2.0)
+                .prefix("Radius (elmos): "),
+        );
+        ui.add(
+            egui::Slider::new(&mut self.brush_strength, 0.0..=1.0)
+                .text("Strength")
+                .clamping(egui::SliderClamping::Always),
+        );
+        ui.label(
+            egui::RichText::new("LMB drag to sculpt, RMB to orbit. Symmetry chip in the top bar.")
                 .small()
                 .weak(),
-            );
-            ui.label(format!("Placed: {}", self.start_positions.len()));
-            let mut to_delete: Option<u8> = None;
-            egui::ScrollArea::vertical()
-                .max_height(140.0)
-                .id_salt("startpos_scroll")
-                .show(ui, |ui| {
-                    let mut sorted: Vec<StartPosition> = self.start_positions.clone();
-                    sorted.sort_by_key(|p| p.team_id);
-                    for p in sorted {
-                        ui.horizontal(|ui| {
-                            let color = team_color(p.team_id);
-                            let (resp, painter) = ui.allocate_painter(
-                                egui::Vec2::new(14.0, 14.0),
-                                egui::Sense::hover(),
-                            );
-                            painter.circle_filled(resp.rect.center(), 6.0, color);
-                            ui.label(format!("team {}: ({}, {})", p.team_id, p.x_elmo, p.z_elmo));
-                            if ui.small_button("×").clicked() {
-                                to_delete = Some(p.team_id);
-                            }
-                        });
-                    }
-                });
-            if let Some(id) = to_delete {
-                self.delete_start_position(id);
-            }
-            if !self.start_positions.is_empty() && ui.button("Clear all").clicked() {
-                info!(
-                    cleared = self.start_positions.len(),
-                    "all start positions cleared"
-                );
-                self.start_positions.clear();
-                self.dragging_start_pos = None;
-            }
+        );
+    }
 
-            ui.separator();
-            ui.heading("Generate from formula");
-            ui.label(
-                egui::RichText::new("f(x, z) → height ∈ [0,1]. Replaces heightmap.")
-                    .small()
-                    .weak(),
-            );
-            let expr_resp = ui.text_edit_singleline(&mut self.procgen_expr);
-            if expr_resp.changed() {
-                self.revalidate_procgen();
-            }
-            ui.horizontal(|ui| {
-                ui.label("Domain:");
-                ui.selectable_value(&mut self.procgen_domain, Domain::Unit, Domain::Unit.label());
-                ui.selectable_value(
-                    &mut self.procgen_domain,
-                    Domain::Centered,
-                    Domain::Centered.label(),
-                );
-            });
-            egui::ComboBox::from_label("Preset")
-                .selected_text("(pick one to fill expression)")
-                .show_ui(ui, |ui| {
-                    for p in PRESETS {
-                        if ui.selectable_label(false, p.label).clicked() {
-                            self.procgen_expr = p.expression.to_string();
-                            self.procgen_domain = p.domain;
-                            self.revalidate_procgen();
+    fn inspector_start_positions(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Start positions");
+        ui.label(
+            egui::RichText::new("LMB to place, drag to move, RMB to delete.")
+                .small()
+                .weak(),
+        );
+        ui.label(format!("Placed: {}", self.start_positions.len()));
+        let mut to_delete: Option<u8> = None;
+        egui::ScrollArea::vertical()
+            .max_height(220.0)
+            .id_salt("startpos_scroll")
+            .show(ui, |ui| {
+                let mut sorted: Vec<StartPosition> = self.start_positions.clone();
+                sorted.sort_by_key(|p| p.team_id);
+                for p in sorted {
+                    ui.horizontal(|ui| {
+                        let color = team_color(p.team_id);
+                        let (resp, painter) =
+                            ui.allocate_painter(egui::Vec2::new(14.0, 14.0), egui::Sense::hover());
+                        painter.circle_filled(resp.rect.center(), 6.0, color);
+                        ui.label(format!("team {}: ({}, {})", p.team_id, p.x_elmo, p.z_elmo));
+                        if ui.small_button("×").clicked() {
+                            to_delete = Some(p.team_id);
                         }
-                    }
-                });
-            // Apply row: button + live-validation chip. Apply is gated on
-            // parse-AND-dry-eval success; the chip tooltip shows the
-            // `#[source]` chain of the validator error.
-            ui.horizontal(|ui| {
-                let parse_ok = self.procgen_validation.is_ok();
-                let apply = ui.add_enabled(parse_ok, egui::Button::new("Apply"));
-                if apply.clicked() {
-                    action = Some(FileAction::ApplyProcGen);
+                    });
                 }
-                match &self.procgen_validation {
-                    Ok(()) => {
-                        ui.colored_label(egui::Color32::GREEN, "✓")
-                            .on_hover_text("expression parses & evaluates");
-                    }
-                    Err(msg) => {
-                        ui.colored_label(egui::Color32::RED, "✗").on_hover_text(msg);
+            });
+        if let Some(id) = to_delete {
+            self.delete_start_position(id);
+        }
+        if !self.start_positions.is_empty() && ui.button("Clear all").clicked() {
+            info!(
+                cleared = self.start_positions.len(),
+                "all start positions cleared"
+            );
+            self.start_positions.clear();
+            self.dragging_start_pos = None;
+        }
+    }
+
+    fn inspector_procgen(&mut self, ui: &mut egui::Ui, action: &mut Option<FileAction>) {
+        ui.heading("Procgen — f(x, z)");
+        ui.label(
+            egui::RichText::new("f(x, z) → height ∈ [0,1]. Apply replaces the heightmap.")
+                .small()
+                .weak(),
+        );
+        let expr_resp = ui.text_edit_singleline(&mut self.procgen_expr);
+        if expr_resp.changed() {
+            self.revalidate_procgen();
+        }
+        ui.horizontal(|ui| {
+            ui.label("Domain:");
+            ui.selectable_value(&mut self.procgen_domain, Domain::Unit, Domain::Unit.label());
+            ui.selectable_value(
+                &mut self.procgen_domain,
+                Domain::Centered,
+                Domain::Centered.label(),
+            );
+        });
+        egui::ComboBox::from_label("Preset")
+            .selected_text("(pick one to fill expression)")
+            .show_ui(ui, |ui| {
+                for p in PRESETS {
+                    if ui.selectable_label(false, p.label).clicked() {
+                        self.procgen_expr = p.expression.to_string();
+                        self.procgen_domain = p.domain;
+                        self.revalidate_procgen();
                     }
                 }
             });
-            if let Some(err) = &self.procgen_last_error {
-                ui.colored_label(egui::Color32::RED, format!("Procgen: {err}"));
+        // Apply row: button + live-validation chip. Apply is gated on
+        // parse-AND-dry-eval success; chip tooltip shows the
+        // `#[source]` chain of the validator error (A4 / ADR-033 era).
+        ui.horizontal(|ui| {
+            let parse_ok = self.procgen_validation.is_ok();
+            let apply = ui.add_enabled(parse_ok, egui::Button::new("Apply"));
+            if apply.clicked() {
+                *action = Some(FileAction::ApplyProcGen);
             }
-
-            ui.separator();
-            ui.heading("Build & Install");
-            let can_install = self.heightmap.is_some();
-            let resp = ui.add_enabled(can_install, egui::Button::new("Build & Install to BAR"));
-            if resp.clicked() {
-                action = Some(FileAction::BuildAndInstall);
-            }
-            if !can_install {
-                ui.label("Load a heightmap to enable.");
-            }
-            match &self.last_install {
-                Some(Ok(p)) => {
-                    ui.colored_label(
-                        egui::Color32::GREEN,
-                        format!(
-                            "Installed: {}",
-                            p.file_name()
-                                .and_then(|s| s.to_str())
-                                .unwrap_or_else(|| p.to_str().unwrap_or("?"))
-                        ),
-                    );
-                    if let Some(parent) = p.parent() {
-                        ui.label(format!("Dir: {}", parent.display()));
-                    }
+            match &self.procgen_validation {
+                Ok(()) => {
+                    ui.colored_label(egui::Color32::GREEN, "✓")
+                        .on_hover_text("expression parses & evaluates");
                 }
-                Some(Err(msg)) => {
-                    ui.colored_label(egui::Color32::RED, format!("Install failed: {msg}"));
+                Err(msg) => {
+                    ui.colored_label(egui::Color32::RED, "✗").on_hover_text(msg);
                 }
-                None => {}
-            }
-
-            if let Some(err) = &self.last_error {
-                ui.separator();
-                ui.colored_label(egui::Color32::RED, err);
             }
         });
+        if let Some(err) = &self.procgen_last_error {
+            ui.colored_label(egui::Color32::RED, format!("Procgen: {err}"));
+        }
+    }
 
+    /// Symmetry chip popover. Visible only when the top-bar chip is
+    /// toggled open. ADR-031 (B2) replaces this with a canvas overlay
+    /// + ghost-brush rings; B1 keeps the existing controls reachable.
+    fn symmetry_popover(&mut self, ctx: &egui::Context) {
+        if !self.symmetry_popover_open {
+            return;
+        }
+        let mut open = true;
+        egui::Window::new("Symmetry")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(220.0)
+            .show(ctx, |ui| {
+                egui::ComboBox::from_label("Axis")
+                    .selected_text(self.symmetry.label())
+                    .show_ui(ui, |ui| {
+                        let options = [
+                            SymmetryAxis::None,
+                            SymmetryAxis::Horizontal,
+                            SymmetryAxis::Vertical,
+                            SymmetryAxis::Quad,
+                            SymmetryAxis::DiagonalMain,
+                            SymmetryAxis::DiagonalAnti,
+                            SymmetryAxis::Rotational {
+                                fold: self.rotational_fold,
+                            },
+                        ];
+                        for opt in options {
+                            let label = opt.label();
+                            ui.selectable_value(&mut self.symmetry, opt, label);
+                        }
+                    });
+                if matches!(self.symmetry, SymmetryAxis::Rotational { .. }) {
+                    let resp = ui.add(
+                        egui::DragValue::new(&mut self.rotational_fold)
+                            .range(2u8..=12u8)
+                            .speed(0.1)
+                            .prefix("Fold (players): "),
+                    );
+                    if resp.changed() {
+                        self.symmetry = SymmetryAxis::Rotational {
+                            fold: self.rotational_fold,
+                        };
+                    }
+                    ui.label(
+                        egui::RichText::new("Tip: 3 = three-player map, 4 = quad-player, etc.")
+                            .small()
+                            .weak(),
+                    );
+                }
+            });
+        if !open {
+            self.symmetry_popover_open = false;
+        }
+    }
+
+    /// Central viewport: the wgpu terrain pass, the start-position
+    /// marker overlay, and tool-driven pointer interaction.
+    ///
+    /// Camera control rules:
+    /// - `Tool::Sculpt` + brush selected + heightmap loaded: LMB
+    ///   sculpts, RMB orbits.
+    /// - `Tool::StartPositions`: LMB places / drags, RMB deletes.
+    /// - `Tool::Select` and `Tool::Procgen` (and Sculpt-without-brush):
+    ///   LMB orbits (no central edit).
+    ///
+    /// Scroll wheel always zooms when the viewport is hovered.
+    fn central(&mut self, ctx: &egui::Context) {
         egui::CentralPanel::default().show(ctx, |ui| {
             let (rect, response) =
                 ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
 
-            // Tool mode determines what the left pointer button does.
-            // Brush sculpt or start-position placement → LMB is tool, RMB
-            // orbits. Otherwise LMB orbits (Stage 0 idle-camera behaviour).
-            let brush_active = matches!(self.tool_mode, ToolMode::Sculpt)
+            let brush_active = matches!(self.tool, Tool::Sculpt)
                 && self.brush_id.is_some()
                 && self.heightmap.is_some();
-            let start_pos_active = matches!(self.tool_mode, ToolMode::StartPositions);
+            let start_pos_active = matches!(self.tool, Tool::StartPositions);
             let central_interactive = brush_active || start_pos_active;
             let camera_drag = if central_interactive {
                 response.dragged_by(egui::PointerButton::Secondary)
@@ -1442,9 +1684,10 @@ impl eframe::App for App {
 
             // Brush stroke: while LMB is down in the central rect, emit
             // one stamp per frame at the cursor's world-space projection
-            // on the y=0 plane. Spacing along the drag is implicit (frame
-            // rate). One LMB-down → LMB-up coalesces into a single undo
-            // unit via `end_stroke` on pointer release (ADR-033).
+            // on the y=0 plane. Spacing along the drag is implicit
+            // (frame rate). One LMB-down → LMB-up coalesces into a
+            // single undo unit via `end_stroke` on pointer release
+            // (ADR-033).
             if brush_active
                 && (response.dragged_by(egui::PointerButton::Primary)
                     || response.clicked_by(egui::PointerButton::Primary))
@@ -1507,8 +1750,10 @@ impl eframe::App for App {
             }
 
             // Overlay start-position markers on top of the terrain pass.
-            // Always rendered when any are placed (regardless of tool mode)
-            // so the user can see them while sculpting.
+            // Always rendered when any are placed (regardless of tool)
+            // so the user can see them while sculpting. B6 will add a
+            // cross-tool alpha falloff (50 % outside StartPositions
+            // mode).
             if !self.start_positions.is_empty() {
                 let rect_size = glam::Vec2::new(rect.width(), rect.height());
                 let painter = ui.painter_at(rect);
@@ -1533,7 +1778,13 @@ impl eframe::App for App {
                 }
             }
         });
+    }
 
+    /// Drain the per-frame `FileAction` queued by panel handlers. Done
+    /// outside the egui closures so IO and project-mutating ops have
+    /// uncontended `&mut self` access (every `.show(...)` closure holds
+    /// `&mut self` for its scope).
+    fn drain_action(&mut self, action: Option<FileAction>) {
         match action {
             Some(FileAction::LoadHeightmap(p)) => self.load_heightmap(p),
             Some(FileAction::OpenWizard) => {
@@ -1565,6 +1816,33 @@ impl eframe::App for App {
             Some(FileAction::Redo) => self.redo_one(),
             None => {}
         }
+    }
+}
+
+impl eframe::App for App {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // 8 px drag threshold (ADR-030). egui exposes the click-vs-drag
+        // discriminator as `InputOptions::max_click_dist` (default 6 px
+        // — small movements within that radius still count as clicks).
+        // Bumping to 8 px restores the click-place vs drag-paint
+        // disambiguation in StartPositions mode and matches the
+        // Photoshop / Blender convention.
+        ctx.options_mut(|o| o.input_options.max_click_dist = 8.0);
+
+        let mut action: Option<FileAction> = None;
+
+        // egui panel add-order rule: top → bottom → left → right →
+        // CentralPanel LAST. Reversing this means CentralPanel eats the
+        // rect later panels were supposed to claim.
+        self.handle_keyboard(ctx, &mut action);
+        self.top_bar(ctx, &mut action);
+        self.status_strip(ctx);
+        self.tool_strip(ctx);
+        self.inspector(ctx, &mut action);
+        self.central(ctx);
+
+        self.drain_action(action);
+        self.symmetry_popover(ctx);
 
         // Wizard renders on top, after all other panels. Drains to
         // `apply_wizard` / close depending on the user's choice. ADR-024.
@@ -1581,6 +1859,222 @@ impl eframe::App for App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Construct an `App` that doesn't need an `eframe::CreationContext`
+    /// or a live wgpu device — enough state to exercise the data-shape
+    /// helpers (`set_tool`, `Tool::*`). Renderer-touching paths
+    /// (`apply_brush_at`, `apply_procgen`'s GPU upload) require a real
+    /// `render_state` and are exercised by the workspace integration
+    /// tests instead.
+    fn make_test_app() -> App {
+        App {
+            project_name: "test".to_string(),
+            map_size: MapSize::square(2),
+            heightmap: None,
+            last_error: None,
+            render_state: None,
+            camera: OrbitCamera::framing(128.0, 128.0),
+            height_scale: 256.0,
+            current_project_path: None,
+            last_install: None,
+            brushes: BrushRegistry::default_set(),
+            brush_id: None,
+            brush_radius: 256.0,
+            brush_strength: 0.5,
+            symmetry: SymmetryAxis::None,
+            rotational_fold: 2,
+            procgen_expr: "0".to_string(),
+            procgen_domain: Domain::Centered,
+            procgen_last_error: None,
+            procgen_validation: Ok(()),
+            history: History::default(),
+            tool: Tool::Sculpt,
+            previous_tool: Tool::Sculpt,
+            start_positions: Vec::new(),
+            dragging_start_pos: None,
+            wizard_open: false,
+            wizard: WizardState::default_for_new_project(),
+            symmetry_popover_open: false,
+        }
+    }
+
+    /// `Tool::ALL` must enumerate every variant exactly once. Adding a
+    /// new variant to `Tool` is what should drive new rows in the tool
+    /// strip — this test fires if the array is forgotten.
+    #[test]
+    fn tool_all_array_has_unique_entries_per_variant() {
+        let mut seen = std::collections::HashSet::new();
+        for t in Tool::ALL {
+            assert!(seen.insert(t), "Tool::ALL has a duplicate entry: {t:?}");
+        }
+        // The current size is documented in ADR-030. A change here is
+        // intentional but should bump the ADR and the phase-3-plan
+        // entry for B1.
+        assert_eq!(
+            Tool::ALL.len(),
+            4,
+            "Tool::ALL size changed — update ADR-030 + phase-3-plan B1"
+        );
+    }
+
+    /// Each tool variant must produce distinct icon, accelerator, and
+    /// label strings. If two variants collided, the left tool strip
+    /// would show indistinguishable buttons.
+    #[test]
+    fn tool_helpers_are_distinct_per_variant() {
+        let mut icons = std::collections::HashSet::new();
+        let mut accels = std::collections::HashSet::new();
+        let mut labels = std::collections::HashSet::new();
+        for t in Tool::ALL {
+            assert!(icons.insert(t.icon()), "duplicate icon for {t:?}");
+            assert!(accels.insert(t.accel()), "duplicate accel for {t:?}");
+            assert!(labels.insert(t.label()), "duplicate label for {t:?}");
+        }
+    }
+
+    /// Accelerators must be single ASCII-uppercase chars — the
+    /// keyboard-handler is hard-coded to `Key::Q / Key::B / Key::S /
+    /// Key::G`, so multi-char or lowercase accels would silently
+    /// detach the strip tooltip from the actual binding.
+    #[test]
+    fn tool_accelerator_is_a_single_uppercase_letter() {
+        for t in Tool::ALL {
+            let a = t.accel();
+            assert_eq!(
+                a.chars().count(),
+                1,
+                "accel for {t:?} should be one char (got {a:?})"
+            );
+            let c = a.chars().next().unwrap();
+            assert!(
+                c.is_ascii_uppercase(),
+                "accel for {t:?} should be ASCII uppercase (got {c})"
+            );
+        }
+    }
+
+    /// ADR-030 nails Q / B / S / G to specific tools. A drift here is
+    /// a documented contract break — bump the ADR if intentional.
+    #[test]
+    fn tool_accelerators_match_adr_030() {
+        assert_eq!(Tool::Select.accel(), "Q");
+        assert_eq!(Tool::Sculpt.accel(), "B");
+        assert_eq!(Tool::StartPositions.accel(), "S");
+        assert_eq!(Tool::Procgen.accel(), "G");
+    }
+
+    /// Calling `set_tool(current)` is a no-op — it MUST NOT bump
+    /// `previous_tool`, otherwise rapid identical keystrokes would
+    /// erase the real prior tool from history.
+    #[test]
+    fn set_tool_is_noop_when_new_matches_current() {
+        let mut app = make_test_app();
+        // Seed previous_tool with a distinct value so we can detect
+        // an unwanted overwrite.
+        app.previous_tool = Tool::Select;
+        app.tool = Tool::Sculpt;
+        app.set_tool(Tool::Sculpt);
+        assert_eq!(app.tool, Tool::Sculpt);
+        assert_eq!(
+            app.previous_tool,
+            Tool::Select,
+            "no-op set_tool must not bump previous_tool"
+        );
+    }
+
+    /// A real tool change advances both `tool` and `previous_tool`. The
+    /// previous-tool sentinel is what the bug-report log line cites, so
+    /// it MUST track the actual transition history.
+    #[test]
+    fn set_tool_updates_current_and_previous() {
+        let mut app = make_test_app();
+        app.tool = Tool::Sculpt;
+        app.previous_tool = Tool::Sculpt;
+        app.set_tool(Tool::Procgen);
+        assert_eq!(app.tool, Tool::Procgen);
+        assert_eq!(app.previous_tool, Tool::Sculpt);
+        app.set_tool(Tool::StartPositions);
+        assert_eq!(app.tool, Tool::StartPositions);
+        assert_eq!(app.previous_tool, Tool::Procgen);
+    }
+
+    /// Leaving any tool must cancel an in-flight marker drag —
+    /// otherwise `dragging_start_pos` would linger across tool
+    /// switches and the next entry into StartPositions would resume
+    /// an invisible drag the user can't see.
+    #[test]
+    fn set_tool_clears_in_flight_start_position_drag() {
+        let mut app = make_test_app();
+        app.tool = Tool::StartPositions;
+        app.dragging_start_pos = Some(3);
+        app.set_tool(Tool::Sculpt);
+        assert_eq!(
+            app.dragging_start_pos, None,
+            "leaving StartPositions must drop any in-flight marker drag"
+        );
+    }
+
+    /// Default-initialised App seeds `previous_tool == tool` so the
+    /// first real `set_tool` transition writes a sensible diff into
+    /// the bug-report log (instead of "tool change from ??? to X").
+    #[test]
+    fn fresh_app_has_consistent_previous_tool_sentinel() {
+        let app = make_test_app();
+        assert_eq!(
+            app.tool, app.previous_tool,
+            "fresh App initialises previous_tool == tool so the first \
+             transition is a real change"
+        );
+    }
+
+    /// Phase-2 smoke #1 (F14 / ADR-020): the procgen Apply path still
+    /// populates the CPU heightmap. GPU upload is skipped when there's
+    /// no render_state (test-only path); the App-level state machine
+    /// MUST still leave `self.heightmap` Some.
+    #[test]
+    fn b1_does_not_regress_procgen_apply_phase2() {
+        let mut app = make_test_app();
+        app.procgen_expr = "0.5".to_string();
+        app.revalidate_procgen();
+        assert!(
+            app.procgen_validation.is_ok(),
+            "expression should validate before Apply"
+        );
+        app.apply_procgen();
+        assert!(
+            app.heightmap.is_some(),
+            "procgen Apply must populate self.heightmap"
+        );
+        let h = app.heightmap.as_ref().unwrap();
+        assert_eq!(h.dims, MapSize::square(2).heightmap_dims());
+    }
+
+    /// Phase-2 smoke #2 (F8 / ADR-023): start-position placement still
+    /// inserts into the `Vec<StartPosition>` with rounded elmo coords.
+    /// The B1 tool-strip switch must not break the underlying state
+    /// machine.
+    #[test]
+    fn b1_does_not_regress_start_position_placement_phase2() {
+        let mut app = make_test_app();
+        app.place_start_position(100.0, 100.0);
+        assert_eq!(app.start_positions.len(), 1);
+        assert_eq!(app.start_positions[0].x_elmo, 100);
+        assert_eq!(app.start_positions[0].z_elmo, 100);
+        // Out-of-bounds click is ignored (existing ADR-023 invariant).
+        app.place_start_position(-1.0, 0.0);
+        assert_eq!(app.start_positions.len(), 1, "off-map click ignored");
+    }
+
+    /// Phase-2 smoke #3 (ADR-022 / ADR-033): undo_one without a loaded
+    /// heightmap is a no-op. Was always true; pin so the B1 refactor
+    /// hasn't tangled the `end_stroke` -> `apply_undo` chain.
+    #[test]
+    fn b1_does_not_regress_undo_with_no_heightmap_phase2() {
+        let mut app = make_test_app();
+        app.undo_one();
+        assert!(app.heightmap.is_none());
+        assert_eq!(app.history.undo_depth(), 0);
+    }
 
     /// Guard against silent regressions to the boot-log filter. If any of
     /// these directives is dropped, the corresponding warn-level events
