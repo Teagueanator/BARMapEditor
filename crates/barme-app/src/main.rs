@@ -222,6 +222,18 @@ struct App {
     /// surface; here we just round-trip the bag so data isn't lost
     /// before that lands.
     mapinfo_overrides: std::collections::HashMap<String, toml::Value>,
+    /// B8: whether the "Next steps" hint window should render this
+    /// frame. Set to `true` by `apply_wizard`; toggled to `false` by
+    /// the X-button handler and persisted into
+    /// `Project.next_steps_dismissed` so reopening the same project
+    /// leaves the window dismissed. A fresh project (`File → New`)
+    /// re-shows it because the new `Project` starts with
+    /// `next_steps_dismissed = false`.
+    show_next_steps: bool,
+    /// B8: mirrors `Project.next_steps_dismissed`. Snapshotted into
+    /// the next save; load_project / new_project sync this with
+    /// `Project::next_steps_dismissed`.
+    next_steps_dismissed: bool,
 }
 
 /// Mutable form state for the F1 wizard. Held independently of App state
@@ -249,7 +261,11 @@ impl WizardState {
             project_name: "untitled".to_string(),
             smu_x: 16,
             smu_z: 16,
-            symmetry: SymmetryAxis::None,
+            // B8: Horizontal default lines up with the two ally groups
+            // apply_wizard places along the N/S strips, so a Create-
+            // and-build user gets a symmetric 1v1 out of the box. User
+            // can still pick anything else in the wizard.
+            symmetry: SymmetryAxis::Horizontal,
             rotational_fold: 2,
             biome_index: 0,
             max_height: BIOMES[0].max_height_hint,
@@ -473,6 +489,8 @@ impl App {
             nav_gizmo_drag_active: false,
             build_variant: BuildVariant::default(),
             mapinfo_overrides: std::collections::HashMap::new(),
+            show_next_steps: false,
+            next_steps_dismissed: false,
         }
     }
 
@@ -547,6 +565,12 @@ impl App {
         self.drag_paint_origin = None;
         self.pulsing_marker = None;
         self.hovered_canvas_marker = None;
+        // B8: a brand-new project always starts with the hint re-armed
+        // and not yet dismissed. apply_wizard sets show_next_steps =
+        // true after this; the bare new_project (e.g. on Cancel) keeps
+        // it hidden until the user goes through the wizard.
+        self.next_steps_dismissed = false;
+        self.show_next_steps = false;
         self.end_stroke();
         self.history.barrier();
     }
@@ -560,6 +584,7 @@ impl App {
             heightmap: self.heightmap.as_ref().map(|h| h.path.clone()),
             ally_groups: self.ally_groups.clone(),
             mapinfo_overrides: self.mapinfo_overrides.clone(),
+            next_steps_dismissed: self.next_steps_dismissed,
         }
     }
 
@@ -862,8 +887,6 @@ impl App {
         };
         self.rotational_fold = w.rotational_fold.max(2);
         self.height_scale = w.max_height.max(1.0);
-        let (ex, ez) = self.map_size.elmo_extents();
-        self.camera = OrbitCamera::framing(ex as f32, ez as f32);
 
         // Seed terrain with the chosen biome's procgen preset.
         let biome = &BIOMES[w.biome_index.min(BIOMES.len() - 1)];
@@ -880,12 +903,152 @@ impl App {
             "F1 wizard: applying"
         );
         self.apply_procgen();
+
+        // B8: pre-place a 1v1 N/S strip pair in ally_groups[0] so the
+        // demo state is non-empty out of the box. Done AFTER
+        // apply_procgen so the valley-vs-peak heuristic can see the
+        // freshly-baked heightmap and dodge the parabolic-dome center.
+        self.seed_demo_start_positions();
+
+        // B8: 35° pitch, ~1.6× diagonal distance from map centre. The
+        // default OrbitCamera::framing tilts at 45° / 1.4× — a slightly
+        // shallower angle reads more like the in-game RTS view and
+        // makes the N/S strip markers easier to read.
+        let (ex, ez) = self.map_size.elmo_extents();
+        self.camera = OrbitCamera::framing(ex as f32, ez as f32);
+        let diag = ((ex as f32).powi(2) + (ez as f32).powi(2)).sqrt();
+        self.camera.pitch = 35f32.to_radians();
+        self.camera.distance = diag * 1.6;
+
         // B5: history is now empty (apply_procgen barriered it). Push
         // one ApplyWizard entry holding the pre-wizard snapshot so
         // Ctrl-Z reverts the whole wizard apply atomically.
         self.history
             .push_project_diff(ProjectDiff::ApplyWizard(Box::new(pre_wizard)));
         self.wizard_open = false;
+
+        // B8: trigger the non-modal "Next steps" hint overlay. Stays
+        // hidden if the user previously dismissed this *project*'s
+        // hint (per-project flag, not per-user), letting reopening a
+        // fresh project re-show the hint.
+        self.show_next_steps = !self.next_steps_dismissed;
+    }
+
+    /// B8: seed the freshly-wizard'd project with two default start
+    /// positions in `ally_groups[0]`. Positions land on the N/S
+    /// strips at `z = 0.15 / 0.85` of map height by default, but are
+    /// nudged into the closest valley pixel (normalised height in
+    /// `[0.2, 0.6]`) when the seeded heightmap places them on a peak
+    /// — relevant for the Parabolic-dome biome where the centre is
+    /// the highest point. Falls back to map quarter-points if no
+    /// valley is found.
+    fn seed_demo_start_positions(&mut self) {
+        let (ex, ez) = self.map_size.elmo_extents();
+        let cx = (ex as f32) * 0.5;
+        let north = (cx, (ez as f32) * 0.15);
+        let south = (cx, (ez as f32) * 0.85);
+        let n_pos = self.nudge_into_valley(north);
+        let s_pos = self.nudge_into_valley(south);
+        let mut group = AllyGroup::new(0);
+        group.start_positions = vec![
+            StartPosition {
+                x_elmo: n_pos.0 as i32,
+                z_elmo: n_pos.1 as i32,
+            },
+            StartPosition {
+                x_elmo: s_pos.0 as i32,
+                z_elmo: s_pos.1 as i32,
+            },
+        ];
+        self.ally_groups.push(group);
+        self.active_ally_group_id = 0;
+        info!(
+            north = ?n_pos,
+            south = ?s_pos,
+            "F1 wizard / B8: seeded demo state with 2 start positions in ally_groups[0]"
+        );
+    }
+
+    /// B8 valley-finder. Given an `(x, z)` proposal in elmos, return
+    /// a nearby coordinate whose normalised heightmap value lies in
+    /// `[0.2, 0.6]`. If the proposal is already in that band (or no
+    /// heightmap is loaded), pass it through unchanged. Otherwise
+    /// scan outward in a small square neighbourhood (16 samples each
+    /// way) for the first pixel that satisfies; fall back to the
+    /// quarter-point on miss so we never plant a marker on a peak
+    /// (parabolic-dome biome) or off the cliff (diagonal-ramp
+    /// biome).
+    fn nudge_into_valley(&self, proposal: (f32, f32)) -> (f32, f32) {
+        let Some(hm) = self.heightmap.as_ref() else {
+            return proposal;
+        };
+        let (w, h) = hm.dims;
+        let (ex, ez) = self.map_size.elmo_extents();
+        let to_pixel = |x: f32, z: f32| -> Option<(u32, u32)> {
+            if ex == 0 || ez == 0 {
+                return None;
+            }
+            let px = ((x / ex as f32) * (w - 1) as f32).round();
+            let pz = ((z / ez as f32) * (h - 1) as f32).round();
+            if px < 0.0 || pz < 0.0 || px > (w - 1) as f32 || pz > (h - 1) as f32 {
+                None
+            } else {
+                Some((px as u32, pz as u32))
+            }
+        };
+        let in_valley = |px: u32, pz: u32| -> bool {
+            let v = hm.data.data()[(pz as usize) * (w as usize) + (px as usize)];
+            let norm = v as f32 / u16::MAX as f32;
+            (0.2..=0.6).contains(&norm)
+        };
+        if let Some((px, pz)) = to_pixel(proposal.0, proposal.1)
+            && in_valley(px, pz)
+        {
+            return proposal;
+        }
+        // Square spiral outward in coarse pixel steps. 16 steps × the
+        // pixel pitch is enough to escape a peaky biome on the seed
+        // heightmap; further than that and we'd cross the symmetry
+        // axis. Iterate radii in increments of (1/32) of map dim so
+        // even a 2-SMU test fixture has some headroom.
+        let step_px = ((w.max(h)) / 32).max(1);
+        let pitch_x = ex as f32 / (w - 1) as f32;
+        let pitch_z = ez as f32 / (h - 1) as f32;
+        for r in 1..=16i32 {
+            for dz in [-r, r] {
+                for dx in -r..=r {
+                    let nx = proposal.0 + dx as f32 * step_px as f32 * pitch_x;
+                    let nz = proposal.1 + dz as f32 * step_px as f32 * pitch_z;
+                    if let Some((px, pz)) = to_pixel(nx, nz)
+                        && in_valley(px, pz)
+                    {
+                        return (nx, nz);
+                    }
+                }
+            }
+            for dx in [-r, r] {
+                for dz in -(r - 1)..=(r - 1) {
+                    let nx = proposal.0 + dx as f32 * step_px as f32 * pitch_x;
+                    let nz = proposal.1 + dz as f32 * step_px as f32 * pitch_z;
+                    if let Some((px, pz)) = to_pixel(nx, nz)
+                        && in_valley(px, pz)
+                    {
+                        return (nx, nz);
+                    }
+                }
+            }
+        }
+        // Fallback: map quarter-points. Far enough from centre to
+        // dodge a parabolic dome's peak even when the search loop
+        // missed.
+        let qx = ex as f32 * 0.25;
+        let qz = ez as f32 * 0.25;
+        warn!(
+            proposal = ?proposal,
+            quarter = ?(qx, qz),
+            "B8 valley search exhausted; falling back to map quarter-point"
+        );
+        (qx, qz)
     }
 
     /// World-space extents (elmos) currently active. Derived from the
@@ -1404,6 +1567,10 @@ impl App {
                 self.active_ally_group_id =
                     self.ally_groups.iter().map(|g| g.id).min().unwrap_or(0);
                 self.mapinfo_overrides = p.mapinfo_overrides;
+                // B8: respect a saved dismissal so reopening the
+                // project doesn't replay the hint window.
+                self.next_steps_dismissed = p.next_steps_dismissed;
+                self.show_next_steps = false;
 
                 if let Some(hm_path) = hm_resolved {
                     if hm_path.exists() {
@@ -1871,6 +2038,20 @@ impl App {
         info!(
             version = config::CURRENT_VERSION,
             "first-launch hint dismissed"
+        );
+    }
+
+    /// B8: hide the Next-steps Window and persist that choice into
+    /// `Project.next_steps_dismissed` so save/open round-trips
+    /// remember the dismissal. Lives on the project, NOT in
+    /// `EditorConfig` — opening another fresh project should re-show
+    /// the hint.
+    fn dismiss_next_steps(&mut self) {
+        self.show_next_steps = false;
+        self.next_steps_dismissed = true;
+        info!(
+            project = %self.project_name,
+            "B8 next-steps hint dismissed"
         );
     }
 
@@ -3076,6 +3257,20 @@ impl eframe::App for App {
             self.dismiss_intro();
         }
 
+        // B8 Next-steps hint: shown after the wizard's Create, hidden
+        // for projects that the user previously dismissed (per-project
+        // flag in the `.barmeproj`). Skipped while either wizard or
+        // intro is up — three stacked floating windows would be
+        // chaos.
+        if self.show_next_steps
+            && !self.wizard_open
+            && !self.show_intro
+            && let Some(crate::ui::next_steps::NextStepsAction::Dismiss) =
+                crate::ui::next_steps::render_next_steps_hint(ctx, &mut self.show_next_steps)
+        {
+            self.dismiss_next_steps();
+        }
+
         // Wizard renders on top, after all other panels. Drains to
         // `apply_wizard` / close depending on the user's choice. ADR-024.
         if self.wizard_open {
@@ -3142,6 +3337,8 @@ mod tests {
             nav_gizmo_drag_active: false,
             build_variant: BuildVariant::default(),
             mapinfo_overrides: std::collections::HashMap::new(),
+            show_next_steps: false,
+            next_steps_dismissed: false,
         }
     }
 
@@ -3662,10 +3859,10 @@ mod tests {
         assert_eq!(app.project_name, "post-wizard");
         assert_eq!(app.map_size, MapSize { smu_x: 8, smu_z: 8 });
         assert!(matches!(app.symmetry, SymmetryAxis::Vertical));
-        assert!(
-            app.ally_groups.is_empty(),
-            "new_project cleared ally_groups"
-        );
+        // B8: apply_wizard seeds 2 demo start positions in
+        // ally_groups[0]. Pre-B8 this assertion was `is_empty()`.
+        assert_eq!(app.ally_groups.len(), 1);
+        assert_eq!(app.ally_groups[0].start_positions.len(), 2);
         assert_eq!(app.history.undo_depth(), 1, "one ApplyWizard entry");
         // Undo.
         app.undo_one();
@@ -3720,6 +3917,86 @@ mod tests {
         // The heightmap branch is covered by the existing
         // `stroke_open()` tests in `barme-core::undo`.
         assert!(!app.is_dragging_anything());
+    }
+
+    // ────── B8 — wizard demo state ──────
+
+    /// The wizard's default state must seed Horizontal symmetry so the
+    /// two demo start positions on the N/S strips read as a 1v1 pair.
+    /// Pre-B8 this default was `None` — flipping it now is the entire
+    /// behavioural point of the item.
+    #[test]
+    fn b8_wizard_default_symmetry_is_horizontal() {
+        let w = WizardState::default_for_new_project();
+        assert_eq!(w.symmetry, SymmetryAxis::Horizontal);
+    }
+
+    /// B8 seeds two positions in `ally_groups[0]` on N/S strips at
+    /// 15 % / 85 % of map Z. When no heightmap is loaded (the
+    /// valley-finder bails on `None`) the proposal is passed
+    /// through unchanged.
+    #[test]
+    fn b8_seed_demo_start_positions_lands_two_on_n_s_strips() {
+        let mut app = make_test_app();
+        app.map_size = MapSize::square(16);
+        app.seed_demo_start_positions();
+        assert_eq!(app.ally_groups.len(), 1, "single ally group");
+        let g = &app.ally_groups[0];
+        assert_eq!(g.id, 0);
+        assert_eq!(g.start_positions.len(), 2, "expected 2 starts");
+        let (ex, ez) = app.map_size.elmo_extents();
+        let cx = ex as i32 / 2;
+        let n = g.start_positions[0];
+        let s = g.start_positions[1];
+        assert_eq!(n.x_elmo, cx, "north strip centred in X");
+        assert_eq!(s.x_elmo, cx, "south strip centred in X");
+        // ~15% of 8192 = 1228; ~85% = 6963 (rounding bands).
+        let z15 = (ez as f32 * 0.15) as i32;
+        let z85 = (ez as f32 * 0.85) as i32;
+        assert!(
+            (n.z_elmo - z15).abs() <= 2,
+            "north should sit on the 15% strip, got {} vs target {z15}",
+            n.z_elmo
+        );
+        assert!(
+            (s.z_elmo - z85).abs() <= 2,
+            "south should sit on the 85% strip, got {} vs target {z85}",
+            s.z_elmo
+        );
+    }
+
+    /// dismiss_next_steps flips both the show flag and the project-
+    /// scoped `next_steps_dismissed`. Latter is what snapshot_project
+    /// will persist into `.barmeproj`.
+    #[test]
+    fn b8_dismiss_next_steps_persists_in_project_state() {
+        let mut app = make_test_app();
+        app.show_next_steps = true;
+        app.next_steps_dismissed = false;
+        app.dismiss_next_steps();
+        assert!(!app.show_next_steps);
+        assert!(app.next_steps_dismissed);
+        let snap = app.snapshot_project();
+        assert!(
+            snap.next_steps_dismissed,
+            "snapshot must round-trip the dismissed flag into .barmeproj"
+        );
+    }
+
+    /// new_project resets the per-project dismissal so a freshly-
+    /// created project re-shows the Next-steps hint on next wizard
+    /// Create. This is the pitfall the per-project (vs per-user) flag
+    /// guards against.
+    #[test]
+    fn b8_new_project_resets_next_steps_dismissed() {
+        let mut app = make_test_app();
+        app.next_steps_dismissed = true;
+        app.show_next_steps = false;
+        app.new_project();
+        assert!(
+            !app.next_steps_dismissed,
+            "new_project must arm the hint for the next wizard Create"
+        );
     }
 
     // ────── B7 — Procgen UX redesign ──────

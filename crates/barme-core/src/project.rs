@@ -75,6 +75,14 @@ pub struct Project {
     /// the emitter knows how to render. Default empty.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub mapinfo_overrides: HashMap<String, toml::Value>,
+    /// B8: when `true`, the wizard's "Next steps" hint window stays
+    /// hidden for this project. Persisted **per-project** (NOT in the
+    /// per-user `EditorConfig`) so reopening a fresh project re-shows
+    /// the hint — the editor opens many projects per user and a
+    /// per-user dismiss would suppress the hint forever after one
+    /// click.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub next_steps_dismissed: bool,
 }
 
 /// One ally team's worth of spawn data (ADR-032).
@@ -166,6 +174,8 @@ struct ProjectWire {
     start_positions: Vec<LegacyStartPosition>,
     #[serde(default)]
     mapinfo_overrides: HashMap<String, toml::Value>,
+    #[serde(default)]
+    next_steps_dismissed: bool,
 }
 
 impl From<ProjectWire> for Project {
@@ -178,6 +188,7 @@ impl From<ProjectWire> for Project {
             heightmap: w.heightmap,
             ally_groups: w.ally_groups,
             mapinfo_overrides: w.mapinfo_overrides,
+            next_steps_dismissed: w.next_steps_dismissed,
         };
         if !w.start_positions.is_empty() {
             if p.ally_groups.is_empty() {
@@ -277,6 +288,7 @@ impl Project {
             heightmap: None,
             ally_groups: Vec::new(),
             mapinfo_overrides: HashMap::new(),
+            next_steps_dismissed: false,
         }
     }
 
@@ -499,6 +511,38 @@ smu_z = 4
         assert_eq!(g0.name, "AllyGroup 0");
         assert_eq!(g0.start_positions.len(), 0);
         assert!(g0.box_polygon.is_none());
+    }
+
+    /// B8: `next_steps_dismissed` is a transient marker the editor
+    /// uses to suppress a hint Window. Default false; serialised only
+    /// when true so a fresh project doesn't carry the flag.
+    #[test]
+    fn next_steps_dismissed_default_false() {
+        let p = Project::new("hint", 4);
+        assert!(!p.next_steps_dismissed);
+    }
+
+    #[test]
+    fn next_steps_dismissed_omitted_when_false() {
+        let p = Project::new("hint", 4);
+        let s = toml::to_string(&p).unwrap();
+        assert!(
+            !s.contains("next_steps_dismissed"),
+            "default-false flag must not serialise; got:\n{s}"
+        );
+    }
+
+    #[test]
+    fn next_steps_dismissed_round_trips_when_true() {
+        let mut p = Project::new("hint", 4);
+        p.next_steps_dismissed = true;
+        let s = toml::to_string(&p).unwrap();
+        assert!(
+            s.contains("next_steps_dismissed = true"),
+            "true flag must serialise; got:\n{s}"
+        );
+        let p2: Project = toml::from_str(&s).unwrap();
+        assert!(p2.next_steps_dismissed);
     }
 
     #[test]

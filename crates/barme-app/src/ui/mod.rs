@@ -7,4 +7,5 @@
 pub mod cheat_sheet;
 pub mod gizmo;
 pub mod intro;
+pub mod next_steps;
 pub mod overlay;
