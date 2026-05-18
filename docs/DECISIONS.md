@@ -666,6 +666,82 @@ empirically green:
       theme toggle, bottom CPU/memory status bar, and the
       user-asset library (F23 deferred to v2 — design ADR first).
 
+## ADR-017 — GPU-resident heightmap as `r16uint` storage texture
+
+**Status:** Accepted (2026-05-17). First Stage 1 ADR.
+**Context:** The Stage 0 renderer baked Y into a `Vec<Vertex>` and rebuilt
+both vertex+index buffers on every `height_scale` change
+(`render::upload_mesh`). Live brush sculpting (next commit) writes a few
+pixels per stroke — at 16 SMU that's ~1 M vertices to rebuild per stamp
+on the CPU path, which is untenable for the SRS NFR-Performance
+"≤ 8 ms stroke latency" target. The heightmap belongs on the GPU as a
+sampled storage texture; the vertex shader reads it per-vertex; brush
+edits become sub-rect `queue.write_texture` calls.
+**Decision:**
+  - Heightmap texture format: **`r16uint`**. Core wgpu (no
+    `TEXTURE_FORMAT_16BIT_NORM` feature needed), matches `Heightmap`'s
+    `Vec<u16>` on-disk type 1:1, no shader-side renormalisation cost
+    (`f32(texel.r) / 65535.0` is one mul). `r16unorm` would have been
+    semantically tidier but is feature-gated and provides zero
+    practical benefit.
+  - **Texture usage flags:** `TEXTURE_BINDING | COPY_DST`. Storage-binding
+    flag deferred to ADR-021 — adding it speculatively here would
+    couple Commit 1's correctness to a feature/format check that only
+    matters for Commit 5.
+  - **No vertex buffer at all.** The vertex shader derives `(px, pz)`
+    from `@builtin(vertex_index)` and `textureDimensions(heightmap)`,
+    then samples the texture for Y. The index buffer alone drives
+    the indexed draw. Saves an upload + a buffer + an attribute slot.
+  - **Bind group layout:** binding 0 = uniform (camera + params),
+    binding 1 = `Texture { Uint, D2 }` visible to vertex stage.
+  - **Dummy 1×1 texture at install time** so the bind group is valid
+    before any heightmap loads. `upload_heightmap` reallocates +
+    rebinds when dims change, then `queue.write_texture` for the
+    full slice.
+  - **`height_scale` moves into the per-frame uniform.** Changing it
+    from the UI writes only the uniform — zero buffer or texture
+    churn. The Stage 0 `App::rebuild_mesh` path is deleted.
+  - **Grid index buffer rebuilds only when heightmap dims change**,
+    not on every height edit. Same CW winding as Stage 0 so
+    `front_face = Cw` still hides back faces.
+  - **Renderer skips draw when no real heightmap uploaded yet** — the
+    dummy 1×1 keeps the bind group valid but the central panel
+    already shows the "Load a heightmap" placeholder text.
+**Alternatives considered:**
+  - **`r16unorm` storage texture** — rejected: requires
+    `TEXTURE_FORMAT_16BIT_NORM` adapter feature with no functional
+    upside over `r16uint` for our use case (we do our own normalisation
+    in one mul).
+  - **Keep vertex Y as a per-vertex attribute, update only the
+    affected rows on brush strokes** — rejected: still needs a CPU-side
+    `Vec<Vertex>` to slice into, still does a buffer write proportional
+    to row width × edit height. Texture write is the same operation but
+    without the parallel CPU mirror cost.
+  - **Pull XZ from a vertex buffer (texture sample only for Y)** —
+    rejected: at 1025² that's 8 MB of XZ data we'd compute and upload
+    once and then keep around forever, when the shader can derive it
+    from the texture dimensions for free.
+  - **Use `texture_2d<f32>` via `rgba8unorm` or similar** — rejected:
+    loses 8 bits of precision relative to the source data, and
+    quadruples upload bandwidth.
+**Consequence:**
+  - `crates/barme-app/src/render.rs` heavily restructured:
+    `RenderResources` now owns a `HeightmapTex { tex, view, dims }` +
+    `Grid { index_buf, index_count, dims }`. `upload_mesh` →
+    `upload_heightmap` (signature drops `height_scale`).
+  - `crates/barme-app/src/terrain.wgsl` rewritten: vertex shader samples
+    the texture; uniform shrinks to `view_proj + params(max_height,
+    elmos_per_pixel)`.
+  - `App::rebuild_mesh` deleted from `main.rs`; height-scale drag no
+    longer triggers re-upload.
+  - **Foundation for ADR-018 (brushes):** dirty-rect sub-uploads use the
+    same texture via `queue.write_texture` with a `Origin3d` offset.
+  - **Foundation for ADR-021 (GPU compute brushes):** the texture is the
+    write target; that commit adds `STORAGE_BINDING` to the usage flags
+    (which may need a fall-back to `r32uint` if `r16uint` storage isn't
+    universally available — recorded as a known unknown there, not
+    here).
+
 ---
 
 ## Template for new entries

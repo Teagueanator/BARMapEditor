@@ -104,7 +104,7 @@ impl App {
                     );
                 }
                 if let Some(rs) = self.render_state.as_ref() {
-                    render::upload_mesh(rs, &h, self.height_scale);
+                    render::upload_heightmap(rs, &h);
                     let extent_x = (dims.0 - 1) as f32 * render::ELMOS_PER_PIXEL;
                     let extent_z = (dims.1 - 1) as f32 * render::ELMOS_PER_PIXEL;
                     self.camera = OrbitCamera::framing(extent_x, extent_z);
@@ -121,19 +121,6 @@ impl App {
                 warn!("failed to load heightmap: {e:#}");
                 self.last_error = Some(format!("{e:#}"));
             }
-        }
-    }
-
-    fn rebuild_mesh(&mut self) {
-        let Some(rs) = self.render_state.as_ref() else {
-            return;
-        };
-        let Some(state) = self.heightmap.as_ref() else {
-            return;
-        };
-        match Heightmap::load_png(&state.path) {
-            Ok(h) => render::upload_mesh(rs, &h, self.height_scale),
-            Err(e) => warn!("rebuild_mesh: {e:#}"),
         }
     }
 
@@ -342,7 +329,6 @@ enum FileAction {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let mut action: Option<FileAction> = None;
-        let mut rebuild_mesh = false;
 
         egui::TopBottomPanel::top("menu").show(ctx, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
@@ -440,15 +426,14 @@ impl eframe::App for App {
 
             ui.separator();
             ui.heading("Render");
-            let resp = ui.add(
+            // Height scale flows through the per-frame uniform — no
+            // texture or grid rebuild needed when this changes (ADR-017).
+            ui.add(
                 egui::DragValue::new(&mut self.height_scale)
                     .range(1.0..=4096.0)
                     .speed(1.0)
                     .prefix("Max height (elmos): "),
             );
-            if resp.changed() {
-                rebuild_mesh = true;
-            }
             ui.label(format!(
                 "Camera: yaw {:.0}° pitch {:.0}° dist {:.0}",
                 self.camera.yaw.to_degrees(),
@@ -551,7 +536,6 @@ impl eframe::App for App {
                 }
             }
             Some(FileAction::BuildAndInstall) => self.build_and_install(),
-            None if rebuild_mesh => self.rebuild_mesh(),
             None => {}
         }
     }
