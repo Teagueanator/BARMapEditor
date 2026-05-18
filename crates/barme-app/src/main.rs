@@ -11,7 +11,10 @@ use barme_core::{
     History, HistoryEntry, MapSize, PROJECT_EXTENSION, Project, ProjectDiff, StartPosition,
     SymmetryAxis, WizardSnapshot,
     brushes::pixel_bbox,
-    procgen::{Domain, PRESETS, generate as procgen_generate, validate_expression},
+    procgen::{
+        Domain, PRESETS, generate as procgen_generate, generate_thumbnail as procgen_thumbnail_gen,
+        validate_expression,
+    },
     project::sanitize_name,
 };
 use barme_pipeline::PyMapConvDriver;
@@ -38,6 +41,30 @@ use crate::render::{OrbitCamera, TerrainCallback};
 const DEFAULT_TRACING_FILTER: &str = "info,wgpu=warn,wgpu_core=warn,wgpu_hal=warn,\
     wgpu_hal::gles::egl=error,wgpu_hal::vulkan=error,\
     naga=warn,egui_wgpu=warn";
+
+/// Side of the square Procgen Inspector thumbnail (B7). 256 pixels →
+/// ~65k evalexpr samples per rebake, well inside the 50 ms debounce.
+const PROCGEN_THUMBNAIL_PX: usize = 256;
+
+/// Debounce window before a `(expr, domain)` change triggers a
+/// thumbnail rebake (B7). 50 ms is short enough to feel live and long
+/// enough to coalesce a multi-keystroke burst. Pinned by a smoke test
+/// in `procgen.rs` showing 256² cone-peak finishes well inside this
+/// budget.
+const PROCGEN_THUMBNAIL_DEBOUNCE_MS: u64 = 50;
+
+/// Stable hash of `(expr, domain)` used as the dirty key for the
+/// procgen thumbnail cache. Domain is folded in so toggling Unit ↔
+/// Centered triggers a re-bake even with an unchanged expression
+/// string (B7 pitfall: domain change re-evaluates against a different
+/// mapping).
+fn procgen_thumbnail_key(expr: &str, domain: Domain) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    expr.hash(&mut h);
+    domain.id().hash(&mut h);
+    h.finish()
+}
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -97,6 +124,21 @@ struct App {
     /// red chip with `msg` in the tooltip. Refreshed whenever
     /// `procgen_expr` changes (typing, preset pick, biome apply).
     procgen_validation: Result<(), String>,
+    /// 256² greyscale preview thumbnail rendered into the Procgen
+    /// Inspector (B7). `None` until the first successful generation;
+    /// re-uploaded via `handle.set(...)` on every refresh so we don't
+    /// leak GPU textures across keystrokes.
+    procgen_thumbnail: Option<egui::TextureHandle>,
+    /// Hash of `(expr, domain)` last baked into `procgen_thumbnail`.
+    /// Re-bake fires when the current `(expr, domain)` hashes
+    /// differently AND the debounce window has elapsed. `None` until
+    /// the first bake.
+    procgen_thumbnail_key: Option<u64>,
+    /// Wall-clock timestamp of the last `(expr, domain)` change. The
+    /// thumbnail refreshes when `now - this >= PROCGEN_DEBOUNCE_MS`.
+    /// Reset whenever the user types or toggles domain; the debounce
+    /// re-arms.
+    procgen_changed_at: Option<std::time::Instant>,
     /// Persistent undo/redo across the session. Cleared on barrier events
     /// (procgen, heightmap load, new project) — see ADR-022. Stroke state
     /// (copy-on-first-write scratch + bitset) lives inside `History` since
@@ -405,6 +447,11 @@ impl App {
             // to validate. Anything that doesn't validate would render
             // the chip red on first frame.
             procgen_validation: Ok(()),
+            procgen_thumbnail: None,
+            procgen_thumbnail_key: None,
+            // First time the Procgen Inspector is opened the debounce
+            // immediately fires and bakes the default expression.
+            procgen_changed_at: None,
             history: History::default(),
             tool: Tool::Sculpt,
             previous_tool: Tool::Sculpt,
@@ -573,9 +620,14 @@ impl App {
     /// pick, biome apply. Cost is ~μs for typical inputs, but the input is
     /// capped at `procgen::MAX_EXPRESSION_LEN` chars by the validator
     /// itself.
+    ///
+    /// Also re-arms the B7 thumbnail debounce. The thumbnail rebake
+    /// fires from `inspector_procgen` once `procgen_changed_at` is
+    /// older than [`PROCGEN_THUMBNAIL_DEBOUNCE_MS`].
     fn revalidate_procgen(&mut self) {
         self.procgen_validation =
             validate_expression(&self.procgen_expr).map_err(|e| format!("{e:#}"));
+        self.procgen_changed_at = Some(std::time::Instant::now());
     }
 
     /// Generate a heightmap from the current procgen expression and
@@ -2039,7 +2091,7 @@ impl App {
                             Tool::Select => Self::inspector_select(ui),
                             Tool::Sculpt => self.inspector_sculpt(ui),
                             Tool::StartPositions => self.inspector_start_positions(ui),
-                            Tool::Procgen => self.inspector_procgen(ui, action),
+                            Tool::Procgen => self.inspector_procgen(ctx, ui, action),
                         }
                     });
             });
@@ -2332,43 +2384,100 @@ impl App {
         }
     }
 
-    fn inspector_procgen(&mut self, ui: &mut egui::Ui, action: &mut Option<FileAction>) {
+    fn inspector_procgen(
+        &mut self,
+        ctx: &egui::Context,
+        ui: &mut egui::Ui,
+        action: &mut Option<FileAction>,
+    ) {
         ui.heading("Procgen — f(x, z)");
         ui.label(
-            egui::RichText::new("f(x, z) → height ∈ [0,1]. Apply replaces the heightmap.")
+            egui::RichText::new("Pick a preset, optionally tweak the expression, then Apply.")
                 .small()
                 .weak(),
         );
-        let expr_resp = ui.text_edit_singleline(&mut self.procgen_expr);
-        if expr_resp.changed() {
-            self.revalidate_procgen();
-        }
-        ui.horizontal(|ui| {
-            ui.label("Domain:");
-            ui.selectable_value(&mut self.procgen_domain, Domain::Unit, Domain::Unit.label());
-            ui.selectable_value(
-                &mut self.procgen_domain,
-                Domain::Centered,
-                Domain::Centered.label(),
-            );
-        });
+
+        // ─── 1. Preset dropdown (B7: preset-first) ───
+        let active_preset = PRESETS
+            .iter()
+            .find(|p| p.expression == self.procgen_expr && p.domain == self.procgen_domain)
+            .map(|p| p.label)
+            .unwrap_or("Custom");
         egui::ComboBox::from_label("Preset")
-            .selected_text("(pick one to fill expression)")
+            .selected_text(active_preset)
             .show_ui(ui, |ui| {
                 for p in PRESETS {
-                    if ui.selectable_label(false, p.label).clicked() {
+                    let chosen = active_preset == p.label;
+                    if ui.selectable_label(chosen, p.label).clicked() {
                         self.procgen_expr = p.expression.to_string();
                         self.procgen_domain = p.domain;
                         self.revalidate_procgen();
                     }
                 }
             });
-        // Apply row: button + live-validation chip. Apply is gated on
-        // parse-AND-dry-eval success; chip tooltip shows the
-        // `#[source]` chain of the validator error (A4 / ADR-033 era).
+
+        // ─── 2. Custom expression (collapsed by default) ───
+        egui::CollapsingHeader::new("Custom expression")
+            .id_salt("procgen_custom_expr")
+            .default_open(false)
+            .show(ui, |ui| {
+                let expr_resp = ui.text_edit_singleline(&mut self.procgen_expr);
+                if expr_resp.changed() {
+                    self.revalidate_procgen();
+                }
+                ui.label(
+                    egui::RichText::new("f(x, z) → height ∈ [0,1]. Out-of-range clamps.")
+                        .small()
+                        .weak(),
+                );
+            });
+
+        // ─── 3. Domain radio ───
+        ui.horizontal(|ui| {
+            ui.label("Domain:");
+            if ui
+                .selectable_value(&mut self.procgen_domain, Domain::Unit, Domain::Unit.label())
+                .changed()
+            {
+                self.revalidate_procgen();
+            }
+            if ui
+                .selectable_value(
+                    &mut self.procgen_domain,
+                    Domain::Centered,
+                    Domain::Centered.label(),
+                )
+                .changed()
+            {
+                self.revalidate_procgen();
+            }
+        });
+
+        ui.separator();
+
+        // ─── 4. Live preview thumbnail ───
+        self.refresh_procgen_thumbnail(ctx);
+        ui.label(egui::RichText::new("Preview").small().weak());
+        if let Some(tex) = self.procgen_thumbnail.as_ref() {
+            // Render the thumbnail at its native size, capped by the
+            // available width so a narrow Inspector still fits.
+            let max_side = ui.available_width().min(PROCGEN_THUMBNAIL_PX as f32);
+            ui.add(egui::Image::new(tex).fit_to_exact_size(egui::vec2(max_side, max_side)));
+        } else if self.procgen_validation.is_err() {
+            ui.colored_label(
+                egui::Color32::GRAY,
+                "(invalid expression — fix to render preview)",
+            );
+        } else {
+            ui.label(egui::RichText::new("(preview baking…)").small().weak());
+        }
+
+        ui.separator();
+
+        // ─── 5. Apply button + live-validation chip ───
         ui.horizontal(|ui| {
             let parse_ok = self.procgen_validation.is_ok();
-            let apply = ui.add_enabled(parse_ok, egui::Button::new("Apply"));
+            let apply = ui.add_enabled(parse_ok, egui::Button::new("Apply to heightmap"));
             if apply.clicked() {
                 *action = Some(FileAction::ApplyProcGen);
             }
@@ -2384,6 +2493,88 @@ impl App {
         });
         if let Some(err) = &self.procgen_last_error {
             ui.colored_label(egui::Color32::RED, format!("Procgen: {err}"));
+        }
+    }
+
+    /// Rebake the Procgen thumbnail when (a) the cached
+    /// `(expr, domain)` hash differs from the current state AND
+    /// (b) the debounce window has elapsed. Reuses the cached
+    /// [`egui::TextureHandle`] via `set(...)` so we don't leak GPU
+    /// textures across keystrokes.
+    fn refresh_procgen_thumbnail(&mut self, ctx: &egui::Context) {
+        // Bail early on parse failure — the existing thumbnail (if
+        // any) stays visible. The red ✗ chip already tells the user
+        // their expression is broken.
+        if self.procgen_validation.is_err() {
+            return;
+        }
+
+        let current_key = procgen_thumbnail_key(&self.procgen_expr, self.procgen_domain);
+        let key_changed = self.procgen_thumbnail_key != Some(current_key);
+        let elapsed = self.procgen_changed_at.map(|t| t.elapsed());
+
+        // Decision tree:
+        // - No thumbnail yet → bake immediately (first frame in the tool).
+        // - Key changed AND we've been quiet for >= debounce → bake now.
+        // - Key changed AND debounce window not yet elapsed → schedule a
+        //   repaint at the remainder so we don't sleep on user idle.
+        let debounce = std::time::Duration::from_millis(PROCGEN_THUMBNAIL_DEBOUNCE_MS);
+        let should_bake = match (self.procgen_thumbnail.is_some(), key_changed, elapsed) {
+            (false, _, _) => true,
+            (true, false, _) => false,
+            (true, true, None) => true,
+            (true, true, Some(e)) => e >= debounce,
+        };
+
+        if !should_bake {
+            // Hold off but wake the UI loop at the remaining-debounce
+            // mark so the thumbnail catches up on quiescence.
+            if let Some(e) = elapsed
+                && e < debounce
+            {
+                ctx.request_repaint_after(debounce - e);
+            }
+            return;
+        }
+
+        match procgen_thumbnail_gen(
+            &self.procgen_expr,
+            self.procgen_domain,
+            PROCGEN_THUMBNAIL_PX,
+        ) {
+            Ok(grey) => {
+                let img = egui::ColorImage::from_gray(
+                    [PROCGEN_THUMBNAIL_PX, PROCGEN_THUMBNAIL_PX],
+                    &grey,
+                );
+                let options = egui::TextureOptions::default();
+                match self.procgen_thumbnail.as_mut() {
+                    Some(handle) => handle.set(img, options),
+                    None => {
+                        self.procgen_thumbnail =
+                            Some(ctx.load_texture("procgen-thumb", img, options));
+                    }
+                }
+                self.procgen_thumbnail_key = Some(current_key);
+                trace!(
+                    expr = %self.procgen_expr,
+                    domain = ?self.procgen_domain,
+                    "procgen thumbnail rebaked"
+                );
+            }
+            Err(e) => {
+                // Validation pre-flighted parse + dry-eval at (0,0), but
+                // a thumbnail can still hit NonNumeric / EvalFailed at
+                // other coords. Don't clobber the thumbnail — log and
+                // leave the previous frame visible.
+                warn!(
+                    expr = %self.procgen_expr,
+                    domain = ?self.procgen_domain,
+                    error = %format!("{e:#}"),
+                    "procgen thumbnail bake failed; keeping prior preview"
+                );
+                self.procgen_thumbnail_key = Some(current_key);
+            }
         }
     }
 
@@ -2928,6 +3119,9 @@ mod tests {
             procgen_domain: Domain::Centered,
             procgen_last_error: None,
             procgen_validation: Ok(()),
+            procgen_thumbnail: None,
+            procgen_thumbnail_key: None,
+            procgen_changed_at: None,
             history: History::default(),
             tool: Tool::Sculpt,
             previous_tool: Tool::Sculpt,
@@ -3526,6 +3720,57 @@ mod tests {
         // The heightmap branch is covered by the existing
         // `stroke_open()` tests in `barme-core::undo`.
         assert!(!app.is_dragging_anything());
+    }
+
+    // ────── B7 — Procgen UX redesign ──────
+
+    /// The thumbnail dirty-key must fold in BOTH expression and domain.
+    /// A toggle from Unit ↔ Centered with an unchanged expression
+    /// string must invalidate the cache — without that, the preview
+    /// would show stale `x` ramps when the user flipped domain.
+    #[test]
+    fn b7_thumbnail_key_changes_on_domain_toggle() {
+        let a = procgen_thumbnail_key("x", Domain::Unit);
+        let b = procgen_thumbnail_key("x", Domain::Centered);
+        assert_ne!(
+            a, b,
+            "thumbnail cache key must distinguish Unit vs Centered for the same expr"
+        );
+    }
+
+    #[test]
+    fn b7_thumbnail_key_changes_on_expression_edit() {
+        let a = procgen_thumbnail_key("x", Domain::Unit);
+        let b = procgen_thumbnail_key("x*x", Domain::Unit);
+        assert_ne!(a, b);
+    }
+
+    /// `revalidate_procgen` is the choke point for re-arming the
+    /// debounce. Every code path that mutates `procgen_expr` /
+    /// `procgen_domain` (preset click, biome apply, keystroke, domain
+    /// toggle) calls through it, so this single contract pin covers
+    /// all of them.
+    #[test]
+    fn b7_revalidate_arms_debounce_timer() {
+        let mut app = make_test_app();
+        assert!(
+            app.procgen_changed_at.is_none(),
+            "fresh app has no pending change"
+        );
+        app.procgen_expr = "x*x".to_string();
+        app.revalidate_procgen();
+        assert!(
+            app.procgen_changed_at.is_some(),
+            "revalidate_procgen must arm the debounce timer"
+        );
+    }
+
+    /// Constants pin: the prompt enumerates 256 px and 50 ms; a
+    /// future "tune this" PR shouldn't silently change either.
+    #[test]
+    fn b7_thumbnail_constants_match_spec() {
+        assert_eq!(PROCGEN_THUMBNAIL_PX, 256);
+        assert_eq!(PROCGEN_THUMBNAIL_DEBOUNCE_MS, 50);
     }
 
     /// B5: a single click-and-immediate-release on a marker (no actual

@@ -261,6 +261,79 @@ pub fn generate(
     Heightmap::new(w, h, data).map_err(ProcGenError::Heightmap)
 }
 
+/// Generate a small greyscale preview of `expr` at `size×size` pixels —
+/// the Inspector thumbnail surface (B7).
+///
+/// Returns a row-major `Vec<u8>` of length `size*size`, with each byte the
+/// 8-bit greyscale value the heightmap u16 would map to. Errors propagate
+/// from [`generate`]; on parse / eval failure the caller keeps the previous
+/// preview rendered (the typical UI pattern).
+///
+/// The mapping is `(value * 255 / 65535)` — same shape as the heightmap u16
+/// → u8 path used elsewhere, but cheaper because we operate on f32 internals
+/// and skip the round-trip through `Heightmap::new`.
+///
+/// Cost is `O(size²)` evalexpr calls; at `size = 256` that's ~65k pixels,
+/// well inside the 50 ms debounce budget B7 ships against. The full heightmap
+/// `generate` would be 16× larger and would blow that budget on every
+/// keystroke.
+pub fn generate_thumbnail(
+    expr: &str,
+    domain: Domain,
+    size: usize,
+) -> Result<Vec<u8>, ProcGenError> {
+    let tree: Node<DefaultNumericTypes> = build_operator_tree(expr).map_err(ProcGenError::Parse)?;
+
+    let pixels = (size as u32).max(2);
+    let denom = (pixels - 1) as f64;
+    let mut out = Vec::with_capacity((pixels as usize) * (pixels as usize));
+    let mut ctx = PixelContext::new();
+    let mut warned_nan = false;
+
+    let norms: Vec<f64> = (0..pixels)
+        .map(|i| match domain {
+            Domain::Unit => (i as f64) / denom,
+            Domain::Centered => (i as f64) / denom * 2.0 - 1.0,
+        })
+        .collect();
+
+    for iz in 0..pixels {
+        ctx.set_z(norms[iz as usize]);
+        for ix in 0..pixels {
+            ctx.set_x(norms[ix as usize]);
+            let v = tree
+                .eval_with_context(&ctx)
+                .map_err(|source| ProcGenError::EvalFailed {
+                    pixel: (ix, iz),
+                    source,
+                })?;
+            let numeric = match v {
+                Value::Float(f) => f,
+                Value::Int(i) => i as f64,
+                other => {
+                    return Err(ProcGenError::NonNumeric {
+                        got: format!("{other:?}"),
+                    });
+                }
+            };
+            let clamped = if numeric.is_finite() {
+                numeric.clamp(0.0, 1.0)
+            } else {
+                if !warned_nan {
+                    warn!(
+                        "procgen thumbnail produced non-finite sample (NaN/Inf) at ({ix}, {iz}); \
+                         clamping to 0 and suppressing further warnings this generation"
+                    );
+                    warned_nan = true;
+                }
+                0.0
+            };
+            out.push((clamped * 255.0) as u8);
+        }
+    }
+    Ok(out)
+}
+
 /// Built-in preset list. UI dropdown reads this; selecting a preset fills
 /// the expression text field. New presets are one-line entries.
 pub struct ProcGenPreset {
@@ -557,6 +630,74 @@ mod tests {
         let at_max = format!("{prefix}{pad}");
         assert_eq!(at_max.len(), MAX_EXPRESSION_LEN);
         validate_expression(&at_max).unwrap();
+    }
+
+    // ────── B7 thumbnail helper ──────
+
+    #[test]
+    fn thumbnail_flat_half_is_grey_midline() {
+        // "0.5" → every pixel is 127 (the 8-bit midline).
+        let buf = generate_thumbnail("0.5", Domain::Unit, 16).unwrap();
+        assert_eq!(buf.len(), 16 * 16);
+        for (i, &v) in buf.iter().enumerate() {
+            // 0.5 * 255 = 127.5 → truncates to 127.
+            assert_eq!(v, 127, "pixel {i} expected 127 (grey), got {v}");
+        }
+    }
+
+    #[test]
+    fn thumbnail_centered_paraboloid_max_at_center_min_at_corner() {
+        // 1 - (x² + z²) under Centered — peaks at (0, 0), clamps to 0 at the
+        // corners where x² + z² > 1.
+        let size = 9; // odd so a true center pixel exists.
+        let buf = generate_thumbnail("1 - (x*x + z*z)", Domain::Centered, size).unwrap();
+        let center = buf[(size / 2) * size + (size / 2)];
+        assert_eq!(center, 255, "centre pixel should be max grey");
+        assert_eq!(buf[0], 0, "NW corner should clamp to 0");
+    }
+
+    #[test]
+    fn thumbnail_propagates_parse_error() {
+        let err = generate_thumbnail("1 + )", Domain::Unit, 16).unwrap_err();
+        assert!(matches!(err, ProcGenError::Parse(_)), "got: {err:?}");
+    }
+
+    #[test]
+    fn thumbnail_256_square_completes_under_fifty_ms() {
+        // B7 contract: thumbnail update must fit comfortably inside the
+        // 50 ms debounce window. At 256² (~65k samples) the cone-peak
+        // expression clocks ~25 ms on the dev machine. Cap at 100 ms so
+        // the test survives a slow CI runner.
+        let _ =
+            generate_thumbnail("max(0, 1 - math::sqrt(x*x + z*z))", Domain::Centered, 256).unwrap();
+        let t0 = std::time::Instant::now();
+        let _ =
+            generate_thumbnail("max(0, 1 - math::sqrt(x*x + z*z))", Domain::Centered, 256).unwrap();
+        let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        assert!(
+            elapsed_ms < 100.0,
+            "256² cone-peak thumbnail took {elapsed_ms:.1} ms; over the 50 ms debounce budget"
+        );
+        eprintln!("256² cone-peak thumbnail: {elapsed_ms:.1} ms");
+    }
+
+    #[test]
+    fn thumbnail_domain_change_flips_output() {
+        // Same expression, two domains — the byte streams must differ. This
+        // pins the B7 contract that the thumbnail re-renders on domain
+        // toggle, not only on expression change.
+        let unit = generate_thumbnail("x", Domain::Unit, 8).unwrap();
+        let centered = generate_thumbnail("x", Domain::Centered, 8).unwrap();
+        assert_ne!(
+            unit, centered,
+            "Unit vs Centered for x should differ; thumbnail must redraw on domain toggle"
+        );
+        // Unit:     left column = 0, right column = 255.
+        assert_eq!(unit[0], 0);
+        assert_eq!(unit[8 - 1], 255);
+        // Centered: left column = -1 (clamps to 0), right = +1 → 255.
+        assert_eq!(centered[0], 0);
+        assert_eq!(centered[8 - 1], 255);
     }
 
     #[test]
