@@ -7,7 +7,7 @@
 //! lives inside `egui_wgpu::CallbackResources` as [`RenderResources`]; the
 //! per-frame [`TerrainCallback`] only carries camera matrix + max_height.
 
-use barme_core::Heightmap;
+use barme_core::{DirtyRect, Heightmap};
 use bytemuck::{Pod, Zeroable};
 use eframe::egui_wgpu;
 use eframe::wgpu;
@@ -364,11 +364,93 @@ impl OrbitCamera {
         self.target + dir * self.distance
     }
 
-    fn view_proj(&self, aspect: f32) -> Mat4 {
+    pub fn view_proj_matrix(&self, aspect: f32) -> Mat4 {
         let proj = Mat4::perspective_lh(self.fov_y, aspect, self.near, self.far);
         let view = Mat4::look_at_lh(self.eye(), self.target, Vec3::Y);
         proj * view
     }
+}
+
+/// Unproject a cursor position (relative to a screen rect) onto the y=0
+/// world plane. Used for brush picking — accurate enough at moderate map
+/// inclinations, sloppy when the camera looks edge-on. Real ray-vs-
+/// heightmap is Stage 1 polish.
+pub fn screen_to_world_y0(
+    cursor_in_rect: glam::Vec2,
+    rect_size: glam::Vec2,
+    camera: &OrbitCamera,
+) -> Option<Vec3> {
+    let aspect = (rect_size.x / rect_size.y).max(0.0001);
+    let vp_inv = camera.view_proj_matrix(aspect).inverse();
+    let ndc_x = 2.0 * cursor_in_rect.x / rect_size.x - 1.0;
+    let ndc_y = 1.0 - 2.0 * cursor_in_rect.y / rect_size.y;
+    let near = vp_inv * glam::Vec4::new(ndc_x, ndc_y, 0.0, 1.0);
+    let far = vp_inv * glam::Vec4::new(ndc_x, ndc_y, 1.0, 1.0);
+    if near.w.abs() < 1e-6 || far.w.abs() < 1e-6 {
+        return None;
+    }
+    let near = near.truncate() / near.w;
+    let far = far.truncate() / far.w;
+    let dir = far - near;
+    if dir.y.abs() < 1e-6 {
+        return None;
+    }
+    let t = -near.y / dir.y;
+    if t < 0.0 {
+        return None;
+    }
+    Some(near + dir * t)
+}
+
+/// Upload a sub-rect of the heightmap to the GPU texture. The full
+/// heightmap data + dims are passed so we can compute the byte offset
+/// into the source slice; this avoids a copy on the CPU side.
+pub fn write_heightmap_rect(
+    render_state: &egui_wgpu::RenderState,
+    full_dims: (u32, u32),
+    full_data: &[u16],
+    rect: DirtyRect,
+) {
+    if rect.w == 0 || rect.h == 0 {
+        return;
+    }
+    let renderer = render_state.renderer.read();
+    let Some(res) = renderer.callback_resources.get::<RenderResources>() else {
+        return;
+    };
+    let Some(hm_tex) = res.heightmap.as_ref() else {
+        return;
+    };
+    if hm_tex.dims != full_dims {
+        // Dims changed since the last upload — caller should be using
+        // `upload_heightmap` instead. Skip silently rather than corrupt.
+        return;
+    }
+    let queue = &render_state.queue;
+    let start = (rect.y as usize) * (full_dims.0 as usize) + (rect.x as usize);
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &hm_tex.tex,
+            mip_level: 0,
+            origin: wgpu::Origin3d {
+                x: rect.x,
+                y: rect.y,
+                z: 0,
+            },
+            aspect: wgpu::TextureAspect::All,
+        },
+        bytemuck::cast_slice(&full_data[start..]),
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(full_dims.0 * 2),
+            rows_per_image: Some(rect.h),
+        },
+        wgpu::Extent3d {
+            width: rect.w,
+            height: rect.h,
+            depth_or_array_layers: 1,
+        },
+    );
 }
 
 pub struct TerrainCallback {
@@ -380,7 +462,7 @@ impl TerrainCallback {
     pub fn new(camera: &OrbitCamera, rect: egui::Rect, max_height: f32) -> Self {
         let aspect = (rect.width() / rect.height()).max(0.0001);
         Self {
-            view_proj: camera.view_proj(aspect).to_cols_array_2d(),
+            view_proj: camera.view_proj_matrix(aspect).to_cols_array_2d(),
             max_height,
         }
     }

@@ -742,6 +742,100 @@ edits become sub-rect `queue.write_texture` calls.
     universally available — recorded as a known unknown there, not
     here).
 
+## ADR-018 — Extensible `Brush` trait + raise/lower/smooth + dirty-rect sub-upload
+
+**Status:** Accepted (2026-05-17).
+**Context:** SRS F2 (heightmap sculpting) is Stage 1's centerpiece. The
+user explicitly asked that brushes ship as a *plugin-shaped* surface ("like
+Blender there are multiple different brush types so we need to have space
+for them in the future"). Three brushes (raise / lower / smooth) cover the
+v0 sculpting loop; the architecture has to accept flatten / erode / noise /
+terrace / ramp later without touching the dispatch site or the UI. Two
+orthogonal choices:
+  1. **Trait + registry vs enum.** Enum is simpler but every new brush
+     forces an `impl Brush for Foo` match arm edit at the dispatch site
+     and an enum variant. Trait `Brush: Send + Sync + 'static` with a
+     `Vec<Box<dyn Brush>>` registry inverts that: new brush = new struct
+     + one `Box::new(...)` in `default_set()`, dispatch is dynamic.
+  2. **CPU kernel vs GPU compute first.** CPU lets us validate UX
+     (radius/strength/falloff/symmetry interaction) without a wgpu
+     compute-shader rabbit hole. Port to GPU in ADR-021 *only if* the CPU
+     path fails the NFR-Performance "≤ 8 ms stroke latency" budget at 16
+     SMU. The dirty-rect bookkeeping introduced here is the foundation
+     ADR-021 will dispatch onto.
+**Decision:**
+  - **`barme-core::brushes`** module with `Brush` trait, `BrushStamp` /
+    `DirtyRect` value types, and `BrushRegistry` (vec of boxed brushes).
+    Trait is object-safe + `Send + Sync + 'static` so a wasm-plugin
+    runtime could feed in brushes from outside the crate later.
+  - **Three starter brushes:** `Raise`, `Lower`, `Smooth`. Stateless unit
+    structs (radius/strength flow through `BrushStamp`, not the struct).
+  - **Kernel math lifted from Jandodev/bar-editor's `terrain-edit.ts`**
+    (MIT, attribution comment at module head). Raise/lower:
+    `delta = ±strength · STAMP_MAX_DELTA · smoothstep(1 - d/r)` where
+    `STAMP_MAX_DELTA = 0.05 · u16::MAX` (≈ 20 full-strength stamps to
+    saturate). Smooth: 3×3 mean blend with `mix = strength · falloff`.
+    Smooth takes a snapshot of the bounding rect + 1 px margin to avoid
+    propagation bias on a single pass.
+  - **`DirtyRect` always returned by `apply`** (or `None` for off-map /
+    zero strength). Caller uses it to scope the GPU sub-upload — one
+    `queue.write_texture` per stroke instead of a full re-upload.
+  - **CPU heightmap is authoritative.** `App::HeightmapState` now owns
+    the `Heightmap` (was a path-only lookup that round-tripped through
+    `load_png` for every redraw). Brushes mutate in place; GPU texture
+    is the derived view. `build_and_install` writes the current
+    in-memory state to a tempdir PNG so unsaved sculpt edits ship.
+  - **Stroke handling: one stamp per frame while LMB is held in the
+    central rect.** Spacing is implicit (frame rate). With a brush
+    active, right-mouse-button orbits the camera; no brush selected
+    keeps Stage 0 left-drag-orbits behaviour.
+  - **Picking: screen-ray vs y=0 plane.** Trades altitude accuracy for
+    predictability and zero per-frame compute work. Ray-vs-heightmap is
+    a Stage 1 polish item. (The plane intersection is in
+    `render::screen_to_world_y0`, callable from anywhere.)
+  - **Sub-upload helper `render::write_heightmap_rect`** issues a single
+    `queue.write_texture` with `Origin3d` offset + `bytes_per_row =
+    full_w · 2` so the caller passes the full heightmap slice + the
+    rect; no scratch copy needed. wgpu has no row-alignment requirement
+    on `queue.write_texture`, so any rect width is fine.
+**Alternatives considered:**
+  - **Enum of brush kinds.** Rejected per Context #1 — adds friction
+    proportional to brush count, no upside.
+  - **Per-frame full texture upload.** Rejected: at 16 SMU = 1025² · 2 B
+    = 2 MB, plausible at 60 FPS but pointless when the affected rect is
+    typically <1 % of the heightmap.
+  - **Skip the CPU mirror and let the GPU texture be authoritative.**
+    Rejected for v0: save / install paths need a CPU heightmap to write
+    a PNG; deferring sync to save-time means a `copy_texture_to_buffer`
+    + readback dance that's better introduced alongside ADR-021's
+    compute dispatches, not now.
+  - **Per-brush parameter structs in `BrushRegistry`.** Rejected:
+    radius/strength are universally meaningful, and brush-specific
+    params (e.g. flatten's target height) can live in the kernel's own
+    state in future commits without changing the trait. v0 stays lean.
+  - **Async stroke processing.** Rejected: a single frame's stamp is
+    microseconds at 16 SMU; threading overhead would dominate.
+**Consequence:**
+  - `barme-core` gains a `brushes/` sub-module. Public re-exports:
+    `Brush`, `BrushRegistry`, `BrushStamp`, `DirtyRect`.
+  - `Heightmap::data_mut()` added (was read-only). All callers go
+    through the trait, so the new mut access doesn't leak into general
+    crate consumers.
+  - `crates/barme-app/src/render.rs` gains `screen_to_world_y0` and
+    `write_heightmap_rect`; `OrbitCamera::view_proj_matrix` is now
+    `pub` (was `fn view_proj`).
+  - **UI:** "Sculpt" panel section with `Off + 3 brushes` dropdown,
+    radius (8–4096 elmos) and strength (0–1) controls. Brush dropdown
+    is populated from `BrushRegistry::iter()`, so adding a brush =
+    a Box-new + an automatic UI entry.
+  - **NFR-Performance:** unmeasured this commit. Bench numbers go into
+    ADR-021's deciding section. If CPU latency clears the budget at
+    16 SMU, ADR-021 becomes a deferred ticket; if not, we port the
+    kernels.
+  - **Symmetry (ADR-019, next commit)** plugs into `apply_brush_at` by
+    replicating `BrushStamp` centers; each rect-result unions into one
+    upload via `DirtyRect::union`.
+
 ---
 
 ## Template for new entries

@@ -52,6 +52,12 @@ impl Heightmap {
         &self.data
     }
 
+    /// Mutable access for brush kernels and other in-place transforms.
+    /// Length always equals `width * height`; modify in row-major order.
+    pub fn data_mut(&mut self) -> &mut [u16] {
+        &mut self.data
+    }
+
     /// Verify dims match `MapSize::heightmap_dims()` — i.e. `64·N + 1`.
     /// Returning a typed error rather than `bail!` so the UI can show it.
     pub fn validate_against(&self, size: MapSize) -> Result<(), DimMismatch> {

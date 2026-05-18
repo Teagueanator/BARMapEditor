@@ -4,7 +4,7 @@ mod render;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
-use barme_core::{Heightmap, MapSize, PROJECT_EXTENSION, Project};
+use barme_core::{BrushRegistry, BrushStamp, Heightmap, MapSize, PROJECT_EXTENSION, Project};
 use barme_pipeline::PyMapConvDriver;
 use eframe::egui;
 use eframe::egui_wgpu;
@@ -53,10 +53,17 @@ struct App {
     height_scale: f32,
     current_project_path: Option<PathBuf>,
     last_install: Option<Result<PathBuf, String>>,
+    brushes: BrushRegistry,
+    brush_id: Option<String>,
+    brush_radius: f32,
+    brush_strength: f32,
 }
 
 struct HeightmapState {
     path: PathBuf,
+    /// Authoritative CPU mirror of the heightmap. Brushes mutate this in
+    /// place; the GPU texture is the derived view (see ADR-017).
+    data: Heightmap,
     dims: (u32, u32),
     min: u16,
     max: u16,
@@ -82,6 +89,10 @@ impl App {
             height_scale: 256.0,
             current_project_path: None,
             last_install: None,
+            brushes: BrushRegistry::default_set(),
+            brush_id: None, // Off
+            brush_radius: 256.0,
+            brush_strength: 0.5,
         }
     }
 
@@ -111,6 +122,7 @@ impl App {
                 }
                 self.heightmap = Some(HeightmapState {
                     path,
+                    data: h,
                     dims,
                     min,
                     max,
@@ -183,6 +195,50 @@ impl App {
         }
     }
 
+    /// Apply one brush stamp at the cursor position. Resolves cursor →
+    /// world via screen-ray vs y=0 plane, runs the kernel against the
+    /// CPU heightmap, then sub-uploads the dirty rect to the GPU
+    /// texture. No-op if no brush is selected or no heightmap is
+    /// loaded.
+    fn apply_brush_at(&mut self, cursor: egui::Pos2, rect: egui::Rect) {
+        let Some(rs) = self.render_state.as_ref() else {
+            return;
+        };
+        let Some(hm_state) = self.heightmap.as_mut() else {
+            return;
+        };
+        let Some(brush_id) = self.brush_id.as_deref() else {
+            return;
+        };
+        let Some(brush) = self.brushes.get(brush_id) else {
+            return;
+        };
+        if !rect.contains(cursor) {
+            return;
+        }
+        let cursor_in = glam::Vec2::new(cursor.x - rect.min.x, cursor.y - rect.min.y);
+        let rect_size = glam::Vec2::new(rect.width(), rect.height());
+        let Some(world) = render::screen_to_world_y0(cursor_in, rect_size, &self.camera) else {
+            return;
+        };
+        let stamp = BrushStamp {
+            world_x: world.x,
+            world_z: world.z,
+            radius: self.brush_radius,
+            strength: self.brush_strength,
+        };
+        let Some(rect_dirty) = brush.apply(&mut hm_state.data, stamp) else {
+            return;
+        };
+        let dims = hm_state.dims;
+        // Sub-upload the dirty rect (one queue.write_texture call).
+        render::write_heightmap_rect(rs, dims, hm_state.data.data(), rect_dirty);
+        // Keep min/max display fresh.
+        let (mn, mx) = hm_state.data.min_max();
+        hm_state.min = mn;
+        hm_state.max = mx;
+    }
+
     /// Compile the current project to a `.sd7` and copy it into BAR's
     /// user maps directory. v0 UX: heightmap must be loaded, texture is a
     /// synthesised flat grey (Stage 1 will replace with real DNTS).
@@ -194,7 +250,25 @@ impl App {
             self.last_error = Some("load a heightmap first".into());
             return;
         };
-        let hm_path = hm.path.clone();
+        // The CPU-side heightmap is authoritative (may include unsaved
+        // brush edits). Serialize to a temp PNG so the pipeline gets the
+        // current state, not a stale on-disk snapshot.
+        let tmp = match tempfile::tempdir() {
+            Ok(t) => t,
+            Err(e) => {
+                let msg = format!("tempdir: {e:#}");
+                error!("build & install tempdir failed: {msg}");
+                self.last_install = Some(Err(msg));
+                return;
+            }
+        };
+        let hm_path = tmp.path().join("heightmap.png");
+        if let Err(e) = hm.data.save_png(&hm_path) {
+            let msg = format!("write heightmap: {e:#}");
+            error!("build & install snapshot failed: {msg}");
+            self.last_install = Some(Err(msg));
+            return;
+        }
         let Some(dst_dir) = launcher::bar_maps_dir() else {
             let msg =
                 "could not locate BAR maps dir on this platform — pick one manually (Stage 1)";
@@ -434,6 +508,35 @@ impl eframe::App for App {
                     .speed(1.0)
                     .prefix("Max height (elmos): "),
             );
+
+            ui.separator();
+            ui.heading("Sculpt");
+            let current_label = self
+                .brush_id
+                .as_deref()
+                .and_then(|id| self.brushes.get(id).map(|b| b.label()))
+                .unwrap_or("Off");
+            egui::ComboBox::from_label("Brush")
+                .selected_text(current_label)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.brush_id, None, "Off");
+                    for b in self.brushes.iter() {
+                        let id_owned = b.id().to_string();
+                        ui.selectable_value(&mut self.brush_id, Some(id_owned), b.label());
+                    }
+                });
+            ui.add(
+                egui::DragValue::new(&mut self.brush_radius)
+                    .range(8.0..=4096.0)
+                    .speed(2.0)
+                    .prefix("Radius (elmos): "),
+            );
+            ui.add(
+                egui::Slider::new(&mut self.brush_strength, 0.0..=1.0)
+                    .text("Strength")
+                    .clamping(egui::SliderClamping::Always),
+            );
+
             ui.label(format!(
                 "Camera: yaw {:.0}° pitch {:.0}° dist {:.0}",
                 self.camera.yaw.to_degrees(),
@@ -482,8 +585,20 @@ impl eframe::App for App {
             let (rect, response) =
                 ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
 
-            if response.dragged() {
-                let d = response.drag_delta();
+            // Brush active → left-drag paints, right-drag orbits camera.
+            // No brush → left-drag orbits (Stage 0 behaviour).
+            let brush_active = self.brush_id.is_some() && self.heightmap.is_some();
+            let camera_drag = if brush_active {
+                response.dragged_by(egui::PointerButton::Secondary)
+            } else {
+                response.dragged()
+            };
+            if camera_drag {
+                let d = if brush_active {
+                    ui.input(|i| i.pointer.delta())
+                } else {
+                    response.drag_delta()
+                };
                 self.camera.yaw -= d.x * 0.005;
                 self.camera.pitch = (self.camera.pitch + d.y * 0.005).clamp(
                     -std::f32::consts::FRAC_PI_2 + 0.05,
@@ -496,6 +611,18 @@ impl eframe::App for App {
                     let factor = (1.0 - scroll * 0.002).clamp(0.5, 2.0);
                     self.camera.distance = (self.camera.distance * factor).clamp(100.0, 200000.0);
                 }
+            }
+
+            // Brush stroke: while LMB is down in the central rect, emit
+            // one stamp per frame at the cursor's world-space projection
+            // on the y=0 plane. Spacing along the drag is implicit (frame
+            // rate). Symmetry / undo land in later commits.
+            if brush_active
+                && (response.dragged_by(egui::PointerButton::Primary)
+                    || response.clicked_by(egui::PointerButton::Primary))
+                && let Some(cursor) = ctx.pointer_interact_pos()
+            {
+                self.apply_brush_at(cursor, rect);
             }
 
             if self.heightmap.is_some() {
