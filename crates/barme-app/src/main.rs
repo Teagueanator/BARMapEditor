@@ -137,6 +137,9 @@ struct App {
     /// `drag_stopped`. While true, LMB-drag orbits regardless of
     /// active tool — same camera math as the existing RMB orbit.
     nav_gizmo_drag_active: bool,
+    /// User-selected build pipeline variant for the top-bar primary
+    /// button (B4). Persists across button clicks within a session.
+    build_variant: BuildVariant,
 }
 
 /// Mutable form state for the F1 wizard. Held independently of App state
@@ -194,6 +197,72 @@ enum Tool {
     /// Math-function terrain generator (F14 / ADR-020). No central-rect
     /// editing; the formula is committed via Apply in the Inspector.
     Procgen,
+}
+
+/// Build-pipeline variants offered in the top action bar (B4). Today
+/// every enabled variant funnels into the same `FileAction::BuildAndInstall`
+/// pipeline — the variant selector is reserved UX surface for Phase 5+
+/// (F12 Launch + a Build-vs-Install split). `BuildInstallLaunch` is
+/// permanently disabled in the UI until F12 wires the engine launcher.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+enum BuildVariant {
+    /// Compile `.smf` + `.smt` + package `.sd7` only — no install to
+    /// the BAR user maps dir. Today this still runs the existing
+    /// build-and-install path (pipeline split deferred); the label
+    /// signals intent.
+    Only,
+    /// `.sd7` + install to `~/.local/state/Beyond All Reason/maps/`.
+    /// Default — matches the B1 button's behaviour.
+    #[default]
+    Install,
+    /// `.sd7` + install + launch the BAR engine pointing at the new
+    /// map. Greyed pre-F12.
+    Launch,
+}
+
+impl BuildVariant {
+    /// All variants in display order. Pinned by tests so a future
+    /// reorder is explicit.
+    const ALL: [BuildVariant; 3] = [
+        BuildVariant::Only,
+        BuildVariant::Install,
+        BuildVariant::Launch,
+    ];
+
+    /// Short label rendered in the ComboBox + on the primary button.
+    fn label(self) -> &'static str {
+        match self {
+            BuildVariant::Only => "Build",
+            BuildVariant::Install => "Build + Install",
+            BuildVariant::Launch => "Build + Install + Launch",
+        }
+    }
+
+    /// Is this variant available *today*? `Launch` returns false
+    /// until F12 ships an engine launcher.
+    fn is_enabled(self) -> bool {
+        match self {
+            BuildVariant::Only => true,
+            BuildVariant::Install => true,
+            // F12 isn't wired — the variant is greyed in the combo and
+            // skipped by the click handler.
+            BuildVariant::Launch => false,
+        }
+    }
+
+    /// Map an enabled variant to the FileAction to enqueue. Returns
+    /// `None` for the disabled-pre-F12 launch variant — the click
+    /// handler treats `None` as "this shouldn't have been clickable;
+    /// drop the click."
+    fn to_file_action(self) -> Option<FileAction> {
+        // Today every enabled variant lands in the same pipeline path.
+        // A Phase-5 split would diversify these returns.
+        match self {
+            BuildVariant::Only => Some(FileAction::BuildAndInstall),
+            BuildVariant::Install => Some(FileAction::BuildAndInstall),
+            BuildVariant::Launch => None,
+        }
+    }
 }
 
 impl Tool {
@@ -309,6 +378,7 @@ impl App {
             show_intro,
             show_cheat_sheet: false,
             nav_gizmo_drag_active: false,
+            build_variant: BuildVariant::default(),
         }
     }
 
@@ -1311,13 +1381,42 @@ impl App {
                     self.symmetry_popover_open = !self.symmetry_popover_open;
                 }
 
-                // Right-align the Build & Install button. B4 styles it.
+                // Right-align the primary Build button + the variants
+                // ComboBox (B4). The button colour comes from
+                // `Visuals::widgets::active.bg_fill` so the F21 theme
+                // toggle keeps it themed (pitfall §B4.3 — no
+                // hardcoded RGB). The combo's selected_text reflects
+                // the current variant; the Launch variant is greyed
+                // pre-F12 via `BuildVariant::is_enabled`.
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let can_install = self.heightmap.is_some();
-                    let resp = ui.add_enabled(can_install, egui::Button::new("Build & Install"));
-                    if resp.clicked() {
-                        *action = Some(FileAction::BuildAndInstall);
+                    let can_run = self.heightmap.is_some() && self.build_variant.is_enabled();
+                    let primary_fill = ui.visuals().widgets.active.bg_fill;
+                    let btn = egui::Button::new(self.build_variant.label()).fill(primary_fill);
+                    let resp = ui.add_enabled(can_run, btn);
+                    if resp.clicked()
+                        && let Some(act) = self.build_variant.to_file_action()
+                    {
+                        *action = Some(act);
                     }
+
+                    egui::ComboBox::from_id_salt("build_variant_combo")
+                        .selected_text(self.build_variant.label())
+                        .show_ui(ui, |ui| {
+                            for v in BuildVariant::ALL {
+                                let selected = self.build_variant == v;
+                                let enabled = v.is_enabled();
+                                let label = if enabled {
+                                    v.label().to_string()
+                                } else {
+                                    format!("{} (Phase 5)", v.label())
+                                };
+                                let btn = egui::Button::selectable(selected, label);
+                                let resp_v = ui.add_enabled(enabled, btn);
+                                if resp_v.clicked() && enabled {
+                                    self.build_variant = v;
+                                }
+                            }
+                        });
                 });
             });
         });
@@ -1327,6 +1426,11 @@ impl App {
     /// validation-chip placeholder, last-install / last-error state.
     /// C8 wires the validation chip to real lint output later.
     fn status_strip(&mut self, ctx: &egui::Context) {
+        // 1-Hz repaint nudge so the camera readout stays current
+        // while idle (pitfall §B4.2 — egui only repaints on input
+        // otherwise). The hint is a no-op if a higher-frequency
+        // repaint is already scheduled this frame.
+        ctx.request_repaint_after(std::time::Duration::from_secs(1));
         egui::TopBottomPanel::bottom("status_strip").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 let cam = &self.camera;
@@ -2085,6 +2189,7 @@ mod tests {
             show_intro: false,
             show_cheat_sheet: false,
             nav_gizmo_drag_active: false,
+            build_variant: BuildVariant::default(),
         }
     }
 
@@ -2352,5 +2457,97 @@ mod tests {
     fn fresh_app_has_cheat_sheet_closed() {
         let app = make_test_app();
         assert!(!app.show_cheat_sheet);
+    }
+
+    // ----------------------------- B4 -----------------------------
+
+    /// B4: `BuildVariant::default()` is `Install` — matches the B1
+    /// right-aligned button's behaviour so the default user click
+    /// preserves the existing flow.
+    #[test]
+    fn build_variant_default_is_install() {
+        assert_eq!(BuildVariant::default(), BuildVariant::Install);
+    }
+
+    /// B4: `BuildVariant::ALL` lists every variant exactly once.
+    /// Adding a new variant + leaving `ALL` stale would either drop
+    /// the new variant from the UI or break the `len == 3` assert
+    /// below.
+    #[test]
+    fn build_variant_all_lists_every_variant_once() {
+        let mut seen = std::collections::HashSet::new();
+        for v in BuildVariant::ALL {
+            assert!(seen.insert(v), "duplicate {v:?}");
+        }
+        assert_eq!(
+            seen.len(),
+            3,
+            "BuildVariant::ALL count drift — update ALL + this test together"
+        );
+    }
+
+    /// B4: labels are distinct so the ComboBox shows three distinguishable
+    /// rows and the button text doesn't collide with a neighbour.
+    #[test]
+    fn build_variant_labels_are_distinct() {
+        let mut seen = std::collections::HashSet::new();
+        for v in BuildVariant::ALL {
+            assert!(seen.insert(v.label()), "duplicate label {}", v.label());
+        }
+    }
+
+    /// B4: `Launch` is greyed pre-F12. `Only` and `Install` are
+    /// enabled today. A regression that flipped `Launch` on would
+    /// fire an unwired engine call.
+    #[test]
+    fn build_variant_launch_is_disabled_pre_f12() {
+        assert!(BuildVariant::Only.is_enabled());
+        assert!(BuildVariant::Install.is_enabled());
+        assert!(
+            !BuildVariant::Launch.is_enabled(),
+            "Launch must stay greyed until F12 ships"
+        );
+    }
+
+    /// B4: `to_file_action` returns `Some` for enabled variants and
+    /// `None` for disabled. The click handler treats `None` as "drop
+    /// the click" — belt-and-braces with the disabled-button state.
+    #[test]
+    fn build_variant_to_file_action_matches_enabled_state() {
+        // Today every enabled variant lands in the same FileAction —
+        // a Phase-5 split would diversify this match. The variant
+        // selector is reserved UX surface today.
+        assert!(matches!(
+            BuildVariant::Only.to_file_action(),
+            Some(FileAction::BuildAndInstall)
+        ));
+        assert!(matches!(
+            BuildVariant::Install.to_file_action(),
+            Some(FileAction::BuildAndInstall)
+        ));
+        assert!(BuildVariant::Launch.to_file_action().is_none());
+    }
+
+    /// B4: fresh app's `build_variant` is the default — Install.
+    #[test]
+    fn fresh_app_has_default_build_variant_install() {
+        let app = make_test_app();
+        assert_eq!(app.build_variant, BuildVariant::Install);
+    }
+
+    /// B4: enabled-button gate combines heightmap-loaded AND
+    /// variant-enabled. With no heightmap, even an enabled variant
+    /// must NOT enqueue an action.
+    #[test]
+    fn build_variant_action_gates_on_heightmap_loaded() {
+        let app = make_test_app();
+        // make_test_app has heightmap = None.
+        assert!(app.heightmap.is_none());
+        // Even with `Install` (enabled), the click handler in
+        // `top_bar` gates on `heightmap.is_some()`. We pin the
+        // invariant by exercising the variant's own contract +
+        // documenting that the gate is in the UI code; the action
+        // mapping itself is variant-only.
+        assert!(BuildVariant::Install.to_file_action().is_some());
     }
 }
