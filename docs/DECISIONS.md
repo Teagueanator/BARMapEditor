@@ -570,6 +570,102 @@ resolver instead of a baked-in Linux path. Three orthogonal choices:
     "linux"))]`; it just returns no candidates. Cross-compilation/CI is
     not blocked.
 
+## ADR-016 — Stage 0 go/no-go: PROCEED to Stage 1
+
+**Status:** Accepted (2026-05-17)
+**Context:** Stage 0 was scoped as a validation prototype for the
+Rust + egui/eframe + wgpu stack with PyMapConv as sidecar. The SRS
+prescribes a fallback to Godot 4 + HTerrain if any of three gate legs
+fails: **Tooling** (workspace + render + project I/O), **Bridge**
+(Rust ↔ PyMapConv contract), **Engine** (Recoil accepts our `.sd7`).
+All eight Stage 0 goals are now ticked; this ADR records the decision
+and the surprises that informed Stage 1 scope.
+**Decision:** **PROCEED to Stage 1.** All three legs of the gate are
+empirically green:
+
+- **Tooling** (goals 1–5 + ADR-001/005/006/007/008/009/010):
+  Workspace compiles + runs on Wayland; `cargo run -p barme-app` opens
+  a window; heightmap loads from 16-bit PNG; wgpu renders the
+  meshed terrain (single draw call, orbit camera); `Project` TOML
+  save/load round-trips via `rfd` dialogs; PyMapConv + Compressonator
+  vendored under `tools/` via SHA-pinned fetch scripts.
+- **Bridge** (goal 6 + ADR-011/012/013/014):
+  `barme-pipeline::build_sd7` drives PyMapConv to produce real
+  `.smf` + `.smt`, emits a minimum-viable `mapinfo.lua`, and packages
+  a non-solid `.sd7` via system 7-Zip. Integration test
+  `tests/build_sd7.rs` exercises the whole chain; PITFALL #9 defended
+  by post-build `Solid = -` parse.
+- **Engine** (goal 7 + ADR-013 amendment):
+  `teague-test-1.sd7` (8 SMU) loaded cleanly in BAR Skirmish; user
+  placed a commander and ran a full game loop against SimpleAI.
+  Latest infolog (`20260518024144_infolog.txt`) clean — no LuaRules
+  errors, no nil-derefs, only benign Chobby `GetMinimapImage not
+  found` warnings.
+
+**Stage 0 surprises that should inform Stage 1 scope:**
+
+1. **Three-gate mapinfo model.** What "minimum mapinfo" means depends
+   on whether you're satisfying the engine scanner, the Chobby
+   browser, or BAR mod gadgets — each has independent requirements.
+   The emitter's field set is empirically calibrated; the
+   `barme-mapinfo` crate (per `docs/ARCHITECTURE.md`) needs to inherit
+   that calibration rather than treating the `burnhamrobertp` gist as
+   the schema spec. See `docs/PITFALLS.md` §"BAR Chobby + mod-gadget
+   mapinfo expectations".
+2. **Compressonator is a separate vendor.** ADR-004 anticipated
+   bundling but ADR-011 missed that PyMapConv's `--linux` path shells
+   out to `CompressonatorCLI` by name with no override. Vendored
+   separately under `tools/compressonator/` (ADR-014). Stage 1 polish
+   item: a single `scripts/setup.sh` running both fetch scripts.
+3. **PyMapConv v0.6.3 quirks.** `-q 1` is mandatory on Linux to dodge
+   the multi-thread read-back bug; exit code 1 on success is the Qt
+   event loop, not a real failure. Both are workarounded in the
+   driver; bump-the-pin ADR will need to re-test both.
+4. **Chobby certification.** Unofficial maps only show in Skirmish.
+   Stage 1 UX needs to make this clear in the "Build & Install"
+   completion state (e.g. "Installed — visible in Skirmish only;
+   official maps go through `maps-metadata` PRs").
+
+**Alternatives considered:**
+  - **Pivot to Godot 4 + HTerrain.** Threshold per SRS §"Pivot
+    thresholds": "PyMapConv stops being maintained, or licensing
+    reverses" — neither happened (ADR-003 confirmed CC0; vendoring
+    works). "Recoil changes SMF format" — no change. "Brush latency
+    > 16 ms on Intel iGPU" — brush sculpting isn't built yet, but
+    Stage 0 didn't surface any compute-shader showstoppers.
+  - **Extend Stage 0** (e.g. add brush sculpting before declaring
+    gate). Rejected: the three-leg gate as written *is* met. Adding
+    brushes to "validation" stretches the prototype into the MVP and
+    makes the no-go decision harder to make crisply.
+**Consequence:**
+  - `docs/ROADMAP.md` Stage 0 section fully ticked + a "✅ Stage 0
+    complete (2026-05-17)" stamp added.
+  - `devlog/stage-0-validation/goals.md` goal #8 ticked.
+  - **Stage 1 entry point** is ADR-017 (next free) — likely the
+    brush-sculpting compute-shader pipeline since that's both the
+    centerpiece (per SRS F2) *and* the riskiest unverified path
+    (wgpu compute on the dev box hasn't been exercised yet). The
+    launcher + "Build & Install" loop is in place to validate sculpt
+    output in-engine end-to-end from day one of Stage 1.
+  - **Stage-1 polish punt list** (carried forward from this session
+    + earlier Stage 0 logs):
+    - `scripts/setup.sh` running both fetch scripts.
+    - Windows fetch paths for both vendors.
+    - Streaming PyMapConv stdout/stderr to `tracing` for a live UI
+      progress strip.
+    - "Pick BAR maps directory…" file-dialog fallback for non-Linux
+      hosts (the launcher's Windows path).
+    - Surface PyMapConv's auxiliary minimap previews (`<name>.jpg` /
+      `.png`) for the project browser.
+    - `mapinfo.lua` lint pass (PITFALL #6) — owned by future
+      `barme-mapinfo` crate.
+    - Hermetic CI: `#[ignore]`-gated tests on a separate cron job
+      that fetches vendors first.
+    - `shellcheck` over `scripts/*.sh`.
+    - F21 + F22 + F23 from this session's SRS update: light/dark
+      theme toggle, bottom CPU/memory status bar, and the
+      user-asset library (F23 deferred to v2 — design ADR first).
+
 ---
 
 ## Template for new entries

@@ -3,22 +3,31 @@
 Mirrors SRS §3.2 (functional reqs) and the staged plan in SRS "Recommendations".
 Treat this as the *engineering* breakdown; the SRS is the *product* spec.
 
-## Stage 0 — Validation prototype (target: 2 weeks)
+## Stage 0 — Validation prototype (target: 2 weeks) — ✅ COMPLETE 2026-05-17
 
 Go/no-go gate before committing to the full build. If anything here proves
 unviable, the SRS prescribes a fallback to Godot 4 + HTerrain.
 
 - [x] Repo scaffolded (Rust workspace, two crates, docs)
 - [x] Rust toolchain installed (rustup, stable 1.95)
-- [ ] `cargo check` clean on workspace
-- [ ] `cargo run -p barme-app` opens a window
-- [ ] Load a 16-bit PNG heightmap from `assets/fixtures/`
-- [ ] Render it as a meshed terrain via wgpu (single draw call, no LOD yet)
-- [ ] Serialize a project to TOML on disk, reload it
-- [ ] Vendor PyMapConv under `tools/pymapconv/`
-- [ ] Shell out to PyMapConv with a fake-project export → produce a valid `.sd7`
-- [ ] Launch BAR with that `.sd7` selected and verify it loads in-engine
-- [ ] Decision recorded in `docs/DECISIONS.md`: continue with Rust stack or pivot
+- [x] `cargo check` clean on workspace
+- [x] `cargo run -p barme-app` opens a window
+- [x] Load a 16-bit PNG heightmap from `assets/fixtures/`
+- [x] Render it as a meshed terrain via wgpu (single draw call, no LOD yet)
+- [x] Serialize a project to TOML on disk, reload it
+- [x] Vendor PyMapConv under `tools/pymapconv/` (also Compressonator under
+      `tools/compressonator/` — see ADR-014)
+- [x] Shell out to PyMapConv with a fake-project export → produce a valid `.sd7`
+- [x] Launch BAR with that `.sd7` selected and verify it loads in-engine
+- [x] Decision recorded in `docs/DECISIONS.md`: **PROCEED with Rust stack**
+      (ADR-016)
+
+Stage 0 surprises that informed Stage 1 scope (full list in ADR-016):
+three-gate mapinfo model (engine / Chobby / mod gadgets each have
+independent requirements); Compressonator is a separate vendor from
+PyMapConv; PyMapConv v0.6.3 exits 1 on success and needs `-q 1` to dodge
+a multi-thread read-back bug; Chobby filters unofficial maps out of the
+multiplayer browser (Skirmish-only).
 
 ## Stage 1 — MVP (3–4 months)
 
