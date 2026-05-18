@@ -58,6 +58,47 @@ impl Heightmap {
         &mut self.data
     }
 
+    /// Copy a sub-rect into a freshly-allocated buffer (row-major,
+    /// `w * h` samples). Panics if the rect runs off the heightmap.
+    /// Used by the undo system to snapshot pre-edit pixels.
+    pub fn copy_rect(&self, x: u32, y: u32, w: u32, h: u32) -> Vec<u16> {
+        assert!(
+            x + w <= self.width && y + h <= self.height,
+            "copy_rect {x},{y} {w}×{h} runs off {}×{} heightmap",
+            self.width,
+            self.height,
+        );
+        let mut out = Vec::with_capacity((w as usize) * (h as usize));
+        for row in 0..h {
+            let start = ((y + row) * self.width + x) as usize;
+            let end = start + w as usize;
+            out.extend_from_slice(&self.data[start..end]);
+        }
+        out
+    }
+
+    /// In-place swap of a sub-rect with `buf`. Both ends are populated:
+    /// the rect's previous contents end up in `buf`, the new pixels end
+    /// up in the heightmap. This is the atomic operation undo uses to
+    /// flip between before / after states. Panics if dims mismatch.
+    pub fn swap_rect(&mut self, x: u32, y: u32, w: u32, h: u32, buf: &mut [u16]) {
+        let expected = (w as usize) * (h as usize);
+        assert_eq!(buf.len(), expected, "swap_rect: buf size != w*h");
+        assert!(
+            x + w <= self.width && y + h <= self.height,
+            "swap_rect {x},{y} {w}×{h} runs off {}×{} heightmap",
+            self.width,
+            self.height,
+        );
+        for row in 0..h {
+            let dst_start = ((y + row) * self.width + x) as usize;
+            let dst_row = &mut self.data[dst_start..dst_start + w as usize];
+            let src_start = (row * w) as usize;
+            let src_row = &mut buf[src_start..src_start + w as usize];
+            dst_row.swap_with_slice(src_row);
+        }
+    }
+
     /// Verify dims match `MapSize::heightmap_dims()` — i.e. `64·N + 1`.
     /// Returning a typed error rather than `bail!` so the UI can show it.
     pub fn validate_against(&self, size: MapSize) -> Result<(), DimMismatch> {
@@ -183,6 +224,32 @@ mod tests {
     fn rejects_pixel_count_mismatch() {
         let err = Heightmap::new(10, 10, vec![0; 99]).unwrap_err();
         assert!(err.to_string().contains("pixel count mismatch"));
+    }
+
+    #[test]
+    fn copy_rect_extracts_subregion() {
+        let h = Heightmap::synth_ramp(MapSize::square(2));
+        let sub = h.copy_rect(10, 20, 4, 3);
+        assert_eq!(sub.len(), 12);
+        // synth_ramp uses (x+y)/denom as the source — pixel (10, 20)
+        // should match the raw read.
+        let raw = h.data()[(20 * h.width() + 10) as usize];
+        assert_eq!(sub[0], raw);
+    }
+
+    #[test]
+    fn swap_rect_round_trips_contents() {
+        let mut h = Heightmap::synth_ramp(MapSize::square(2));
+        let orig = h.copy_rect(5, 7, 3, 2);
+        let mut buf = vec![0u16; 6];
+        h.swap_rect(5, 7, 3, 2, &mut buf);
+        // After swap: heightmap rect is zero, buf holds the original.
+        assert_eq!(buf, orig);
+        let now = h.copy_rect(5, 7, 3, 2);
+        assert!(now.iter().all(|&v| v == 0));
+        // Swap back.
+        h.swap_rect(5, 7, 3, 2, &mut buf);
+        assert_eq!(h.copy_rect(5, 7, 3, 2), orig);
     }
 
     #[test]

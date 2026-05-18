@@ -125,9 +125,9 @@ impl Default for BrushRegistry {
 
 /// Convert a world-space stamp into a pixel bounding box clipped to the
 /// heightmap. Returns `None` if the rect is empty (off-map or zero radius).
-/// Kernel helpers in the per-brush modules call this; exposed here so a
-/// new brush can re-use it.
-pub(crate) fn pixel_bbox(hm: &Heightmap, stamp: BrushStamp) -> Option<DirtyRect> {
+/// Kernel helpers in the per-brush modules call this; the undo system
+/// also uses it to snapshot pixels *before* `apply` runs.
+pub fn pixel_bbox(hm: &Heightmap, stamp: BrushStamp) -> Option<DirtyRect> {
     let (w, h) = hm.dims();
     if w == 0 || h == 0 {
         return None;

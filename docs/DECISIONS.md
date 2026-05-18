@@ -1088,6 +1088,82 @@ is written down below.
 
 ---
 
+## ADR-022 — Undo / redo over heightmap dirty-rect snapshots
+
+**Status:** Accepted (2026-05-17).
+**Context:** Sculpting is exploratory — the user paints, evaluates, often
+regrets. The smoothstep falloff in ADR-018 is not strictly invertible:
+re-stamping with negative strength does not reproduce the original
+heights because falloff is multiplicative and the kernel clamps to
+`[0, u16::MAX]`. Misclicks therefore become irrecoverable, and "try a
+different brush mode and see how it feels" is impossible without a
+manual save-before-experiment workflow. Every comparable tool
+(Photoshop, Blender, Krita) has undo because exploratory edit–evaluate
+is the core loop, not an edge case.
+
+Two design decisions follow from the ADR-018 architecture:
+
+1. **The dirty rect is the natural diff unit.** The brush trait already
+   returns a `DirtyRect` because the GPU re-upload path needs one. The
+   same rect plus a copy of its pre-edit pixels is the smallest object
+   that fully describes "what changed." A typical 256-elmo brush stamp
+   at radius 32 px is ~4 KB; even at radius 1024 px the snapshot is
+   ~512 KB — small enough that 100 strokes of headroom fits in 100 MB
+   on a 16-SMU map.
+2. **Stamps coalesce into strokes.** A user-perceived edit is one
+   LMB-down → LMB-up, not the 60 individual stamps emitted along the
+   drag. Without coalescing, Ctrl-Z would peel back one stamp at a time
+   — useless for an exploratory drag and surprising as UX.
+
+**Alternatives considered:**
+- **Full-map snapshots per edit.** ~2 MB per stroke at 16 SMU
+  (`1025·1025·2 B`). Simpler model, but at 32 SMU the snapshot is ~16
+  MB and procgen would have to snapshot the whole new map every apply.
+  Rejected on memory + uniformity grounds.
+- **Command pattern (replay strokes forward).** Would require every
+  brush kernel to be deterministic *and* re-runnable from the
+  pre-state. The smooth kernel reads neighbours that the raise kernel
+  may have moved; replay would have to remember the order of *every*
+  kernel application, including symmetric stamps. The diff/snapshot
+  model is the same data with simpler invariants.
+- **Tile-COW heightmap (Stage 2).** When that lands, the snapshot can
+  shrink further by reference-counting unchanged tiles. ADR-018's
+  dirty-rect bookkeeping is the precursor; tile-COW is orthogonal.
+
+**Barrier events.** Procgen apply, heightmap PNG load, and "new
+project" *replace* the heightmap wholesale rather than mutate a sub-
+rect. Capturing a 2 MB full-map diff for each is feasible but the UX
+of "Ctrl-Z across a procgen swap silently restores a half-formed bowl"
+is confusing; the editor barriers history at those events instead.
+This is the same convention Blender uses for File → New.
+
+**Memory cap.** 100 MB is enforced as a ring buffer (`VecDeque`):
+on push, evict from the front until under cap. The cap is exposed via
+`History::new(cap_bytes)` for testing; the user-facing instance always
+uses the default. The eviction emits a `warn!` once per evicted entry
+so the bug-where-a-stroke-balloons-into-a-gigabyte is visible.
+
+**Linear redo.** A new edit clears the redo stack. Branching history
+is occasionally requested by power users but the implementation cost
+(tree visualization, branch labels) is disproportionate; no upstream
+mapping tool offers it.
+
+**Consequence:**
+- New module `barme-core::undo` with `StampSnapshot`, `UndoEntry`,
+  `History`. Public API is `push / apply_undo / apply_redo / barrier`.
+- `Heightmap` grows `copy_rect` and `swap_rect` — slice-level row
+  copies, no allocation in the hot path beyond the initial pre-edit
+  capture.
+- `brushes::pixel_bbox` is now `pub` so callers can pre-compute the
+  unioned snapshot rect *without* applying the kernel first.
+- `App.history: History`, `App.stroke: Option<UndoEntry>`. Stamps
+  accumulate into the open stroke; pointer-release commits it.
+- Edit menu added (first new top-level menu since Stage 0); Ctrl-Z /
+  Ctrl-Shift-Z / Ctrl-Y bindings. Disabled states reflect stack
+  emptiness.
+- 6 unit tests cover round-trip, overlapping-stamp ordering, redo
+  invalidation on new edits, barrier semantics, and cap eviction.
+
 ## Template for new entries
 
 ```

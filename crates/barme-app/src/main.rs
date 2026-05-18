@@ -5,8 +5,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use barme_core::{
-    BrushRegistry, BrushStamp, DirtyRect, Heightmap, MapSize, PROJECT_EXTENSION, Project,
-    SymmetryAxis,
+    BrushRegistry, BrushStamp, DirtyRect, Heightmap, History, MapSize, PROJECT_EXTENSION, Project,
+    StampSnapshot, SymmetryAxis, UndoEntry,
+    brushes::pixel_bbox,
     procgen::{Domain, PRESETS, generate as procgen_generate},
 };
 use barme_pipeline::PyMapConvDriver;
@@ -69,6 +70,12 @@ struct App {
     procgen_expr: String,
     procgen_domain: Domain,
     procgen_last_error: Option<String>,
+    /// Persistent undo/redo across the session. Cleared on barrier events
+    /// (procgen, heightmap load, new project) — see ADR-022.
+    history: History,
+    /// Open stroke — populated on the first stamp after LMB-down, flushed
+    /// to `history` when the pointer is released.
+    stroke: Option<UndoEntry>,
 }
 
 struct HeightmapState {
@@ -119,11 +126,17 @@ impl App {
             procgen_expr: "1 - (x*x + z*z)".to_string(),
             procgen_domain: Domain::Centered,
             procgen_last_error: None,
+            history: History::default(),
+            stroke: None,
         }
     }
 
     fn load_heightmap(&mut self, path: PathBuf) {
         self.last_error = None;
+        // Wholesale replacement — undoing across it would require a full-map
+        // pre-snapshot. ADR-022 barriers the history instead.
+        self.end_stroke();
+        self.history.barrier();
         match Heightmap::load_png(&path) {
             Ok(h) => {
                 let dims = h.dims();
@@ -180,6 +193,8 @@ impl App {
         self.camera = OrbitCamera::framing(8192.0, 8192.0);
         self.last_error = None;
         self.last_install = None;
+        self.end_stroke();
+        self.history.barrier();
     }
 
     fn snapshot_project(&self) -> Project {
@@ -234,6 +249,10 @@ impl App {
     /// untouched on failure.
     fn apply_procgen(&mut self) {
         self.procgen_last_error = None;
+        // Procgen replaces the entire map; barrier history so undo doesn't
+        // try to walk across a wholesale swap. ADR-022.
+        self.end_stroke();
+        self.history.barrier();
         let size = MapSize::square(self.map_size_smu);
         let expr = self.procgen_expr.clone();
         let domain = self.procgen_domain;
@@ -333,11 +352,12 @@ impl App {
             (dims.0 - 1) as f32 * render::ELMOS_PER_PIXEL,
             (dims.1 - 1) as f32 * render::ELMOS_PER_PIXEL,
         );
-        // Symmetry replicates the stamp through all derived centers; one
-        // brush.apply per center, dirty rects unioned for a single GPU
-        // upload (ADR-019).
+        // Symmetry replicates the stamp through all derived centers
+        // (ADR-019). Compute every stamp's bbox *first* — without applying —
+        // so we can snapshot the unioned region pre-edit for undo (ADR-022).
         let centers = self.symmetry.replicate((world.x, world.z), extents);
-        let mut union: Option<DirtyRect> = None;
+        let mut planned: Vec<(BrushStamp, DirtyRect)> = Vec::with_capacity(centers.len());
+        let mut pre_union: Option<DirtyRect> = None;
         for (cx, cz) in centers {
             let stamp = BrushStamp {
                 world_x: cx,
@@ -345,6 +365,25 @@ impl App {
                 radius: self.brush_radius,
                 strength: self.brush_strength,
             };
+            if let Some(r) = pixel_bbox(&hm_state.data, stamp) {
+                pre_union = Some(match pre_union {
+                    Some(u) => u.union(r),
+                    None => r,
+                });
+                planned.push((stamp, r));
+            }
+        }
+        let Some(snap_rect) = pre_union else {
+            return;
+        };
+        let before = hm_state
+            .data
+            .copy_rect(snap_rect.x, snap_rect.y, snap_rect.w, snap_rect.h);
+
+        // Apply each planned stamp, then sub-upload the union for one
+        // queue.write_texture call.
+        let mut union: Option<DirtyRect> = None;
+        for (stamp, _) in planned {
             if let Some(r) = brush.apply(&mut hm_state.data, stamp) {
                 union = Some(match union {
                     Some(u) => u.union(r),
@@ -355,9 +394,82 @@ impl App {
         let Some(rect_dirty) = union else {
             return;
         };
-        // Sub-upload the union of all symmetric edits (one queue.write_texture call).
+        // Record the pre-edit snapshot into the open stroke (created on
+        // demand).
+        self.stroke
+            .get_or_insert_with(UndoEntry::new)
+            .push(StampSnapshot {
+                rect: snap_rect,
+                before,
+            });
+
         render::write_heightmap_rect(rs, dims, hm_state.data.data(), rect_dirty);
-        // Keep min/max display fresh.
+        let (mn, mx) = hm_state.data.min_max();
+        hm_state.min = mn;
+        hm_state.max = mx;
+    }
+
+    /// Flush the in-progress stroke into the undo stack. Idempotent; a no-op
+    /// when no stroke is open. Called on pointer-release and before every
+    /// barrier event (procgen / load / new project).
+    fn end_stroke(&mut self) {
+        if let Some(entry) = self.stroke.take()
+            && !entry.is_empty()
+        {
+            trace!(
+                stamps = entry.stamp_count(),
+                bytes = entry.bytes(),
+                "stroke committed to undo history"
+            );
+            self.history.push(entry);
+        }
+    }
+
+    /// Pop one stroke off the undo stack and re-upload the affected pixels.
+    /// Also flushes an open stroke first so the user always undoes a
+    /// finished unit.
+    fn undo_one(&mut self) {
+        self.end_stroke();
+        let Some(hm_state) = self.heightmap.as_mut() else {
+            return;
+        };
+        let Some(rect) = self.history.apply_undo(&mut hm_state.data) else {
+            trace!("undo: nothing to undo");
+            return;
+        };
+        info!(
+            rect = ?(rect.x, rect.y, rect.w, rect.h),
+            undo_depth = self.history.undo_depth(),
+            redo_depth = self.history.redo_depth(),
+            "undo applied"
+        );
+        if let Some(rs) = self.render_state.as_ref() {
+            render::write_heightmap_rect(rs, hm_state.dims, hm_state.data.data(), rect);
+        }
+        let (mn, mx) = hm_state.data.min_max();
+        hm_state.min = mn;
+        hm_state.max = mx;
+    }
+
+    /// Inverse of `undo_one`.
+    fn redo_one(&mut self) {
+        self.end_stroke();
+        let Some(hm_state) = self.heightmap.as_mut() else {
+            return;
+        };
+        let Some(rect) = self.history.apply_redo(&mut hm_state.data) else {
+            trace!("redo: nothing to redo");
+            return;
+        };
+        info!(
+            rect = ?(rect.x, rect.y, rect.w, rect.h),
+            undo_depth = self.history.undo_depth(),
+            redo_depth = self.history.redo_depth(),
+            "redo applied"
+        );
+        if let Some(rs) = self.render_state.as_ref() {
+            render::write_heightmap_rect(rs, hm_state.dims, hm_state.data.data(), rect);
+        }
         let (mn, mx) = hm_state.data.min_max();
         hm_state.min = mn;
         hm_state.max = mx;
@@ -438,6 +550,8 @@ impl App {
     }
 
     fn open_from(&mut self, path: PathBuf) {
+        self.end_stroke();
+        self.history.barrier();
         match Project::load_from_file(&path) {
             Ok(p) => {
                 info!(
@@ -523,11 +637,28 @@ enum FileAction {
     Open,
     BuildAndInstall,
     ApplyProcGen,
+    Undo,
+    Redo,
 }
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let mut action: Option<FileAction> = None;
+
+        // Ctrl-Z / Ctrl-Shift-Z keybinds (Cmd on macOS via egui's `command`).
+        // Queued through `action` so we don't mutate state mid-frame.
+        let (key_undo, key_redo) = ctx.input(|i| {
+            let cmd = i.modifiers.command;
+            let shift = i.modifiers.shift;
+            let z = i.key_pressed(egui::Key::Z);
+            let y = i.key_pressed(egui::Key::Y);
+            (cmd && !shift && z, (cmd && shift && z) || (cmd && y))
+        });
+        if key_undo {
+            action = Some(FileAction::Undo);
+        } else if key_redo {
+            action = Some(FileAction::Redo);
+        }
 
         egui::TopBottomPanel::top("menu").show(ctx, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
@@ -555,6 +686,24 @@ impl eframe::App for App {
                             action = Some(FileAction::LoadHeightmap(fixture_path(smu)));
                             ui.close();
                         }
+                    }
+                });
+                ui.menu_button("Edit", |ui| {
+                    let can_undo = self.history.can_undo() || self.stroke.is_some();
+                    let can_redo = self.history.can_redo();
+                    if ui
+                        .add_enabled(can_undo, egui::Button::new("Undo\tCtrl+Z"))
+                        .clicked()
+                    {
+                        action = Some(FileAction::Undo);
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(can_redo, egui::Button::new("Redo\tCtrl+Shift+Z"))
+                        .clicked()
+                    {
+                        action = Some(FileAction::Redo);
+                        ui.close();
                     }
                 });
                 ui.menu_button("Build", |ui| {
@@ -818,13 +967,17 @@ impl eframe::App for App {
             // Brush stroke: while LMB is down in the central rect, emit
             // one stamp per frame at the cursor's world-space projection
             // on the y=0 plane. Spacing along the drag is implicit (frame
-            // rate). Symmetry / undo land in later commits.
+            // rate). One LMB-down → LMB-up coalesces into a single undo
+            // unit via `end_stroke` on pointer release (ADR-022).
             if brush_active
                 && (response.dragged_by(egui::PointerButton::Primary)
                     || response.clicked_by(egui::PointerButton::Primary))
                 && let Some(cursor) = ctx.pointer_interact_pos()
             {
                 self.apply_brush_at(cursor, rect);
+            }
+            if self.stroke.is_some() && !response.dragged_by(egui::PointerButton::Primary) {
+                self.end_stroke();
             }
 
             if self.heightmap.is_some() {
@@ -866,6 +1019,8 @@ impl eframe::App for App {
             }
             Some(FileAction::BuildAndInstall) => self.build_and_install(),
             Some(FileAction::ApplyProcGen) => self.apply_procgen(),
+            Some(FileAction::Undo) => self.undo_one(),
+            Some(FileAction::Redo) => self.redo_one(),
             None => {}
         }
     }
