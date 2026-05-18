@@ -37,6 +37,9 @@ rfd = "0.15"
 # Subprocess plumbing
 which = "8"
 
+# Math-function terrain generator (procgen)
+evalexpr = "13"
+
 # Cross-platform user directories (BAR maps-dir lookup; see ADR-015)
 directories = "6"
 

@@ -15,6 +15,7 @@ glam.workspace = true
 bytemuck.workspace = true
 tracing.workspace = true
 image.workspace = true
+evalexpr.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

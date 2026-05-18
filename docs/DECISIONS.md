@@ -910,6 +910,99 @@ orthogonal choices:
     Serde derive is already in place). New-project wizard (F1) can
     surface symmetry as a first-class choice.
 
+## ADR-020 — Math-function terrain generator (`procgen`)
+
+**Status:** Accepted (2026-05-17). Partial implementation of SRS F14.
+**Context:** User wants `f(x, z) → height` terrain generation now
+("if we want to make a hill that follows a parabola, we should be
+able to enter a math function that describes the terrain"). This is
+F14 territory (procedural terrain), which the SRS originally put in
+Stage 2 alongside FBM + hydraulic erosion + river-carve. But the
+math-function subset is small (~30 LOC of glue + one expression-eval
+crate), and it unlocks the user's actual workflow: "start with a
+parabolic bowl, then sculpt detail with brushes." Shipping it now
+makes the brush opener immediately useful on blank projects.
+**Decision:**
+  - **`barme_core::procgen` module** with one public function
+    `generate(expr, domain, size, min_h, max_h) -> Result<Heightmap, ProcGenError>`.
+  - **Expression evaluator: `evalexpr` v13.**
+    `build_operator_tree::<DefaultNumericTypes>(expr)` parses once
+    (returns typed parse errors via `ProcGenError::Parse`);
+    `node.eval_with_context(&ctx)` evaluates per pixel against a
+    `HashMapContext` that rebinds `x` / `z` floats each iteration.
+    Built-ins cover `+ - * / ^`, trig (`math::sin` / `cos` / `tan`),
+    `exp` / `log`, `sqrt`, `abs`, `min`, `max`, and comparisons.
+  - **Two normalisation domains:**
+    `Domain::Unit` → `x, z ∈ [0, 1]` (NW=(0,0), SE=(1,1));
+    `Domain::Centered` → `x, z ∈ [-1, 1]` (origin=center, ±1=edge).
+    Centered is the right default for radial shapes; Unit is the
+    right default for ramps.
+  - **Output scaling:** `clamp(value, 0, 1) · u16::MAX`. The
+    expression's range `[0, 1]` is "fraction of the height budget";
+    out-of-range values clamp without erroring. NaN / Inf samples
+    count as 0 with a one-shot `warn!` per generation so users
+    notice degenerate input but the generation completes.
+  - **Error surface:** `ProcGenError` is `thiserror`-typed —
+    `Parse(EvalexprError)` at parse time, `EvalFailed { pixel,
+    source }` at per-pixel-eval time, `NonNumeric { got }` if the
+    expression returns a boolean or string, `Heightmap(source)`
+    if `Heightmap::new` rejects the dims (shouldn't happen — we
+    derive them from `MapSize`).
+  - **Preset list as code, not data file.** Seven starter presets
+    (flat, parabolic bowl / dome, conical peak, ridge, diagonal
+    ramp, sine ripples) live in `PRESETS: &[ProcGenPreset]`.
+    Selecting one fills the UI text field with the expression
+    + sets the appropriate domain. Adding a preset = one entry
+    in the array; the UI iterates.
+  - **UI:** "Generate from formula" section in the side panel.
+    Text-edit for the expression, two-radio domain picker, a
+    preset combo box, an "Apply" button. Apply replaces the
+    current heightmap with the generated one (re-uses
+    `render::upload_heightmap` from ADR-017) and re-frames the
+    camera. Errors render inline as a red label; the existing
+    heightmap is untouched on failure.
+  - **`build_and_install` snapshots in-memory first.** Already
+    handled in ADR-018 — the in-memory `Heightmap` is the
+    authoritative source for the build pipeline, not whatever
+    PNG the project was loaded from.
+**Alternatives considered:**
+  - **`meval` crate.** Smaller, has a closure-builder ergonomics
+    win, but lacks `min`/`max` and a couple of math functions we'd
+    want for presets. Tip-the-scale for `evalexpr`.
+  - **Hand-rolled shunting-yard parser.** ~200 LOC, zero deps.
+    Rejected: `evalexpr` is well-maintained, has good error
+    messages, and shipping our own bug-for-bug rebuild of an
+    expression evaluator doesn't earn its keep.
+  - **Defer until Stage 2** as originally planned. Rejected: user
+    explicitly asked, and this is the right time to ship — the
+    feature is one-day work and unlocks the brush opener.
+  - **Symmetry applied to math-gen results.** Rejected per the
+    plan-mode question: math expressions are symmetric if the
+    expression is symmetric; forcing a fold-and-average step
+    would be surprising. Symmetry stays scoped to brush strokes
+    (ADR-019).
+  - **Bind additional variables** (map-relative distance to
+    center, polar angle). Rejected for v0: easily derivable from
+    `x, z`, and starting minimal makes the surface cleaner. Add
+    them when a real preset wants them.
+**Consequence:**
+  - `evalexpr = "13"` added to workspace deps. `barme-core`
+    depends on it directly.
+  - `barme-core::procgen` module + 5 unit tests (corner values,
+    parse-error propagation, paraboloid shape, preset
+    parse-runs-clean). Re-exported from the crate root as
+    `Domain`, `PRESETS`, `ProcGenError`, `ProcGenPreset`, and
+    `procgen_generate`.
+  - `App` state grows `procgen_expr / procgen_domain /
+    procgen_last_error`. `FileAction::ApplyProcGen` variant +
+    handler `apply_procgen()`.
+  - **SRS F14 STATUS:** math-function subset shipped in Stage 1.
+    Remaining (FBM, hydraulic erosion, river carve) still Stage
+    2. Add a STATUS UPDATE noting the partial.
+  - **Future:** when the project file gains a procgen-history
+    field, the expression + domain + apply-order ride alongside
+    brush strokes for true reproducibility.
+
 ---
 
 ## Template for new entries

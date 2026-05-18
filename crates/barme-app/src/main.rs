@@ -7,6 +7,7 @@ use anyhow::Result;
 use barme_core::{
     BrushRegistry, BrushStamp, DirtyRect, Heightmap, MapSize, PROJECT_EXTENSION, Project,
     SymmetryAxis,
+    procgen::{Domain, PRESETS, generate as procgen_generate},
 };
 use barme_pipeline::PyMapConvDriver;
 use eframe::egui;
@@ -65,6 +66,9 @@ struct App {
     /// can preserve the user's last choice when toggling between rotational
     /// and non-rotational modes.
     rotational_fold: u8,
+    procgen_expr: String,
+    procgen_domain: Domain,
+    procgen_last_error: Option<String>,
 }
 
 struct HeightmapState {
@@ -103,6 +107,9 @@ impl App {
             brush_strength: 0.5,
             symmetry: SymmetryAxis::None,
             rotational_fold: 2,
+            procgen_expr: "1 - (x*x + z*z)".to_string(),
+            procgen_domain: Domain::Centered,
+            procgen_last_error: None,
         }
     }
 
@@ -203,6 +210,53 @@ impl App {
                 self.last_error = Some(format!("save: {e}"));
             }
         }
+    }
+
+    /// Generate a heightmap from the current procgen expression and
+    /// replace the loaded heightmap. Errors render as a red label in the
+    /// "Generate from formula" panel; the existing heightmap is left
+    /// untouched on failure.
+    fn apply_procgen(&mut self) {
+        self.procgen_last_error = None;
+        let size = MapSize::square(self.map_size_smu);
+        let expr = self.procgen_expr.clone();
+        let domain = self.procgen_domain;
+        info!(
+            expr = %expr,
+            domain = ?domain,
+            smu = self.map_size_smu,
+            "applying procgen expression"
+        );
+        let hm = match procgen_generate(&expr, domain, size, 0.0, self.height_scale) {
+            Ok(h) => h,
+            Err(e) => {
+                let msg = format!("{e:#}");
+                warn!("procgen failed: {msg}");
+                self.procgen_last_error = Some(msg);
+                return;
+            }
+        };
+        let dims = hm.dims();
+        let (min, max) = hm.min_max();
+        if let Some(rs) = self.render_state.as_ref() {
+            render::upload_heightmap(rs, &hm);
+            let extent_x = (dims.0 - 1) as f32 * render::ELMOS_PER_PIXEL;
+            let extent_z = (dims.1 - 1) as f32 * render::ELMOS_PER_PIXEL;
+            self.camera = OrbitCamera::framing(extent_x, extent_z);
+        }
+        // Synthetic project path so save flow doesn't reuse a stale on-disk PNG.
+        let synth_path = PathBuf::from(format!(
+            "<procgen:{}>",
+            expr.chars().take(40).collect::<String>()
+        ));
+        self.heightmap = Some(HeightmapState {
+            path: synth_path,
+            data: hm,
+            dims,
+            min,
+            max,
+            validated_against: Some(size),
+        });
     }
 
     /// Apply one brush stamp at the cursor position. Resolves cursor →
@@ -425,6 +479,7 @@ enum FileAction {
     SaveAs,
     Open,
     BuildAndInstall,
+    ApplyProcGen,
 }
 
 impl eframe::App for App {
@@ -615,6 +670,40 @@ impl eframe::App for App {
             ));
 
             ui.separator();
+            ui.heading("Generate from formula");
+            ui.label(
+                egui::RichText::new("f(x, z) → height ∈ [0,1]. Replaces heightmap.")
+                    .small()
+                    .weak(),
+            );
+            ui.text_edit_singleline(&mut self.procgen_expr);
+            ui.horizontal(|ui| {
+                ui.label("Domain:");
+                ui.selectable_value(&mut self.procgen_domain, Domain::Unit, Domain::Unit.label());
+                ui.selectable_value(
+                    &mut self.procgen_domain,
+                    Domain::Centered,
+                    Domain::Centered.label(),
+                );
+            });
+            egui::ComboBox::from_label("Preset")
+                .selected_text("(pick one to fill expression)")
+                .show_ui(ui, |ui| {
+                    for p in PRESETS {
+                        if ui.selectable_label(false, p.label).clicked() {
+                            self.procgen_expr = p.expression.to_string();
+                            self.procgen_domain = p.domain;
+                        }
+                    }
+                });
+            if ui.button("Apply").clicked() {
+                action = Some(FileAction::ApplyProcGen);
+            }
+            if let Some(err) = &self.procgen_last_error {
+                ui.colored_label(egui::Color32::RED, format!("Procgen: {err}"));
+            }
+
+            ui.separator();
             ui.heading("Build & Install");
             let can_install = self.heightmap.is_some();
             let resp = ui.add_enabled(can_install, egui::Button::new("Build & Install to BAR"));
@@ -733,6 +822,7 @@ impl eframe::App for App {
                 }
             }
             Some(FileAction::BuildAndInstall) => self.build_and_install(),
+            Some(FileAction::ApplyProcGen) => self.apply_procgen(),
             None => {}
         }
     }
