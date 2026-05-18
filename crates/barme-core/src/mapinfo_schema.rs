@@ -524,18 +524,7 @@ impl MapInfo {
                 tex_mults: [1.0; 4],
             },
             resources: ResourcesBlock::default(),
-            terrain_types: vec![TerrainTypeBlock {
-                index: 0,
-                name: Some("Default".to_string()),
-                hardness: Some(1.0),
-                receive_tracks: Some(true),
-                move_speeds: Some(TerrainMoveSpeeds {
-                    tank: Some(1.0),
-                    kbot: Some(1.0),
-                    hover: Some(1.0),
-                    ship: Some(1.0),
-                }),
-            }],
+            terrain_types: bar_default_terrain_types(),
             grass: None,
             teams: Vec::new(),
             sound: None,
@@ -543,6 +532,112 @@ impl MapInfo {
             custom: HashMap::new(),
         }
     }
+
+    /// Variant of [`MapInfo::bar_default`] that also populates the
+    /// `water` sub-table with the BAR-tuned defaults from the digest
+    /// (§water table). Use when the project opts into water rendering
+    /// — typically `tidal_strength > 0` or `min_height < 0`. Dry maps
+    /// should keep [`MapInfo::bar_default`] (no water block) so the
+    /// emitter doesn't ship a water plane that the engine then has to
+    /// clip below the terrain.
+    pub fn bar_default_with_water() -> Self {
+        let mut info = Self::bar_default();
+        info.water = Some(WaterBlock {
+            damage: Some(0.0),
+            // BAR-style cool grey-blue surface; digest §water defaults.
+            surface_color: Some([0.75, 0.8, 0.85]),
+            // Must be Some(..) for non-void-water; voidWater stays false.
+            plane_color: Some([0.2, 0.34, 0.48]),
+            base_color: Some([0.4, 0.7, 0.8]),
+            min_color: Some([0.1, 0.2, 0.3]),
+            absorb: Some([0.0, 0.0, 0.0]),
+            ambient_factor: Some(1.0),
+            diffuse_factor: Some(1.0),
+            specular_factor: Some(1.0),
+            specular_color: None, // engine defaults to atmosphere.sunColor
+            specular_power: Some(20.0),
+            fresnel_min: Some(0.2),
+            fresnel_max: Some(0.8),
+            fresnel_power: Some(4.0),
+            reflection_distortion: Some(1.0),
+            blur_base: Some(2.0),
+            blur_exponent: Some(1.5),
+            perlin_start_freq: Some(8.0),
+            perlin_lacunarity: Some(3.0),
+            perlin_amplitude: Some(0.9),
+            num_tiles: Some(1),
+            shore_waves: Some(true),
+            force_rendering: Some(false),
+            repeat_x: None,
+            repeat_y: None,
+            texture: None,
+            foam_texture: None,
+            normal_texture: None,
+            caustics: Vec::new(),
+        });
+        info
+    }
+}
+
+/// The four BAR-convention terrain types — Default / Rock / Sand /
+/// Water — keyed by typemap byte 0..=3 per digest §8 (lines 500–509)
+/// and the per-field defaults from digest §terrainTypes.
+///
+/// These values aren't load-bearing in the empty-project case (the
+/// emitter writes the table regardless), but having the convention
+/// seeded means an authored typemap immediately gets sensible
+/// gameplay scalars when bytes 1/2/3 appear in the byte stream.
+fn bar_default_terrain_types() -> Vec<TerrainTypeBlock> {
+    vec![
+        TerrainTypeBlock {
+            index: 0,
+            name: Some("Default".to_string()),
+            hardness: Some(1.0),
+            receive_tracks: Some(true),
+            move_speeds: Some(TerrainMoveSpeeds {
+                tank: Some(1.0),
+                kbot: Some(1.0),
+                hover: Some(1.0),
+                ship: Some(1.0),
+            }),
+        },
+        TerrainTypeBlock {
+            index: 1,
+            name: Some("Rock".to_string()),
+            hardness: Some(2.0),
+            receive_tracks: Some(false),
+            move_speeds: Some(TerrainMoveSpeeds {
+                tank: Some(0.85),
+                kbot: Some(1.0),
+                hover: Some(1.0),
+                ship: Some(0.0),
+            }),
+        },
+        TerrainTypeBlock {
+            index: 2,
+            name: Some("Sand".to_string()),
+            hardness: Some(0.4),
+            receive_tracks: Some(true),
+            move_speeds: Some(TerrainMoveSpeeds {
+                tank: Some(0.7),
+                kbot: Some(0.9),
+                hover: Some(1.2),
+                ship: Some(0.0),
+            }),
+        },
+        TerrainTypeBlock {
+            index: 3,
+            name: Some("Water".to_string()),
+            hardness: Some(0.1),
+            receive_tracks: Some(false),
+            move_speeds: Some(TerrainMoveSpeeds {
+                tank: Some(0.0),
+                kbot: Some(0.0),
+                hover: Some(1.0),
+                ship: Some(1.0),
+            }),
+        },
+    ]
 }
 
 /// Build a [`MapInfo`] from a [`Project`] — name + heights + mapfile
@@ -666,6 +761,149 @@ mod tests {
         assert_eq!(t0.index, 0);
         assert_eq!(t0.name.as_deref(), Some("Default"));
         assert_eq!(t0.hardness, Some(1.0));
+    }
+
+    /// C3: BAR ships four default terrain types (Default / Rock / Sand
+    /// / Water). The schema seeds all four so an authored typemap with
+    /// bytes 0..3 immediately gets sensible gameplay scalars.
+    #[test]
+    fn bar_default_terrain_types_has_four_entries() {
+        let info = MapInfo::bar_default();
+        assert_eq!(
+            info.terrain_types.len(),
+            4,
+            "expected 4 default terrain types; got {:?}",
+            info.terrain_types
+        );
+    }
+
+    #[test]
+    fn bar_default_terrain_types_index_one_is_rock() {
+        let t = &MapInfo::bar_default().terrain_types[1];
+        assert_eq!(t.index, 1);
+        assert_eq!(t.name.as_deref(), Some("Rock"));
+        assert_eq!(t.hardness, Some(2.0));
+        // Rock blocks ships and refuses tracks (digest §8).
+        assert_eq!(t.receive_tracks, Some(false));
+        let ms = t.move_speeds.as_ref().expect("rock has moveSpeeds");
+        assert_eq!(ms.ship, Some(0.0));
+        assert_eq!(ms.tank, Some(0.85));
+    }
+
+    #[test]
+    fn bar_default_terrain_types_index_two_is_sand() {
+        let t = &MapInfo::bar_default().terrain_types[2];
+        assert_eq!(t.index, 2);
+        assert_eq!(t.name.as_deref(), Some("Sand"));
+        assert_eq!(t.hardness, Some(0.4));
+        assert_eq!(t.receive_tracks, Some(true));
+        let ms = t.move_speeds.as_ref().expect("sand has moveSpeeds");
+        // Hovers gain on sand; ships still blocked (it's a beach).
+        assert_eq!(ms.hover, Some(1.2));
+        assert_eq!(ms.ship, Some(0.0));
+    }
+
+    #[test]
+    fn bar_default_terrain_types_index_three_is_water() {
+        let t = &MapInfo::bar_default().terrain_types[3];
+        assert_eq!(t.index, 3);
+        assert_eq!(t.name.as_deref(), Some("Water"));
+        assert_eq!(t.hardness, Some(0.1));
+        assert_eq!(t.receive_tracks, Some(false));
+        let ms = t.move_speeds.as_ref().expect("water has moveSpeeds");
+        // Only ships + hovers move through water.
+        assert_eq!(ms.tank, Some(0.0));
+        assert_eq!(ms.kbot, Some(0.0));
+        assert_eq!(ms.hover, Some(1.0));
+        assert_eq!(ms.ship, Some(1.0));
+    }
+
+    // ────── lighting + atmosphere default values (digest §lighting / §atmosphere) ──────
+
+    #[test]
+    fn bar_default_lighting_colour_values_match_digest() {
+        let l = MapInfo::bar_default().lighting;
+        assert_eq!(l.ground_ambient_color, Some([0.5, 0.5, 0.5]));
+        assert_eq!(l.ground_diffuse_color, Some([0.5, 0.5, 0.5]));
+        assert_eq!(l.ground_specular_color, Some([0.1, 0.1, 0.1]));
+        assert_eq!(l.ground_shadow_density, Some(0.8));
+        assert_eq!(l.unit_ambient_color, Some([0.4, 0.4, 0.4]));
+        assert_eq!(l.unit_diffuse_color, Some([0.7, 0.7, 0.7]));
+        // None means "engine falls back to unit_diffuse_color" — the
+        // emitter should not write a specific value here.
+        assert_eq!(l.unit_specular_color, None);
+        assert_eq!(l.unit_shadow_density, Some(0.8));
+        assert_eq!(l.specular_exponent, Some(100.0));
+    }
+
+    #[test]
+    fn bar_default_atmosphere_wind_matches_digest() {
+        let a = MapInfo::bar_default().atmosphere;
+        // BAR convention 5..25 (balanced economy per digest §atmosphere).
+        assert_eq!(a.min_wind, Some(5.0));
+        assert_eq!(a.max_wind, Some(25.0));
+    }
+
+    #[test]
+    fn bar_default_atmosphere_colour_values_match_digest() {
+        let a = MapInfo::bar_default().atmosphere;
+        assert_eq!(a.fog_color, Some([0.7, 0.7, 0.8]));
+        assert_eq!(a.sun_color, Some([1.0, 1.0, 1.0]));
+        assert_eq!(a.sky_color, Some([0.1, 0.15, 0.7]));
+        assert_eq!(a.sky_dir, Some([0.0, 0.0, -1.0]));
+        assert_eq!(a.cloud_density, Some(0.5));
+        assert_eq!(a.cloud_color, Some([1.0, 1.0, 1.0]));
+        // No skybox is set by default — projects opt in.
+        assert!(a.sky_box.is_none());
+    }
+
+    // ────── water-opt-in constructor (C3) ──────
+
+    #[test]
+    fn bar_default_with_water_populates_block() {
+        let info = MapInfo::bar_default_with_water();
+        let w = info.water.expect("water block populated");
+        // Surface, plane, min, base are the four colour fields the
+        // digest flags as required for water maps.
+        assert!(w.surface_color.is_some());
+        assert!(w.plane_color.is_some());
+        assert!(w.min_color.is_some());
+        assert!(w.base_color.is_some());
+        // BAR-tuned defaults: shore foam on, force_rendering off.
+        assert_eq!(w.shore_waves, Some(true));
+        assert_eq!(w.force_rendering, Some(false));
+        // Everything else still inherits bar_default's dry layout
+        // (modtype 3, gravity 130, etc.).
+        assert_eq!(info.modtype, 3);
+        assert_eq!(info.gravity, Some(130.0));
+    }
+
+    #[test]
+    fn bar_default_with_water_does_not_break_void_water_pairing() {
+        // Void-water + plane_color is the silent-disable pitfall in
+        // PITFALLS.md §6. The constructor sets plane_color so it
+        // must leave void_water = false.
+        let info = MapInfo::bar_default_with_water();
+        assert!(!info.void_water);
+        let w = info.water.as_ref().unwrap();
+        assert!(w.plane_color.is_some());
+    }
+
+    // ────── version + mapfile + smt defaults ──────
+
+    #[test]
+    fn bar_default_version_and_modtype_pinned() {
+        let info = MapInfo::bar_default();
+        assert_eq!(info.version, "1.0");
+        // mapfile is filled in by From<&Project>; the bare default is
+        // empty and that's intentional — saving as-is is invalid.
+        assert!(info.mapfile.is_empty());
+    }
+
+    #[test]
+    fn bar_default_maphardness_is_one_hundred() {
+        // Digest §scalars: maphardness default 100.
+        assert_eq!(MapInfo::bar_default().maphardness, Some(100.0));
     }
 
     #[test]

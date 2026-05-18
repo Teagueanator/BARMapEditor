@@ -727,6 +727,70 @@ mod tests {
         assert!(s.contains(r#"name = "Default""#), "got:\n{s}");
     }
 
+    /// C3: the schema seeds four BAR-convention terrain types (Default
+    /// / Rock / Sand / Water); the emitter should write all four with
+    /// their canonical names so authored typemaps with bytes 1..3
+    /// inherit sensible gameplay scalars.
+    #[test]
+    fn terrain_types_emits_four_bar_default_entries() {
+        let p = Project::new("terrain_four", 4);
+        let s = render(&p);
+        let block_start = s.find("terrainTypes = {").expect("terrainTypes block");
+        let block = &s[block_start..];
+        assert!(block.contains(r#"name = "Default""#), "got:\n{block}");
+        assert!(block.contains(r#"name = "Rock""#), "got:\n{block}");
+        assert!(block.contains(r#"name = "Sand""#), "got:\n{block}");
+        assert!(block.contains(r#"name = "Water""#), "got:\n{block}");
+    }
+
+    /// Regression: `lighting.sun_dir` is `sunDir` (camelCase) in Lua,
+    /// not `sundir` (lowercase). Mod gadgets read both historically;
+    /// the digest says camelCase is the current canonical form
+    /// (`Rendering/Env/SunLighting.cpp`).
+    #[test]
+    fn lighting_sundir_key_is_camel_case_not_lowercase() {
+        let p = Project::new("camelsun", 4);
+        let s = render(&p);
+        assert!(
+            s.contains("sunDir = {"),
+            "expected camelCase sunDir; got:\n{s}"
+        );
+        // Also defensively assert the lowercase form is NOT emitted —
+        // a future refactor that accidentally lowercases the key would
+        // break BAR-mod gadgets that read `mapinfo.lighting.sunDir`.
+        assert!(
+            !s.contains("sundir = {"),
+            "lowercase sundir leaked into output; got:\n{s}"
+        );
+    }
+
+    /// C3 smoke test mirror: the SRS prompt's exit criteria. If any
+    /// of these drift the rest of the pipeline will quietly produce a
+    /// broken `.sd7`.
+    #[test]
+    fn bar_convention_smoke_test_all_scalars_emit() {
+        let p = Project::new("smoke", 4);
+        let s = render(&p);
+        // From the C3 prompt's smoke-test list:
+        assert!(s.contains("gravity = 130.0"), "gravity drift; got:\n{s}");
+        assert!(
+            s.contains("extractorRadius = 80.0"),
+            "extractor drift; got:\n{s}"
+        );
+        assert!(s.contains("modtype = 3"), "modtype drift; got:\n{s}");
+        assert!(s.contains("fogStart = 0.1"), "fog_start drift; got:\n{s}");
+        assert!(s.contains("fogEnd = 1.0"), "fog_end drift; got:\n{s}");
+        // splats arrays — 4 entries each.
+        let scales_start = s.find("texScales = {").expect("texScales");
+        let scales_end_rel = s[scales_start..].find('}').expect("texScales close");
+        let scales = &s[scales_start..scales_start + scales_end_rel + 1];
+        assert_eq!(
+            scales.matches("0.02,").count(),
+            4,
+            "texScales should be 4 × 0.02; got:\n{scales}"
+        );
+    }
+
     #[test]
     fn output_terminates_with_return_mapinfo() {
         let p = Project::new("ret", 4);
