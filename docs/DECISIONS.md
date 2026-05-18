@@ -323,6 +323,64 @@ model.
     (= SMF mapx=128 = BAR 2 SMU), not the "65×65" the post-compact
     prompt suggested. See session log for derivation.
 
+## ADR-013 — `mapinfo.lua` emit + `.sd7` packaging via system `7z`
+
+**Status:** Accepted (2026-05-17)
+**Context:** ADR-012 produces a `.smf` + `.smt`. Recoil needs them
+wrapped in a non-solid 7-Zip archive named `.sd7`, alongside a
+`mapinfo.lua` that names them. PITFALL #9 (SpringFiles silently rejects
+solid `.sd7`) and PITFALL #7 (pink-map trap if `smtFileName0` doesn't
+match) both bear directly on this decision.
+**Decision:**
+  - **Hand-rolled mapinfo.lua emitter, not a Lua AST.** Lives in
+    `barme-pipeline::mapinfo`. Writes a minimum-viable file based on a
+    `Project`: name / shortname / version / mapfile / smf.smtFileName0
+    (always `maps/<name>.smt` to keep PITFALL #7 closed) / minheight /
+    maxheight, plus reasonable defaults for the keys Recoil refuses to
+    boot without. A real Lua-AST emitter is the future `barme-mapinfo`
+    crate's job (per the architecture in CLAUDE.md).
+  - **Shell out to system `7z` for packaging.** Resolution order:
+    `7zz`, `7z`, `7za`. `7zr` is skipped (it's read-only / `.rar`-style
+    minimal). Missing binary → `Sd7Error::SevenZipMissing` with a
+    suggested install command.
+  - **`-ms=off` is mandatory** — the literal PITFALL #9 flag.
+    `-t7z -mx=9` round out the create command. Run from inside a staging
+    tempdir so the archive's root contains `maps/` and `mapinfo.lua`
+    directly (not nested under a top-level dir).
+  - **Verify non-solid post-build.** `7z l -slt <out>.sd7` and parse the
+    `Solid = -` header. If it's `+` (solid), return an `Sd7Error::Solid`
+    — defends against a future flag-name change or wrong-binary regression.
+  - **Staging layout:** `<stage>/maps/<name>.smf`, `<stage>/maps/<name>.smt`,
+    `<stage>/mapinfo.lua`. Matches what Recoil's vfs scan expects.
+**Alternatives:**
+  - **`sevenz-rust` / `sevenz-rust2` crate** — rejected: non-solid
+    output mode has had upstream bugs reported, and SpringFiles
+    silently-reject behaviour (PITFALL #9) means we'd discover any
+    drift only after a real upload. Shelling out to the system binary
+    is the trusted reference path for now. Revisit if cross-platform
+    distribution pressure (Windows packaging) makes the system-binary
+    dependency painful.
+  - **Bundle our own 7-Zip binary under `tools/`** — rejected: adds an
+    install vector + license tracking for a tool every Linux distro
+    already packages. Reconsider in Stage 1 if rejecting users without
+    `7zip` installed becomes a real friction point.
+  - **Real Lua AST emitter now** — rejected: minimum-viable mapinfo is
+    ~25 lines of formatted output; the AST emitter has value only when
+    the editor UI needs round-tripping handwritten mapinfo files,
+    which is a Stage 1+ concern.
+**Consequence:**
+  - `barme-pipeline` uses the `which` crate for 7z discovery.
+  - End-to-end public surface:
+    `barme_pipeline::build_sd7(project, hm_png, tex_bmp, out_path) ->
+    Result<PathBuf, BuildError>`. The integration test exercises this
+    end-to-end, producing a real `.sd7` and asserting `Solid = -`.
+  - **System dependency declared.** README / install docs (Stage 1
+    polish) need a line about `apt install 7zip` (or distro equivalent)
+    being required *to package* — not to run the editor's GUI.
+  - PITFALL #7 (pink-map on rename) defended at the source: the
+    emitter always derives `smtFileName0` from the same `name` field
+    the SMT is written with. There is no path that lets them diverge.
+
 ## ADR-014 — Compressonator CLI vendored via `scripts/fetch-compressonator.sh`, pinned to V4.5.52
 
 **Status:** Accepted (2026-05-17). Refines ADR-004; corrects an
