@@ -1,5 +1,6 @@
 mod launcher;
 mod render;
+mod ui;
 
 use std::path::{Path, PathBuf};
 
@@ -1747,6 +1748,52 @@ impl App {
                     egui::FontId::proportional(16.0),
                     ui.visuals().weak_text_color(),
                 );
+            }
+
+            // Symmetry canvas overlay (ADR-031 / B2). Paints AFTER the
+            // wgpu terrain pass and BEFORE the start-position markers
+            // so markers stay readable on top of the axes. No-op when
+            // `symmetry == None`.
+            let extents = self.world_extents();
+            let overlay_painter = ui.painter_at(rect);
+            crate::ui::overlay::paint_symmetry_overlay(
+                &overlay_painter,
+                rect,
+                &self.camera,
+                self.symmetry,
+                extents,
+            );
+
+            // Mirror-brush ghost rings — Sculpt tool + brush selected +
+            // cursor over central rect + symmetry ≠ None. Cursor world
+            // position reuses the existing y=0 raycast from stamp
+            // placement (pitfall §B2.4 — no second projection path).
+            // B2 ships only the ghosts; B3 adds the primary ring.
+            if matches!(self.tool, Tool::Sculpt)
+                && self.brush_id.is_some()
+                && !matches!(self.symmetry, SymmetryAxis::None)
+                && response.hovered()
+                && let Some(cursor) = ctx.pointer_interact_pos()
+                && rect.contains(cursor)
+            {
+                let cursor_in = glam::Vec2::new(cursor.x - rect.min.x, cursor.y - rect.min.y);
+                let rect_size_v = glam::Vec2::new(rect.width(), rect.height());
+                if let Some(world) =
+                    render::screen_to_world_y0(cursor_in, rect_size_v, &self.camera)
+                {
+                    crate::ui::overlay::paint_brush_ghosts(
+                        &overlay_painter,
+                        rect,
+                        &self.camera,
+                        self.symmetry,
+                        crate::ui::overlay::BrushCursor {
+                            world,
+                            radius_world: self.brush_radius,
+                            brush_id: self.brush_id.as_deref(),
+                        },
+                        extents,
+                    );
+                }
             }
 
             // Overlay start-position markers on top of the terrain pass.

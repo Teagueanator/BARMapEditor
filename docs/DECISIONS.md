@@ -1586,6 +1586,115 @@ is gone — it's session-global, not a tool parameter.
   `App::update` via `ctx.options_mut(|o| o.input_options.max_click_dist = 8.0)`.
   Idempotent; cheap.
 
+## ADR-031 — Symmetry canvas overlay: dashed axes + mirror-brush ghosts
+
+**Status:** Accepted (2026-05-18).
+**Context:** ADR-019 (symmetry replicate engine) and ADR-030 (the
+top-bar chip + popover) already give the user a way to *set* symmetry,
+but at B1 close there's no visual confirmation of which axes are
+active. UX research (`docs/research/ui/claude-research-findings.md`
+§3 "Symmetry as a global mode" + §5 "On-canvas feedback") flagged
+this as frustration #5 — the user paints, sees one stamp, can't tell
+whether symmetry is on or which axis is mirroring. The Aseprite
+convention (a draggable on-canvas symmetry handle) is the obvious
+prior art for 2D editors; we adopt the visible-axis half but **lock
+axes to the map's geometric centre** because the BAR engine assumes
+centre-of-symmetry for spawn pairing (ADR-019). A movable handle
+would let the user produce a project that mirrors visually but
+breaks engine assumptions about start-position pairing — silent
+corruption.
+
+The brush ring (B3) is the cursor's primary feedback under Sculpt,
+but it only shows where the *user* stamps. Symmetry replicates
+through N derived centres — the user can't predict where those land
+without a ghost ring at each image. Mirror-brush ghosts in B2 + the
+primary ring in B3 together render the full prediction.
+
+**Decision:**
+- **Persistent canvas overlay.** Whenever `App.symmetry != None`, the
+  central viewport renders symmetry guides on top of the wgpu terrain
+  pass, before the start-position marker overlay:
+  - Mirror modes (Horizontal / Vertical / Quad / DiagonalMain /
+    DiagonalAnti): one or two dashed lines crossing the map through
+    centre, end-to-end.
+  - `Rotational { fold }`: `fold` dashed spokes from centre outwards,
+    each clipped to the map rect's `[0, ex] × [0, ez]` bounds via a
+    parametric ray-vs-rect intersection.
+- **Dash cadence is in screen pixels** (8 on / 4 off), not world
+  units. World-unit dashes shrink to a fuzzy solid under zoom-out
+  (pitfall §B2.1). Below 32 px projected length the dash pattern
+  ceases to read as dashed; we fall back to a thin solid line.
+- **Mirror-brush ghosts.** When `Tool::Sculpt` is active AND a brush
+  is selected AND `symmetry != None` AND the cursor is over the
+  central rect, faint ghost rings render at every symmetry-derived
+  centre (skipping the primary — B3 owns the primary ring). Ghost
+  alpha is ~50 % of the primary's so the user can distinguish "where
+  I click" from "where it lands by symmetry."
+- **Ring radius in screen space.** Brush radius is in world elmos.
+  We project the centre AND a tangent point `(cx + radius, 0, cz)`;
+  the screen distance between the two projected points is the
+  screen-space ring radius. Cheap, correct under perspective, no
+  inverse-projection bookkeeping (pitfall §B2.4).
+- **Reuse the existing y=0 raycast.** Cursor → world projection goes
+  through `render::screen_to_world_y0` (already wired for brush
+  placement in `apply_brush_at`). A second projection path is
+  explicitly forbidden by pitfall §B2.5.
+- **High-fold rotational crowding accepted.** For fold ≥ 8 the
+  spokes pack densely near centre; we accept this rather than
+  introduce an inner-circle fall-back. If a user complains about
+  unreadability, the inner-circle variant lands in a follow-up.
+
+**Module layout.** Overlay code lives in
+`crates/barme-app/src/ui/overlay.rs`, with a sibling `mod.rs` and a
+new `mod ui;` in `main.rs`. B1's closing log set the line-count
+threshold for splitting at ~2500; B2 is on track to push past that
+once B3's brush ring + nav gizmo + cheat-sheet land. Splitting now
+keeps `App::central` from growing into a 500-line function.
+
+**Alternatives considered:**
+- **Movable axis handles (Aseprite convention).** Visually elegant
+  but breaks ADR-019's geometric-centre assumption. Rejected; the
+  engine's spawn-pair math would diverge from the editor preview.
+- **Depth-conformant wgpu decal axes.** Render the dashed lines as
+  a textured quad sampling the heightmap so the axis hugs the
+  terrain surface. Deferred — Phase 4 polish. The 2D painter overlay
+  reads "close enough" against the terrain and avoids a new shader.
+- **Inner-circle fall-back for high-fold rotational.** Considered;
+  deferred per the falsifier in
+  `devlog/stage-1-ux-symmetry-global/theories.md` — accept the
+  crowding until user feedback proves it unreadable.
+- **Skip overlay when no heightmap is loaded.** Rejected — symmetry
+  is a session property, not heightmap-derived; rendering the
+  axes against the "Load a heightmap" placeholder still helps the
+  user understand the active mode.
+
+**Consequence:**
+- New module `crates/barme-app/src/ui/overlay.rs` with
+  `paint_symmetry_overlay`, `paint_brush_ghosts`, `brush_ring_color`,
+  `BrushCursor`, plus pure helpers `axis_segments_for`,
+  `dash_subsegments`, `ghost_centres`, `rotational_spoke_segments`,
+  `clip_ray_to_rect`. The pure helpers are pulled out specifically so
+  geometry / cadence / centre-derivation logic is unit-testable
+  without a painter or wgpu context.
+- `main.rs`: new `mod ui;` declaration; `App::central` calls the two
+  paint functions after the wgpu callback and before the
+  start-position marker block. `App` field-set unchanged.
+- 36 new tests in `ui::overlay::tests` covering: `clip_ray_to_rect`
+  (right/top/left/bottom/corner/inside-endpoint), spoke count +
+  origin + endpoints per fold (2/3/4/6/8/12), spoke clipping on
+  square + rectangular maps, `axis_segments_for` per `SymmetryAxis`
+  variant + Rotational fold<2 vs fold≥2, `dash_subsegments`
+  (zero-length / short-solid / long-dashed / threshold-boundary /
+  diagonal direction), `ghost_centres` (None / H / V / Quad /
+  DiagonalMain / Rotational per fold / map-centre degeneracy /
+  off-map originating stamp), brush colour mapping (dominance +
+  distinctness + neutral fallback), and a `BrushCursor` round-trip.
+  `barme-app` test count: 54 (was 18 after B1).
+- B3 inherits this module — primary brush ring + nav gizmo + first-
+  launch hint + `?` cheat-sheet land in the same `ui/overlay.rs` file
+  (or sibling files under `crates/barme-app/src/ui/`).
+- Future B4 / B6 / B7 overlays drop into the same module.
+
 ## Template for new entries
 
 ```
