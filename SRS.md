@@ -232,15 +232,56 @@ A single-window, single-executable desktop app that produces a *playable* BAR ma
 > remain Stage 2 — they need their own ADR (noise basis function,
 > erosion solver choice, river network seeding).
 
+> **STATUS UPDATE 2026-05-17 (F8, Phase 2 shape):** Currently
+> `barme_pipeline::mapinfo` emits two hardcoded start positions at
+> 25% / 75% along the map diagonal — sufficient for 1v1 skirmish testing
+> but not for real maps. Reference shape from real BAR maps (e.g.
+> `gecko_isle_remake_v1.2.1.sd7` ships with **12 teams** in two
+> mirror-symmetric halves): start-position placement must integrate
+> with the F3 symmetry system so placing team 0 auto-fills its mirror
+> teammates. F8 implementation should extend `barme_core::Project`
+> with `start_positions: Vec<StartPos { team_id, x_elmo, z_elmo }>` +
+> a 2D placement UI in the central preview rect.
+
+> **STATUS UPDATE 2026-05-17 (F1, Phase 2 shape):** The app currently
+> opens at a hardcoded "untitled 16×16 SMU" in-memory project.
+> New-project wizard should be the proper entry point: choose
+> map size (SMU x/z — including rectangular sizes like 16×18 used by
+> real maps such as gecko), starting symmetry mode, biome preset
+> (initially: flat / parabolic bowl / cone — drives the procgen
+> baseline), and project name. Biome preset is a thin wrapper around
+> the existing ADR-020 procgen.
+
+> **STATUS UPDATE 2026-05-17 (Project model, Phase 2 shape):** Current
+> `Project` is `{ name, size, min_height, max_height, heightmap }`.
+> Phase 2 expansion needs `start_positions` (F8) and the slot for
+> later additions: `metal_spots` (F5), `geo_vents` (F6),
+> `features: Vec<FeatureInstance>` (F7), `splat_distribution`
+> (F4 — when it lands), and a `mapinfo_overrides` blob (F9). Each
+> addition serialises via `serde` with `#[serde(default)]` so old
+> project files load forward.
+
 ### 3.3 Non-functional requirements
 
 - **NFR-Performance:** Brush stroke latency ≤ 8 ms on a 16×16 map at 60 fps preview on a mid-range 2020 GPU.
 - **NFR-Memory:** Resident set ≤ 4 GB editing a 16×16 map; ≤ 8 GB at 32×32.
 - **NFR-Portability:** Single static binary on Windows x86_64 and Linux x86_64; AppImage for Linux. No system-wide install required.
-- **NFR-Toolchain:** Bundle PyMapConv + nvdxt under a `tools/` subdirectory of the executable.
+- **NFR-Toolchain:** Bundle PyMapConv + Compressonator under a `tools/` subdirectory of the executable.
+  Also requires the host system to provide a 7-Zip binary (`7z` / `7zz` / `7za`) — declared in install docs, not bundled.
 - **NFR-Determinism:** Same project → byte-identical `.sd7` (compile timestamps stripped).
 - **NFR-Crash safety:** Autosave every 60 s to disk-backed project file.
 - **NFR-Audit:** Emitted mapinfo.lua is human-readable, diff-friendly, and matches BAR community style.
+- **NFR-Observability:** All operations are traced via `tracing` with consistent severity levels —
+  `error!` on operation failure, `warn!` on degradation / defensive catches, `info!` on lifecycle
+  (load / save / build / generate / adapter selection), `trace!` on per-stamp brush diagnostics.
+  UI error strings render full `#[source]` chains via `{e:#}`. Boot logs include backend, adapter
+  name, vendor, and device type so bug reports include the GPU context out-of-the-box.
+
+> **STATUS UPDATE 2026-05-17:** NFR-Toolchain corrected — ADR-004 replaced
+> nvdxt.exe with AMD Compressonator (ADR-014 vendors it separately under
+> `tools/compressonator/`). NFR-Observability added after the Stage 1
+> logging audit; convention is documented in ADR-018 / ADR-019 / ADR-020.
+> NFR-Crash safety (autosave) is still aspirational — Phase 2+ work.
 
 ### 3.4 Architecture (conceptual)
 
@@ -271,11 +312,11 @@ A single-window, single-executable desktop app that produces a *playable* BAR ma
 
 ### 3.5 Data flow (terrain edit → playable)
 
-1. User drags brush; UI emits `BrushStroke(world_xz, radius, power, mode)`.
-2. Stroke is dispatched to a wgpu compute shader that modifies the tiled R16 heightmap texture in place; affected tiles are marked dirty in the CPU mirror.
-3. Symmetry post-pass replays the stroke into mirrored tiles.
-4. Preview mesh tessellation reads the heightmap as a GPU texture every frame.
-5. On Save: dirty CPU tiles flushed to project file. On Build: PNG export → PyMapConv subprocess → 7z non-solid packaging.
+1. User drags brush; UI emits a sequence of `BrushStamp { world_x, world_z, radius, strength }` values, one per frame the pointer is held.
+2. **STATUS UPDATE (ADR-018 / ADR-021):** stamps are applied by **CPU kernels** in `barme_core::brushes` (the GPU compute path described in earlier drafts is formally deferred — bench shows ~10× headroom in the CPU implementation; see ADR-021). The CPU `Heightmap` is the source of truth; the affected pixel rect is sub-uploaded to the GPU r16uint storage texture via a single `queue.write_texture` call (ADR-017).
+3. Symmetry replicates each stamp into N derived centers via `SymmetryAxis::replicate`; their dirty rects union into one upload (ADR-019).
+4. Vertex shader samples the GPU heightmap texture per-vertex every frame; the per-frame uniform carries the camera matrix + `max_height` (changing height-scale costs zero buffer churn).
+5. On Save: in-memory `Heightmap` flushed to a sibling PNG; project manifest written as `<name>.barmeproj` TOML. On Build: in-memory heightmap serialised to a temp PNG → PyMapConv subprocess → mapinfo emitter → 7-Zip non-solid packaging → optional install into BAR's user maps dir (ADR-015).
 
 ### 3.6 User stories (top 5)
 
