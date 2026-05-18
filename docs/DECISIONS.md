@@ -1164,6 +1164,90 @@ mapping tool offers it.
 - 6 unit tests cover round-trip, overlapping-stamp ordering, redo
   invalidation on new edits, barrier semantics, and cap eviction.
 
+## ADR-023 — Project `start_positions` + F8 placement editor
+
+**Status:** Accepted (2026-05-17).
+**Context:** Stage 0 closed with `barme-pipeline::mapinfo` emitting two
+hardcoded teams at 25 % / 75 % along the map diagonal. That's enough to
+boot a 1v1 in BAR but it's not a *map editor* feature — real BAR maps
+ship with up to 12+ teams in symmetric clusters
+(`gecko_isle_remake_v1.2.1.sd7` is a working reference: 16×18 SMU, 12
+teams arranged across two mirror halves). F8 is the first surface where
+the editor stops being a heightmap tool and starts being a map tool.
+
+The shape of the feature is constrained by three forces already in the
+codebase:
+
+1. **Symmetry is sticky.** Users already configure mirror / quad /
+   rotational symmetry for brushes (ADR-019). Placing a team under
+   active symmetry must replicate it through the same `replicate(...)`
+   primitive — anything else is a surprising inconsistency.
+2. **The mapinfo emitter is a string formatter, not an AST.** ADR-013
+   pinned that on purpose for v0. Adding `start_positions` is one more
+   sorted iteration, not a new dependency.
+3. **Project files must load forward.** Projects authored before this
+   commit need to keep opening. `#[serde(default,
+   skip_serializing_if = "Vec::is_empty")]` solves both directions in
+   one annotation.
+
+**Team-id assignment under symmetry.** When the user places one team
+and symmetry replicates N − 1 mirrors, the editor needs to hand each
+output position a fresh team id. BAR's `teams[]` convention is even-id
+on side A, odd-id on side B. The natural mapping is: original = lowest
+unused *even* id; mirror 1 = lowest unused *odd* id; mirror 2 = next
+unused even; etc. This is implemented as
+`start_pos::assign_team_ids(used, n)` — a pure function with unit tests
+covering both empty and partially-filled `used` sets, plus the 3-fold
+rotational case (3 outputs, alternating parity).
+
+**Alternatives considered:**
+- **Sequential ids without parity awareness.** Simpler but breaks the
+  side convention; a quad-symmetric placement would yield
+  `{0, 1, 2, 3}` on the same side. Rejected.
+- **Group-id metadata on each StartPosition.** Would let "move team 0"
+  also move its mirror counterparts as a unit. Deliberately deferred:
+  the simple model (drag moves one position) ships now and matches what
+  the gecko maintainers do (hand-place each side). Worth revisiting
+  when undo grows symmetry-aware grouping.
+- **Snap-to-heightmap-Y on placement.** `startPos` in `mapinfo.lua` is
+  `{ x, z }` only — engine resolves Y at load time from the heightmap.
+  2D placement is the canonical model; ray-vs-heightmap would only help
+  the visual marker, not the data.
+
+**Interactions and hit testing.** The central preview rect already
+projects world-space points to screen via `OrbitCamera::view_proj_matrix`;
+the inverse `screen_to_world_y0` from ADR-018 handles ray-vs-plane for
+brush picking. We add `render::world_to_screen` as the forward direction
+so the placement-mode hit test runs in screen space without a per-marker
+Z-sort. Hit-test radius is 12 px, larger than the 8 px filled disc so
+the click target is forgiving.
+
+**Marker overlay.** Drawn as filled circles on top of the terrain via
+`ui.painter_at(rect)`. Always rendered when any positions exist, even in
+Sculpt mode, so users see them while brushing. Team-id label above each
+disc. The 8-colour palette alternates warm / cool by parity so the side
+convention is visually reinforced.
+
+**Consequence:**
+- `Project` grows two opt-in fields: `start_positions: Vec<StartPosition>`
+  with `#[serde(default, skip_serializing_if = "Vec::is_empty")]`.
+  `StartPosition` is `{ team_id, x_elmo, z_elmo }`. The model is now
+  ready for `metal_spots`, `geo_vents`, `features` to land under the
+  same pattern.
+- `start_pos` module in `barme-core` for the id-assignment logic —
+  7 unit tests cover parity, partially-used sets, and 3-fold rotation.
+- `mapinfo::render` switches to emitting authored teams when present;
+  falls back to the 25/75 default pair when the vector is empty. Output
+  is sorted by `team_id` so diffs stay deterministic. 2 new emitter
+  tests pin the contract.
+- `App` gains `tool_mode: ToolMode { Sculpt, StartPositions }`,
+  `start_positions: Vec<StartPosition>`, `dragging_start_pos: Option<u8>`.
+  Side-panel radio selects mode; in Start-positions mode the central
+  rect's LMB places / drags markers, RMB-click deletes, RMB-drag orbits.
+- `render::world_to_screen` added with 3 unit tests (inverse
+  consistency, off-screen rejection, camera-target sanity).
+- 8-colour `team_color` palette in the app (warm = even, cool = odd).
+
 ## Template for new entries
 
 ```

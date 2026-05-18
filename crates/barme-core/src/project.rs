@@ -25,6 +25,25 @@ pub struct Project {
     /// file's parent directory (see [`Project::resolve_heightmap`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub heightmap: Option<PathBuf>,
+    /// Team start positions (F8 / ADR-023). Empty in legacy projects;
+    /// `#[serde(default)]` lets them load forward. The pipeline emits these
+    /// into `mapinfo.lua` `teams[]` when non-empty, or falls back to a
+    /// 25%/75% diagonal pair when empty so blank projects still build a
+    /// playable 1v1 map.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub start_positions: Vec<StartPosition>,
+}
+
+/// A single team start position in world coordinates (elmos).
+///
+/// `team_id` indexes the `teams[]` table in `mapinfo.lua` — BAR's per-side
+/// convention is even IDs on side A, odd IDs on side B, so the F8 editor
+/// auto-assigns mirrors `{0,1}`, `{2,3}`, etc. when symmetry is enabled.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StartPosition {
+    pub team_id: u8,
+    pub x_elmo: u32,
+    pub z_elmo: u32,
 }
 
 #[derive(Debug, Error)]
@@ -63,6 +82,7 @@ impl Project {
             min_height: 0.0,
             max_height: 256.0,
             heightmap: None,
+            start_positions: Vec::new(),
         }
     }
 
@@ -136,6 +156,49 @@ mod tests {
         let p = Project::new("no-hm", 4);
         let s = toml::to_string(&p).unwrap();
         assert!(!s.contains("heightmap"), "got:\n{s}");
+    }
+
+    #[test]
+    fn start_positions_omitted_when_empty() {
+        let p = Project::new("no-teams", 4);
+        let s = toml::to_string(&p).unwrap();
+        assert!(!s.contains("start_positions"), "got:\n{s}");
+    }
+
+    #[test]
+    fn start_positions_round_trip() {
+        let mut p = Project::new("teams", 8);
+        p.start_positions = vec![
+            StartPosition {
+                team_id: 0,
+                x_elmo: 1024,
+                z_elmo: 1024,
+            },
+            StartPosition {
+                team_id: 1,
+                x_elmo: 3072,
+                z_elmo: 3072,
+            },
+        ];
+        let s = toml::to_string(&p).unwrap();
+        let p2: Project = toml::from_str(&s).unwrap();
+        assert_eq!(p.start_positions, p2.start_positions);
+    }
+
+    #[test]
+    fn legacy_project_without_start_positions_loads_forward() {
+        let toml_str = r#"
+name = "legacy"
+min_height = 0.0
+max_height = 256.0
+
+[size]
+smu_x = 4
+smu_z = 4
+"#;
+        let p: Project = toml::from_str(toml_str).unwrap();
+        assert_eq!(p.name, "legacy");
+        assert!(p.start_positions.is_empty());
     }
 
     #[test]

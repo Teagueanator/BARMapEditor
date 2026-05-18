@@ -6,9 +6,10 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use barme_core::{
     BrushRegistry, BrushStamp, DirtyRect, Heightmap, History, MapSize, PROJECT_EXTENSION, Project,
-    StampSnapshot, SymmetryAxis, UndoEntry,
+    StampSnapshot, StartPosition, SymmetryAxis, UndoEntry,
     brushes::pixel_bbox,
     procgen::{Domain, PRESETS, generate as procgen_generate},
+    start_pos::assign_team_ids,
 };
 use barme_pipeline::PyMapConvDriver;
 use eframe::egui;
@@ -76,6 +77,23 @@ struct App {
     /// Open stroke — populated on the first stamp after LMB-down, flushed
     /// to `history` when the pointer is released.
     stroke: Option<UndoEntry>,
+    /// Active tool mode for the central preview rect (ADR-023).
+    tool_mode: ToolMode,
+    /// Authored team start positions; round-trips through `Project`.
+    /// Empty by default — the pipeline falls back to a 25/75 default pair.
+    start_positions: Vec<StartPosition>,
+    /// While LMB is held in `StartPositions` mode on an existing marker,
+    /// holds that team's id so the drag re-positions it. Cleared on release.
+    dragging_start_pos: Option<u8>,
+}
+
+/// Central-rect interaction mode. Stays in `Sculpt` for the existing brush
+/// flow; flips to `StartPositions` when F8 placement is active. Mode is
+/// exposed in the side panel as a radio.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolMode {
+    Sculpt,
+    StartPositions,
 }
 
 struct HeightmapState {
@@ -128,6 +146,9 @@ impl App {
             procgen_last_error: None,
             history: History::default(),
             stroke: None,
+            tool_mode: ToolMode::Sculpt,
+            start_positions: Vec::new(),
+            dragging_start_pos: None,
         }
     }
 
@@ -193,6 +214,8 @@ impl App {
         self.camera = OrbitCamera::framing(8192.0, 8192.0);
         self.last_error = None;
         self.last_install = None;
+        self.start_positions.clear();
+        self.dragging_start_pos = None;
         self.end_stroke();
         self.history.barrier();
     }
@@ -204,6 +227,7 @@ impl App {
             min_height: 0.0,
             max_height: self.height_scale,
             heightmap: self.heightmap.as_ref().map(|h| h.path.clone()),
+            start_positions: self.start_positions.clone(),
         }
     }
 
@@ -451,6 +475,108 @@ impl App {
         hm_state.max = mx;
     }
 
+    /// World-space extents (elmos) currently active. Derived from the
+    /// loaded heightmap dims when present, falling back to the project's
+    /// declared SMU. Used by symmetry replication + start-position
+    /// placement so off-map mirrors get filtered.
+    fn world_extents(&self) -> (f32, f32) {
+        if let Some(hm) = self.heightmap.as_ref() {
+            (
+                (hm.dims.0 - 1) as f32 * render::ELMOS_PER_PIXEL,
+                (hm.dims.1 - 1) as f32 * render::ELMOS_PER_PIXEL,
+            )
+        } else {
+            let (ex, ez) = MapSize::square(self.map_size_smu).elmo_extents();
+            (ex as f32, ez as f32)
+        }
+    }
+
+    /// Place a new start position at `(world_x, world_z)` and, when
+    /// symmetry is active, place its mirror counterparts at the derived
+    /// centers. Team ids are assigned via [`assign_team_ids`] alternating
+    /// even / odd from the lowest unused even id so mirror pairs map onto
+    /// BAR's per-side `teams[]` convention. ADR-023.
+    fn place_start_position(&mut self, world_x: f32, world_z: f32) {
+        let extents = self.world_extents();
+        let (ex, ez) = extents;
+        // Clip the originating click; bail if outside the map.
+        if world_x < 0.0 || world_x > ex || world_z < 0.0 || world_z > ez {
+            trace!(
+                world_x,
+                world_z,
+                extents = ?extents,
+                "start position click landed off-map; ignored"
+            );
+            return;
+        }
+        let centers = self.symmetry.replicate((world_x, world_z), extents);
+        let used: Vec<u8> = self.start_positions.iter().map(|p| p.team_id).collect();
+        let ids = assign_team_ids(&used, centers.len());
+        for ((cx, cz), id) in centers.into_iter().zip(ids) {
+            let pos = StartPosition {
+                team_id: id,
+                x_elmo: cx.round().clamp(0.0, ex) as u32,
+                z_elmo: cz.round().clamp(0.0, ez) as u32,
+            };
+            info!(
+                team_id = pos.team_id,
+                x_elmo = pos.x_elmo,
+                z_elmo = pos.z_elmo,
+                symmetry = self.symmetry.id(),
+                "start position placed"
+            );
+            self.start_positions.push(pos);
+        }
+    }
+
+    /// Move the position with `team_id` to the given world coordinates,
+    /// clamped to the map. No-op if the id isn't present.
+    fn move_start_position(&mut self, team_id: u8, world_x: f32, world_z: f32) {
+        let (ex, ez) = self.world_extents();
+        if let Some(p) = self
+            .start_positions
+            .iter_mut()
+            .find(|p| p.team_id == team_id)
+        {
+            p.x_elmo = world_x.clamp(0.0, ex).round() as u32;
+            p.z_elmo = world_z.clamp(0.0, ez).round() as u32;
+        }
+    }
+
+    /// Remove the position with `team_id`. No-op if absent.
+    fn delete_start_position(&mut self, team_id: u8) {
+        let before = self.start_positions.len();
+        self.start_positions.retain(|p| p.team_id != team_id);
+        if self.start_positions.len() < before {
+            info!(team_id, "start position deleted");
+        }
+    }
+
+    /// Find the start position whose on-screen marker is within `radius_px`
+    /// of `cursor`. Returns its team_id. Used for drag and right-click hit
+    /// testing in the central preview rect.
+    fn hit_test_start_position(
+        &self,
+        cursor: egui::Pos2,
+        rect: egui::Rect,
+        radius_px: f32,
+    ) -> Option<u8> {
+        let rect_size = glam::Vec2::new(rect.width(), rect.height());
+        let cursor_in_rect = glam::Vec2::new(cursor.x - rect.min.x, cursor.y - rect.min.y);
+        let mut best: Option<(u8, f32)> = None;
+        for pos in &self.start_positions {
+            let world = glam::Vec3::new(pos.x_elmo as f32, 0.0, pos.z_elmo as f32);
+            let Some(screen) = render::world_to_screen(world, rect_size, &self.camera) else {
+                continue;
+            };
+            let d = (screen - cursor_in_rect).length();
+            if d <= radius_px && best.map(|(_, bd)| d < bd).unwrap_or(true) {
+                best = Some((pos.team_id, d));
+            }
+        }
+        best.map(|(id, _)| id)
+    }
+
     /// Inverse of `undo_one`.
     fn redo_one(&mut self) {
         self.end_stroke();
@@ -575,6 +701,8 @@ impl App {
                 let (ex, ez) = MapSize::square(self.map_size_smu).elmo_extents();
                 self.camera = OrbitCamera::framing(ex as f32, ez as f32);
 
+                self.start_positions = p.start_positions;
+
                 if let Some(hm_path) = hm_resolved {
                     if hm_path.exists() {
                         info!("restoring heightmap from {}", hm_path.display());
@@ -595,6 +723,24 @@ impl App {
             }
         }
     }
+}
+
+/// 8-colour palette indexed by `team_id`. Even ids get warm tones (side A),
+/// odd get cool (side B), matching the BAR per-side convention the F8 editor
+/// auto-assigns to. Beyond 8 ids the palette wraps; the wrap is visible and
+/// intentional — colour is a hint, the team-id label is the source of truth.
+fn team_color(team_id: u8) -> egui::Color32 {
+    const PALETTE: [egui::Color32; 8] = [
+        egui::Color32::from_rgb(0xE5, 0x3E, 0x3E), // 0 — red    (side A)
+        egui::Color32::from_rgb(0x3E, 0x7C, 0xE5), // 1 — blue   (side B)
+        egui::Color32::from_rgb(0xE5, 0xA8, 0x3E), // 2 — orange (side A)
+        egui::Color32::from_rgb(0x3E, 0xC2, 0xE5), // 3 — cyan   (side B)
+        egui::Color32::from_rgb(0xE5, 0x3E, 0xB1), // 4 — pink   (side A)
+        egui::Color32::from_rgb(0x76, 0x3E, 0xE5), // 5 — violet (side B)
+        egui::Color32::from_rgb(0xE5, 0xDE, 0x3E), // 6 — yellow (side A)
+        egui::Color32::from_rgb(0x3E, 0xE5, 0xA7), // 7 — teal   (side B)
+    ];
+    PALETTE[(team_id as usize) % PALETTE.len()]
 }
 
 fn pick_save_path(suggested_name: &str) -> Option<PathBuf> {
@@ -784,6 +930,17 @@ impl eframe::App for App {
             );
 
             ui.separator();
+            ui.heading("Tool");
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.tool_mode, ToolMode::Sculpt, "Sculpt");
+                ui.selectable_value(
+                    &mut self.tool_mode,
+                    ToolMode::StartPositions,
+                    "Start positions",
+                );
+            });
+
+            ui.separator();
             ui.heading("Sculpt");
             let current_label = self
                 .brush_id
@@ -862,6 +1019,50 @@ impl eframe::App for App {
             ));
 
             ui.separator();
+            ui.heading("Start positions");
+            ui.label(
+                egui::RichText::new(
+                    "Tool = Start positions: LMB to place, drag to move, RMB to delete.",
+                )
+                .small()
+                .weak(),
+            );
+            ui.label(format!("Placed: {}", self.start_positions.len()));
+            let mut to_delete: Option<u8> = None;
+            egui::ScrollArea::vertical()
+                .max_height(140.0)
+                .id_salt("startpos_scroll")
+                .show(ui, |ui| {
+                    let mut sorted: Vec<StartPosition> = self.start_positions.clone();
+                    sorted.sort_by_key(|p| p.team_id);
+                    for p in sorted {
+                        ui.horizontal(|ui| {
+                            let color = team_color(p.team_id);
+                            let (resp, painter) = ui.allocate_painter(
+                                egui::Vec2::new(14.0, 14.0),
+                                egui::Sense::hover(),
+                            );
+                            painter.circle_filled(resp.rect.center(), 6.0, color);
+                            ui.label(format!("team {}: ({}, {})", p.team_id, p.x_elmo, p.z_elmo));
+                            if ui.small_button("×").clicked() {
+                                to_delete = Some(p.team_id);
+                            }
+                        });
+                    }
+                });
+            if let Some(id) = to_delete {
+                self.delete_start_position(id);
+            }
+            if !self.start_positions.is_empty() && ui.button("Clear all").clicked() {
+                info!(
+                    cleared = self.start_positions.len(),
+                    "all start positions cleared"
+                );
+                self.start_positions.clear();
+                self.dragging_start_pos = None;
+            }
+
+            ui.separator();
             ui.heading("Generate from formula");
             ui.label(
                 egui::RichText::new("f(x, z) → height ∈ [0,1]. Replaces heightmap.")
@@ -936,16 +1137,21 @@ impl eframe::App for App {
             let (rect, response) =
                 ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
 
-            // Brush active → left-drag paints, right-drag orbits camera.
-            // No brush → left-drag orbits (Stage 0 behaviour).
-            let brush_active = self.brush_id.is_some() && self.heightmap.is_some();
-            let camera_drag = if brush_active {
+            // Tool mode determines what the left pointer button does.
+            // Brush sculpt or start-position placement → LMB is tool, RMB
+            // orbits. Otherwise LMB orbits (Stage 0 idle-camera behaviour).
+            let brush_active = matches!(self.tool_mode, ToolMode::Sculpt)
+                && self.brush_id.is_some()
+                && self.heightmap.is_some();
+            let start_pos_active = matches!(self.tool_mode, ToolMode::StartPositions);
+            let central_interactive = brush_active || start_pos_active;
+            let camera_drag = if central_interactive {
                 response.dragged_by(egui::PointerButton::Secondary)
             } else {
                 response.dragged()
             };
             if camera_drag {
-                let d = if brush_active {
+                let d = if central_interactive {
                     ui.input(|i| i.pointer.delta())
                 } else {
                     response.drag_delta()
@@ -980,6 +1186,42 @@ impl eframe::App for App {
                 self.end_stroke();
             }
 
+            // Start-position placement / move / delete (ADR-023).
+            if start_pos_active && let Some(cursor) = ctx.pointer_interact_pos() {
+                let cursor_in = glam::Vec2::new(cursor.x - rect.min.x, cursor.y - rect.min.y);
+                let rect_size = glam::Vec2::new(rect.width(), rect.height());
+                const HIT_RADIUS_PX: f32 = 12.0;
+
+                if response.clicked_by(egui::PointerButton::Secondary)
+                    && let Some(id) = self.hit_test_start_position(cursor, rect, HIT_RADIUS_PX)
+                {
+                    self.delete_start_position(id);
+                }
+                if response.drag_started_by(egui::PointerButton::Primary) {
+                    self.dragging_start_pos =
+                        self.hit_test_start_position(cursor, rect, HIT_RADIUS_PX);
+                }
+                if response.dragged_by(egui::PointerButton::Primary)
+                    && let Some(id) = self.dragging_start_pos
+                    && let Some(world) =
+                        render::screen_to_world_y0(cursor_in, rect_size, &self.camera)
+                {
+                    self.move_start_position(id, world.x, world.z);
+                }
+                if response.drag_stopped_by(egui::PointerButton::Primary) {
+                    self.dragging_start_pos = None;
+                }
+                if response.clicked_by(egui::PointerButton::Primary)
+                    && self
+                        .hit_test_start_position(cursor, rect, HIT_RADIUS_PX)
+                        .is_none()
+                    && let Some(world) =
+                        render::screen_to_world_y0(cursor_in, rect_size, &self.camera)
+                {
+                    self.place_start_position(world.x, world.z);
+                }
+            }
+
             if self.heightmap.is_some() {
                 let cb = TerrainCallback::new(&self.camera, rect, self.height_scale);
                 ui.painter()
@@ -992,6 +1234,33 @@ impl eframe::App for App {
                     egui::FontId::proportional(16.0),
                     ui.visuals().weak_text_color(),
                 );
+            }
+
+            // Overlay start-position markers on top of the terrain pass.
+            // Always rendered when any are placed (regardless of tool mode)
+            // so the user can see them while sculpting.
+            if !self.start_positions.is_empty() {
+                let rect_size = glam::Vec2::new(rect.width(), rect.height());
+                let painter = ui.painter_at(rect);
+                for pos in &self.start_positions {
+                    let world = glam::Vec3::new(pos.x_elmo as f32, 0.0, pos.z_elmo as f32);
+                    let Some(screen) = render::world_to_screen(world, rect_size, &self.camera)
+                    else {
+                        continue;
+                    };
+                    let p = egui::Pos2::new(rect.min.x + screen.x, rect.min.y + screen.y);
+                    let highlighted = self.dragging_start_pos == Some(pos.team_id);
+                    let r = if highlighted { 10.0 } else { 8.0 };
+                    painter.circle_filled(p, r, team_color(pos.team_id));
+                    painter.circle_stroke(p, r, egui::Stroke::new(2.0, egui::Color32::WHITE));
+                    painter.text(
+                        p + egui::Vec2::new(0.0, -r - 2.0),
+                        egui::Align2::CENTER_BOTTOM,
+                        format!("{}", pos.team_id),
+                        egui::FontId::proportional(11.0),
+                        egui::Color32::WHITE,
+                    );
+                }
             }
         });
 

@@ -418,6 +418,30 @@ pub fn screen_to_world_y0(
     Some(near + dir * t)
 }
 
+/// Project a world-space point onto the central preview rect. Returns
+/// `None` if the point is behind the camera (clip-space `w <= 0`) or
+/// projects outside `[-1, 1]` NDC (off-screen). Used by the F8 / ADR-023
+/// start-position overlay so 2D markers track their 3D positions.
+pub fn world_to_screen(
+    world: glam::Vec3,
+    rect_size: glam::Vec2,
+    camera: &OrbitCamera,
+) -> Option<glam::Vec2> {
+    let aspect = (rect_size.x / rect_size.y).max(0.0001);
+    let clip = camera.view_proj_matrix(aspect) * world.extend(1.0);
+    if clip.w <= 0.0 {
+        return None;
+    }
+    let ndc = glam::Vec3::new(clip.x / clip.w, clip.y / clip.w, clip.z / clip.w);
+    if !(-1.0..=1.0).contains(&ndc.x) || !(-1.0..=1.0).contains(&ndc.y) {
+        return None;
+    }
+    Some(glam::Vec2::new(
+        (ndc.x + 1.0) * 0.5 * rect_size.x,
+        (1.0 - ndc.y) * 0.5 * rect_size.y,
+    ))
+}
+
 /// Upload a sub-rect of the heightmap to the GPU texture. The full
 /// heightmap data + dims are passed so we can compute the byte offset
 /// into the source slice; this avoids a copy on the CPU side.
@@ -536,5 +560,48 @@ impl egui_wgpu::CallbackTrait for TerrainCallback {
         pass.set_bind_group(0, &res.bind_group, &[]);
         pass.set_index_buffer(grid.index_buf.slice(..), wgpu::IndexFormat::Uint32);
         pass.draw_indexed(0..grid.index_count, 0, 0..1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cam() -> OrbitCamera {
+        OrbitCamera::framing(8192.0, 8192.0)
+    }
+
+    #[test]
+    fn world_to_screen_round_trip_with_screen_to_world() {
+        let camera = cam();
+        let rect = glam::Vec2::new(800.0, 600.0);
+        // Map center on y=0 plane.
+        let world = glam::Vec3::new(4096.0, 0.0, 4096.0);
+        let screen = world_to_screen(world, rect, &camera).expect("center should be on screen");
+        let back = screen_to_world_y0(screen, rect, &camera).expect("inverse projects back");
+        // f32 round-trip through perspective matrices loses a couple
+        // elmos; a few units of slack is fine for a UI hit-test helper.
+        assert!((back.x - world.x).abs() < 5.0, "got back.x = {}", back.x);
+        assert!((back.z - world.z).abs() < 5.0, "got back.z = {}", back.z);
+    }
+
+    #[test]
+    fn world_to_screen_off_screen_returns_none() {
+        let camera = cam();
+        let rect = glam::Vec2::new(800.0, 600.0);
+        let world = glam::Vec3::new(-100000.0, 0.0, -100000.0);
+        assert!(world_to_screen(world, rect, &camera).is_none());
+    }
+
+    #[test]
+    fn world_to_screen_center_lands_near_rect_center() {
+        let camera = cam();
+        let rect = glam::Vec2::new(800.0, 600.0);
+        let screen =
+            world_to_screen(camera.target, rect, &camera).expect("camera target is visible");
+        let cx = rect.x * 0.5;
+        let cy = rect.y * 0.5;
+        assert!((screen.x - cx).abs() < 50.0, "screen.x = {}", screen.x);
+        assert!((screen.y - cy).abs() < 50.0, "screen.y = {}", screen.y);
     }
 }
