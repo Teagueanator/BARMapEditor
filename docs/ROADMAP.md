@@ -47,12 +47,19 @@ Implements SRS F1–F12. Ships a Windows `.exe` and a Linux AppImage.
 - [ ] **F5** Metal-spot placement (point + radius → red-channel density)
 - [ ] **F6** Geo-vent placement
 - [ ] **F7** Feature placement (trees, rocks, wreckage) into a Lua gadget
-- [x] **F8** Start-position editor — `Project.start_positions:
-      Vec<StartPosition>` round-trips through `.barmeproj`; 2D
-      placement / drag / delete UI in the central rect, with symmetry
-      replication and BAR-side even/odd team-id assignment via
-      `start_pos::assign_team_ids`. mapinfo emitter consumes the vec
-      with 25/75 fallback (ADR-023).
+- [x] **F8** Start-position editor — Phase 2 ADR-023 shipped the flat
+      `Vec<StartPosition>` model; Phase 3 ADR-032 (B6) supersedes the
+      data shape with `Project.ally_groups: Vec<AllyGroup>` (id + name
+      + sRGB colour + sources + `box_polygon`). Inspector becomes a
+      collapsing-header tree with configuration-preset dropdown
+      (`1v1` / `8v8` / `3-way FFA` / `4-way FFA`). LMB-drag distributes
+      N markers along the vector; hover↔pulse links tree to canvas;
+      markers ghost cross-tool (B1 pattern). Mirrors live in the same
+      ally group as the source; build path expands sources through the
+      active symmetry before emission. Pre-Phase-3 `.barmeproj` files
+      migrate via custom `Deserialize` (legacy `[[start_positions]]`
+      → `ally_groups[0]`). C2 / ADR-029 wires the ally tree into
+      `mapconfig/map_startboxes.lua`.
 - [ ] **F9** `mapinfo.lua` editor (form + raw Lua tab)
 - [ ] **F10** Minimap auto-generation
 - [ ] **F11** One-click `.sd7` build via PyMapConv
@@ -95,6 +102,23 @@ Implements SRS F1–F12. Ships a Windows `.exe` and a Linux AppImage.
       added (F9 / C7 will populate). Foundational only — B6 (F8
       allyteam redesign) and C2 (three-file emission) consume these
       next sprint.
+- [x] **Three-file emission + F8 allyteam tree (Phase 3 / Sprint 5 =
+      C2 + B6)** — ADR-029 swaps the string-concat mapinfo emitter
+      for a Lua AST (`barme-pipeline::lua_ast`) walking the C1 schema;
+      three sibling emitters land for `mapconfig/map_metal_layout.lua`
+      (placeholder until C4 / C5), `mapconfig/map_startboxes.lua`
+      (populated from `Project.ally_groups[*].box_polygon`),
+      `mapconfig/featureplacer/features.lua` (placeholder until C6).
+      All four files stage into the `.sd7` via the existing
+      `barme-pipeline::sd7::package` machinery. Determinism pinned by
+      per-emitter byte-identical-repeated-render tests. ADR-032 / B6
+      replaces flat `Project.start_positions` with `ally_groups:
+      Vec<AllyGroup>`; F8 Inspector becomes a tree with configuration
+      presets (`1v1` / `8v8` / `3-way FFA` / `4-way FFA`); LMB-drag
+      paints N markers along a vector; hover↔pulse links tree to
+      canvas; cross-tool ghosting at 50 % alpha. Pre-Phase-3
+      `.barmeproj` migration via custom `Deserialize`. ADR-013's
+      emitter half + ADR-023's data shape are superseded.
 - [ ] Beherith (or active mapper) reviews `.sd7` byte-for-byte against PyMapConv
       reference output on three test maps
 - [ ] Listed on `beyondallreason.info/guide/mapmaking-resources` as beta

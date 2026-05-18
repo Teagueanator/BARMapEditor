@@ -244,6 +244,27 @@ A single-window, single-executable desktop app that produces a *playable* BAR ma
 > drag remain Phase-3 polish; this commit closes the editor surface F8
 > implies.
 
+> **STATUS UPDATE 2026-05-18 (F8 — allyteam tree, ADR-032 / B6):** the
+> flat `start_positions` shape was wrong for 8v8 / 3-way FFA / 4-way
+> FFA — those need an ally-team layer. `Project.start_positions`
+> replaced by `Project.ally_groups: Vec<AllyGroup>` (id + name + sRGB
+> colour + sources + optional `box_polygon`). Inspector becomes a
+> tree with a configuration-preset dropdown (`1v1` / `8v8` /
+> `3-way FFA` / `4-way FFA`), per-group collapsing header, and child
+> rows for sources + greyed mirror entries. Canvas grows LMB-drag-
+> paint: drag distributes N evenly-spaced positions along the vector
+> (default 8). Hover↔pulse links the tree to the canvas (Inspector
+> row → marker pulse; marker hover → tree scrolls). Markers ghost to
+> 50 % alpha outside the StartPositions tool (B1 pattern). Symmetry
+> mirrors land in the SAME ally group as the source (sources stored;
+> mirrors recomputed each frame). Build path expands sources through
+> the active symmetry before emission so the `.sd7` carries every
+> spawn the user saw on canvas. Pre-Phase-3 `.barmeproj` migration is
+> backwards-compatible: legacy `[[start_positions]]` materialises
+> into `ally_groups[0]` via a custom `Deserialize`. ADR-023's data
+> shape is superseded; its UX surface (LMB place / drag / RMB delete)
+> survives.
+
 > **STATUS UPDATE 2026-05-17 (F1 — shipped):** Phase 2 ADR-024 lands a
 > modal new-project wizard as the app's entry point — auto-opens on
 > launch, re-opens via File → New project. Fields: project name
@@ -264,6 +285,17 @@ A single-window, single-executable desktop app that produces a *playable* BAR ma
 > `mapinfo_overrides`) follow the same pattern when each F-feature
 > lands.
 
+> **STATUS UPDATE 2026-05-18 (Project model — ally_groups, ADR-032):**
+> `Project.start_positions` superseded by `Project.ally_groups:
+> Vec<AllyGroup>`. Each group carries id + name + sRGB colour +
+> sources + optional `box_polygon` (0..1 fractions feeding
+> `mapconfig/map_startboxes.lua` per ADR-029). `StartPosition` is now
+> just `(x_elmo: i32, z_elmo: i32)`; team ids are positional at
+> emission time. Custom `Deserialize` (via `#[serde(from =
+> "ProjectWire")]`) migrates pre-Phase-3 flat `[[start_positions]]`
+> into `ally_groups[0]` on load. `team_id` in legacy files is
+> ignored via `serde::de::IgnoredAny`.
+
 > **STATUS UPDATE 2026-05-18 (F9 — schema shipped; form editor pending):**
 > Sprint 4 / C1 / ADR-028 lands the typed `mapinfo.lua` schema at
 > `crates/barme-core/src/mapinfo_schema.rs` (`MapInfo` + 9 sub-blocks).
@@ -276,8 +308,30 @@ A single-window, single-executable desktop app that produces a *playable* BAR ma
 > `Project` gained `mapinfo_overrides: HashMap<String, toml::Value>`
 > for F9's eventual form-edit bag. **F9 itself (form editor + raw Lua
 > tab) is still pending — C7 will wire the UI on top of this schema.**
-> The current `barme-pipeline::mapinfo` string emitter is unchanged;
-> swapping it for a Lua-AST emitter is Sprint 6 / ADR-029 / C2.
+
+> **STATUS UPDATE 2026-05-18 (F11 — Lua AST emitter + three-file
+> convention, ADR-029 / C2):** the ad-hoc string formatter at
+> `barme-pipeline::mapinfo` is gone. New `barme-pipeline::lua_ast`
+> exposes `LuaKey`/`LuaValue` + a 2-space-indent, alpha-sorted,
+> trailing-comma renderer. The mapinfo emitter walks the typed
+> [`MapInfo`] schema from C1; the BUILD path stages **four** Lua
+> files into the `.sd7` (was: one):
+> - `mapinfo.lua` (root)
+> - `mapconfig/map_metal_layout.lua` (empty placeholder; C4 / C5
+>   populate spots + geos)
+> - `mapconfig/map_startboxes.lua` (populated from
+>   `Project.ally_groups[*].box_polygon` per B6; empty when
+>   `ally_groups.len() <= 1`)
+> - `mapconfig/featureplacer/features.lua` (empty placeholder;
+>   C6 populates)
+>
+> The renderer is deterministic — repeated builds produce
+> byte-identical `.sd7` (NFR-Det), pinned by
+> `determinism_repeated_render_byte_identical` in each emitter
+> module. `description` escapes `\`, `"`, `\n`, `\r`, `\t`
+> correctly (round-trip pinned). ADR-013's emitter half is
+> superseded; the packaging half (`7z -ms=off`, post-build
+> `Solid = -` check, PITFALL #7 defence) remains in force.
 
 > **STATUS UPDATE 2026-05-18 (Undo for non-heightmap state — B5):**
 > Sprint 4 / B5 lands a unified
