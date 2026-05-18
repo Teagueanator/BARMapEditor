@@ -12,6 +12,7 @@ use bytemuck::{Pod, Zeroable};
 use eframe::egui_wgpu;
 use eframe::wgpu;
 use glam::{Mat4, Vec3};
+use tracing::{info, warn};
 use wgpu::util::DeviceExt;
 
 /// 8 elmos per heightmap pixel — `MapSize::ELMOS_PER_SMU / HEIGHTMAP_PER_SMU`.
@@ -270,6 +271,10 @@ pub fn upload_heightmap(render_state: &egui_wgpu::RenderState, heightmap: &Heigh
 
     let mut renderer = render_state.renderer.write();
     let Some(res) = renderer.callback_resources.get_mut::<RenderResources>() else {
+        warn!(
+            "upload_heightmap called before render::install — heightmap discarded; \
+             this is a programming error"
+        );
         return;
     };
 
@@ -279,6 +284,13 @@ pub fn upload_heightmap(render_state: &egui_wgpu::RenderState, heightmap: &Heigh
         None => true,
     };
     if need_alloc {
+        info!(
+            width = dims.0,
+            height = dims.1,
+            bytes = (dims.0 as u64) * (dims.1 as u64) * 2,
+            format = ?HEIGHTMAP_FORMAT,
+            "allocating heightmap texture"
+        );
         let tex = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("terrain.heightmap"),
             size: wgpu::Extent3d {
@@ -299,7 +311,11 @@ pub fn upload_heightmap(render_state: &egui_wgpu::RenderState, heightmap: &Heigh
     }
 
     // Full write — small relative to texture size, cheap.
-    let tex = &res.heightmap.as_ref().expect("just allocated").tex;
+    let tex = &res
+        .heightmap
+        .as_ref()
+        .expect("upload_heightmap: texture was just allocated above")
+        .tex;
     queue.write_texture(
         wgpu::TexelCopyTextureInfo {
             texture: tex,
@@ -416,14 +432,25 @@ pub fn write_heightmap_rect(
     }
     let renderer = render_state.renderer.read();
     let Some(res) = renderer.callback_resources.get::<RenderResources>() else {
+        warn!("write_heightmap_rect: no RenderResources (install() not run)");
         return;
     };
     let Some(hm_tex) = res.heightmap.as_ref() else {
+        warn!(
+            "write_heightmap_rect called before upload_heightmap — dropping update; \
+             this is a programming error"
+        );
         return;
     };
     if hm_tex.dims != full_dims {
         // Dims changed since the last upload — caller should be using
-        // `upload_heightmap` instead. Skip silently rather than corrupt.
+        // `upload_heightmap` instead. Refuse rather than corrupt and warn
+        // loudly so the bug is found.
+        warn!(
+            tex_dims = ?hm_tex.dims,
+            caller_dims = ?full_dims,
+            "write_heightmap_rect: dim mismatch with GPU texture; update dropped"
+        );
         return;
     }
     let queue = &render_state.queue;

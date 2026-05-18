@@ -12,7 +12,7 @@ use barme_core::{
 use barme_pipeline::PyMapConvDriver;
 use eframe::egui;
 use eframe::egui_wgpu;
-use tracing::{error, info, warn};
+use tracing::{error, info, trace, warn};
 
 use crate::render::{OrbitCamera, TerrainCallback};
 
@@ -86,9 +86,18 @@ impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let render_state = cc.wgpu_render_state.clone();
         if let Some(rs) = render_state.as_ref() {
+            let info = rs.adapter.get_info();
+            info!(
+                backend = ?info.backend,
+                adapter = %info.name,
+                vendor = info.vendor,
+                device_type = ?info.device_type,
+                "wgpu adapter selected"
+            );
             render::install(rs);
+            info!("terrain renderer installed (ADR-017 r16uint storage)");
         } else {
-            warn!("no wgpu render state — terrain preview disabled");
+            error!("no wgpu render state — terrain preview disabled");
         }
 
         Self {
@@ -123,12 +132,11 @@ impl App {
                 let validated_against = h.validate_against(size).ok().map(|_| size);
                 if validated_against.is_none() {
                     warn!(
-                        "loaded heightmap {} dims {:?} do not match {}×{} SMU ({:?})",
-                        path.display(),
-                        dims,
-                        self.map_size_smu,
-                        self.map_size_smu,
-                        size.heightmap_dims(),
+                        path = %path.display(),
+                        loaded_dims = ?dims,
+                        expected_dims = ?size.heightmap_dims(),
+                        smu = self.map_size_smu,
+                        "heightmap dims do not match project SMU; rendering anyway"
                     );
                 }
                 if let Some(rs) = self.render_state.as_ref() {
@@ -137,6 +145,14 @@ impl App {
                     let extent_z = (dims.1 - 1) as f32 * render::ELMOS_PER_PIXEL;
                     self.camera = OrbitCamera::framing(extent_x, extent_z);
                 }
+                info!(
+                    path = %path.display(),
+                    dims = ?dims,
+                    min,
+                    max,
+                    validated = validated_against.is_some(),
+                    "heightmap loaded"
+                );
                 self.heightmap = Some(HeightmapState {
                     path,
                     data: h,
@@ -147,7 +163,7 @@ impl App {
                 });
             }
             Err(e) => {
-                warn!("failed to load heightmap: {e:#}");
+                error!(path = %path.display(), error = %format!("{e:#}"), "heightmap load failed");
                 self.last_error = Some(format!("{e:#}"));
             }
         }
@@ -206,8 +222,8 @@ impl App {
                 self.last_error = None;
             }
             Err(e) => {
-                warn!("save to {} failed: {e}", path.display());
-                self.last_error = Some(format!("save: {e}"));
+                error!(path = %path.display(), error = %format!("{e:#}"), "project save failed");
+                self.last_error = Some(format!("save: {e:#}"));
             }
         }
     }
@@ -225,19 +241,28 @@ impl App {
             expr = %expr,
             domain = ?domain,
             smu = self.map_size_smu,
-            "applying procgen expression"
+            "procgen: applying expression"
         );
+        let t0 = std::time::Instant::now();
         let hm = match procgen_generate(&expr, domain, size, 0.0, self.height_scale) {
             Ok(h) => h,
             Err(e) => {
                 let msg = format!("{e:#}");
-                warn!("procgen failed: {msg}");
+                error!(expr = %expr, error = %msg, "procgen failed");
                 self.procgen_last_error = Some(msg);
                 return;
             }
         };
+        let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
         let dims = hm.dims();
         let (min, max) = hm.min_max();
+        info!(
+            dims = ?dims,
+            min,
+            max,
+            elapsed_ms,
+            "procgen: heightmap generated"
+        );
         if let Some(rs) = self.render_state.as_ref() {
             render::upload_heightmap(rs, &hm);
             let extent_x = (dims.0 - 1) as f32 * render::ELMOS_PER_PIXEL;
@@ -275,6 +300,9 @@ impl App {
             return;
         };
         let Some(brush) = self.brushes.get(brush_id) else {
+            // Selected brush id refers to something not in the registry —
+            // a real bug (state out of sync). Warn so it's not swallowed.
+            warn!(brush_id, "selected brush id not present in registry");
             return;
         };
         if !rect.contains(cursor) {
@@ -283,8 +311,23 @@ impl App {
         let cursor_in = glam::Vec2::new(cursor.x - rect.min.x, cursor.y - rect.min.y);
         let rect_size = glam::Vec2::new(rect.width(), rect.height());
         let Some(world) = render::screen_to_world_y0(cursor_in, rect_size, &self.camera) else {
+            // Ray missed the y=0 plane (camera looking up / behind). Trace-
+            // only since this is a common harmless case at oblique angles.
+            trace!(
+                cursor = ?(cursor.x, cursor.y),
+                "brush picking: ray-vs-plane miss"
+            );
             return;
         };
+        trace!(
+            brush = brush_id,
+            world_x = world.x,
+            world_z = world.z,
+            radius = self.brush_radius,
+            strength = self.brush_strength,
+            symmetry = self.symmetry.id(),
+            "brush stamp"
+        );
         let dims = hm_state.dims;
         let extents = (
             (dims.0 - 1) as f32 * render::ELMOS_PER_PIXEL,
@@ -433,8 +476,8 @@ impl App {
                 }
             }
             Err(e) => {
-                warn!("open {} failed: {e}", path.display());
-                self.last_error = Some(format!("open: {e}"));
+                error!(path = %path.display(), error = %format!("{e:#}"), "project open failed");
+                self.last_error = Some(format!("open: {e:#}"));
             }
         }
     }
