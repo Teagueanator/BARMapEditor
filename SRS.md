@@ -268,6 +268,13 @@ A single-window, single-executable desktop app that produces a *playable* BAR ma
 
 - **NFR-Performance:** Brush stroke latency ≤ 8 ms on a 16×16 map at 60 fps preview on a mid-range 2020 GPU.
 - **NFR-Memory:** Resident set ≤ 4 GB editing a 16×16 map; ≤ 8 GB at 32×32.
+  - **STATUS UPDATE 2026-05-18 (A1 / ADR-033):** undo history now obeys
+    the 100 MB ring cap reliably. The prior per-stamp snapshot model
+    (ADR-022) blew past that cap by 2-3× on long brush strokes —
+    single stroke at radius 1024 captured ~244 MB on a 16-SMU map.
+    Copy-on-first-write within a stroke bounds a single `UndoEntry` at
+    `bbox.w × bbox.h × 2 bytes` (≤ ~2 MB at 16 SMU, ≤ ~9 MB at 32
+    SMU), independent of stamp count.
 - **NFR-Portability:** Single static binary on Windows x86_64 and Linux x86_64; AppImage for Linux. No system-wide install required.
 - **NFR-Toolchain:** Bundle PyMapConv + Compressonator under a `tools/` subdirectory of the executable.
   Also requires the host system to provide a 7-Zip binary (`7z` / `7zz` / `7za`) — declared in install docs, not bundled.
