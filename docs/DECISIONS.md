@@ -325,16 +325,23 @@ model.
 
 ## ADR-013 — `mapinfo.lua` emit + `.sd7` packaging via system `7z`
 
-**Status:** Accepted (2026-05-17). **STATUS UPDATE 2026-05-18 (C1 /
+**Status:** Accepted (2026-05-17). **Superseded 2026-05-18 (C2 /
+ADR-029)** for the *mapinfo emitter half*: the hand-rolled string
+formatter is replaced by a Lua AST in `barme-pipeline::lua_ast` and a
+schema-driven renderer in `barme-pipeline::mapinfo` (consumes the C1 /
+ADR-028 typed schema). Three sidecar emitters
+(`mapconfig/map_metal_layout.lua`, `mapconfig/map_startboxes.lua`,
+`mapconfig/featureplacer/features.lua`) join `mapinfo.lua` in the
+staging tree. **The packaging half** of this ADR (system `7z`,
+`-ms=off`, post-build `Solid = -` check, staging layout, PITFALL #7
+defence at source) remains in force. **STATUS UPDATE 2026-05-18 (C1 /
 ADR-028):** the "minimum-viable, hand-rolled string formatter"
-language is **superseded** by ADR-028 for the *data shape*. The
+language is superseded by ADR-028 for the *data shape*. The
 typed schema now lives at `crates/barme-core/src/mapinfo_schema.rs`
 and is the canonical model F9 + C8 lint will consume. **The
 emitter** (this ADR's other half) is *unchanged* in C1 — Sprint 6 /
-ADR-029 will swap it for a Lua-AST emitter + three-file convention
-(`mapconfig/map_metal_layout.lua`, `mapconfig/map_startboxes.lua`,
-`mapconfig/featureplacer/features.lua`). Until ADR-029 lands, the
-hand-rolled string formatter in this ADR remains in force.
+ADR-029 (now landed) swapped it for a Lua-AST emitter + three-file
+convention.
 **Context:** ADR-012 produces a `.smf` + `.smt`. Recoil needs them
 wrapped in a non-solid 7-Zip archive named `.sd7`, alongside a
 `mapinfo.lua` that names them. PITFALL #9 (SpringFiles silently rejects
@@ -1817,6 +1824,149 @@ so legacy projects load forward.
   pitfall.
 - ADR-013 STATUS UPDATE annotates the supersession scope
   (data-shape only; emitter unchanged until ADR-029).
+
+## ADR-029 — Three-file emission convention + Lua AST emitter
+
+**Status:** Accepted (2026-05-18). Supersedes the **emitter half** of
+ADR-013 (the packaging half — system `7z`, `-ms=off`, `Solid = -`
+check — stays in force). Sister to ADR-028 (data shape) and gated by
+ADR-032 (B6 — `Project.ally_groups` data model that
+`mapconfig/map_startboxes.lua` consumes).
+
+**Context:** ADR-028 landed the typed `MapInfo` schema in
+`barme-core`. The emitter at `barme-pipeline::mapinfo` was still
+the ad-hoc string formatter from ADR-013 — ~10 % of the consumable
+mapinfo surface, line-stitched with `format!`. The C7 form editor,
+C8 linter, C4/C5/C6 placement tools, and the B6 allyteam UX all
+need to round-trip through the schema → bytes path. Doing that with
+`format!` per field is unsustainable and produces non-deterministic
+key ordering (NFR-Audit / NFR-Determinism violations).
+
+The research digest also surfaced a separate point: BAR maps don't
+ship a single `mapinfo.lua`. They ship a **four-file convention**:
+
+| File (archive path) | Role |
+|---|---|
+| `mapinfo.lua` | Engine config + lighting + resources + flat `teams[]` pool. |
+| `mapconfig/map_metal_layout.lua` | Mex spots + geo vents (consumed by `resource_spot_finder` gadget). |
+| `mapconfig/map_startboxes.lua` | Per-ally start-box polygons (consumed by SPADS + Chobby). |
+| `mapconfig/featureplacer/features.lua` | Feature instances (consumed by feature-placer gadget). |
+
+Without the three sidecars, SPADS auto-hosts default to whole-map
+start boxes (terrible 8v8 matchups), mex snap and the F4 view fall
+back to the SMF metalmap (suboptimal spot clustering), and the
+visual steam plumes for geo vents are missing. These are silent
+failures the engine doesn't crash on — they only surface at
+ranked-play / community-review time.
+
+**Decision:**
+- **New module `barme-pipeline::lua_ast`** carries `LuaKey`,
+  `LuaValue`, and `serialize(&LuaValue) -> String`. 2-space indent,
+  trailing commas, identifier vs `["bracketed"]` key forms, full
+  escape coverage (`\\`, `\"`, `\n`, `\r`, `\t`), `f32`-aware float
+  formatting (avoids the `0.1f32 as f64 → "0.10000000149011612"`
+  widening that bare `{:?}` would produce). `sort_table_by_key` is
+  the deterministic-emission helper every per-block builder calls
+  before handing its table off.
+- **`barme-pipeline::mapinfo` rewritten** on top of the AST. Walks
+  the typed schema from ADR-028 (`MapInfo::from(&Project)`) and
+  builds one `LuaValue` per sub-block. Empty `teams[]` falls back
+  to the 25 % / 75 % diagonal pair (preserves ADR-013 behaviour for
+  pre-F8 projects).
+- **Three new sibling modules**: `metal_layout.rs`, `startboxes.rs`,
+  `featureplacer.rs`. Each exposes `render(&Project) -> String`
+  emitting `return { … }` text. This sprint they emit **empty
+  placeholder bodies** — the data sources (`Project.metal_spots`,
+  `ally_groups[*].box_polygon`, `Project.features`) land in C4 /
+  C5 / B6 / C6.
+- **`build_sd7` stages all four files** into the SD7 archive at
+  their canonical paths: `mapinfo.lua` at root,
+  `mapconfig/map_metal_layout.lua`,
+  `mapconfig/map_startboxes.lua`,
+  `mapconfig/featureplacer/features.lua`. PITFALL #2:
+  `featureplacer/` lives at archive root, NOT inside `LuaGaia/`.
+- **Key naming.** Rust snake_case → BAR Lua camelCase. The mapping
+  is explicit in the per-block builders, no auto-conversion (the
+  BAR community style guide has historical exceptions:
+  `maphardness` is lowercase, `smtFileName0` is camelCase with a
+  trailing digit). The mapping is implicitly tested via
+  golden-substring assertions.
+- **Determinism.** Every keyed table is sorted alphabetically by
+  rendered key before emission. Integer-keyed tables sort
+  numerically. Sequence tables preserve input order (caller's
+  responsibility; e.g. `teams[]` is built in increasing index
+  order). Repeated `render()` calls produce byte-identical output —
+  pinned by `determinism_repeated_render_byte_identical` in each
+  emitter module.
+- **`description` escape coverage.** A field as benign as
+  `description = "Has \"quotes\" and\nnewlines"` round-trips through
+  the emitter without breaking the Lua parser. Pinned by
+  `description_with_quotes_and_newlines_escapes` in the mapinfo
+  tests and by the AST's own escape-coverage tests.
+
+**Pitfalls pinned at compile / test time:**
+- `teams[]` carries ONLY `startPos`. The C1 schema's `TeamBlock`
+  exhaustive-destructure test (`team_block_carries_only_start_pos`)
+  prevents anyone re-adding `allyTeam`. Emission walks this shape
+  unchanged.
+- `mapinfo.depend` includes `"Map Helper v1"`. `bar_default` does
+  the work; the emitter test
+  `depend_contains_map_helper_v1` pins the round-trip.
+- `extractorRadius = 80.0`, `fogStart = 0.1`, `fogEnd = 1.0`. All
+  pinned in `mapinfo::tests` by string-substring assertions.
+- `featureplacer/features.lua` lives at `mapconfig/featureplacer/`,
+  not `LuaGaia/`. Pinned by the `archive_rel` literal in
+  `build_sd7`. (Gemini's report misspelled this path; Claude's
+  was correct — adopted Claude per phase-3-plan §"Adopt Claude on
+  every divergence".)
+- Feature `rot` is **string-typed** Spring heading (`"0"`…`"65535"`),
+  not float. Pinned by
+  `featureplacer::tests::feature_entry_carries_name_x_z_rot_as_string`.
+- `map_startboxes.lua` is empty when `ally_groups.len() < 2`.
+  Pinned by `startboxes::tests::empty_when_under_two_ally_groups`.
+
+**Alternatives considered:**
+- **Keep growing the string formatter.** Rejected — every new
+  field doubles the surface, and string concat can't enforce
+  determinism. Sub-block separation is already painful at the
+  current ~30-field surface; the schema's 100+ fields would
+  collapse the format strings under their own weight.
+- **Promote to a separate `barme-mapinfo` crate now.** CLAUDE.md's
+  repo-layout sketch reserves the name. Defer until the schema +
+  emitter + sidecars exceed ~700 combined LOC of non-test code.
+  Current total (lua_ast + mapinfo + 3 sidecars) is well under that;
+  4 sibling modules under `barme-pipeline/src/` are right-sized.
+- **`lua-rs` / `mlua` AST.** Rejected: those are full-fidelity Lua
+  parsers / evaluators. The emitter only needs to *write*; not
+  read. A 200-line AST is the appropriately scoped tool.
+- **JSON serializer + Lua post-process.** Rejected: the BAR
+  community reads mapinfo by hand. Round-tripping through JSON
+  loses the human-friendly idioms (trailing commas, integer-keyed
+  table form) the community style guide expects.
+
+**Out of scope (later items):**
+- Real bodies for the three sidecars: C4 (metal), C5 (geo), C6
+  (features). C2 ships placeholders.
+- F9 form editor — C7. The schema is editable; this commit makes it
+  *emittable*.
+- Lint pass — C8. The emitter doesn't validate; it just renders.
+- The `barme-mapinfo` sub-crate split — deferred until LOC justifies.
+
+**Consequence:**
+- 4 new files in `crates/barme-pipeline/src/`: `lua_ast.rs`,
+  `metal_layout.rs`, `startboxes.rs`, `featureplacer.rs`.
+- `mapinfo.rs` rewritten (~430 LOC including tests).
+- `lib.rs` re-exports + `build_sd7` grows to stage 4 Lua files
+  alongside the SMF/SMT.
+- `barme-pipeline` test count: 31 → 47 (+16 new across AST + 3
+  sidecars + new emitter coverage).
+- ADR-013 status-updated to scope its supersession (emitter half
+  superseded; packaging half retained).
+- `Project.ally_groups` does not yet exist — `startboxes::render`
+  reads via a `ally_group_boxes` helper that returns `Vec::new()`
+  until B6 lands. C2 + B6 are bundled this sprint for exactly this
+  reason: B6 swaps the data source without changing the emitter
+  shape.
 
 ## Template for new entries
 

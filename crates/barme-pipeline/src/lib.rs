@@ -1,11 +1,16 @@
 //! Build pipeline — turn a [`barme_core::Project`] + on-disk asset PNG/BMP into
-//! the artefacts Recoil consumes (`.smf` + `.smt` + `mapinfo.lua`, packaged as
-//! a non-solid `.sd7`).
+//! the artefacts Recoil consumes (`.smf` + `.smt` + `mapinfo.lua` + sidecar
+//! `mapconfig/*.lua`, packaged as a non-solid `.sd7`).
 //!
 //! - [`pymapconv`] — subprocess driver around the vendored PyMapConv binary
 //!   (ADR-012). Produces `.smf` + `.smt`.
-//! - [`mapinfo`]   — minimum-viable `mapinfo.lua` emitter (ADR-013).
-//! - [`sd7`]       — non-solid `.sd7` packager around system 7-Zip (ADR-013).
+//! - [`lua_ast`] — typed Lua AST + pretty-printer (ADR-029).
+//! - [`mapinfo`] — `mapinfo.lua` emitter built on the AST (ADR-029,
+//!   supersedes ADR-013).
+//! - [`metal_layout`] — `mapconfig/map_metal_layout.lua` (spots + geos).
+//! - [`startboxes`] — `mapconfig/map_startboxes.lua` (per-ally polygons).
+//! - [`featureplacer`] — `mapconfig/featureplacer/features.lua`.
+//! - [`sd7`] — non-solid `.sd7` packager around system 7-Zip (ADR-013).
 //!
 //! The end-to-end orchestrator is [`build_sd7`].
 
@@ -14,9 +19,13 @@ use std::path::{Path, PathBuf};
 use barme_core::Project;
 use tracing::info;
 
+pub mod featureplacer;
+pub mod lua_ast;
 pub mod mapinfo;
+pub mod metal_layout;
 pub mod pymapconv;
 pub mod sd7;
+pub mod startboxes;
 
 pub use pymapconv::{CompileInputs, CompileOutputs, PyMapConvDriver, PyMapConvError};
 pub use sd7::{Sd7Error, StagedFile};
@@ -37,7 +46,8 @@ pub enum BuildError {
     },
 }
 
-/// Orchestrate a full build: PyMapConv → mapinfo emit → 7-Zip non-solid pack.
+/// Orchestrate a full build: PyMapConv → 4-file Lua emit → 7-Zip
+/// non-solid pack.
 ///
 /// `work_dir` is the scratch root for intermediate compile output and the
 /// archive staging tree. Typically a `tempfile::tempdir()` per build. Must
@@ -70,12 +80,18 @@ pub fn build_sd7(
         out_dir: &compile_out,
     })?;
 
-    let mapinfo_text = mapinfo::render(project);
-    let mapinfo_path = work_dir.join("mapinfo.lua");
-    std::fs::write(&mapinfo_path, &mapinfo_text).map_err(|source| BuildError::Io {
-        path: mapinfo_path.clone(),
-        source,
-    })?;
+    // Lua sidecars — written to scratch paths under work_dir, then
+    // staged into the archive at their canonical layout (mapinfo.lua at
+    // root; the rest under `mapconfig/`).
+    let mapinfo_path = write_lua_file(work_dir, "mapinfo.lua", &mapinfo::render(project))?;
+    let metal_path = write_lua_file(
+        work_dir,
+        "map_metal_layout.lua",
+        &metal_layout::render(project),
+    )?;
+    let startboxes_path =
+        write_lua_file(work_dir, "map_startboxes.lua", &startboxes::render(project))?;
+    let features_path = write_lua_file(work_dir, "features.lua", &featureplacer::render(project))?;
 
     let staging = work_dir.join("staging");
     std::fs::create_dir_all(&staging).map_err(|source| BuildError::Io {
@@ -98,9 +114,30 @@ pub fn build_sd7(
             src: &mapinfo_path,
             archive_rel: "mapinfo.lua",
         },
+        StagedFile {
+            src: &metal_path,
+            archive_rel: "mapconfig/map_metal_layout.lua",
+        },
+        StagedFile {
+            src: &startboxes_path,
+            archive_rel: "mapconfig/map_startboxes.lua",
+        },
+        StagedFile {
+            src: &features_path,
+            archive_rel: "mapconfig/featureplacer/features.lua",
+        },
     ];
 
     info!(?out_sd7, "build_sd7: packaging");
     let sd7_path = sd7::package(out_sd7, &staging, &staged)?;
     Ok(sd7_path)
+}
+
+fn write_lua_file(work_dir: &Path, name: &str, contents: &str) -> Result<PathBuf, BuildError> {
+    let path = work_dir.join(name);
+    std::fs::write(&path, contents).map_err(|source| BuildError::Io {
+        path: path.clone(),
+        source,
+    })?;
+    Ok(path)
 }
