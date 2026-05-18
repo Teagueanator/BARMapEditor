@@ -56,7 +56,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::project::{Project, StartPosition};
+use crate::project::Project;
 
 /// RGB triple in the engine's `[0, 1]` float space. Same shape as
 /// `glam::Vec3` but kept opaque since the schema crosses serde + Lua.
@@ -561,16 +561,19 @@ impl From<&Project> for MapInfo {
         info.smf.smt_file_name_0 = format!("maps/{}.smt", p.name);
         info.smf.min_height = Some(p.min_height);
         info.smf.max_height = Some(p.max_height);
-        // Teams: flat ordered pool, sorted by team_id for deterministic
-        // emission. `start_pos` only — never `ally_team`.
-        let mut sorted: Vec<&StartPosition> = p.start_positions.iter().collect();
-        sorted.sort_by_key(|s| s.team_id);
-        info.teams = sorted
+        // Teams: flat ordered pool, ally-group id order + within-group
+        // order. Emission walks groups sorted by `id` for determinism
+        // (NFR-Det); within each group positions emit in the order the
+        // user placed them. `start_pos` only — never `ally_team`.
+        let mut groups: Vec<&crate::project::AllyGroup> = p.ally_groups.iter().collect();
+        groups.sort_by_key(|g| g.id);
+        info.teams = groups
             .into_iter()
+            .flat_map(|g| g.start_positions.iter())
             .map(|s| TeamBlock {
                 start_pos: TeamStartPos {
-                    x: s.x_elmo as i32,
-                    z: s.z_elmo as i32,
+                    x: s.x_elmo,
+                    z: s.z_elmo,
                 },
             })
             .collect();
@@ -725,35 +728,46 @@ mod tests {
     }
 
     #[test]
-    fn from_project_teams_are_sorted_by_team_id() {
+    fn from_project_teams_are_flattened_in_ally_group_id_order() {
+        use crate::project::{AllyGroup, StartPosition};
         let mut p = Project::new("teams", 4);
-        p.start_positions = vec![
+        // Add groups out of order — emission must sort by `id`.
+        let mut g1 = AllyGroup::new(1);
+        g1.start_positions = vec![
             StartPosition {
-                team_id: 3,
+                x_elmo: 500,
+                z_elmo: 500,
+            },
+            StartPosition {
+                x_elmo: 600,
+                z_elmo: 600,
+            },
+        ];
+        p.ally_groups.push(g1);
+        let mut g0 = AllyGroup::new(0);
+        g0.start_positions = vec![
+            StartPosition {
                 x_elmo: 100,
                 z_elmo: 100,
             },
             StartPosition {
-                team_id: 0,
                 x_elmo: 200,
                 z_elmo: 200,
             },
-            StartPosition {
-                team_id: 1,
-                x_elmo: 300,
-                z_elmo: 300,
-            },
         ];
+        p.ally_groups.push(g0);
         let info: MapInfo = (&p).into();
-        assert_eq!(info.teams.len(), 3);
-        // Sorted by team_id: 0, 1, 3 → teams[0].x == 200, teams[1].x == 300, teams[2].x == 100.
-        assert_eq!(info.teams[0].start_pos.x, 200);
-        assert_eq!(info.teams[1].start_pos.x, 300);
-        assert_eq!(info.teams[2].start_pos.x, 100);
+        assert_eq!(info.teams.len(), 4);
+        // Emission order: group 0's positions first (in insertion
+        // order), then group 1's.
+        assert_eq!(info.teams[0].start_pos.x, 100);
+        assert_eq!(info.teams[1].start_pos.x, 200);
+        assert_eq!(info.teams[2].start_pos.x, 500);
+        assert_eq!(info.teams[3].start_pos.x, 600);
     }
 
     #[test]
-    fn from_project_empty_start_positions_yields_empty_teams() {
+    fn from_project_empty_ally_groups_yields_empty_teams() {
         let p = Project::new("empty", 4);
         let info: MapInfo = (&p).into();
         assert!(info.teams.is_empty());
@@ -879,7 +893,7 @@ mod tests {
             min_height: 0.0,
             max_height: 256.0,
             heightmap: None,
-            start_positions: vec![],
+            ally_groups: vec![],
             mapinfo_overrides: HashMap::new(),
         };
         let info: MapInfo = (&p).into();

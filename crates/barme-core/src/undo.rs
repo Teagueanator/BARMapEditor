@@ -44,7 +44,7 @@ use crate::MapSize;
 use crate::brushes::DirtyRect;
 use crate::heightmap::Heightmap;
 use crate::procgen::Domain;
-use crate::project::StartPosition;
+use crate::project::{AllyGroup, StartPosition};
 use crate::symmetry::SymmetryAxis;
 
 /// One committed undo entry. Either a heightmap stroke (the ADR-033
@@ -89,18 +89,33 @@ impl HeightmapEntry {
 /// on redo, the mirror. Inversion lives in the app because Wizard
 /// snapshots cross the barme-core / barme-app boundary (project name +
 /// height scale live on `App`, not `Project`).
+///
+/// **ADR-032 (B6):** position identifiers are `(ally_group_id, pos)`
+/// not `team_id`. The flat `team_id` was a property of the
+/// pre-Phase-3 model. Now a position is uniquely identified by the
+/// group it lives in and its coordinates (coords are unique within a
+/// group by construction — the F8 logic refuses duplicate placements).
 #[derive(Debug, Clone, PartialEq)]
 pub enum ProjectDiff {
-    /// A start position was added at `pos`. Undo removes it; redo re-adds.
-    PlaceStartPosition(StartPosition),
-    /// A start position was deleted. Undo re-adds it; redo removes again.
-    DeleteStartPosition(StartPosition),
-    /// A start position with `team_id` was moved from `from` to `to`
-    /// (elmos). Undo restores `from`; redo restores `to`.
+    /// A start position was added to `ally_group_id` at `pos`. Undo
+    /// removes it; redo re-adds.
+    PlaceStartPosition {
+        ally_group_id: u8,
+        pos: StartPosition,
+    },
+    /// A start position was deleted from `ally_group_id`. Undo
+    /// re-adds; redo removes.
+    DeleteStartPosition {
+        ally_group_id: u8,
+        pos: StartPosition,
+    },
+    /// A start position in `ally_group_id` was moved from `from` to
+    /// `to`. Undo restores `from`; redo restores `to`. The drag
+    /// finalizer collapses an entire drag gesture into one entry.
     MoveStartPosition {
-        team_id: u8,
-        from: (u32, u32),
-        to: (u32, u32),
+        ally_group_id: u8,
+        from: StartPosition,
+        to: StartPosition,
     },
     /// The F1 wizard replaced project-level state wholesale. The boxed
     /// snapshot holds the *pre-wizard* state; on undo the app swaps it
@@ -113,8 +128,9 @@ impl ProjectDiff {
     pub fn bytes(&self) -> usize {
         let inline = std::mem::size_of::<Self>();
         match self {
-            ProjectDiff::PlaceStartPosition(_) | ProjectDiff::DeleteStartPosition(_) => inline,
-            ProjectDiff::MoveStartPosition { .. } => inline,
+            ProjectDiff::PlaceStartPosition { .. }
+            | ProjectDiff::DeleteStartPosition { .. }
+            | ProjectDiff::MoveStartPosition { .. } => inline,
             ProjectDiff::ApplyWizard(snap) => inline + snap.bytes(),
         }
     }
@@ -132,7 +148,11 @@ pub struct WizardSnapshot {
     pub height_scale: f32,
     pub symmetry: SymmetryAxis,
     pub rotational_fold: u8,
-    pub start_positions: Vec<StartPosition>,
+    /// **ADR-032:** the wizard snapshot carries the full ally-group
+    /// tree (the pre-Phase-3 flat vec is gone). Undo restores the
+    /// entire tree wholesale, including colours, names, and box
+    /// polygons.
+    pub ally_groups: Vec<AllyGroup>,
     pub procgen_expr: String,
     pub procgen_domain: Domain,
 }
@@ -140,11 +160,22 @@ pub struct WizardSnapshot {
 impl WizardSnapshot {
     /// Bytes the heap-owned fields occupy. Used by the cap eviction.
     pub fn bytes(&self) -> usize {
-        let positions_bytes =
-            self.start_positions.capacity() * std::mem::size_of::<StartPosition>();
+        let positions_bytes: usize = self
+            .ally_groups
+            .iter()
+            .map(|g| {
+                g.start_positions.capacity() * std::mem::size_of::<StartPosition>()
+                    + g.name.capacity()
+                    + g.box_polygon
+                        .as_ref()
+                        .map(|p| p.capacity() * std::mem::size_of::<(f32, f32)>())
+                        .unwrap_or(0)
+            })
+            .sum();
         let name_bytes = self.project_name.capacity();
         let expr_bytes = self.procgen_expr.capacity();
-        positions_bytes + name_bytes + expr_bytes
+        let groups_bytes = self.ally_groups.capacity() * std::mem::size_of::<AllyGroup>();
+        positions_bytes + name_bytes + expr_bytes + groups_bytes
     }
 }
 
@@ -526,14 +557,10 @@ mod tests {
     }
 
     /// Walk the unified undo stack to completion, applying each entry
-    /// against `hm` and the supplied position list. Used by the
+    /// against `hm` and the supplied group's positions. Used by the
     /// "stroke + 50 placements -> 51 walkback" test to mirror the
     /// app-side dispatcher without pulling main.rs into barme-core.
-    fn drain_undo_to_state(
-        history: &mut History,
-        hm: &mut Heightmap,
-        positions: &mut Vec<StartPosition>,
-    ) {
+    fn drain_undo_to_state(history: &mut History, hm: &mut Heightmap, group: &mut AllyGroup) {
         while let Some(entry) = history.pop_undo() {
             match entry {
                 HistoryEntry::Heightmap(mut e) => {
@@ -541,7 +568,7 @@ mod tests {
                     history.push_to_redo(HistoryEntry::Heightmap(e));
                 }
                 HistoryEntry::Project(diff) => {
-                    let inverse = apply_project_diff_for_test(diff, positions);
+                    let inverse = apply_project_diff_for_test(diff, group);
                     history.push_to_redo(HistoryEntry::Project(inverse));
                 }
             }
@@ -549,26 +576,32 @@ mod tests {
     }
 
     /// Test-only project-diff dispatcher mirroring the app-side one.
-    fn apply_project_diff_for_test(
-        diff: ProjectDiff,
-        positions: &mut Vec<StartPosition>,
-    ) -> ProjectDiff {
+    /// Operates on a single ally group's `start_positions`; the app
+    /// dispatches by `ally_group_id` and forwards to the matching
+    /// group in `Project.ally_groups`.
+    fn apply_project_diff_for_test(diff: ProjectDiff, group: &mut AllyGroup) -> ProjectDiff {
         match diff {
-            ProjectDiff::PlaceStartPosition(p) => {
-                positions.retain(|q| q.team_id != p.team_id);
-                ProjectDiff::DeleteStartPosition(p)
+            ProjectDiff::PlaceStartPosition { ally_group_id, pos } => {
+                assert_eq!(ally_group_id, group.id);
+                group.start_positions.retain(|q| *q != pos);
+                ProjectDiff::DeleteStartPosition { ally_group_id, pos }
             }
-            ProjectDiff::DeleteStartPosition(p) => {
-                positions.push(p);
-                ProjectDiff::PlaceStartPosition(p)
+            ProjectDiff::DeleteStartPosition { ally_group_id, pos } => {
+                assert_eq!(ally_group_id, group.id);
+                group.start_positions.push(pos);
+                ProjectDiff::PlaceStartPosition { ally_group_id, pos }
             }
-            ProjectDiff::MoveStartPosition { team_id, from, to } => {
-                if let Some(p) = positions.iter_mut().find(|p| p.team_id == team_id) {
-                    p.x_elmo = from.0;
-                    p.z_elmo = from.1;
+            ProjectDiff::MoveStartPosition {
+                ally_group_id,
+                from,
+                to,
+            } => {
+                assert_eq!(ally_group_id, group.id);
+                if let Some(p) = group.start_positions.iter_mut().find(|p| **p == to) {
+                    *p = from;
                 }
                 ProjectDiff::MoveStartPosition {
-                    team_id,
+                    ally_group_id,
                     from: to,
                     to: from,
                 }
@@ -771,16 +804,21 @@ mod tests {
     fn new_project_diff_clears_redo() {
         let mut h = History::default();
         let pos = StartPosition {
-            team_id: 0,
             x_elmo: 100,
             z_elmo: 100,
         };
-        h.push_project_diff(ProjectDiff::PlaceStartPosition(pos));
+        h.push_project_diff(ProjectDiff::PlaceStartPosition {
+            ally_group_id: 0,
+            pos,
+        });
         let popped = h.pop_undo().unwrap();
         h.push_to_redo(popped);
         assert!(h.can_redo());
 
-        h.push_project_diff(ProjectDiff::PlaceStartPosition(pos));
+        h.push_project_diff(ProjectDiff::PlaceStartPosition {
+            ally_group_id: 0,
+            pos,
+        });
         assert!(!h.can_redo(), "new project-diff push must clear redo stack");
     }
 
@@ -806,11 +844,13 @@ mod tests {
         }
         h.push_to_redo(e);
 
-        h.push_project_diff(ProjectDiff::PlaceStartPosition(StartPosition {
-            team_id: 4,
-            x_elmo: 50,
-            z_elmo: 50,
-        }));
+        h.push_project_diff(ProjectDiff::PlaceStartPosition {
+            ally_group_id: 0,
+            pos: StartPosition {
+                x_elmo: 50,
+                z_elmo: 50,
+            },
+        });
 
         // Open a fresh stroke without committing.
         h.snapshot_rect(
@@ -860,11 +900,13 @@ mod tests {
         let mut h = History::new(40); // small cap to force eviction
 
         let pos = StartPosition {
-            team_id: 0,
             x_elmo: 1,
             z_elmo: 1,
         };
-        h.push_project_diff(ProjectDiff::PlaceStartPosition(pos));
+        h.push_project_diff(ProjectDiff::PlaceStartPosition {
+            ally_group_id: 0,
+            pos,
+        });
         let small_bytes = h.bytes();
 
         // Now push a heightmap entry larger than the project diff.
@@ -887,8 +929,12 @@ mod tests {
         assert_eq!(h.undo_depth(), 1);
         let surviving = h.undo.back().unwrap();
         match surviving {
-            HistoryEntry::Project(ProjectDiff::PlaceStartPosition(p2)) => {
-                assert_eq!(p2.team_id, 0);
+            HistoryEntry::Project(ProjectDiff::PlaceStartPosition {
+                ally_group_id,
+                pos: p2,
+            }) => {
+                assert_eq!(*ally_group_id, 0);
+                assert_eq!(p2.x_elmo, 1);
             }
             _ => panic!("largest entry should have been evicted, got {surviving:?}"),
         }
@@ -950,24 +996,26 @@ mod tests {
     #[test]
     fn place_start_position_round_trip() {
         let mut h = History::default();
-        let mut positions: Vec<StartPosition> = vec![];
+        let mut group = AllyGroup::new(0);
         let pos = StartPosition {
-            team_id: 0,
             x_elmo: 100,
             z_elmo: 200,
         };
-        positions.push(pos);
-        h.push_project_diff(ProjectDiff::PlaceStartPosition(pos));
+        group.start_positions.push(pos);
+        h.push_project_diff(ProjectDiff::PlaceStartPosition {
+            ally_group_id: 0,
+            pos,
+        });
 
         // Undo: remove pos.
         let entry = h.pop_undo().unwrap();
         let HistoryEntry::Project(diff) = entry else {
             panic!("expected Project entry");
         };
-        let inverse = apply_project_diff_for_test(diff, &mut positions);
+        let inverse = apply_project_diff_for_test(diff, &mut group);
         h.push_to_redo(HistoryEntry::Project(inverse));
         assert!(
-            positions.is_empty(),
+            group.start_positions.is_empty(),
             "undo should remove the placed position"
         );
 
@@ -976,27 +1024,32 @@ mod tests {
         let HistoryEntry::Project(diff) = entry else {
             panic!("expected Project entry");
         };
-        let inverse = apply_project_diff_for_test(diff, &mut positions);
+        let inverse = apply_project_diff_for_test(diff, &mut group);
         h.push_to_undo(HistoryEntry::Project(inverse));
-        assert_eq!(positions.len(), 1);
-        assert_eq!(positions[0], pos);
+        assert_eq!(group.start_positions.len(), 1);
+        assert_eq!(group.start_positions[0], pos);
     }
 
     #[test]
     fn move_start_position_round_trip() {
         let mut h = History::default();
-        let mut positions = vec![StartPosition {
-            team_id: 0,
+        let from = StartPosition {
             x_elmo: 500,
             z_elmo: 600,
-        }];
-        // App pretends the marker moved from (500,600) to (1500,1600).
-        positions[0].x_elmo = 1500;
-        positions[0].z_elmo = 1600;
+        };
+        let to = StartPosition {
+            x_elmo: 1500,
+            z_elmo: 1600,
+        };
+        let mut group = AllyGroup {
+            start_positions: vec![to],
+            ..AllyGroup::new(0)
+        };
+        // App pretends the marker moved from `from` to `to`.
         h.push_project_diff(ProjectDiff::MoveStartPosition {
-            team_id: 0,
-            from: (500, 600),
-            to: (1500, 1600),
+            ally_group_id: 0,
+            from,
+            to,
         });
 
         // Undo.
@@ -1004,9 +1057,8 @@ mod tests {
         let HistoryEntry::Project(diff) = entry else {
             unreachable!()
         };
-        let inverse = apply_project_diff_for_test(diff, &mut positions);
-        assert_eq!(positions[0].x_elmo, 500);
-        assert_eq!(positions[0].z_elmo, 600);
+        let inverse = apply_project_diff_for_test(diff, &mut group);
+        assert_eq!(group.start_positions[0], from);
         h.push_to_redo(HistoryEntry::Project(inverse));
 
         // Redo.
@@ -1014,30 +1066,31 @@ mod tests {
         let HistoryEntry::Project(diff) = entry else {
             unreachable!()
         };
-        apply_project_diff_for_test(diff, &mut positions);
-        assert_eq!(positions[0].x_elmo, 1500);
-        assert_eq!(positions[0].z_elmo, 1600);
+        apply_project_diff_for_test(diff, &mut group);
+        assert_eq!(group.start_positions[0], to);
     }
 
     #[test]
     fn delete_start_position_round_trip() {
         let mut h = History::default();
         let pos = StartPosition {
-            team_id: 3,
             x_elmo: 99,
             z_elmo: 99,
         };
-        let mut positions: Vec<StartPosition> = vec![];
+        let mut group = AllyGroup::new(0);
         // App removed pos already; record the diff.
-        h.push_project_diff(ProjectDiff::DeleteStartPosition(pos));
+        h.push_project_diff(ProjectDiff::DeleteStartPosition {
+            ally_group_id: 0,
+            pos,
+        });
 
         // Undo: pos returns.
         let entry = h.pop_undo().unwrap();
         let HistoryEntry::Project(diff) = entry else {
             unreachable!()
         };
-        let inverse = apply_project_diff_for_test(diff, &mut positions);
-        assert_eq!(positions.len(), 1);
+        let inverse = apply_project_diff_for_test(diff, &mut group);
+        assert_eq!(group.start_positions.len(), 1);
         h.push_to_redo(HistoryEntry::Project(inverse));
 
         // Redo: pos goes away again.
@@ -1045,8 +1098,8 @@ mod tests {
         let HistoryEntry::Project(diff) = entry else {
             unreachable!()
         };
-        apply_project_diff_for_test(diff, &mut positions);
-        assert!(positions.is_empty());
+        apply_project_diff_for_test(diff, &mut group);
+        assert!(group.start_positions.is_empty());
     }
 
     /// Phase-3-plan smoke: one long stroke + 50 placements + Ctrl-Z×51
@@ -1055,7 +1108,7 @@ mod tests {
     fn stroke_then_50_placements_walks_back_in_51_steps() {
         let mut hm = mk_hm();
         let orig = hm.data().to_vec();
-        let mut positions: Vec<StartPosition> = vec![];
+        let mut group = AllyGroup::new(0);
         let mut h = History::default();
 
         // 1. Long stroke — 80 overlapping stamps along a diagonal.
@@ -1076,23 +1129,28 @@ mod tests {
         assert_eq!(h.undo_depth(), 1);
 
         // 2. 50 start-position placements.
-        for i in 0..50u8 {
+        for i in 0..50i32 {
             let pos = StartPosition {
-                team_id: i,
-                x_elmo: (i as u32) * 10,
-                z_elmo: (i as u32) * 10,
+                x_elmo: i * 10,
+                z_elmo: i * 10,
             };
-            positions.push(pos);
-            h.push_project_diff(ProjectDiff::PlaceStartPosition(pos));
+            group.start_positions.push(pos);
+            h.push_project_diff(ProjectDiff::PlaceStartPosition {
+                ally_group_id: 0,
+                pos,
+            });
         }
         assert_eq!(h.undo_depth(), 51);
-        assert_eq!(positions.len(), 50);
+        assert_eq!(group.start_positions.len(), 50);
 
         // 3. Walk all 51 back. After each pop the heightmap or position
         //    list mutates. After 51 pops we expect pre-stroke state.
-        drain_undo_to_state(&mut h, &mut hm, &mut positions);
+        drain_undo_to_state(&mut h, &mut hm, &mut group);
 
-        assert!(positions.is_empty(), "all 50 positions should be cleared");
+        assert!(
+            group.start_positions.is_empty(),
+            "all 50 positions should be cleared"
+        );
         assert_eq!(hm.data(), &orig[..], "heightmap should be pre-stroke");
         assert!(!h.can_undo(), "stack should be empty");
         assert_eq!(h.bytes(), 0);
@@ -1102,17 +1160,18 @@ mod tests {
     #[test]
     fn apply_wizard_snapshot_round_trip() {
         let mut h = History::default();
+        let mut g = AllyGroup::new(0);
+        g.start_positions.push(StartPosition {
+            x_elmo: 1,
+            z_elmo: 1,
+        });
         let snap = WizardSnapshot {
             project_name: "pre-wizard".to_string(),
             map_size: MapSize::square(8),
             height_scale: 256.0,
             symmetry: SymmetryAxis::None,
             rotational_fold: 2,
-            start_positions: vec![StartPosition {
-                team_id: 7,
-                x_elmo: 1,
-                z_elmo: 1,
-            }],
+            ally_groups: vec![g],
             procgen_expr: "x".to_string(),
             procgen_domain: Domain::Unit,
         };
@@ -1134,12 +1193,14 @@ mod tests {
         // heightmap entry, not the small diffs.
         let mut hm = mk_hm();
         let mut h = History::new(10_000);
-        for i in 0..100u8 {
-            h.push_project_diff(ProjectDiff::PlaceStartPosition(StartPosition {
-                team_id: i,
-                x_elmo: i as u32,
-                z_elmo: i as u32,
-            }));
+        for i in 0..100i32 {
+            h.push_project_diff(ProjectDiff::PlaceStartPosition {
+                ally_group_id: 0,
+                pos: StartPosition {
+                    x_elmo: i,
+                    z_elmo: i,
+                },
+            });
         }
         let depth_before = h.undo_depth();
         // ~50×50 stamp = 50*50*2 = 5000 bytes. Push another 5000-byte

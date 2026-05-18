@@ -7,12 +7,12 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use barme_core::{
-    BIOMES, BrushRegistry, BrushStamp, DirtyRect, Heightmap, History, HistoryEntry, MapSize,
-    PROJECT_EXTENSION, Project, ProjectDiff, StartPosition, SymmetryAxis, WizardSnapshot,
+    ALLY_GROUP_PALETTE, AllyGroup, BIOMES, BrushRegistry, BrushStamp, DirtyRect, Heightmap,
+    History, HistoryEntry, MapSize, PROJECT_EXTENSION, Project, ProjectDiff, StartPosition,
+    SymmetryAxis, WizardSnapshot,
     brushes::pixel_bbox,
     procgen::{Domain, PRESETS, generate as procgen_generate, validate_expression},
     project::sanitize_name,
-    start_pos::assign_team_ids,
 };
 use barme_pipeline::PyMapConvDriver;
 use eframe::egui;
@@ -109,18 +109,46 @@ struct App {
     /// Last-seen value of `tool` — used by `set_tool` to emit a single
     /// `tracing::info!` line per actual change, not on every frame.
     previous_tool: Tool,
-    /// Authored team start positions; round-trips through `Project`.
-    /// Empty by default — the pipeline falls back to a 25/75 default pair.
-    start_positions: Vec<StartPosition>,
-    /// While LMB is held in `StartPositions` mode on an existing marker,
-    /// holds that team's id so the drag re-positions it. Cleared on
-    /// release.
-    dragging_start_pos: Option<u8>,
-    /// Pre-drag elmo coordinates for the marker currently being dragged.
-    /// `Some` whenever `dragging_start_pos` is `Some`; on drag-stop the
+    /// Per-side configuration tree (ADR-032 / B6). Round-trips through
+    /// `Project`. Empty by default — the pipeline emits a 25 % / 75 %
+    /// diagonal default pair when ally_groups is empty. The F8 tool
+    /// adds a default `AllyGroup` on first placement when this is
+    /// empty.
+    ally_groups: Vec<AllyGroup>,
+    /// Identifier of the ally group currently receiving F8 placements.
+    /// Tracks the user's selection in the Inspector tree. Adjusted on
+    /// preset apply / Add AllyGroup / group delete to point at a
+    /// surviving group.
+    active_ally_group_id: u8,
+    /// While LMB is held in `StartPositions` on an existing marker,
+    /// holds `(ally_group_id, source_index_within_group)` so the drag
+    /// re-positions that exact source. Cleared on release.
+    dragging_start_pos: Option<(u8, usize)>,
+    /// Pre-drag coordinates of the source being dragged. `Some`
+    /// whenever `dragging_start_pos` is `Some`; on drag-stop the
     /// `from` is paired with the now-current `to` and pushed as a
-    /// `ProjectDiff::MoveStartPosition` undo entry (B5).
-    dragging_start_pos_from: Option<(u32, u32)>,
+    /// `ProjectDiff::MoveStartPosition` undo entry (B5 / ADR-032).
+    dragging_start_pos_from: Option<StartPosition>,
+    /// F8 drag-paint count: when the user LMB-drags across empty
+    /// terrain, this many positions are distributed evenly along the
+    /// drag vector. Default 8 — the canonical 8v8 case. Lives in an
+    /// Inspector `DragValue`. ADR-032.
+    drag_paint_count: u8,
+    /// Frame of in-flight drag origin world coords. `Some` from
+    /// `drag_started_by(LMB)` until `drag_stopped_by(LMB)`. Used to
+    /// disambiguate drag-paint (origin on empty terrain) from
+    /// drag-move (origin on a marker — recorded in
+    /// `dragging_start_pos`).
+    drag_paint_origin: Option<glam::Vec2>,
+    /// Hover↔pulse plumbing (ADR-032). `Some((ally_group_id, source
+    /// index, hover-instant))` when an Inspector row is hovered;
+    /// the marker pulses (thick ring at 2 Hz) for 1 s after the
+    /// timestamp.
+    pulsing_marker: Option<(u8, usize, std::time::Instant)>,
+    /// `Some((ally_group_id, source_index))` when the canvas marker is
+    /// hovered. Drives the Inspector to scroll the matching row into
+    /// view. Cleared every frame; set during marker hit-test.
+    hovered_canvas_marker: Option<(u8, usize)>,
     /// F1 new-project wizard (ADR-024). Open on app launch (replaces the
     /// pre-F1 in-memory "untitled" auto-start) and via File → New project.
     wizard_open: bool,
@@ -380,9 +408,14 @@ impl App {
             history: History::default(),
             tool: Tool::Sculpt,
             previous_tool: Tool::Sculpt,
-            start_positions: Vec::new(),
+            ally_groups: Vec::new(),
+            active_ally_group_id: 0,
             dragging_start_pos: None,
             dragging_start_pos_from: None,
+            drag_paint_count: 8,
+            drag_paint_origin: None,
+            pulsing_marker: None,
+            hovered_canvas_marker: None,
             // Open on first launch — the F1 wizard *is* the entry point now.
             wizard_open: true,
             wizard: WizardState::default_for_new_project(),
@@ -459,10 +492,14 @@ impl App {
         self.camera = OrbitCamera::framing(8192.0, 8192.0);
         self.last_error = None;
         self.last_install = None;
-        self.start_positions.clear();
+        self.ally_groups.clear();
+        self.active_ally_group_id = 0;
         self.mapinfo_overrides.clear();
         self.dragging_start_pos = None;
         self.dragging_start_pos_from = None;
+        self.drag_paint_origin = None;
+        self.pulsing_marker = None;
+        self.hovered_canvas_marker = None;
         self.end_stroke();
         self.history.barrier();
     }
@@ -474,9 +511,24 @@ impl App {
             min_height: 0.0,
             max_height: self.height_scale,
             heightmap: self.heightmap.as_ref().map(|h| h.path.clone()),
-            start_positions: self.start_positions.clone(),
+            ally_groups: self.ally_groups.clone(),
             mapinfo_overrides: self.mapinfo_overrides.clone(),
         }
+    }
+
+    /// Build-time snapshot: like [`Self::snapshot_project`] but with
+    /// every source position replicated through the active symmetry
+    /// axis into the same ally group. The pipeline emitter walks the
+    /// resulting `teams[]` flat — without this expansion, a Quad-
+    /// symmetric placement would only ship 1 `teams[*].startPos`
+    /// instead of 4, and BAR would only render one spawn per side.
+    ///
+    /// Idempotent — exact-coord duplicates are dropped, so calling
+    /// twice is safe.
+    fn snapshot_project_for_build(&self) -> Project {
+        let mut p = self.snapshot_project();
+        expand_symmetry_into_ally_groups(&mut p, self.symmetry);
+        p
     }
 
     fn save_to(&mut self, path: PathBuf) {
@@ -800,15 +852,36 @@ impl App {
         }
     }
 
-    /// Place a new start position at `(world_x, world_z)` and, when
-    /// symmetry is active, place its mirror counterparts at the derived
-    /// centers. Team ids are assigned via [`assign_team_ids`] alternating
-    /// even / odd from the lowest unused even id so mirror pairs map onto
-    /// BAR's per-side `teams[]` convention. ADR-023.
+    /// Ensure an ally group with `active_ally_group_id` exists,
+    /// creating it on first F8 placement when the project is empty.
+    /// Returns the active group's vec index for further mutation.
+    fn ensure_active_ally_group(&mut self) -> usize {
+        if let Some(idx) = self
+            .ally_groups
+            .iter()
+            .position(|g| g.id == self.active_ally_group_id)
+        {
+            return idx;
+        }
+        // No matching group — create one. New id = active_ally_group_id;
+        // sequence to keep colours stable when the user adds more.
+        let g = AllyGroup::new(self.active_ally_group_id);
+        self.ally_groups.push(g);
+        info!(
+            ally_group_id = self.active_ally_group_id,
+            "F8: auto-created AllyGroup for first placement"
+        );
+        self.ally_groups.len() - 1
+    }
+
+    /// Place a new start position at `(world_x, world_z)` in the active
+    /// ally group. When symmetry is active, mirror counterparts go into
+    /// the SAME ally group (per ADR-032's "mirror into same group"
+    /// rule). Each placement is its own undo entry — Ctrl-Z peels them
+    /// off one at a time in reverse-placement order.
     fn place_start_position(&mut self, world_x: f32, world_z: f32) {
         let extents = self.world_extents();
         let (ex, ez) = extents;
-        // Clip the originating click; bail if outside the map.
         if world_x < 0.0 || world_x > ex || world_z < 0.0 || world_z > ez {
             trace!(
                 world_x,
@@ -819,73 +892,110 @@ impl App {
             return;
         }
         let centers = self.symmetry.replicate((world_x, world_z), extents);
-        let used: Vec<u8> = self.start_positions.iter().map(|p| p.team_id).collect();
-        let ids = assign_team_ids(&used, centers.len());
-        for ((cx, cz), id) in centers.into_iter().zip(ids) {
+        let group_idx = self.ensure_active_ally_group();
+        let ally_group_id = self.ally_groups[group_idx].id;
+        for (cx, cz) in centers {
+            // Clamp to map; mirrors that land off-map are dropped.
+            if cx < 0.0 || cx > ex || cz < 0.0 || cz > ez {
+                continue;
+            }
             let pos = StartPosition {
-                team_id: id,
-                x_elmo: cx.round().clamp(0.0, ex) as u32,
-                z_elmo: cz.round().clamp(0.0, ez) as u32,
+                x_elmo: cx.round().clamp(0.0, ex) as i32,
+                z_elmo: cz.round().clamp(0.0, ez) as i32,
             };
+            // Skip exact-coord duplicates within the group (a
+            // symmetry-replicated stamp may land on top of an existing
+            // source when the center is on the symmetry axis itself).
+            if self.ally_groups[group_idx].start_positions.contains(&pos) {
+                continue;
+            }
             info!(
-                team_id = pos.team_id,
+                ally_group_id,
                 x_elmo = pos.x_elmo,
                 z_elmo = pos.z_elmo,
                 symmetry = self.symmetry.id(),
                 "start position placed"
             );
-            self.start_positions.push(pos);
-            // B5: each placed position is its own undo entry. Symmetry-
-            // replicated mirrors push individually so Ctrl-Z peels them
-            // off one at a time in reverse-placement order.
+            self.ally_groups[group_idx].start_positions.push(pos);
             self.history
-                .push_project_diff(ProjectDiff::PlaceStartPosition(pos));
+                .push_project_diff(ProjectDiff::PlaceStartPosition { ally_group_id, pos });
         }
     }
 
-    /// Move the position with `team_id` to the given world coordinates,
-    /// clamped to the map. No-op if the id isn't present. Drag-emitted
-    /// frame-by-frame, so this does NOT push an undo entry — that lands
-    /// on `drag_stopped` via [`Self::finish_start_position_drag`].
-    fn move_start_position(&mut self, team_id: u8, world_x: f32, world_z: f32) {
+    /// Place `count` evenly-spaced positions along the line segment
+    /// from `(x0, z0)` to `(x1, z1)`. Used by F8 drag-paint (default
+    /// 8 for the canonical 8v8 case). Each step goes through
+    /// [`Self::place_start_position`] so symmetry replication +
+    /// dedup + undo entries all apply uniformly.
+    fn drag_paint_start_positions(&mut self, x0: f32, z0: f32, x1: f32, z1: f32) {
+        if self.drag_paint_count == 0 {
+            return;
+        }
+        let n = self.drag_paint_count as usize;
+        if n == 1 {
+            self.place_start_position((x0 + x1) * 0.5, (z0 + z1) * 0.5);
+            return;
+        }
+        for i in 0..n {
+            let t = i as f32 / (n - 1) as f32;
+            let x = x0 + (x1 - x0) * t;
+            let z = z0 + (z1 - z0) * t;
+            self.place_start_position(x, z);
+        }
+    }
+
+    /// Move the source position identified by `(ally_group_id,
+    /// source_index)` to the given world coordinates, clamped to the
+    /// map. No-op if the source isn't present. Drag-emitted
+    /// frame-by-frame, so this does NOT push an undo entry — that
+    /// lands on `drag_stopped` via
+    /// [`Self::finish_start_position_drag`].
+    fn move_start_position(
+        &mut self,
+        ally_group_id: u8,
+        source_index: usize,
+        world_x: f32,
+        world_z: f32,
+    ) {
         let (ex, ez) = self.world_extents();
-        if let Some(p) = self
-            .start_positions
-            .iter_mut()
-            .find(|p| p.team_id == team_id)
+        if let Some(g) = self.ally_groups.iter_mut().find(|g| g.id == ally_group_id)
+            && let Some(p) = g.start_positions.get_mut(source_index)
         {
-            p.x_elmo = world_x.clamp(0.0, ex).round() as u32;
-            p.z_elmo = world_z.clamp(0.0, ez).round() as u32;
+            p.x_elmo = world_x.clamp(0.0, ex).round() as i32;
+            p.z_elmo = world_z.clamp(0.0, ez).round() as i32;
         }
     }
 
     /// Commit an in-flight start-position drag. Pushes a single
     /// `MoveStartPosition` undo entry covering the whole drag (start
     /// coords → end coords) when both are known and changed. Idempotent;
-    /// always clears `dragging_start_pos*`. B5.
+    /// always clears `dragging_start_pos*`. B5 / ADR-032.
     fn finish_start_position_drag(&mut self) {
-        let (Some(team_id), Some(from)) = (
+        let (Some((ally_group_id, source_index)), Some(from)) = (
             self.dragging_start_pos.take(),
             self.dragging_start_pos_from.take(),
         ) else {
-            // No drag was in flight, or the drag started off-marker.
             self.dragging_start_pos = None;
             self.dragging_start_pos_from = None;
             return;
         };
-        let Some(p) = self.start_positions.iter().find(|p| p.team_id == team_id) else {
+        let Some(g) = self.ally_groups.iter().find(|g| g.id == ally_group_id) else {
+            return;
+        };
+        let Some(to) = g.start_positions.get(source_index).copied() else {
             // Marker was deleted during the drag (RMB clicks fire
             // concurrently). Nothing to commit.
             return;
         };
-        let to = (p.x_elmo, p.z_elmo);
         if from == to {
-            // Zero-distance drag (click + immediate release). Don't
-            // pollute the undo stack with a no-op move.
             return;
         }
         self.history
-            .push_project_diff(ProjectDiff::MoveStartPosition { team_id, from, to });
+            .push_project_diff(ProjectDiff::MoveStartPosition {
+                ally_group_id,
+                from,
+                to,
+            });
     }
 
     /// Predicate: is any edit drag currently in flight? Brush strokes
@@ -899,44 +1009,84 @@ impl App {
     /// Remove the position with `team_id`. No-op if absent. B5: pushes a
     /// `DeleteStartPosition` undo entry holding the full pre-delete
     /// position so undo can re-add it verbatim.
-    fn delete_start_position(&mut self, team_id: u8) {
-        let removed = self
-            .start_positions
-            .iter()
-            .find(|p| p.team_id == team_id)
-            .copied();
-        let Some(pos) = removed else {
+    fn delete_start_position(&mut self, ally_group_id: u8, source_index: usize) {
+        let Some(g) = self.ally_groups.iter_mut().find(|g| g.id == ally_group_id) else {
             return;
         };
-        self.start_positions.retain(|p| p.team_id != team_id);
-        info!(team_id, "start position deleted");
+        if source_index >= g.start_positions.len() {
+            return;
+        }
+        let pos = g.start_positions.remove(source_index);
+        info!(ally_group_id, source_index, "start position deleted");
         self.history
-            .push_project_diff(ProjectDiff::DeleteStartPosition(pos));
+            .push_project_diff(ProjectDiff::DeleteStartPosition { ally_group_id, pos });
     }
 
-    /// Find the start position whose on-screen marker is within `radius_px`
-    /// of `cursor`. Returns its team_id. Used for drag and right-click hit
-    /// testing in the central preview rect.
+    /// Find the SOURCE start position whose on-screen marker is within
+    /// `radius_px` of `cursor`. Returns `(ally_group_id, source_index)`.
+    /// Symmetry-derived display markers are NOT hit-tested (they're
+    /// non-interactive; the user is told to edit the source instead).
     fn hit_test_start_position(
         &self,
         cursor: egui::Pos2,
         rect: egui::Rect,
         radius_px: f32,
-    ) -> Option<u8> {
+    ) -> Option<(u8, usize)> {
         let rect_size = glam::Vec2::new(rect.width(), rect.height());
         let cursor_in_rect = glam::Vec2::new(cursor.x - rect.min.x, cursor.y - rect.min.y);
-        let mut best: Option<(u8, f32)> = None;
-        for pos in &self.start_positions {
-            let world = glam::Vec3::new(pos.x_elmo as f32, 0.0, pos.z_elmo as f32);
-            let Some(screen) = render::world_to_screen(world, rect_size, &self.camera) else {
-                continue;
-            };
-            let d = (screen - cursor_in_rect).length();
-            if d <= radius_px && best.map(|(_, bd)| d < bd).unwrap_or(true) {
-                best = Some((pos.team_id, d));
+        let mut best: Option<((u8, usize), f32)> = None;
+        for g in &self.ally_groups {
+            for (i, pos) in g.start_positions.iter().enumerate() {
+                let world = glam::Vec3::new(pos.x_elmo as f32, 0.0, pos.z_elmo as f32);
+                let Some(screen) = render::world_to_screen(world, rect_size, &self.camera) else {
+                    continue;
+                };
+                let d = (screen - cursor_in_rect).length();
+                if d <= radius_px && best.map(|(_, bd)| d < bd).unwrap_or(true) {
+                    best = Some(((g.id, i), d));
+                }
             }
         }
-        best.map(|(id, _)| id)
+        best.map(|(handle, _)| handle)
+    }
+
+    /// Allocate the lowest unused ally-group id and add a fresh group
+    /// (default palette colour, default name). Returns its id. Sets
+    /// the new group as active.
+    fn add_ally_group(&mut self) -> u8 {
+        let used: std::collections::HashSet<u8> = self.ally_groups.iter().map(|g| g.id).collect();
+        let id = (0u16..=255)
+            .find(|i| !used.contains(&(*i as u8)))
+            .unwrap_or(255) as u8;
+        let g = AllyGroup::new(id);
+        info!(ally_group_id = id, "F8: added ally group");
+        self.ally_groups.push(g);
+        self.active_ally_group_id = id;
+        id
+    }
+
+    /// Remove the ally group with `id` and all its positions. Sets the
+    /// active group to the lowest surviving id, or 0 if none.
+    fn delete_ally_group(&mut self, id: u8) {
+        self.ally_groups.retain(|g| g.id != id);
+        self.active_ally_group_id = self.ally_groups.iter().map(|g| g.id).min().unwrap_or(0);
+        // Any in-flight drag against the deleted group is now stale.
+        if matches!(self.dragging_start_pos, Some((gid, _)) if gid == id) {
+            self.dragging_start_pos = None;
+            self.dragging_start_pos_from = None;
+        }
+        info!(ally_group_id = id, "F8: deleted ally group");
+    }
+
+    /// Replace the entire `ally_groups` tree with a preset layout.
+    /// Used by the Inspector's preset dropdown.
+    fn apply_ally_preset(&mut self, preset: AllyPreset) {
+        let (ex, ez) = self.world_extents();
+        self.ally_groups = preset.materialise(ex, ez);
+        self.active_ally_group_id = self.ally_groups.iter().map(|g| g.id).min().unwrap_or(0);
+        self.dragging_start_pos = None;
+        self.dragging_start_pos_from = None;
+        info!(preset = ?preset, "F8: applied ally preset");
     }
 
     /// Inverse of `undo_one`. Same drag-gating rules.
@@ -995,36 +1145,64 @@ impl App {
     /// respectively). B5.
     fn apply_project_diff(&mut self, diff: ProjectDiff) -> ProjectDiff {
         match diff {
-            ProjectDiff::PlaceStartPosition(p) => {
-                // Undo: remove p. Redo direction: re-add.
-                self.start_positions.retain(|q| q.team_id != p.team_id);
-                trace!(team_id = p.team_id, "undo: removed placed start position");
-                ProjectDiff::DeleteStartPosition(p)
-            }
-            ProjectDiff::DeleteStartPosition(p) => {
-                self.start_positions.push(p);
-                trace!(team_id = p.team_id, "undo: restored deleted start position");
-                ProjectDiff::PlaceStartPosition(p)
-            }
-            ProjectDiff::MoveStartPosition { team_id, from, to } => {
-                if let Some(p) = self
-                    .start_positions
-                    .iter_mut()
-                    .find(|p| p.team_id == team_id)
-                {
-                    p.x_elmo = from.0;
-                    p.z_elmo = from.1;
+            ProjectDiff::PlaceStartPosition { ally_group_id, pos } => {
+                // Undo: remove the position with matching coords from
+                // its ally group. Redo direction: re-add.
+                if let Some(g) = self.ally_groups.iter_mut().find(|g| g.id == ally_group_id) {
+                    g.start_positions.retain(|q| *q != pos);
                 }
-                trace!(team_id, ?from, ?to, "undo: reverted start position move");
+                trace!(
+                    ally_group_id,
+                    x = pos.x_elmo,
+                    z = pos.z_elmo,
+                    "undo: removed placed start position"
+                );
+                ProjectDiff::DeleteStartPosition { ally_group_id, pos }
+            }
+            ProjectDiff::DeleteStartPosition { ally_group_id, pos } => {
+                // Undo a delete: re-add to the group. Create the group
+                // if it's missing (e.g. group was deleted between
+                // delete and undo — unusual but defensive).
+                let group_idx = match self.ally_groups.iter().position(|g| g.id == ally_group_id) {
+                    Some(i) => i,
+                    None => {
+                        let g = AllyGroup::new(ally_group_id);
+                        self.ally_groups.push(g);
+                        self.ally_groups.len() - 1
+                    }
+                };
+                self.ally_groups[group_idx].start_positions.push(pos);
+                trace!(
+                    ally_group_id,
+                    x = pos.x_elmo,
+                    z = pos.z_elmo,
+                    "undo: restored deleted start position"
+                );
+                ProjectDiff::PlaceStartPosition { ally_group_id, pos }
+            }
+            ProjectDiff::MoveStartPosition {
+                ally_group_id,
+                from,
+                to,
+            } => {
+                if let Some(g) = self.ally_groups.iter_mut().find(|g| g.id == ally_group_id)
+                    && let Some(p) = g.start_positions.iter_mut().find(|p| **p == to)
+                {
+                    *p = from;
+                }
+                trace!(
+                    ally_group_id,
+                    ?from,
+                    ?to,
+                    "undo: reverted start position move"
+                );
                 ProjectDiff::MoveStartPosition {
-                    team_id,
+                    ally_group_id,
                     from: to,
                     to: from,
                 }
             }
             ProjectDiff::ApplyWizard(snap) => {
-                // Capture the *current* (post-wizard) state into the
-                // inverse so redo restores it. Then swap in `*snap`.
                 let current = Box::new(self.capture_wizard_snapshot());
                 self.restore_wizard_snapshot(*snap);
                 info!("undo: reverted F1 wizard apply");
@@ -1044,7 +1222,7 @@ impl App {
             height_scale: self.height_scale,
             symmetry: self.symmetry,
             rotational_fold: self.rotational_fold,
-            start_positions: self.start_positions.clone(),
+            ally_groups: self.ally_groups.clone(),
             procgen_expr: self.procgen_expr.clone(),
             procgen_domain: self.procgen_domain,
         }
@@ -1052,14 +1230,15 @@ impl App {
 
     /// Restore a `WizardSnapshot` over the current app state. Mirror of
     /// [`Self::capture_wizard_snapshot`]; the camera is reframed from
-    /// the restored map size. B5.
+    /// the restored map size. B5 / ADR-032.
     fn restore_wizard_snapshot(&mut self, snap: WizardSnapshot) {
         self.project_name = snap.project_name;
         self.map_size = snap.map_size;
         self.height_scale = snap.height_scale;
         self.symmetry = snap.symmetry;
         self.rotational_fold = snap.rotational_fold;
-        self.start_positions = snap.start_positions;
+        self.ally_groups = snap.ally_groups;
+        self.active_ally_group_id = self.ally_groups.iter().map(|g| g.id).min().unwrap_or(0);
         self.procgen_expr = snap.procgen_expr;
         self.procgen_domain = snap.procgen_domain;
         self.revalidate_procgen();
@@ -1114,7 +1293,7 @@ impl App {
                 return;
             }
         };
-        let project = self.snapshot_project();
+        let project = self.snapshot_project_for_build();
         info!(
             name = %project.name,
             smu_x = self.map_size.smu_x,
@@ -1168,7 +1347,10 @@ impl App {
                 let (ex, ez) = self.map_size.elmo_extents();
                 self.camera = OrbitCamera::framing(ex as f32, ez as f32);
 
-                self.start_positions = p.start_positions;
+                self.ally_groups = p.ally_groups;
+                // Active group: first by id, or 0 if none.
+                self.active_ally_group_id =
+                    self.ally_groups.iter().map(|g| g.id).min().unwrap_or(0);
                 self.mapinfo_overrides = p.mapinfo_overrides;
 
                 if let Some(hm_path) = hm_resolved {
@@ -1326,18 +1508,163 @@ impl App {
 /// odd get cool (side B), matching the BAR per-side convention the F8 editor
 /// auto-assigns to. Beyond 8 ids the palette wraps; the wrap is visible and
 /// intentional — colour is a hint, the team-id label is the source of truth.
-fn team_color(team_id: u8) -> egui::Color32 {
-    const PALETTE: [egui::Color32; 8] = [
-        egui::Color32::from_rgb(0xE5, 0x3E, 0x3E), // 0 — red    (side A)
-        egui::Color32::from_rgb(0x3E, 0x7C, 0xE5), // 1 — blue   (side B)
-        egui::Color32::from_rgb(0xE5, 0xA8, 0x3E), // 2 — orange (side A)
-        egui::Color32::from_rgb(0x3E, 0xC2, 0xE5), // 3 — cyan   (side B)
-        egui::Color32::from_rgb(0xE5, 0x3E, 0xB1), // 4 — pink   (side A)
-        egui::Color32::from_rgb(0x76, 0x3E, 0xE5), // 5 — violet (side B)
-        egui::Color32::from_rgb(0xE5, 0xDE, 0x3E), // 6 — yellow (side A)
-        egui::Color32::from_rgb(0x3E, 0xE5, 0xA7), // 7 — teal   (side B)
+/// Configuration preset for the F8 ally-group tree (ADR-032).
+/// Materialising one replaces `Project.ally_groups` wholesale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AllyPreset {
+    /// 2 ally groups, 1 position each on the 25 % / 75 % diagonal.
+    OneVOne,
+    /// 2 ally groups, 8 positions each laid out north / south strips
+    /// at the BAR-standard 12 % / 88 % offsets.
+    EightVEight,
+    /// 3 ally groups arranged in a triangle (N, SW, SE) — Comet
+    /// Catcher style FFA.
+    ThreeWayFfa,
+    /// 4 ally groups at the four corners.
+    FourWayFfa,
+}
+
+impl AllyPreset {
+    const ALL: [AllyPreset; 4] = [
+        AllyPreset::OneVOne,
+        AllyPreset::EightVEight,
+        AllyPreset::ThreeWayFfa,
+        AllyPreset::FourWayFfa,
     ];
-    PALETTE[(team_id as usize) % PALETTE.len()]
+
+    fn label(self) -> &'static str {
+        match self {
+            AllyPreset::OneVOne => "1v1",
+            AllyPreset::EightVEight => "8v8",
+            AllyPreset::ThreeWayFfa => "3-way FFA",
+            AllyPreset::FourWayFfa => "4-way FFA",
+        }
+    }
+
+    /// Build the ally-group tree for this preset given the map's
+    /// world-space extents. Default colours come from
+    /// [`ALLY_GROUP_PALETTE`]; box polygons mirror the BAR community
+    /// convention (north / south / corner strips).
+    fn materialise(self, ex: f32, ez: f32) -> Vec<AllyGroup> {
+        fn group(id: u8, positions: &[(f32, f32)], polygon: Option<Vec<(f32, f32)>>) -> AllyGroup {
+            AllyGroup {
+                id,
+                name: format!("AllyGroup {id}"),
+                color: ALLY_GROUP_PALETTE[(id as usize) % ALLY_GROUP_PALETTE.len()],
+                start_positions: positions
+                    .iter()
+                    .map(|&(x, z)| StartPosition {
+                        x_elmo: x.round() as i32,
+                        z_elmo: z.round() as i32,
+                    })
+                    .collect(),
+                box_polygon: polygon,
+            }
+        }
+        match self {
+            AllyPreset::OneVOne => {
+                let g0 = group(
+                    0,
+                    &[(ex * 0.25, ez * 0.25)],
+                    Some(vec![(0.0, 0.0), (1.0, 0.5)]),
+                );
+                let g1 = group(
+                    1,
+                    &[(ex * 0.75, ez * 0.75)],
+                    Some(vec![(0.0, 0.5), (1.0, 1.0)]),
+                );
+                vec![g0, g1]
+            }
+            AllyPreset::EightVEight => {
+                // North + south strips, 8 evenly-spaced positions per
+                // side. Y-coords pin to ~6 %/94 % of map extent.
+                let n_z = ez * 0.06;
+                let s_z = ez * 0.94;
+                let mut north_xs = Vec::with_capacity(8);
+                let mut south_xs = Vec::with_capacity(8);
+                for i in 0..8 {
+                    let t = (i as f32 + 0.5) / 8.0;
+                    north_xs.push((ex * t, n_z));
+                    south_xs.push((ex * t, s_z));
+                }
+                let g0 = group(0, &north_xs, Some(vec![(0.0, 0.0), (1.0, 0.12)]));
+                let g1 = group(1, &south_xs, Some(vec![(0.0, 0.88), (1.0, 1.0)]));
+                vec![g0, g1]
+            }
+            AllyPreset::ThreeWayFfa => {
+                let g0 = group(
+                    0,
+                    &[(ex * 0.5, ez * 0.1)],
+                    Some(vec![(0.0, 0.0), (1.0, 0.25)]),
+                );
+                let g1 = group(
+                    1,
+                    &[(ex * 0.1, ez * 0.85)],
+                    Some(vec![(0.0, 0.65), (0.5, 1.0)]),
+                );
+                let g2 = group(
+                    2,
+                    &[(ex * 0.9, ez * 0.85)],
+                    Some(vec![(0.5, 0.65), (1.0, 1.0)]),
+                );
+                vec![g0, g1, g2]
+            }
+            AllyPreset::FourWayFfa => {
+                let g0 = group(
+                    0,
+                    &[(ex * 0.15, ez * 0.15)],
+                    Some(vec![(0.0, 0.0), (0.3, 0.3)]),
+                );
+                let g1 = group(
+                    1,
+                    &[(ex * 0.85, ez * 0.15)],
+                    Some(vec![(0.7, 0.0), (1.0, 0.3)]),
+                );
+                let g2 = group(
+                    2,
+                    &[(ex * 0.15, ez * 0.85)],
+                    Some(vec![(0.0, 0.7), (0.3, 1.0)]),
+                );
+                let g3 = group(
+                    3,
+                    &[(ex * 0.85, ez * 0.85)],
+                    Some(vec![(0.7, 0.7), (1.0, 1.0)]),
+                );
+                vec![g0, g1, g2, g3]
+            }
+        }
+    }
+}
+
+/// Replicate every source position in `project.ally_groups` through
+/// `symmetry` into the same ally group. Used by the build path so the
+/// emitted `mapinfo.lua` `teams[]` carries every concrete spawn the
+/// editor showed on the canvas. Idempotent: exact-coord duplicates
+/// within a group are dropped.
+fn expand_symmetry_into_ally_groups(project: &mut Project, symmetry: SymmetryAxis) {
+    if matches!(symmetry, SymmetryAxis::None) {
+        return;
+    }
+    let (ex, ez) = project.size.elmo_extents();
+    let extents = (ex as f32, ez as f32);
+    for g in &mut project.ally_groups {
+        let sources: Vec<StartPosition> = g.start_positions.clone();
+        for src in &sources {
+            let mirrors = symmetry.replicate((src.x_elmo as f32, src.z_elmo as f32), extents);
+            for (mx, mz) in mirrors.into_iter().skip(1) {
+                if mx < 0.0 || mx > extents.0 || mz < 0.0 || mz > extents.1 {
+                    continue;
+                }
+                let p = StartPosition {
+                    x_elmo: mx.round() as i32,
+                    z_elmo: mz.round() as i32,
+                };
+                if !g.start_positions.contains(&p) {
+                    g.start_positions.push(p);
+                }
+            }
+        }
+    }
 }
 
 fn pick_save_path(suggested_name: &str) -> Option<PathBuf> {
@@ -1831,44 +2158,177 @@ impl App {
         );
     }
 
+    /// F8 Inspector tree (ADR-032 / B6). One collapsing header per
+    /// ally group with colour swatch, name, count, delete. Child rows
+    /// show source positions; clicking a row marks it for the
+    /// hover-pulse on the canvas. Symmetry-derived positions render
+    /// greyed with a `(mirror of …)` label.
     fn inspector_start_positions(&mut self, ui: &mut egui::Ui) {
         ui.heading("Start positions");
         ui.label(
-            egui::RichText::new("LMB to place, drag to move, RMB to delete.")
-                .small()
-                .weak(),
+            egui::RichText::new(
+                "LMB to place, LMB-drag to paint N along a line, drag to move, RMB to delete.",
+            )
+            .small()
+            .weak(),
         );
-        ui.label(format!("Placed: {}", self.start_positions.len()));
-        let mut to_delete: Option<u8> = None;
-        egui::ScrollArea::vertical()
-            .max_height(220.0)
-            .id_salt("startpos_scroll")
-            .show(ui, |ui| {
-                let mut sorted: Vec<StartPosition> = self.start_positions.clone();
-                sorted.sort_by_key(|p| p.team_id);
-                for p in sorted {
-                    ui.horizontal(|ui| {
-                        let color = team_color(p.team_id);
-                        let (resp, painter) =
-                            ui.allocate_painter(egui::Vec2::new(14.0, 14.0), egui::Sense::hover());
-                        painter.circle_filled(resp.rect.center(), 6.0, color);
-                        ui.label(format!("team {}: ({}, {})", p.team_id, p.x_elmo, p.z_elmo));
-                        if ui.small_button("×").clicked() {
-                            to_delete = Some(p.team_id);
+
+        // ─── Preset dropdown ───
+        let (ex, ez) = self.world_extents();
+        ui.horizontal(|ui| {
+            ui.label("Preset:");
+            let mut selected: Option<AllyPreset> = None;
+            egui::ComboBox::from_id_salt("ally_preset")
+                .selected_text("(apply a layout)")
+                .show_ui(ui, |ui| {
+                    for preset in AllyPreset::ALL {
+                        if ui.selectable_label(false, preset.label()).clicked() {
+                            selected = Some(preset);
                         }
-                    });
+                    }
+                });
+            if let Some(p) = selected {
+                self.apply_ally_preset(p);
+            }
+            let _ = (ex, ez);
+        });
+
+        // ─── Drag-paint N spinner ───
+        ui.horizontal(|ui| {
+            ui.label("Drag-paint N:");
+            ui.add(egui::DragValue::new(&mut self.drag_paint_count).range(1u8..=32));
+        });
+
+        ui.separator();
+
+        // ─── AllyGroup tree ───
+        let mut to_delete_pos: Option<(u8, usize)> = None;
+        let mut to_delete_group: Option<u8> = None;
+        let mut new_active: Option<u8> = None;
+        let mut new_pulse: Option<(u8, usize)> = None;
+        let active = self.active_ally_group_id;
+        // Materialise a stable ordering so the tree doesn't shuffle
+        // when ids are non-contiguous.
+        let mut group_indices: Vec<usize> = (0..self.ally_groups.len()).collect();
+        group_indices.sort_by_key(|&i| self.ally_groups[i].id);
+
+        egui::ScrollArea::vertical()
+            .max_height(420.0)
+            .id_salt("ally_groups_scroll")
+            .show(ui, |ui| {
+                for idx in group_indices {
+                    let g_id = self.ally_groups[idx].id;
+                    let is_active = g_id == active;
+                    let header_label = {
+                        let g = &self.ally_groups[idx];
+                        format!("{} — {} pos", g.name, g.start_positions.len())
+                    };
+                    let header_id = egui::Id::new(("ally_group_header", g_id));
+                    egui::CollapsingHeader::new(header_label)
+                        .id_salt(header_id)
+                        .default_open(true)
+                        .show(ui, |ui| {
+                            // Row: swatch + name + active marker + delete.
+                            ui.horizontal(|ui| {
+                                // Persistent egui::Id for the colour
+                                // popover so it survives tool switches +
+                                // tree rebuilds (PITFALL #6).
+                                let g = &mut self.ally_groups[idx];
+                                let mut c =
+                                    egui::Color32::from_rgb(g.color[0], g.color[1], g.color[2]);
+                                if ui
+                                    .color_edit_button_srgba(&mut c)
+                                    .on_hover_text("AllyGroup colour")
+                                    .changed()
+                                {
+                                    g.color = [c.r(), c.g(), c.b()];
+                                }
+                                ui.text_edit_singleline(&mut g.name);
+                                if ui
+                                    .selectable_label(is_active, "★")
+                                    .on_hover_text("Make active (receives new placements)")
+                                    .clicked()
+                                {
+                                    new_active = Some(g_id);
+                                }
+                                if ui
+                                    .small_button("delete group")
+                                    .on_hover_text("Remove this ally group and all its positions")
+                                    .clicked()
+                                {
+                                    to_delete_group = Some(g_id);
+                                }
+                            });
+
+                            // Source position rows.
+                            let positions: Vec<(usize, StartPosition)> = self.ally_groups[idx]
+                                .start_positions
+                                .iter()
+                                .enumerate()
+                                .map(|(i, p)| (i, *p))
+                                .collect();
+                            for (i, pos) in &positions {
+                                let row = ui.horizontal(|ui| {
+                                    ui.label(format!("#{}: ({}, {})", i, pos.x_elmo, pos.z_elmo));
+                                    if ui.small_button("×").clicked() {
+                                        to_delete_pos = Some((g_id, *i));
+                                    }
+                                });
+                                if row.response.hovered() {
+                                    new_pulse = Some((g_id, *i));
+                                }
+                                // Hover-from-canvas: scroll the row
+                                // into view if it matches.
+                                if self.hovered_canvas_marker == Some((g_id, *i)) {
+                                    row.response.scroll_to_me(Some(egui::Align::Center));
+                                }
+                            }
+
+                            // Greyed derived (mirror) rows.
+                            if !matches!(self.symmetry, SymmetryAxis::None) {
+                                let extents = (ex, ez);
+                                for (src_i, pos) in &positions {
+                                    let mirrors = self
+                                        .symmetry
+                                        .replicate((pos.x_elmo as f32, pos.z_elmo as f32), extents);
+                                    // replicate yields the source as
+                                    // its first element; skip it.
+                                    for (mx, mz) in mirrors.into_iter().skip(1) {
+                                        if mx < 0.0 || mx > ex || mz < 0.0 || mz > ez {
+                                            continue;
+                                        }
+                                        ui.add_enabled(
+                                            false,
+                                            egui::Label::new(format!(
+                                                "  ↳ ({}, {})  (mirror of #{src_i})",
+                                                mx.round() as i32,
+                                                mz.round() as i32,
+                                            )),
+                                        )
+                                        .on_disabled_hover_text(format!(
+                                            "Edit source #{src_i} to move this mirror."
+                                        ));
+                                    }
+                                }
+                            }
+                        });
+                }
+                if ui.button("+ Add AllyGroup").clicked() {
+                    self.add_ally_group();
                 }
             });
-        if let Some(id) = to_delete {
-            self.delete_start_position(id);
+
+        if let Some(id) = new_active {
+            self.active_ally_group_id = id;
         }
-        if !self.start_positions.is_empty() && ui.button("Clear all").clicked() {
-            info!(
-                cleared = self.start_positions.len(),
-                "all start positions cleared"
-            );
-            self.start_positions.clear();
-            self.dragging_start_pos = None;
+        if let Some(handle) = new_pulse {
+            self.pulsing_marker = Some((handle.0, handle.1, std::time::Instant::now()));
+        }
+        if let Some((g_id, i)) = to_delete_pos {
+            self.delete_start_position(g_id, i);
+        }
+        if let Some(id) = to_delete_group {
+            self.delete_ally_group(id);
         }
     }
 
@@ -2086,7 +2546,8 @@ impl App {
                 self.end_stroke();
             }
 
-            // Start-position placement / move / delete (ADR-023).
+            // Start-position placement / move / delete / drag-paint
+            // (ADR-032 supersedes ADR-023 in mode-specific behaviour).
             if start_pos_active
                 && !self.nav_gizmo_drag_active
                 && !consumed_click
@@ -2098,32 +2559,57 @@ impl App {
                 const HIT_RADIUS_PX: f32 = 12.0;
 
                 if response.clicked_by(egui::PointerButton::Secondary)
-                    && let Some(id) = self.hit_test_start_position(cursor, rect, HIT_RADIUS_PX)
+                    && let Some((gid, idx)) =
+                        self.hit_test_start_position(cursor, rect, HIT_RADIUS_PX)
                 {
-                    self.delete_start_position(id);
+                    self.delete_start_position(gid, idx);
                 }
                 if response.drag_started_by(egui::PointerButton::Primary) {
+                    // Drag-move if the press started on a marker;
+                    // drag-paint otherwise (capture origin world coord
+                    // for the line endpoint on drag_stopped).
                     self.dragging_start_pos =
                         self.hit_test_start_position(cursor, rect, HIT_RADIUS_PX);
-                    // B5: capture the pre-drag coords so drag-stop can
-                    // push a MoveStartPosition undo entry with a real
-                    // `from`. None if the drag didn't begin on a marker.
-                    self.dragging_start_pos_from = self.dragging_start_pos.and_then(|id| {
-                        self.start_positions
-                            .iter()
-                            .find(|p| p.team_id == id)
-                            .map(|p| (p.x_elmo, p.z_elmo))
-                    });
+                    self.dragging_start_pos_from =
+                        self.dragging_start_pos.and_then(|(gid, idx)| {
+                            self.ally_groups
+                                .iter()
+                                .find(|g| g.id == gid)
+                                .and_then(|g| g.start_positions.get(idx).copied())
+                        });
+                    self.drag_paint_origin = if self.dragging_start_pos.is_none() {
+                        render::screen_to_world_y0(cursor_in, rect_size, &self.camera)
+                            .map(|w| glam::Vec2::new(w.x, w.z))
+                    } else {
+                        None
+                    };
                 }
                 if response.dragged_by(egui::PointerButton::Primary)
-                    && let Some(id) = self.dragging_start_pos
+                    && let Some((gid, idx)) = self.dragging_start_pos
                     && let Some(world) =
                         render::screen_to_world_y0(cursor_in, rect_size, &self.camera)
                 {
-                    self.move_start_position(id, world.x, world.z);
+                    self.move_start_position(gid, idx, world.x, world.z);
                 }
                 if response.drag_stopped_by(egui::PointerButton::Primary) {
+                    // Finish drag-move if a marker was being dragged…
+                    let was_moving = self.dragging_start_pos.is_some();
                     self.finish_start_position_drag();
+                    // …else commit a drag-paint line from origin →
+                    // cursor (if both ends resolved to map coords).
+                    if !was_moving
+                        && let Some(origin) = self.drag_paint_origin.take()
+                        && let Some(end) =
+                            render::screen_to_world_y0(cursor_in, rect_size, &self.camera)
+                    {
+                        let len_sq = (origin.x - end.x).powi(2) + (origin.y - end.z).powi(2);
+                        // Threshold matches the egui click-vs-drag
+                        // disambiguator. If the line is tiny, treat as
+                        // a click (handled below).
+                        if len_sq.sqrt() > 32.0 {
+                            self.drag_paint_start_positions(origin.x, origin.y, end.x, end.z);
+                        }
+                    }
                 }
                 if response.clicked_by(egui::PointerButton::Primary)
                     && self
@@ -2134,6 +2620,11 @@ impl App {
                 {
                     self.place_start_position(world.x, world.z);
                 }
+                // Canvas marker hover → drives Inspector scroll-to-row.
+                self.hovered_canvas_marker =
+                    self.hit_test_start_position(cursor, rect, HIT_RADIUS_PX);
+            } else {
+                self.hovered_canvas_marker = None;
             }
 
             if self.heightmap.is_some() {
@@ -2211,32 +2702,92 @@ impl App {
                 }
             }
 
-            // Overlay start-position markers on top of the terrain pass.
-            // Always rendered when any are placed (regardless of tool)
-            // so the user can see them while sculpting. B6 will add a
-            // cross-tool alpha falloff (50 % outside StartPositions
-            // mode).
-            if !self.start_positions.is_empty() {
+            // Overlay start-position markers on top of the terrain
+            // pass. ADR-032: cross-tool ghost falloff (50 % alpha) when
+            // the StartPositions tool isn't active. Sources render as
+            // filled circles in their AllyGroup colour; symmetry-
+            // derived mirrors render as outlined rings with a thinner
+            // stroke. Hovered-from-Inspector source pulses at 2 Hz for
+            // 1 s after the hover event.
+            if !self.ally_groups.is_empty() {
                 let rect_size = glam::Vec2::new(rect.width(), rect.height());
                 let painter = ui.painter_at(rect);
-                for pos in &self.start_positions {
-                    let world = glam::Vec3::new(pos.x_elmo as f32, 0.0, pos.z_elmo as f32);
-                    let Some(screen) = render::world_to_screen(world, rect_size, &self.camera)
-                    else {
-                        continue;
-                    };
-                    let p = egui::Pos2::new(rect.min.x + screen.x, rect.min.y + screen.y);
-                    let highlighted = self.dragging_start_pos == Some(pos.team_id);
-                    let r = if highlighted { 10.0 } else { 8.0 };
-                    painter.circle_filled(p, r, team_color(pos.team_id));
-                    painter.circle_stroke(p, r, egui::Stroke::new(2.0, egui::Color32::WHITE));
-                    painter.text(
-                        p + egui::Vec2::new(0.0, -r - 2.0),
-                        egui::Align2::CENTER_BOTTOM,
-                        format!("{}", pos.team_id),
-                        egui::FontId::proportional(11.0),
-                        egui::Color32::WHITE,
+                let cross_tool_ghost = !matches!(self.tool, Tool::StartPositions);
+                let alpha_mul = if cross_tool_ghost { 128 } else { 255 };
+                let now = std::time::Instant::now();
+                let extents = self.world_extents();
+                for g in &self.ally_groups {
+                    let base_color = egui::Color32::from_rgba_unmultiplied(
+                        g.color[0], g.color[1], g.color[2], alpha_mul,
                     );
+                    for (i, pos) in g.start_positions.iter().enumerate() {
+                        let world = glam::Vec3::new(pos.x_elmo as f32, 0.0, pos.z_elmo as f32);
+                        let Some(screen) = render::world_to_screen(world, rect_size, &self.camera)
+                        else {
+                            continue;
+                        };
+                        let p = egui::Pos2::new(rect.min.x + screen.x, rect.min.y + screen.y);
+                        let dragging = self.dragging_start_pos == Some((g.id, i));
+                        let mut r = if dragging { 10.0 } else { 8.0 };
+
+                        // Hover-pulse: thick ring at 2 Hz for 1 s after
+                        // the Inspector row hover instant.
+                        if let Some((pg, pi, t0)) = self.pulsing_marker
+                            && pg == g.id
+                            && pi == i
+                        {
+                            let dt = now.duration_since(t0).as_secs_f32();
+                            if dt < 1.0 {
+                                // 2 Hz triangle wave on radius.
+                                let osc = (dt * 2.0 * std::f32::consts::TAU).sin().abs();
+                                r += 3.0 * osc;
+                                ctx.request_repaint();
+                            } else {
+                                // Time's up — clear so we don't repaint
+                                // forever.
+                                self.pulsing_marker = None;
+                            }
+                        }
+
+                        painter.circle_filled(p, r, base_color);
+                        painter.circle_stroke(
+                            p,
+                            r,
+                            egui::Stroke::new(
+                                2.0,
+                                egui::Color32::from_rgba_unmultiplied(255, 255, 255, alpha_mul),
+                            ),
+                        );
+                        painter.text(
+                            p + egui::Vec2::new(0.0, -r - 2.0),
+                            egui::Align2::CENTER_BOTTOM,
+                            format!("{}", i),
+                            egui::FontId::proportional(11.0),
+                            egui::Color32::from_rgba_unmultiplied(255, 255, 255, alpha_mul),
+                        );
+
+                        // Render symmetry-derived mirrors of this
+                        // source as outline-only rings. Idempotent:
+                        // when the source is on a symmetry axis its
+                        // first mirror equals itself (we skip).
+                        if !matches!(self.symmetry, SymmetryAxis::None) {
+                            let mirrors = self
+                                .symmetry
+                                .replicate((pos.x_elmo as f32, pos.z_elmo as f32), extents);
+                            for (mx, mz) in mirrors.into_iter().skip(1) {
+                                if mx < 0.0 || mx > extents.0 || mz < 0.0 || mz > extents.1 {
+                                    continue;
+                                }
+                                let mw = glam::Vec3::new(mx, 0.0, mz);
+                                let Some(ms) = render::world_to_screen(mw, rect_size, &self.camera)
+                                else {
+                                    continue;
+                                };
+                                let mp = egui::Pos2::new(rect.min.x + ms.x, rect.min.y + ms.y);
+                                painter.circle_stroke(mp, 7.0, egui::Stroke::new(1.5, base_color));
+                            }
+                        }
+                    }
                 }
             }
 
@@ -2380,9 +2931,14 @@ mod tests {
             history: History::default(),
             tool: Tool::Sculpt,
             previous_tool: Tool::Sculpt,
-            start_positions: Vec::new(),
+            ally_groups: Vec::new(),
+            active_ally_group_id: 0,
             dragging_start_pos: None,
             dragging_start_pos_from: None,
+            drag_paint_count: 8,
+            drag_paint_origin: None,
+            pulsing_marker: None,
+            hovered_canvas_marker: None,
             wizard_open: false,
             wizard: WizardState::default_for_new_project(),
             symmetry_popover_open: false,
@@ -2503,7 +3059,7 @@ mod tests {
     fn set_tool_clears_in_flight_start_position_drag() {
         let mut app = make_test_app();
         app.tool = Tool::StartPositions;
-        app.dragging_start_pos = Some(3);
+        app.dragging_start_pos = Some((0, 3));
         app.set_tool(Tool::Sculpt);
         assert_eq!(
             app.dragging_start_pos, None,
@@ -2546,20 +3102,104 @@ mod tests {
         assert_eq!(h.dims, MapSize::square(2).heightmap_dims());
     }
 
-    /// Phase-2 smoke #2 (F8 / ADR-023): start-position placement still
-    /// inserts into the `Vec<StartPosition>` with rounded elmo coords.
-    /// The B1 tool-strip switch must not break the underlying state
-    /// machine.
+    /// Phase-2 smoke #2 (F8 / ADR-023 → ADR-032): start-position
+    /// placement still inserts into the active ally group's
+    /// `start_positions` with rounded elmo coords. The B6 tree
+    /// refactor must not break the underlying placement state machine.
     #[test]
     fn b1_does_not_regress_start_position_placement_phase2() {
         let mut app = make_test_app();
+        app.tool = Tool::StartPositions;
         app.place_start_position(100.0, 100.0);
-        assert_eq!(app.start_positions.len(), 1);
-        assert_eq!(app.start_positions[0].x_elmo, 100);
-        assert_eq!(app.start_positions[0].z_elmo, 100);
-        // Out-of-bounds click is ignored (existing ADR-023 invariant).
+        assert_eq!(app.ally_groups.len(), 1);
+        let g0 = &app.ally_groups[0];
+        assert_eq!(g0.id, 0);
+        assert_eq!(g0.start_positions.len(), 1);
+        assert_eq!(g0.start_positions[0].x_elmo, 100);
+        assert_eq!(g0.start_positions[0].z_elmo, 100);
+        // Out-of-bounds click is ignored.
         app.place_start_position(-1.0, 0.0);
-        assert_eq!(app.start_positions.len(), 1, "off-map click ignored");
+        assert_eq!(
+            app.ally_groups[0].start_positions.len(),
+            1,
+            "off-map click ignored"
+        );
+    }
+
+    /// ADR-032 / B6: applying the 8v8 preset materialises 2 ally
+    /// groups with 8 positions each (north / south strips). The
+    /// pre-placement layout is the canonical starter for big-team
+    /// queue maps.
+    #[test]
+    fn b6_eight_v_eight_preset_lays_out_2_groups_of_8() {
+        let mut app = make_test_app();
+        // make_test_app uses MapSize::square(2) → 1024 elmos per side.
+        app.apply_ally_preset(AllyPreset::EightVEight);
+        assert_eq!(app.ally_groups.len(), 2, "8v8 → 2 ally groups");
+        assert_eq!(app.ally_groups[0].start_positions.len(), 8);
+        assert_eq!(app.ally_groups[1].start_positions.len(), 8);
+        // North strip z-coords ≈ 6 % of extent; south strip ≈ 94 %.
+        let ez = 1024.0f32;
+        let n_z = (ez * 0.06).round() as i32;
+        let s_z = (ez * 0.94).round() as i32;
+        assert!(
+            app.ally_groups[0]
+                .start_positions
+                .iter()
+                .all(|p| p.z_elmo == n_z)
+        );
+        assert!(
+            app.ally_groups[1]
+                .start_positions
+                .iter()
+                .all(|p| p.z_elmo == s_z)
+        );
+        // Both groups carry a box polygon — emitter consumes these.
+        assert!(app.ally_groups[0].box_polygon.is_some());
+        assert!(app.ally_groups[1].box_polygon.is_some());
+    }
+
+    /// ADR-032 / B6: drag-paint distributes N evenly-spaced positions
+    /// along the drag vector. Canonical default is 8 (the 8v8 case).
+    #[test]
+    fn b6_drag_paint_distributes_n_positions_along_vector() {
+        let mut app = make_test_app();
+        app.tool = Tool::StartPositions;
+        app.drag_paint_count = 8;
+        // Diagonal across the test-map's 1024-elmo extent.
+        app.drag_paint_start_positions(100.0, 100.0, 900.0, 900.0);
+        assert_eq!(app.ally_groups.len(), 1);
+        let g0 = &app.ally_groups[0];
+        assert_eq!(g0.start_positions.len(), 8);
+        // Endpoints land at the drag start / end (rounded).
+        assert_eq!(g0.start_positions[0].x_elmo, 100);
+        assert_eq!(g0.start_positions[7].x_elmo, 900);
+    }
+
+    /// ADR-032: the build-path snapshot expands every source position
+    /// through the active symmetry into the same ally group, so the
+    /// emitted `mapinfo.lua` ships every mirror as a real
+    /// `teams[*].startPos`. Without this, a Quad-symmetric placement
+    /// would only ship 1 spawn — BAR sees only one team.
+    #[test]
+    fn b6_build_snapshot_expands_symmetry_mirrors() {
+        let mut app = make_test_app();
+        app.tool = Tool::StartPositions;
+        app.symmetry = SymmetryAxis::Horizontal;
+        app.place_start_position(256.0, 256.0);
+        // Place under symmetry: source + 1 mirror landed.
+        assert_eq!(app.ally_groups[0].start_positions.len(), 2);
+        // Storage matches what the editor shows (sources + mirrors as
+        // sources in the same group — see place_start_position).
+        // Toggle symmetry off; the build snapshot must still contain
+        // every spawn that the user saw on screen.
+        app.symmetry = SymmetryAxis::None;
+        let p = app.snapshot_project_for_build();
+        let total_positions: usize = p.ally_groups.iter().map(|g| g.start_positions.len()).sum();
+        assert!(
+            total_positions >= 2,
+            "build snapshot must preserve every concrete spawn; got {total_positions}"
+        );
     }
 
     /// Phase-2 smoke #3 (ADR-022 / ADR-033): undo_one without a loaded
@@ -2762,10 +3402,10 @@ mod tests {
     fn b5_place_then_undo_removes_marker() {
         let mut app = make_test_app();
         app.place_start_position(100.0, 100.0);
-        assert_eq!(app.start_positions.len(), 1);
+        assert_eq!(app.ally_groups[0].start_positions.len(), 1);
         assert_eq!(app.history.undo_depth(), 1);
         app.undo_one();
-        assert!(app.start_positions.is_empty());
+        assert!(app.ally_groups[0].start_positions.is_empty());
         assert_eq!(app.history.undo_depth(), 0);
         assert_eq!(app.history.redo_depth(), 1, "undo pushes onto redo");
     }
@@ -2775,12 +3415,12 @@ mod tests {
     fn b5_place_then_undo_redo_round_trips() {
         let mut app = make_test_app();
         app.place_start_position(50.0, 75.0);
-        let pos_before = app.start_positions[0];
+        let pos_before = app.ally_groups[0].start_positions[0];
         app.undo_one();
-        assert!(app.start_positions.is_empty());
+        assert!(app.ally_groups[0].start_positions.is_empty());
         app.redo_one();
-        assert_eq!(app.start_positions.len(), 1);
-        assert_eq!(app.start_positions[0], pos_before);
+        assert_eq!(app.ally_groups[0].start_positions.len(), 1);
+        assert_eq!(app.ally_groups[0].start_positions[0], pos_before);
     }
 
     /// B5 smoke: delete a marker, Ctrl-Z restores it (RMB path).
@@ -2788,14 +3428,14 @@ mod tests {
     fn b5_delete_then_undo_restores_marker() {
         let mut app = make_test_app();
         app.place_start_position(100.0, 100.0);
-        let id = app.start_positions[0].team_id;
+        let pos = app.ally_groups[0].start_positions[0];
         // Place pushed one diff; clear redo bookkeeping by deleting.
-        app.delete_start_position(id);
-        assert!(app.start_positions.is_empty());
+        app.delete_start_position(0, 0);
+        assert!(app.ally_groups[0].start_positions.is_empty());
         assert_eq!(app.history.undo_depth(), 2, "place + delete pushed");
         app.undo_one(); // undo the delete
-        assert_eq!(app.start_positions.len(), 1);
-        assert_eq!(app.start_positions[0].team_id, id);
+        assert_eq!(app.ally_groups[0].start_positions.len(), 1);
+        assert_eq!(app.ally_groups[0].start_positions[0], pos);
     }
 
     /// B5 smoke: F1 wizard apply followed by Ctrl-Z restores the
@@ -2810,11 +3450,12 @@ mod tests {
         app.map_size = MapSize { smu_x: 4, smu_z: 6 };
         app.height_scale = 123.0;
         app.symmetry = SymmetryAxis::Horizontal;
-        app.start_positions = vec![StartPosition {
-            team_id: 0,
+        let mut pre_group = AllyGroup::new(0);
+        pre_group.start_positions.push(StartPosition {
             x_elmo: 999,
             z_elmo: 999,
-        }];
+        });
+        app.ally_groups = vec![pre_group];
         // Configure wizard for a different post-apply state.
         app.wizard.project_name = "post-wizard".to_string();
         app.wizard.smu_x = 8;
@@ -2828,8 +3469,8 @@ mod tests {
         assert_eq!(app.map_size, MapSize { smu_x: 8, smu_z: 8 });
         assert!(matches!(app.symmetry, SymmetryAxis::Vertical));
         assert!(
-            app.start_positions.is_empty(),
-            "new_project cleared positions"
+            app.ally_groups.is_empty(),
+            "new_project cleared ally_groups"
         );
         assert_eq!(app.history.undo_depth(), 1, "one ApplyWizard entry");
         // Undo.
@@ -2838,8 +3479,8 @@ mod tests {
         assert_eq!(app.map_size, MapSize { smu_x: 4, smu_z: 6 });
         assert_eq!(app.height_scale, 123.0);
         assert!(matches!(app.symmetry, SymmetryAxis::Horizontal));
-        assert_eq!(app.start_positions.len(), 1);
-        assert_eq!(app.start_positions[0].x_elmo, 999);
+        assert_eq!(app.ally_groups.len(), 1);
+        assert_eq!(app.ally_groups[0].start_positions[0].x_elmo, 999);
         assert_eq!(app.history.redo_depth(), 1);
     }
 
@@ -2853,8 +3494,9 @@ mod tests {
         app.place_start_position(100.0, 100.0);
         assert_eq!(app.history.undo_depth(), 1);
         // Simulate a drag-in-progress on the same marker.
-        app.dragging_start_pos = Some(app.start_positions[0].team_id);
-        app.dragging_start_pos_from = Some((100, 100));
+        let pos = app.ally_groups[0].start_positions[0];
+        app.dragging_start_pos = Some((0, 0));
+        app.dragging_start_pos_from = Some(pos);
         app.undo_one();
         // Drag gate held: nothing popped.
         assert_eq!(
@@ -2862,7 +3504,7 @@ mod tests {
             1,
             "undo while dragging must be a no-op"
         );
-        assert_eq!(app.start_positions.len(), 1);
+        assert_eq!(app.ally_groups[0].start_positions.len(), 1);
         // Releasing the drag clears the gate; subsequent undo works.
         app.dragging_start_pos = None;
         app.dragging_start_pos_from = None;
@@ -2876,7 +3518,7 @@ mod tests {
     fn b5_is_dragging_anything_covers_both_channels() {
         let mut app = make_test_app();
         assert!(!app.is_dragging_anything());
-        app.dragging_start_pos = Some(0);
+        app.dragging_start_pos = Some((0, 0));
         assert!(app.is_dragging_anything(), "start-pos drag should gate");
         app.dragging_start_pos = None;
         // Heightmap-stroke gate is harder to fake without a heightmap;
@@ -2895,9 +3537,9 @@ mod tests {
         app.place_start_position(100.0, 100.0);
         let depth_after_place = app.history.undo_depth();
         // Simulate a drag start + drag stop with no movement.
-        let id = app.start_positions[0].team_id;
-        app.dragging_start_pos = Some(id);
-        app.dragging_start_pos_from = Some((100, 100));
+        let pos = app.ally_groups[0].start_positions[0];
+        app.dragging_start_pos = Some((0, 0));
+        app.dragging_start_pos_from = Some(pos);
         app.finish_start_position_drag();
         assert_eq!(
             app.history.undo_depth(),

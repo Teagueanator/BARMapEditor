@@ -444,7 +444,19 @@ fn default_team_pair(project: &Project) -> Vec<TeamBlock> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use barme_core::StartPosition;
+    use barme_core::{AllyGroup, StartPosition};
+
+    /// Build a single-group project with the given positions, mirroring
+    /// the most common F8 layout. Tests use this to express
+    /// "non-empty teams[]" without manually building the ally-group
+    /// tree at every call site.
+    fn project_with_positions(name: &str, smu: u32, positions: Vec<StartPosition>) -> Project {
+        let mut p = Project::new(name, smu);
+        let mut g = AllyGroup::new(0);
+        g.start_positions = positions;
+        p.ally_groups.push(g);
+        p
+    }
 
     #[test]
     fn renders_with_name_and_heights() {
@@ -495,7 +507,7 @@ mod tests {
 
     #[test]
     fn description_with_quotes_and_newlines_escapes() {
-        let mut p = Project::new("escape", 4);
+        let p = Project::new("escape", 4);
         let mut info: MapInfo = (&p).into();
         info.description = Some("has \"quotes\" and\nnewlines".to_string());
         let s = render_mapinfo(&info);
@@ -503,29 +515,28 @@ mod tests {
             s.contains(r#"description = "has \"quotes\" and\nnewlines""#),
             "got:\n{s}"
         );
-        let _ = &mut p; // silence unused
     }
 
     #[test]
     fn authored_start_positions_replace_default_pair() {
-        let mut p = Project::new("teams", 8);
-        p.start_positions = vec![
-            StartPosition {
-                team_id: 0,
-                x_elmo: 500,
-                z_elmo: 600,
-            },
-            StartPosition {
-                team_id: 1,
-                x_elmo: 1500,
-                z_elmo: 1600,
-            },
-            StartPosition {
-                team_id: 2,
-                x_elmo: 2500,
-                z_elmo: 2600,
-            },
-        ];
+        let p = project_with_positions(
+            "teams",
+            8,
+            vec![
+                StartPosition {
+                    x_elmo: 500,
+                    z_elmo: 600,
+                },
+                StartPosition {
+                    x_elmo: 1500,
+                    z_elmo: 1600,
+                },
+                StartPosition {
+                    x_elmo: 2500,
+                    z_elmo: 2600,
+                },
+            ],
+        );
         let s = render(&p);
         // 25/75 default must not appear.
         assert!(!s.contains("x = 1024,\n        z = 1024,"), "got:\n{s}");
@@ -543,41 +554,51 @@ mod tests {
     }
 
     #[test]
-    fn teams_indices_are_dense_and_ordered() {
-        // teams[] is positional in the flat pool — index reflects
-        // emission order, NOT the project's team_id.
+    fn teams_emission_order_walks_ally_groups_by_id_then_position_order() {
+        // Ally-group id determines block ordering; within a group,
+        // positions emit in insertion order. Build groups out of id
+        // order to verify the sort.
         let mut p = Project::new("ordered", 4);
-        p.start_positions = vec![
+        let mut g1 = AllyGroup::new(1);
+        g1.start_positions = vec![
             StartPosition {
-                team_id: 3,
+                x_elmo: 1100,
+                z_elmo: 1100,
+            },
+            StartPosition {
+                x_elmo: 1200,
+                z_elmo: 1200,
+            },
+        ];
+        p.ally_groups.push(g1);
+        let mut g0 = AllyGroup::new(0);
+        g0.start_positions = vec![
+            StartPosition {
                 x_elmo: 100,
                 z_elmo: 100,
             },
             StartPosition {
-                team_id: 0,
                 x_elmo: 200,
                 z_elmo: 200,
             },
-            StartPosition {
-                team_id: 1,
-                x_elmo: 300,
-                z_elmo: 300,
-            },
         ];
+        p.ally_groups.push(g0);
+
         let s = render(&p);
-        // C1's `From<&Project> for MapInfo` sorts by team_id, so the
-        // emission order is the team_id-sorted view: 0, 1, 3 → x =
-        // 200, 300, 100.
+        // teams[0..1] = g0 positions, teams[2..3] = g1 positions.
         let p0 = s.find("[0] = {").unwrap();
         let p1 = s.find("[1] = {").unwrap();
         let p2 = s.find("[2] = {").unwrap();
-        assert!(p0 < p1 && p1 < p2);
-        let block0 = &s[p0..p1];
-        let block1 = &s[p1..p2];
-        let block2 = &s[p2..];
-        assert!(block0.contains("x = 200,"));
-        assert!(block1.contains("x = 300,"));
-        assert!(block2.contains("x = 100,"));
+        let p3 = s.find("[3] = {").unwrap();
+        assert!(p0 < p1 && p1 < p2 && p2 < p3);
+        let b0 = &s[p0..p1];
+        let b1 = &s[p1..p2];
+        let b2 = &s[p2..p3];
+        let b3 = &s[p3..];
+        assert!(b0.contains("x = 100,"));
+        assert!(b1.contains("x = 200,"));
+        assert!(b2.contains("x = 1100,"));
+        assert!(b3.contains("x = 1200,"));
     }
 
     #[test]
@@ -594,21 +615,22 @@ mod tests {
     #[test]
     fn determinism_repeated_render_byte_identical() {
         // NFR-Determinism: render twice, expect byte-identical output.
-        let mut p = Project::new("det", 4);
+        let mut p = project_with_positions(
+            "det",
+            4,
+            vec![
+                StartPosition {
+                    x_elmo: 100,
+                    z_elmo: 100,
+                },
+                StartPosition {
+                    x_elmo: 900,
+                    z_elmo: 900,
+                },
+            ],
+        );
         p.min_height = -10.0;
         p.max_height = 200.0;
-        p.start_positions = vec![
-            StartPosition {
-                team_id: 0,
-                x_elmo: 100,
-                z_elmo: 100,
-            },
-            StartPosition {
-                team_id: 1,
-                x_elmo: 900,
-                z_elmo: 900,
-            },
-        ];
         let a = render(&p);
         let b = render(&p);
         assert_eq!(a, b);

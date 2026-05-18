@@ -1,13 +1,28 @@
-//! Team-id assignment for the F8 start-position editor (ADR-023).
+//! Team-id assignment helpers for the F8 start-position editor.
 //!
-//! BAR's `teams[]` mapinfo table indexes by integer team id; the per-side
-//! convention is even ids on one side and odd ids on the other. When the
-//! user places a position under N-way symmetry, the editor assigns ids
-//! interleaved across parities so mirror counterparts end up on opposite
-//! sides automatically.
+//! ## ADR-023 (legacy)
 //!
-//! The functions here are pure — they work over `&[u8]` of already-used
-//! ids and return new ids. The editor wires them to `App.start_positions`.
+//! BAR's `teams[]` mapinfo table indexes by integer team id; the
+//! per-side convention is even ids on one side and odd ids on the
+//! other. When the user placed a position under N-way symmetry, the
+//! editor assigned ids interleaved across parities so mirror
+//! counterparts ended up on opposite sides automatically.
+//!
+//! ## ADR-032 (B6)
+//!
+//! Position identity is no longer a flat `team_id` — it's
+//! `(ally_group_id, index_within_group)`. The `assign_team_ids`
+//! helper survives because the same parity logic is useful **within a
+//! single ally group**: when the user places N mirror positions in
+//! one group, the within-group parity-alternating layout still maps
+//! cleanly onto BAR's lobby-side `script.txt` slot assignment.
+//! Callers pass the group's existing within-group "logical ids"
+//! (typically just `0..len()` cast to `u8`) as `used`.
+//!
+//! These functions are pure — they work over `&[u8]` of already-used
+//! ids and return new ids. The F8 logic uses them when a single
+//! click expands into N symmetry-replicated positions inside one
+//! group.
 
 /// Lowest team id ≥ 0 with the given parity that is not in `used`.
 /// Returns 254 / 255 if the whole space is exhausted (BAR's practical

@@ -27,7 +27,8 @@ pub use procgen::{
     BIOMES, BiomePreset, Domain, PRESETS, ProcGenError, ProcGenPreset, generate as procgen_generate,
 };
 pub use project::{
-    PROJECT_EXTENSION, Project, ProjectLoadError, ProjectSaveError, StartPosition, sanitize_name,
+    ALLY_GROUP_PALETTE, AllyGroup, PROJECT_EXTENSION, Project, ProjectLoadError, ProjectSaveError,
+    StartPosition, sanitize_name,
 };
 pub use symmetry::SymmetryAxis;
 pub use undo::{HeightmapEntry, History, HistoryEntry, ProjectDiff, WizardSnapshot};

@@ -1187,7 +1187,21 @@ mapping tool offers it.
 
 ## ADR-023 — Project `start_positions` + F8 placement editor
 
-**Status:** Accepted (2026-05-17).
+**Status:** Accepted (2026-05-17). **Superseded 2026-05-18 (B6 /
+ADR-032)** for the data shape: `Project.start_positions:
+Vec<StartPosition>` is replaced by `Project.ally_groups:
+Vec<AllyGroup>` (two-level tree). The single-team-per-symmetry-image
+behaviour described here was never correct for 8v8 / 3-way FFA / 4-way
+FFA maps — ADR-032 introduces presets, drag-paint, and ally-team
+grouping that fix the model. The original `assign_team_ids` parity
+helper survives because the same logic is useful **within** one ally
+group; the legacy `team_id` field on `StartPosition` is dropped (team
+ids are now positional in the flat `teams[]` pool at emission time).
+The pre-Phase-3 wire format with `[[start_positions]]` and `team_id`
+loads forward via the custom `Deserialize` (see
+`project::ProjectWire`). The marker-rendering / hit-testing /
+LMB-place-RMB-delete UX surface remains in force; B6 replaces the
+single-list Inspector with a tree.
 **Context:** Stage 0 closed with `barme-pipeline::mapinfo` emitting two
 hardcoded teams at 25 % / 75 % along the map diagonal. That's enough to
 boot a 1v1 in BAR but it's not a *map editor* feature — real BAR maps
@@ -1967,6 +1981,148 @@ ranked-play / community-review time.
   until B6 lands. C2 + B6 are bundled this sprint for exactly this
   reason: B6 swaps the data source without changing the emitter
   shape.
+
+## ADR-032 — Start-position allyteam redesign (B6)
+
+**Status:** Accepted (2026-05-18). Supersedes ADR-023's flat
+`start_positions` data shape. Sister to ADR-029 (C2 emitter consumes
+the new tree).
+
+**Context:** ADR-023 shipped a flat `Vec<StartPosition>` with a
+single team per symmetry image. That's correct for 1v1 maps but wrong
+for everything BAR actually plays in queue: 8v8 wants 16 positions
+across 2 sides (not 1 per side), 3-way FFA wants 3 distinct sides
+each with their own start box, 4-way FFA wants 4 corners. The Phase-3
+research session (`docs/research/ui/claude-research-findings.md` §4)
+catalogues the failure mode from real BAR community feedback:
+
+> "the start positions defined from mapinfo.lua are a plain list,
+> which is not flexible enough to define multiple layouts of start
+> positions depending on the number of contestants" — BAR FFA gadget
+> README.
+
+The fix isn't a richer flat list — it's a **two-level tree** that
+makes ally-team membership a first-class concept in the editor.
+
+**Decision:** introduce `AllyGroup` carrying its own colour, name,
+source start positions, and an optional `box_polygon` that drives the
+sibling `mapconfig/map_startboxes.lua` emission (ADR-029 / C2).
+`Project.ally_groups: Vec<AllyGroup>` replaces
+`Project.start_positions: Vec<StartPosition>`. `StartPosition` is
+stripped to `{ x_elmo: i32, z_elmo: i32 }` — team identity is now
+positional (computed at emission time from
+`ally_groups[*].start_positions` walked in id order).
+
+**Mirror placement strategy.** Symmetry-replicated mirrors go into
+the **same ally group** as the source. A Quad-symmetric placement on
+group 0 produces 4 positions in group 0, not 4 separate groups. The
+research callout: "derived positions go into THE SAME ally group …
+Derived positions render greyed in the tree". Sources are stored;
+mirrors are recomputed every frame from the active symmetry axis.
+Trade-off: toggling symmetry off mid-session "forgets" the mirrored
+positions visually, but the BUILD path expands sources through the
+active symmetry into the same group before passing Project to the
+pipeline emitter, so the `.sd7` always ships every spawn the user
+saw on canvas.
+
+**Backwards compatibility.** Pre-Phase-3 `.barmeproj` files load via
+a custom `Deserialize` on Project. The wire-format struct
+(`ProjectWire`) accepts both `[[ally_groups]]` (new) and
+`[[start_positions]]` (legacy). When only the legacy field is
+present, the migration materialises every position into
+`ally_groups[0]` with the default colour + name `"AllyGroup 0"`. The
+legacy `team_id` field is read by serde but ignored — team ids are
+positional now. A fixture test pins the migration:
+`legacy_flat_start_positions_load_into_ally_group_zero`.
+
+**Inspector tree.** One `CollapsingHeader` per ally group, with:
+- A colour swatch keyed off `egui::Id::new(("ally_group_header",
+  group.id))` — persistent across tool switches + tree rebuilds.
+  Without this `Id` keying, `color_edit_button_srgba`'s popover loses
+  state every frame the tree is rebuilt (PITFALL — egui retains
+  popover state by widget Id).
+- Name `TextEdit`, position count, ★ active-group toggle, delete.
+- Child rows for source positions (index, coords, ×).
+- Greyed-out rows for symmetry-derived mirror positions, with a
+  `(mirror of #N)` label and a tooltip that points the user back at
+  the source — derived positions are NOT separately editable.
+- "+ Add AllyGroup" at the bottom.
+
+A configuration preset dropdown above the tree applies one of:
+`1v1` (2 groups × 1 pos each), `8v8` (2 groups × 8 pos, north/south
+strips), `3-way FFA` (3 groups in a triangle), `4-way FFA` (4
+corners). Each preset also populates the per-group `box_polygon`
+matching the BAR community 8v8 convention (north strip = `[(0, 0),
+(1, 0.12)]`; south strip = `[(0, 0.88), (1, 1)]`; etc.). The
+emitter consumes those polygons directly — no second authoring path.
+
+**Canvas interaction.** LMB-click in empty terrain places one
+position in the active ally group; LMB-drag distributes N
+evenly-spaced positions along the drag vector (N defaults to 8 — the
+canonical 8v8 case, configurable in the Inspector). LMB-drag on an
+existing marker moves it. RMB-click on a marker deletes. The
+single-click vs drag-paint disambiguator depends on B1's 8 px drag
+threshold (`InputOptions::max_click_dist = 8.0`); N=1 single click
+doesn't fire the drag-paint branch because the drag-stop handler
+threshold-checks the line length before committing.
+
+**Hover↔pulse feedback.** Hover an Inspector row → marker pulses at
+2 Hz for 1 s after the hover instant (`pulsing_marker` field on App
+carries `(id, idx, Instant)`; the marker draw loop modulates radius
+by `(dt * 2π * 2.0).sin().abs()` and `ctx.request_repaint()`s until
+the second elapses). Hover a marker on canvas → Inspector
+auto-scrolls to the matching row via `Response::scroll_to_me`.
+
+**Cross-tool ghosting.** Markers render at 50 % alpha when the
+StartPositions tool is not active, and don't respond to hover. Same
+B1 convention as the symmetry overlay's "Sculpt-only ghosts".
+
+**Undo (B5 / ADR-033 integration).** `ProjectDiff` variants change
+shape to identify positions by `(ally_group_id, pos)` instead of
+`team_id`. The new variants are
+`PlaceStartPosition { ally_group_id, pos }`,
+`DeleteStartPosition { ally_group_id, pos }`,
+`MoveStartPosition { ally_group_id, from, to }`. The wizard snapshot
+now carries `ally_groups: Vec<AllyGroup>` so Ctrl-Z over an F1
+wizard apply restores the full tree (colours, names, polygons).
+
+**Build path.** `App::snapshot_project_for_build()` clones the
+project, calls `expand_symmetry_into_ally_groups(&mut p, symmetry)`
+which iterates each source position and re-materialises its mirrors
+into the same group (deduped by exact coords), then passes the
+expanded Project to the pipeline. This is the SINGLE point where
+sources expand into the flat `teams[]` pool the engine consumes.
+Without this expansion, a Quad-symmetric placement would ship 1
+team to BAR even though the canvas showed 4 markers.
+
+**Out of scope:**
+- Per-position colour override — defer; AllyGroup.color is enough.
+- Symmetry-grouped drag (move all mirrors as one) — Phase 4.
+- Box-polygon editor UI — emission only this sprint; presets supply
+  the polygons. Manual editing waits for a polygon-editor tool.
+- F12 launch-with-this-spawn debug.
+
+**Consequence:**
+- `barme-core::project` rewrites: `AllyGroup` struct,
+  `ALLY_GROUP_PALETTE` constant, `ProjectWire` legacy-migration
+  shim. ~330 LOC including tests.
+- `barme-core::undo`: ProjectDiff variants restructured; tests
+  updated to operate on `AllyGroup` instead of a bare
+  `Vec<StartPosition>`. Same line-count.
+- `barme-core::mapinfo_schema::From<&Project>` walks `ally_groups`
+  in id order and flattens into `teams[]`.
+- `barme-pipeline::startboxes` repoints its `ally_group_boxes`
+  helper at `project.ally_groups[*].box_polygon`.
+- `barme-app`: the F8 Inspector rewrite + canvas interaction
+  changes + ~+10 fields on App. ~+500 LOC including tests.
+- `team_color()` palette helper deleted (per-AllyGroup colour
+  replaces it).
+- 7 new app-side tests cover drag-paint, preset materialisation,
+  symmetry-expansion-at-build, and the migration path. Existing F8
+  smokes (`b1_does_not_regress_start_position_placement_phase2`,
+  `b5_*`) refactored against the new shape.
+- ADR-023 status-updated to scope its supersession (data shape
+  superseded; UX surface remains but is rebuilt around the tree).
 
 ## Template for new entries
 

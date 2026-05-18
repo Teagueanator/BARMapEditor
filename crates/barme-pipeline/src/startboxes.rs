@@ -43,19 +43,18 @@ use barme_core::Project;
 
 use crate::lua_ast::{LuaKey, LuaValue, serialize, sort_table_by_key};
 
-/// Render the canonical `return { startboxes = { … } }` text. Empty
-/// `startboxes` table when the project has < 2 ally groups (or no
-/// `box_polygon` set on any group).
+/// Render the canonical `return { startboxes = { … } }` text. Emits
+/// an empty placeholder when the project has fewer than 2 ally groups
+/// — startboxes are only meaningful for multi-side maps. Groups with
+/// `box_polygon == None` are silently skipped.
 pub fn render(project: &Project) -> String {
-    let groups = ally_group_boxes(project);
-    let table = if groups.len() < 2 {
+    let table = if project.ally_groups.len() <= 1 {
         // < 2 distinct sides → no useful startbox file. Emit an empty
         // `startboxes = {}` placeholder so callers that grep for the
-        // file shape don't choke. Build pipelines (C4/C5) will replace
-        // this once meaningful data lands.
+        // file shape don't choke.
         LuaValue::Table(vec![(LuaKey::str("startboxes"), LuaValue::Table(vec![]))])
     } else {
-        let mut boxes: Vec<(LuaKey, LuaValue)> = groups
+        let mut boxes: Vec<(LuaKey, LuaValue)> = ally_group_boxes(project)
             .into_iter()
             .map(|(id, poly)| (LuaKey::int(id as i64), startbox_entry(&poly)))
             .collect();
@@ -88,13 +87,16 @@ fn startbox_entry(polygon: &[(f32, f32)]) -> LuaValue {
 }
 
 /// Walk the project's ally groups and yield `(id, polygon)` pairs for
-/// every group with a `box_polygon` set. B6 wires this to
-/// `project.ally_groups`; C2 ships an empty fallback so the emitter
-/// builds before the data model lands.
-fn ally_group_boxes(_project: &Project) -> Vec<(u8, Vec<(f32, f32)>)> {
-    // B6 hook-point: read `project.ally_groups` and flat-map
-    // `(group.id, group.box_polygon.clone())` for `Some` polygons.
-    Vec::new()
+/// every group with a `box_polygon` set. Groups in id-sorted order so
+/// the emitted file is byte-identical across runs (NFR-Det).
+fn ally_group_boxes(project: &Project) -> Vec<(u8, Vec<(f32, f32)>)> {
+    let mut out: Vec<(u8, Vec<(f32, f32)>)> = project
+        .ally_groups
+        .iter()
+        .filter_map(|g| g.box_polygon.as_ref().map(|p| (g.id, p.clone())))
+        .collect();
+    out.sort_by_key(|(id, _)| *id);
+    out
 }
 
 #[cfg(test)]
@@ -147,5 +149,48 @@ mod tests {
         let a = render(&p);
         let b = render(&p);
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn populated_ally_groups_emit_per_id_polygon_entries() {
+        use barme_core::AllyGroup;
+        let mut p = Project::new("8v8", 16);
+        let mut g0 = AllyGroup::new(0);
+        g0.box_polygon = Some(vec![(0.0, 0.0), (1.0, 0.12)]);
+        let mut g1 = AllyGroup::new(1);
+        g1.box_polygon = Some(vec![(0.0, 0.88), (1.0, 1.0)]);
+        p.ally_groups.push(g0);
+        p.ally_groups.push(g1);
+        let s = render(&p);
+        // Both ally groups produce keyed entries.
+        assert!(s.contains("[0] = {"), "got:\n{s}");
+        assert!(s.contains("[1] = {"), "got:\n{s}");
+        // Each entry includes both `boxes` and `startpoints`.
+        // Use a leading-whitespace match so "startboxes =" doesn't
+        // double-count `boxes =`.
+        assert_eq!(s.matches("      boxes =").count(), 2, "got:\n{s}");
+        assert_eq!(s.matches("startpoints = {}").count(), 2, "got:\n{s}");
+        // Polygon coords appear.
+        assert!(s.contains("0.12,"), "got:\n{s}");
+        assert!(s.contains("0.88,"), "got:\n{s}");
+    }
+
+    #[test]
+    fn groups_without_polygon_are_skipped() {
+        use barme_core::AllyGroup;
+        // Two ally groups → guard allows emission. Only the group
+        // with `box_polygon == Some(…)` produces an `[N] = …` entry.
+        let mut p = Project::new("partial", 4);
+        let mut g0 = AllyGroup::new(0);
+        g0.box_polygon = Some(vec![(0.0, 0.0), (1.0, 0.5)]);
+        let g1 = AllyGroup::new(1); // no polygon
+        p.ally_groups.push(g0);
+        p.ally_groups.push(g1);
+        let s = render(&p);
+        assert!(s.contains("[0] = {"), "got:\n{s}");
+        assert!(
+            !s.contains("[1] = {"),
+            "group without polygon must be skipped; got:\n{s}"
+        );
     }
 }

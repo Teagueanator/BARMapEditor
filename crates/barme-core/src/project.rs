@@ -3,6 +3,19 @@
 //! Persisted as `<name>.barmeproj` (TOML manifest) plus a sibling directory of
 //! raw asset PNGs (heightmap, metal, type, splat distribution, diffuse). The
 //! `.sd7` is build output, not source of truth.
+//!
+//! ## ADR-032 — F8 allyteam model
+//!
+//! Phase 3 replaces the flat `Vec<StartPosition>` (ADR-023) with a
+//! two-level tree anchored by [`AllyGroup`]. Each group carries an id, a
+//! name, an sRGB display colour, its source start positions, and an
+//! optional `box_polygon` that emits into `mapconfig/map_startboxes.lua`
+//! (C2 / ADR-029).
+//!
+//! Pre-Phase-3 `.barmeproj` files carry the flat `[[start_positions]]`
+//! TOML array (with `team_id`). They load forward via `#[serde(from = …)]`
+//! → the legacy vec materialises into `ally_groups[0]` with the default
+//! colour and name. Tested by [`tests::legacy_flat_start_positions_load_into_ally_group_zero`].
 
 use std::collections::HashMap;
 use std::fs;
@@ -10,13 +23,30 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tracing::warn;
 
 use crate::MapSize;
 
 /// File extension for the project manifest (no leading dot).
 pub const PROJECT_EXTENSION: &str = "barmeproj";
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Default sRGB palette for fresh ally groups. The first four match
+/// the BAR faction colours surfaced in lobby UIs (Armada blue, Cortex
+/// red, Legion green, Raptors yellow). Indices ≥ 4 are fallback
+/// distinct colours for unusual layouts (5+ ally FFA).
+pub const ALLY_GROUP_PALETTE: [[u8; 3]; 8] = [
+    [70, 130, 220], // Armada blue
+    [220, 50, 50],  // Cortex red
+    [60, 180, 80],  // Legion green
+    [240, 200, 50], // Raptors yellow
+    [80, 200, 200], // cyan
+    [200, 80, 200], // magenta
+    [230, 130, 50], // orange
+    [150, 80, 220], // purple
+];
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(from = "ProjectWire")]
 pub struct Project {
     pub name: String,
     pub size: MapSize,
@@ -26,13 +56,16 @@ pub struct Project {
     /// file's parent directory (see [`Project::resolve_heightmap`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub heightmap: Option<PathBuf>,
-    /// Team start positions (F8 / ADR-023). Empty in legacy projects;
-    /// `#[serde(default)]` lets them load forward. The pipeline emits these
-    /// into `mapinfo.lua` `teams[]` when non-empty, or falls back to a
-    /// 25%/75% diagonal pair when empty so blank projects still build a
-    /// playable 1v1 map.
+    /// Per-side configuration tree (ADR-032). Empty in pre-Phase-3
+    /// projects; the legacy `[[start_positions]]` array migrates into
+    /// `ally_groups[0]` on load.
+    ///
+    /// The pipeline emits each group's `start_positions` into
+    /// `mapinfo.teams[]` in id-order (concatenated). The `box_polygon`
+    /// field — when set — emits into
+    /// `mapconfig/map_startboxes.lua` keyed by `id`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub start_positions: Vec<StartPosition>,
+    pub ally_groups: Vec<AllyGroup>,
     /// User-authored `mapinfo.lua` field overrides (C1 / ADR-028).
     /// Populated by the F9 form editor (C7) on top of the
     /// `MapInfo::bar_default()` baseline so unusual maps (skybox
@@ -44,16 +77,136 @@ pub struct Project {
     pub mapinfo_overrides: HashMap<String, toml::Value>,
 }
 
+/// One ally team's worth of spawn data (ADR-032).
+///
+/// `id` is the stable identifier used by emission + undo dispatch;
+/// reordering ally groups changes their position in the flat `teams[]`
+/// pool emitted to mapinfo.lua. Reorder consciously.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AllyGroup {
+    /// Stable identifier. Used by `mapconfig/map_startboxes.lua` keys
+    /// and by undo dispatch. Reusing an id from a deleted group is
+    /// valid; the editor allocates the lowest unused u8.
+    pub id: u8,
+    /// Display name in the Inspector tree ("AllyGroup 0", "North",
+    /// "Allies", …). Purely cosmetic — never emitted to mapinfo.lua.
+    pub name: String,
+    /// sRGB triple in `[0, 255]`. UI converts to / from `egui::Color32`.
+    /// Persists across save / load and across tool switches.
+    pub color: [u8; 3],
+    /// Source start positions (mirror counterparts under symmetry are
+    /// NOT stored; the F8 editor recomputes them every frame from
+    /// `Project.symmetry`-class state on the app side).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub start_positions: Vec<StartPosition>,
+    /// Per-ally start-box polygon in `[0, 1]` fractions of the map
+    /// extent. `None` = no box, this group is omitted from
+    /// `map_startboxes.lua`. C2's emitter walks this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub box_polygon: Option<Vec<(f32, f32)>>,
+}
+
+impl AllyGroup {
+    /// Construct a fresh ally group with the palette colour for its
+    /// id, empty positions, and no box polygon.
+    pub fn new(id: u8) -> Self {
+        Self {
+            id,
+            name: format!("AllyGroup {id}"),
+            color: ALLY_GROUP_PALETTE[(id as usize) % ALLY_GROUP_PALETTE.len()],
+            start_positions: Vec::new(),
+            box_polygon: None,
+        }
+    }
+}
+
 /// A single team start position in world coordinates (elmos).
 ///
-/// `team_id` indexes the `teams[]` table in `mapinfo.lua` — BAR's per-side
-/// convention is even IDs on side A, odd IDs on side B, so the F8 editor
-/// auto-assigns mirrors `{0,1}`, `{2,3}`, etc. when symmetry is enabled.
+/// **ADR-032 (B6):** `team_id` was removed. Position identity is now
+/// `(ally_group_id, index_within_group)` for app-level operations
+/// (undo, drag, delete), and the flat `teams[]` index is computed at
+/// emission time by walking ally groups in id order.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StartPosition {
-    pub team_id: u8,
-    pub x_elmo: u32,
-    pub z_elmo: u32,
+    pub x_elmo: i32,
+    pub z_elmo: i32,
+}
+
+// ─────── Legacy wire format (pre-Phase-3 .barmeproj migration) ───────
+
+/// Pre-ADR-032 flat start position. Carried `team_id`; the field is
+/// dropped on migration (team ids are now computed positionally).
+/// `_team_id` is read by serde but intentionally ignored — kept so a
+/// legacy file with `team_id` doesn't fail deserialization.
+#[derive(Debug, Deserialize)]
+struct LegacyStartPosition {
+    #[serde(default, rename = "team_id")]
+    _team_id: serde::de::IgnoredAny,
+    x_elmo: i64,
+    z_elmo: i64,
+}
+
+/// Wire-format projection for [`Project`] deserialize. Accepts BOTH
+/// the new `[[ally_groups]]` shape AND the legacy `[[start_positions]]`
+/// flat vec. Migration runs in `From<ProjectWire>`.
+#[derive(Debug, Deserialize)]
+struct ProjectWire {
+    name: String,
+    size: MapSize,
+    min_height: f32,
+    max_height: f32,
+    #[serde(default)]
+    heightmap: Option<PathBuf>,
+    #[serde(default)]
+    ally_groups: Vec<AllyGroup>,
+    /// Legacy: pre-ADR-032 flat vec. Materialised into `ally_groups[0]`
+    /// if `ally_groups` is empty. Ignored otherwise (corrupt file —
+    /// `warn!`).
+    #[serde(default)]
+    start_positions: Vec<LegacyStartPosition>,
+    #[serde(default)]
+    mapinfo_overrides: HashMap<String, toml::Value>,
+}
+
+impl From<ProjectWire> for Project {
+    fn from(w: ProjectWire) -> Self {
+        let mut p = Project {
+            name: w.name,
+            size: w.size,
+            min_height: w.min_height,
+            max_height: w.max_height,
+            heightmap: w.heightmap,
+            ally_groups: w.ally_groups,
+            mapinfo_overrides: w.mapinfo_overrides,
+        };
+        if !w.start_positions.is_empty() {
+            if p.ally_groups.is_empty() {
+                let positions: Vec<StartPosition> = w
+                    .start_positions
+                    .into_iter()
+                    .map(|l| StartPosition {
+                        x_elmo: l.x_elmo as i32,
+                        z_elmo: l.z_elmo as i32,
+                    })
+                    .collect();
+                let group = AllyGroup {
+                    id: 0,
+                    name: "AllyGroup 0".to_string(),
+                    color: ALLY_GROUP_PALETTE[0],
+                    start_positions: positions,
+                    box_polygon: None,
+                };
+                p.ally_groups.push(group);
+            } else {
+                warn!(
+                    legacy_count = w.start_positions.len(),
+                    new_count = p.ally_groups.len(),
+                    "legacy start_positions present alongside ally_groups in .barmeproj; ignoring legacy"
+                );
+            }
+        }
+        p
+    }
 }
 
 #[derive(Debug, Error)]
@@ -122,7 +275,7 @@ impl Project {
             min_height: 0.0,
             max_height: 256.0,
             heightmap: None,
-            start_positions: Vec::new(),
+            ally_groups: Vec::new(),
             mapinfo_overrides: HashMap::new(),
         }
     }
@@ -200,30 +353,152 @@ mod tests {
     }
 
     #[test]
-    fn start_positions_omitted_when_empty() {
+    fn ally_groups_omitted_when_empty() {
         let p = Project::new("no-teams", 4);
         let s = toml::to_string(&p).unwrap();
+        assert!(!s.contains("ally_groups"), "got:\n{s}");
         assert!(!s.contains("start_positions"), "got:\n{s}");
     }
 
     #[test]
-    fn start_positions_round_trip() {
+    fn ally_groups_round_trip() {
         let mut p = Project::new("teams", 8);
-        p.start_positions = vec![
+        let mut g = AllyGroup::new(0);
+        g.start_positions = vec![
             StartPosition {
-                team_id: 0,
                 x_elmo: 1024,
                 z_elmo: 1024,
             },
             StartPosition {
-                team_id: 1,
-                x_elmo: 3072,
-                z_elmo: 3072,
+                x_elmo: 1280,
+                z_elmo: 1024,
             },
         ];
+        g.box_polygon = Some(vec![(0.0, 0.0), (1.0, 0.12)]);
+        p.ally_groups.push(g);
+
+        let mut g1 = AllyGroup::new(1);
+        g1.start_positions = vec![StartPosition {
+            x_elmo: 3072,
+            z_elmo: 3072,
+        }];
+        p.ally_groups.push(g1);
+
         let s = toml::to_string(&p).unwrap();
         let p2: Project = toml::from_str(&s).unwrap();
-        assert_eq!(p.start_positions, p2.start_positions);
+        assert_eq!(p.ally_groups, p2.ally_groups);
+    }
+
+    /// Pre-ADR-032 `.barmeproj` files carry `[[start_positions]]`
+    /// with a `team_id` field. Loading must put every position in
+    /// `ally_groups[0]` and drop the team_id. A silent data-loss
+    /// bug here destroys user projects.
+    #[test]
+    fn legacy_flat_start_positions_load_into_ally_group_zero() {
+        let toml_str = r#"
+name = "legacy_v2"
+min_height = 0.0
+max_height = 256.0
+
+[size]
+smu_x = 4
+smu_z = 4
+
+[[start_positions]]
+team_id = 0
+x_elmo = 100
+z_elmo = 200
+
+[[start_positions]]
+team_id = 1
+x_elmo = 900
+z_elmo = 800
+"#;
+        let p: Project = toml::from_str(toml_str).unwrap();
+        assert_eq!(p.ally_groups.len(), 1, "should produce exactly 1 group");
+        let g0 = &p.ally_groups[0];
+        assert_eq!(g0.id, 0);
+        assert_eq!(g0.color, ALLY_GROUP_PALETTE[0]);
+        assert_eq!(g0.name, "AllyGroup 0");
+        assert_eq!(g0.start_positions.len(), 2);
+        assert_eq!(
+            g0.start_positions[0],
+            StartPosition {
+                x_elmo: 100,
+                z_elmo: 200
+            }
+        );
+        assert_eq!(
+            g0.start_positions[1],
+            StartPosition {
+                x_elmo: 900,
+                z_elmo: 800
+            }
+        );
+    }
+
+    #[test]
+    fn legacy_with_modern_ally_groups_ignores_legacy() {
+        // Corrupt file: both shapes present. Migration ignores the
+        // legacy vec rather than blending it into ally_groups[0].
+        let toml_str = r#"
+name = "mixed"
+min_height = 0.0
+max_height = 256.0
+
+[size]
+smu_x = 4
+smu_z = 4
+
+[[ally_groups]]
+id = 0
+name = "Modern"
+color = [10, 20, 30]
+[[ally_groups.start_positions]]
+x_elmo = 1
+z_elmo = 2
+
+[[start_positions]]
+team_id = 9
+x_elmo = 9999
+z_elmo = 9999
+"#;
+        let p: Project = toml::from_str(toml_str).unwrap();
+        assert_eq!(p.ally_groups.len(), 1);
+        let g0 = &p.ally_groups[0];
+        assert_eq!(g0.color, [10, 20, 30]);
+        assert_eq!(g0.start_positions.len(), 1);
+        // Legacy position discarded.
+        assert!(!g0.start_positions.iter().any(|p| p.x_elmo == 9999));
+    }
+
+    #[test]
+    fn pre_f8_project_without_any_start_positions_loads_forward() {
+        let toml_str = r#"
+name = "pre_f8"
+min_height = 0.0
+max_height = 256.0
+
+[size]
+smu_x = 4
+smu_z = 4
+"#;
+        let p: Project = toml::from_str(toml_str).unwrap();
+        assert!(p.ally_groups.is_empty());
+        assert!(p.mapinfo_overrides.is_empty());
+    }
+
+    #[test]
+    fn ally_group_default_uses_palette() {
+        let g0 = AllyGroup::new(0);
+        let g1 = AllyGroup::new(1);
+        let g2 = AllyGroup::new(2);
+        assert_eq!(g0.color, ALLY_GROUP_PALETTE[0]);
+        assert_eq!(g1.color, ALLY_GROUP_PALETTE[1]);
+        assert_eq!(g2.color, ALLY_GROUP_PALETTE[2]);
+        assert_eq!(g0.name, "AllyGroup 0");
+        assert_eq!(g0.start_positions.len(), 0);
+        assert!(g0.box_polygon.is_none());
     }
 
     #[test]
@@ -246,39 +521,6 @@ mod tests {
         let s = toml::to_string(&p).unwrap();
         let p2: Project = toml::from_str(&s).unwrap();
         assert_eq!(p.mapinfo_overrides, p2.mapinfo_overrides);
-    }
-
-    #[test]
-    fn legacy_project_without_mapinfo_overrides_loads_forward() {
-        // Pre-C1 projects don't carry the field. serde(default) seeds
-        // an empty map.
-        let toml_str = r#"
-name = "legacy"
-min_height = 0.0
-max_height = 256.0
-
-[size]
-smu_x = 4
-smu_z = 4
-"#;
-        let p: Project = toml::from_str(toml_str).unwrap();
-        assert!(p.mapinfo_overrides.is_empty());
-    }
-
-    #[test]
-    fn legacy_project_without_start_positions_loads_forward() {
-        let toml_str = r#"
-name = "legacy"
-min_height = 0.0
-max_height = 256.0
-
-[size]
-smu_x = 4
-smu_z = 4
-"#;
-        let p: Project = toml::from_str(toml_str).unwrap();
-        assert_eq!(p.name, "legacy");
-        assert!(p.start_positions.is_empty());
     }
 
     #[test]
@@ -314,8 +556,6 @@ smu_z = 4
 
     #[test]
     fn sanitize_name_creates_safe_filenames() {
-        // Anything sanitize produces must be a legal portable filename
-        // (no path separators, no colons, no spaces).
         for input in ["maps/foo", "C:\\Users\\me", "a b c", "x/y\\z"] {
             let s = sanitize_name(input);
             assert!(!s.contains('/'));
