@@ -245,6 +245,164 @@ Three orthogonal choices were on the table:
     they fork upstream, rebuild the PyInstaller bundle, and we bump the
     pin. Don't try to mix the two.
 
+**Correction (2026-05-17, later same day):** the recon note above
+claimed the bundled `tools/{dragon-dxt1,dragon-dxt5,magick}` collapsed
+the "install Compressonator yourself" requirement on Linux. **That was
+wrong.** Those bundled binaries are auxiliary GUI converters used by
+PyMapConv's "convert individual texture" feature, not by the
+`--linux`-mode compile path. The compile path shells out to
+`CompressonatorCLI` literally (upstream `src/pymapconv.py` lines 828 +
+1032; `os.system(cmd)` with no path override). Without it on `PATH`,
+the compile fails at the minimap DXT step with
+`sh: 1: CompressonatorCLI: not found`. Compressonator is now vendored
+separately under `tools/compressonator/` per ADR-014.
+
+## ADR-012 — `barme-pipeline` crate + PyMapConv subprocess driver
+
+**Status:** Accepted (2026-05-17)
+**Context:** Stage 0 goal #6 needs Rust code that drives the vendored
+PyMapConv (ADR-011) to produce `.smf` + `.smt`. Per ADR-005 we add a new
+workspace crate rather than growing `barme-core`: the pipeline owns
+subprocess concerns, error surfaces meaningful to the eventual UI, and
+output-path semantics that have nothing to do with the in-memory project
+model.
+**Decision:**
+  - New crate `crates/barme-pipeline`. Depends on `barme-core` (Project,
+    MapSize) and `image` (BMP encoder for synthesized test assets).
+    Does *not* depend on egui / eframe / wgpu — pipeline must stay
+    headless-testable.
+  - Public surface:
+    `PyMapConvDriver::vendored(repo_root) -> Result<_, PyMapConvError>` +
+    `compile(CompileInputs) -> Result<CompileOutputs, PyMapConvError>`.
+  - `PyMapConvError` (thiserror): `BinaryMissing`, `Spawn`,
+    `NonZeroExit { status, stdout, stderr }`, `MissingOutput`. The
+    UI surfaces the full captured stdout/stderr on failure — PyMapConv's
+    own diagnostics are how authors will debug bad inputs.
+  - **Working directory = the binary's parent.** PyMapConv resolves
+    `./resources/geovent.bmp` and the bundled `tools/{dragon-dxt1,
+    dragon-dxt5,magick}` relative to its cwd, not relative to its
+    `argv[0]`. Setting cwd to `tools/pymapconv/` keeps those resolutions
+    correct without rewriting any flags.
+  - **Outputs absolute.** `-o` takes an absolute path under the caller's
+    chosen `out_dir`, so a tempdir-scoped integration test stays
+    hermetic regardless of where pymapconv decides to look.
+  - **Minimum flags on Linux:** `-o`, `-t`, `-a`, `-x`, `-n`, `-u`
+    (per ADR-011). Everything else is optional and not exposed in v0.
+  - **Buffered stdout/stderr.** v0 `Command::output()`. Streaming-to-
+    tracing for live progress is Stage 1 ergonomic polish.
+  - **Post-condition check.** After exit code 0, verify the expected
+    `.smf` + `.smt` exist; otherwise return `MissingOutput`. Defends
+    against the failure mode where pymapconv silently writes nothing
+    on subtle input errors.
+  - **Integration test is `#[ignore]`-gated.** `cargo test --workspace`
+    stays hermetic and offline. End-to-end compile runs via
+    `cargo test -p barme-pipeline -- --ignored`.
+**Alternatives:**
+  - **Grow `barme-core`** — rejected: subprocess + image-encoder deps
+    don't belong in the data-model crate; would force core's consumers
+    (eventually a Web preview build per SRS §3.5 "maybe") to pull
+    process-spawning code they don't need.
+  - **Streaming output via threads + channels** — rejected for v0: adds
+    machinery before there's a UI to consume it. Buffered output is
+    fine for headless tests and a "compile spinner" UI.
+  - **Build a Rust wrapper around the Python pymapconv source directly
+    (PyO3)** — rejected: ADR-011 explicitly does *not* vendor source;
+    the PyInstaller bundle is the integration boundary.
+**Consequence:**
+  - Two-crate workspace becomes three: `barme-app`, `barme-core`,
+    `barme-pipeline`.
+  - `image` workspace dep gains the `bmp` feature (encoder) so the
+    integration test can synthesize a 1024² stub texture without
+    committing a binary fixture (ADR-007).
+  - PyMapConv exit-code semantics observed empirically and recorded in
+    the session log: status 0 = success, non-zero on any error PyMapConv
+    can detect at parse time. (No multi-tier exit-code language — it's
+    just "did it work or not".)
+  - **Dim math correction** versus the previous session's flag table:
+    the minimum-legal compile is a 1024×1024 BMP + 129×129 heightmap
+    (= SMF mapx=128 = BAR 2 SMU), not the "65×65" the post-compact
+    prompt suggested. See session log for derivation.
+
+## ADR-014 — Compressonator CLI vendored via `scripts/fetch-compressonator.sh`, pinned to V4.5.52
+
+**Status:** Accepted (2026-05-17). Refines ADR-004; corrects an
+inaccurate inference in the original ADR-011 (see ADR-011's correction
+note).
+**Context:** PyMapConv on Linux (`-u/--linux`, per ADR-011) invokes
+`CompressonatorCLI` by name via `os.system()` in upstream
+`src/pymapconv.py` lines 828 (minimap) and 1032 (tiles). There is no
+flag, env var, or config knob to point at a custom binary path. ADR-004
+anticipated bundling Compressonator; ADR-011 missed that the PyMapConv
+tarball does not include it (the bundled `tools/dragon-dxt*` + `magick`
+are unrelated GUI converters). The driver's first end-to-end run in
+this session surfaced `sh: 1: CompressonatorCLI: not found` and forced
+the issue.
+**Decision:**
+  - Vendor AMD Compressonator CLI **V4.5.52 linux-amd64** under
+    `tools/compressonator/` (gitignored — ~20 MB extracted; already
+    covered by the pre-existing `/tools/compressonator/` rule in
+    `.gitignore`).
+  - Fetch via `scripts/fetch-compressonator.sh` — same shape as
+    `scripts/fetch-pymapconv.sh`: `set -euo pipefail`, SHA256-pinned,
+    `mktemp -d` + trap, idempotent, linux-amd64-only.
+  - **Pinned SHA256:**
+    `70c9cdb27a19875df03766f349864951a749a44c0f5c001c33903944465f6b97`
+    (verified 2026-05-17 against the GitHub release artifact).
+  - Upstream entry point is a bash launcher (`compressonatorcli`,
+    lowercase) that sets `LD_LIBRARY_PATH` and execs
+    `compressonatorcli-bin`. PyMapConv invokes `CompressonatorCLI`
+    (camelcase). Linux is case-sensitive, so the fetch script creates a
+    sibling `CompressonatorCLI` → `compressonatorcli` symlink.
+  - The Rust driver
+    (`barme_pipeline::PyMapConvDriver::vendored`) prepends
+    `tools/compressonator/` to the child's `PATH` so PyMapConv
+    resolves the call. `PyMapConvError::CompressonatorMissing` fails
+    fast with an actionable "run the fetch script" message.
+  - Frozen pin per ADR-011's pattern. Bumping is a deliberate ADR.
+**Alternatives:**
+  - **Apt `compressonator` package** — rejected: not in Ubuntu /
+    Debian main repos; would push the install vector onto every
+    contributor.
+  - **`.deb` from the same release** — rejected: requires `sudo dpkg
+    -i` and pollutes `/usr/bin/`. The tarball gives the same binary in
+    a relocatable layout.
+  - **Build Compressonator from source** — rejected: ~1 GB of
+    CMake/OpenCV/Qt-Linguist build deps for a tool we treat as an
+    opaque DXT compressor.
+  - **Patch PyMapConv to accept a custom Compressonator path** —
+    rejected at v0: forks the upstream we explicitly chose to track
+    untouched (ADR-002 / ADR-011).
+**Consequence:**
+  - Stage 0 vendor footprint is now two binary trees: PyMapConv
+    (~90 MB) and Compressonator (~20 MB). Both gitignored. First-time
+    setup is two scripts: `./scripts/fetch-pymapconv.sh &&
+    ./scripts/fetch-compressonator.sh`. Worth folding into a single
+    `scripts/setup.sh` in Stage 1 polish.
+  - The PyMapConv driver constructor now requires *both* binaries to
+    be present. A missing-Compressonator error mentions the right
+    fetch script, not the wrong one.
+  - **Upstream Linux multi-thread bug discovered while wiring this
+    up:** PyMapConv v0.6.3 with `numthreads > 1` (default 4) tries to
+    read tile DDS files from `temp/thread{n}/temp{i}.dds` (Windows
+    multi-thread layout) even when the Linux path wrote them flat into
+    `temp/temp{i}.dds`. Workaround: the driver always passes `-q 1`
+    (the previous session's flag table mislabelled `-q` as "Win only" —
+    it's in scope on Linux too, and forcing it to 1 dodges the
+    read-back mismatch). Source: v0.6.3 `src/pymapconv.py` lines
+    960-986.
+  - **Upstream Linux exit-code quirk:** PyMapConv exits with status 1
+    even after a successful compile ("All Done!" then exit 1) — the
+    bundled Qt event loop misbehaves when no display is held open. The
+    driver treats artifact presence (`.smf` + `.smt`) as the success
+    contract; non-zero exit is logged at `warn` and ignored when both
+    artifacts wrote. If artifacts are missing AND the exit was
+    non-zero, the typed `NonZeroExit` error still fires with captured
+    streams.
+  - **Windows path (deferred to Stage 1):** the sibling asset
+    `compressonatorcli-4.5.52-win64.zip` exists on the same release
+    and needs a different unzip target layout. Out of scope for
+    Stage 0.
+
 ---
 
 ## Template for new entries
