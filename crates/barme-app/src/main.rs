@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use barme_core::{
     BIOMES, BrushRegistry, BrushStamp, DirtyRect, Heightmap, History, MapSize, PROJECT_EXTENSION,
-    Project, StampSnapshot, StartPosition, SymmetryAxis, UndoEntry,
+    Project, StartPosition, SymmetryAxis,
     brushes::pixel_bbox,
     procgen::{Domain, PRESETS, generate as procgen_generate},
     project::sanitize_name,
@@ -76,11 +76,10 @@ struct App {
     procgen_domain: Domain,
     procgen_last_error: Option<String>,
     /// Persistent undo/redo across the session. Cleared on barrier events
-    /// (procgen, heightmap load, new project) — see ADR-022.
+    /// (procgen, heightmap load, new project) — see ADR-022. Stroke state
+    /// (copy-on-first-write scratch + bitset) lives inside `History` since
+    /// ADR-033.
     history: History,
-    /// Open stroke — populated on the first stamp after LMB-down, flushed
-    /// to `history` when the pointer is released.
-    stroke: Option<UndoEntry>,
     /// Active tool mode for the central preview rect (ADR-023).
     tool_mode: ToolMode,
     /// Authored team start positions; round-trips through `Project`.
@@ -187,7 +186,6 @@ impl App {
             procgen_domain: Domain::Centered,
             procgen_last_error: None,
             history: History::default(),
-            stroke: None,
             tool_mode: ToolMode::Sculpt,
             start_positions: Vec::new(),
             dragging_start_pos: None,
@@ -425,7 +423,8 @@ impl App {
         );
         // Symmetry replicates the stamp through all derived centers
         // (ADR-019). Compute every stamp's bbox *first* — without applying —
-        // so we can snapshot the unioned region pre-edit for undo (ADR-022).
+        // so we can hand the unioned region to History::snapshot_rect for
+        // copy-on-first-write capture (ADR-033).
         let centers = self.symmetry.replicate((world.x, world.z), extents);
         let mut planned: Vec<(BrushStamp, DirtyRect)> = Vec::with_capacity(centers.len());
         let mut pre_union: Option<DirtyRect> = None;
@@ -447,9 +446,11 @@ impl App {
         let Some(snap_rect) = pre_union else {
             return;
         };
-        let before = hm_state
-            .data
-            .copy_rect(snap_rect.x, snap_rect.y, snap_rect.w, snap_rect.h);
+
+        // Capture pre-edit pixel values for any pixels in `snap_rect` that
+        // haven't been snapshotted yet in this stroke (ADR-033). Must run
+        // BEFORE the brush writes to the heightmap.
+        self.history.snapshot_rect(&hm_state.data, snap_rect);
 
         // Apply each planned stamp, then sub-upload the union for one
         // queue.write_texture call.
@@ -465,14 +466,6 @@ impl App {
         let Some(rect_dirty) = union else {
             return;
         };
-        // Record the pre-edit snapshot into the open stroke (created on
-        // demand).
-        self.stroke
-            .get_or_insert_with(UndoEntry::new)
-            .push(StampSnapshot {
-                rect: snap_rect,
-                before,
-            });
 
         render::write_heightmap_rect(rs, dims, hm_state.data.data(), rect_dirty);
         let (mn, mx) = hm_state.data.min_max();
@@ -484,15 +477,14 @@ impl App {
     /// when no stroke is open. Called on pointer-release and before every
     /// barrier event (procgen / load / new project).
     fn end_stroke(&mut self) {
-        if let Some(entry) = self.stroke.take()
-            && !entry.is_empty()
-        {
-            trace!(
-                stamps = entry.stamp_count(),
-                bytes = entry.bytes(),
-                "stroke committed to undo history"
-            );
-            self.history.push(entry);
+        if let Some(hm_state) = self.heightmap.as_ref() {
+            self.history.end_stroke(&hm_state.data);
+        } else {
+            // No heightmap → history can't snapshot from it. Drop any
+            // in-flight stroke state via barrier (cheap if already empty).
+            if self.history.stroke_open() {
+                self.history.barrier();
+            }
         }
     }
 
@@ -1055,7 +1047,7 @@ impl eframe::App for App {
                     }
                 });
                 ui.menu_button("Edit", |ui| {
-                    let can_undo = self.history.can_undo() || self.stroke.is_some();
+                    let can_undo = self.history.can_undo() || self.history.stroke_open();
                     let can_redo = self.history.can_redo();
                     if ui
                         .add_enabled(can_undo, egui::Button::new("Undo\tCtrl+Z"))
@@ -1396,7 +1388,7 @@ impl eframe::App for App {
             // one stamp per frame at the cursor's world-space projection
             // on the y=0 plane. Spacing along the drag is implicit (frame
             // rate). One LMB-down → LMB-up coalesces into a single undo
-            // unit via `end_stroke` on pointer release (ADR-022).
+            // unit via `end_stroke` on pointer release (ADR-033).
             if brush_active
                 && (response.dragged_by(egui::PointerButton::Primary)
                     || response.clicked_by(egui::PointerButton::Primary))
@@ -1404,7 +1396,7 @@ impl eframe::App for App {
             {
                 self.apply_brush_at(cursor, rect);
             }
-            if self.stroke.is_some() && !response.dragged_by(egui::PointerButton::Primary) {
+            if self.history.stroke_open() && !response.dragged_by(egui::PointerButton::Primary) {
                 self.end_stroke();
             }
 

@@ -24,4 +24,4 @@ pub use project::{
     PROJECT_EXTENSION, Project, ProjectLoadError, ProjectSaveError, StartPosition, sanitize_name,
 };
 pub use symmetry::SymmetryAxis;
-pub use undo::{History, StampSnapshot, UndoEntry};
+pub use undo::{History, UndoEntry};

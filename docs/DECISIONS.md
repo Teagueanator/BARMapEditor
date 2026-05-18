@@ -1090,7 +1090,12 @@ is written down below.
 
 ## ADR-022 — Undo / redo over heightmap dirty-rect snapshots
 
-**Status:** Accepted (2026-05-17).
+**Status:** Accepted (2026-05-17). **STATUS UPDATE 2026-05-18:** the
+per-stamp `StampSnapshot { rect, before }` capture rule is **superseded
+by ADR-033** (copy-on-first-write within a stroke). The high-level
+contract — stamps coalesce into strokes, strokes are the undo unit,
+barriers clear history wholesale, 100 MB ring cap — is unchanged. Read
+ADR-033 for the new data path.
 **Context:** Sculpting is exploratory — the user paints, evaluates, often
 regrets. The smoothstep falloff in ADR-018 is not strictly invertible:
 re-stamping with negative strength does not reproduce the original
@@ -1344,6 +1349,90 @@ showing terrain immediately.
 - Side panel now exposes both `smu_x` and `smu_z` DragValues.
 - `FileAction::NewProject` renamed to `OpenWizard` — File → New project
   is now wizard-first.
+
+## ADR-033 — Undo per-stroke copy-on-first-write (supersedes ADR-022 snapshot rule)
+
+**Status:** Accepted (2026-05-18).
+**Context:** ADR-022's per-stamp `StampSnapshot { rect, before }` model
+captured the full bbox of every brush stamp emitted during a stroke.
+For an LMB-down → LMB-up drag the engine emits one stamp per frame —
+roughly 60–240 stamps for a multi-second sculpt — and each stamp's bbox
+overlapped the previous frame's by ~95% at typical pointer speeds.
+Capturing the same pixel 120 times bloated a single stroke to
+~244 MB on a 16-SMU map at radius 1024, blowing past the 100 MB ring
+cap by 2-3× on every paint pass. Logs showed runaway eviction of the
+*previous* stroke whenever the current one finished, which destroyed
+the multi-step undo affordance the system was supposed to provide.
+
+The bug is structural — coalescing must happen at *pixel* granularity
+within a stroke, not at *rect* granularity across stamps. A pixel's
+pre-stroke value is captured exactly once (the first time any stamp
+touches it). Subsequent stamps that overlap that pixel snapshot
+nothing. The resulting committed entry covers the unioned bbox of all
+pixels touched during the stroke — bounded by the heightmap size, not
+by stamp count.
+
+**Decision: copy-on-first-write within an open stroke.** `History`
+owns the in-flight stroke state:
+- A `Vec<u16>` mirroring heightmap dims exactly once (the scratch
+  buffer).
+- A packed `Vec<u64>` bitset, one bit per pixel, marking which slots in
+  scratch hold a real pre-edit value.
+Each frame, before the brush runs, the caller passes the union of
+that frame's symmetric stamp rects to `History::snapshot_rect`. For
+every pixel in the rect whose bit is clear, we copy from the heightmap
+into scratch and set the bit. On `end_stroke`, we walk the bitset to
+find the tight bbox of set bits, build a bbox-sized `Vec<u16>` (using
+scratch for snapshotted pixels and the current heightmap value for
+unsnapshotted pixels-in-bbox — those values match pre-stroke because
+the stroke never touched them), and push that as a single `UndoEntry`.
+
+**Memory bound:**
+- Transient (while a stroke is open): `w·h·2` bytes for scratch +
+  `w·h/8` bytes for the bitset (~2.1 MB at 16 SMU, ~4.5 MB at 32 SMU).
+- Committed (per entry): `bbox.w · bbox.h · 2` bytes, capped at the
+  full heightmap size (~2 MB at 16 SMU).
+
+**Alternatives considered:**
+- **`HashSet<(u32, u32)>` instead of a packed bitset.** Correct, but
+  ~24 bytes per pixel — worse than the disease at 1025². Rejected.
+- **Per-stamp rect union maintained on `History` instead of the
+  bitset.** Avoids the heightmap-sized scratch buffer. Rejected
+  because the bbox bound is then "union of input rects" rather than
+  "union of pixels we actually snapshotted" — a caller that passes a
+  rect that adds no novel pixels would still extend the bbox. The
+  bitset gives a tighter, more predictable bound.
+- **Reuse the scratch+bitset across strokes via a generation
+  counter.** Avoids the per-stroke `vec![0u16; pixels]` allocation.
+  Defer: profiling shows the alloc-and-drop pattern is sub-millisecond
+  at 16 SMU and only happens on LMB-down. Reopen if 32 SMU exposes a
+  hitch.
+- **Replay strokes forward (command pattern).** Same rejection
+  rationale as ADR-022 — kernels read pixels the previous stamp may
+  have moved, so deterministic replay would have to remember every
+  kernel application in order. Snapshots are simpler.
+
+**Consequence:**
+- `barme-core::undo` rewritten. `StampSnapshot` is gone; `UndoEntry`
+  collapses to `{ rect: DirtyRect, before: Vec<u16> }`. New public API:
+  `History::snapshot_rect(&Heightmap, DirtyRect)`,
+  `History::end_stroke(&Heightmap)`, `History::stroke_open()`.
+  `History::push(UndoEntry)` is gone — strokes commit themselves.
+- `lib.rs` export `StampSnapshot` removed; `UndoEntry` retained but
+  with the new fields.
+- `App.stroke: Option<UndoEntry>` field removed — the in-flight stroke
+  state lives inside `History` now.
+- `App::end_stroke` becomes a thin wrapper that hands the current
+  heightmap to `History::end_stroke`. The barrier path (procgen / load
+  / new project) discards any in-flight stroke automatically.
+- `History::barrier` now also drops the open stroke (previously a
+  no-op for the `Option<UndoEntry>` on `App`, which was cleared
+  separately).
+- 12 unit tests on `undo` (previously 6): round-trip, overlapping
+  stamps, 120-stamp-same-position bound, 120-stamp diagonal-drag
+  bound, snapshot-then-undo byte-identity, redo invalidation, barrier
+  drops open stroke, empty stroke no-op, cap eviction, off-rect-pixel
+  correctness, bbox-of-set-bits exactness, redo chain.
 
 ## Template for new entries
 
