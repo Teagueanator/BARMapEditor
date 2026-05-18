@@ -178,6 +178,73 @@ should be re-read with this in mind (it lists "wgpu" without a pin; no
 edit needed). Bumping again past 0.33 will require porting to the new
 eframe `App` trait.
 
+## ADR-011 — PyMapConv vendored via `scripts/fetch-pymapconv.sh`, pinned to v0.6.3
+
+**Status:** Accepted (2026-05-17)
+**Context:** Stage 0 goal #5 — get PyMapConv on disk under `tools/pymapconv/`
+so the eventual subprocess driver (ADR-012, future) has something to drive.
+Three orthogonal choices were on the table:
+  1. **What to vendor.** The upstream `v0.6.3` release ships three artifacts:
+     a Linux tarball, a Windows zip, and the source tree. Vendoring the
+     **prebuilt Linux tarball** removes the Python toolchain entirely from
+     the user's machine — the release is a PyInstaller-bundled ELF binary,
+     not a Python script. (This contradicts both the upstream README and the
+     SRS §1.2 survey table; see drift annotation in SRS line 56.) Compressonator-
+     derived DXT encoders and ImageMagick ship inside the tarball at
+     `tools/{dragon-dxt1,dragon-dxt5,magick}`, so the README's "install
+     Compressonator + ImageMagick yourself" instruction is stale for the
+     Linux prebuilt path.
+  2. **How to fetch.** A shell script (`scripts/fetch-pymapconv.sh`) over
+     `build.rs`. `build.rs` network access is hostile to offline builds,
+     CI without network, and reproducible packaging. The script is a one-shot
+     dev/install step; the build itself stays hermetic.
+  3. **How to verify.** Pinned `sha256` baked into the script. Mismatch
+     hard-fails. Re-running with the artifact already extracted is a no-op
+     apart from a `chmod +x` sweep.
+**Decision:**
+  - Vendor PyMapConv **v0.6.3 linux-amd64 prebuilt** under `tools/pymapconv/`
+    (gitignored — 90 MB extracted).
+  - Fetch via `scripts/fetch-pymapconv.sh`: idempotent, sha256-verified,
+    linux-amd64-only for now (errors loudly on other platforms).
+  - Frozen snapshot, **not** upstream-tracking. Upstream is maintenance-mode
+    (last commit 2024-10-30). Bumping the pin will be a deliberate decision
+    in its own ADR.
+  - **Pinned SHA256:** `7040c68f7a7f401e8e7613b4f51df8a8147f66ac24b717a91888fbf15d980a73`
+    (verified 2026-05-17 against the GitHub release artifact).
+**Alternatives:**
+  - **git submodule of source repo** — rejected: would force Python + PyQt
+    install on every user, defeating the single-binary distribution goal
+    of ADR-001.
+  - **git-lfs the tarball** — rejected: 90 MB binary in repo history forever,
+    LFS quota / hosting complications, no value over a downloader script.
+  - **`build.rs` fetch** — rejected: see above (offline-hostile).
+  - **Bump pin per release** — rejected: upstream barely moves; pinning
+    by tag and reviewing bumps deliberately is cheaper than chasing.
+**Consequence:**
+  - Entry point is `tools/pymapconv/pymapconv` (ELF binary). The Rust
+    subprocess driver (ADR-012) `exec`s this directly with CLI flags —
+    no `python3`, no `pip install`, no PyQt or Pillow on the user's
+    machine. Compressonator-derived encoders are found at
+    `tools/pymapconv/tools/` relative to the binary, which PyMapConv
+    locates on its own.
+  - Upstream `--help` is broken in v0.6.3 (argparse `_expand_help` crashes
+    on `unsupported format character ')'` in some help string). Not our
+    bug; the GUI form documents the full CLI surface and is the authority
+    for flag wiring. The Stage 0 → ADR-012 session log captures the flag
+    table verbatim so we don't re-launch the GUI to recover it.
+  - The `-u --linux` flag is the "use AMD Compressonator instead of
+    nvdxt.exe" toggle and is mandatory on Linux. ADR-004 collapsed the
+    nvdxt risk; this flag is the concrete switch.
+  - **Windows support (deferred):** the sibling
+    `pymapconv.v0.6.3.windows-amd64.zip` is published on the same release.
+    When we add Windows to Stage 1, the script grows a `Windows_NT-AMD64`
+    case (different unzip + different bundled tool layout). Out of scope
+    for Stage 0.
+  - **Python source-distribution path:** explicitly NOT supported by this
+    vendoring. If a future contributor needs to patch PyMapConv source,
+    they fork upstream, rebuild the PyInstaller bundle, and we bump the
+    pin. Don't try to mix the two.
+
 ---
 
 ## Template for new entries
