@@ -7,8 +7,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use barme_core::{
-    BIOMES, BrushRegistry, BrushStamp, DirtyRect, Heightmap, History, MapSize, PROJECT_EXTENSION,
-    Project, StartPosition, SymmetryAxis,
+    BIOMES, BrushRegistry, BrushStamp, DirtyRect, Heightmap, History, HistoryEntry, MapSize,
+    PROJECT_EXTENSION, Project, ProjectDiff, StartPosition, SymmetryAxis, WizardSnapshot,
     brushes::pixel_bbox,
     procgen::{Domain, PRESETS, generate as procgen_generate, validate_expression},
     project::sanitize_name,
@@ -113,8 +113,14 @@ struct App {
     /// Empty by default — the pipeline falls back to a 25/75 default pair.
     start_positions: Vec<StartPosition>,
     /// While LMB is held in `StartPositions` mode on an existing marker,
-    /// holds that team's id so the drag re-positions it. Cleared on release.
+    /// holds that team's id so the drag re-positions it. Cleared on
+    /// release.
     dragging_start_pos: Option<u8>,
+    /// Pre-drag elmo coordinates for the marker currently being dragged.
+    /// `Some` whenever `dragging_start_pos` is `Some`; on drag-stop the
+    /// `from` is paired with the now-current `to` and pushed as a
+    /// `ProjectDiff::MoveStartPosition` undo entry (B5).
+    dragging_start_pos_from: Option<(u32, u32)>,
     /// F1 new-project wizard (ADR-024). Open on app launch (replaces the
     /// pre-F1 in-memory "untitled" auto-start) and via File → New project.
     wizard_open: bool,
@@ -370,6 +376,7 @@ impl App {
             previous_tool: Tool::Sculpt,
             start_positions: Vec::new(),
             dragging_start_pos: None,
+            dragging_start_pos_from: None,
             // Open on first launch — the F1 wizard *is* the entry point now.
             wizard_open: true,
             wizard: WizardState::default_for_new_project(),
@@ -447,6 +454,7 @@ impl App {
         self.last_install = None;
         self.start_positions.clear();
         self.dragging_start_pos = None;
+        self.dragging_start_pos_from = None;
         self.end_stroke();
         self.history.barrier();
     }
@@ -686,39 +694,47 @@ impl App {
         }
     }
 
-    /// Pop one stroke off the undo stack and re-upload the affected pixels.
-    /// Also flushes an open stroke first so the user always undoes a
-    /// finished unit.
+    /// Pop one entry off the unified undo stack and apply it. Heightmap
+    /// strokes swap the affected rect and re-upload to the GPU; project
+    /// diffs mutate F8 / wizard state via the local dispatcher. Always
+    /// flushes an open stroke first so the user undoes a finished unit.
+    /// Gated on `!is_dragging_anything()` so undo can't fire mid-gesture
+    /// (B5 pitfall #2). Pushes the inverse onto redo.
     fn undo_one(&mut self) {
         self.end_stroke();
-        let Some(hm_state) = self.heightmap.as_mut() else {
+        if self.is_dragging_anything() {
+            trace!("undo: gated by in-flight drag");
             return;
-        };
-        let Some(rect) = self.history.apply_undo(&mut hm_state.data) else {
+        }
+        let Some(entry) = self.history.pop_undo() else {
             trace!("undo: nothing to undo");
             return;
         };
+        let inverse = self.apply_history_entry(entry);
         info!(
-            rect = ?(rect.x, rect.y, rect.w, rect.h),
             undo_depth = self.history.undo_depth(),
-            redo_depth = self.history.redo_depth(),
+            redo_depth = self.history.redo_depth() + 1,
             "undo applied"
         );
-        if let Some(rs) = self.render_state.as_ref() {
-            render::write_heightmap_rect(rs, hm_state.dims, hm_state.data.data(), rect);
-        }
-        let (mn, mx) = hm_state.data.min_max();
-        hm_state.min = mn;
-        hm_state.max = mx;
+        self.history.push_to_redo(inverse);
     }
 
     /// Commit the wizard form: reset app state, apply size + symmetry +
     /// max height, run the chosen biome's procgen preset to seed the
     /// heightmap. Idempotent if called twice — `new_project()` clears
     /// per-project state first. ADR-024.
+    ///
+    /// B5: snapshots the pre-wizard project state BEFORE the
+    /// `new_project()` / `apply_procgen()` barriers wipe history, then
+    /// pushes one `ProjectDiff::ApplyWizard` entry on top of the
+    /// freshly-cleared stack so Ctrl-Z reverts the wizard.
     fn apply_wizard(&mut self) {
         let w = self.wizard.clone();
         let sanitized = sanitize_name(&w.project_name);
+        // Capture pre-wizard state for B5 undo. Cloned before any
+        // mutation; `new_project()` clears `start_positions` two lines
+        // below, so this must run first.
+        let pre_wizard = self.capture_wizard_snapshot();
         self.new_project();
         self.project_name = sanitized;
         self.map_size = MapSize {
@@ -751,6 +767,11 @@ impl App {
             "F1 wizard: applying"
         );
         self.apply_procgen();
+        // B5: history is now empty (apply_procgen barriered it). Push
+        // one ApplyWizard entry holding the pre-wizard snapshot so
+        // Ctrl-Z reverts the whole wizard apply atomically.
+        self.history
+            .push_project_diff(ProjectDiff::ApplyWizard(Box::new(pre_wizard)));
         self.wizard_open = false;
     }
 
@@ -805,11 +826,18 @@ impl App {
                 "start position placed"
             );
             self.start_positions.push(pos);
+            // B5: each placed position is its own undo entry. Symmetry-
+            // replicated mirrors push individually so Ctrl-Z peels them
+            // off one at a time in reverse-placement order.
+            self.history
+                .push_project_diff(ProjectDiff::PlaceStartPosition(pos));
         }
     }
 
     /// Move the position with `team_id` to the given world coordinates,
-    /// clamped to the map. No-op if the id isn't present.
+    /// clamped to the map. No-op if the id isn't present. Drag-emitted
+    /// frame-by-frame, so this does NOT push an undo entry — that lands
+    /// on `drag_stopped` via [`Self::finish_start_position_drag`].
     fn move_start_position(&mut self, team_id: u8, world_x: f32, world_z: f32) {
         let (ex, ez) = self.world_extents();
         if let Some(p) = self
@@ -822,13 +850,59 @@ impl App {
         }
     }
 
-    /// Remove the position with `team_id`. No-op if absent.
-    fn delete_start_position(&mut self, team_id: u8) {
-        let before = self.start_positions.len();
-        self.start_positions.retain(|p| p.team_id != team_id);
-        if self.start_positions.len() < before {
-            info!(team_id, "start position deleted");
+    /// Commit an in-flight start-position drag. Pushes a single
+    /// `MoveStartPosition` undo entry covering the whole drag (start
+    /// coords → end coords) when both are known and changed. Idempotent;
+    /// always clears `dragging_start_pos*`. B5.
+    fn finish_start_position_drag(&mut self) {
+        let (Some(team_id), Some(from)) = (
+            self.dragging_start_pos.take(),
+            self.dragging_start_pos_from.take(),
+        ) else {
+            // No drag was in flight, or the drag started off-marker.
+            self.dragging_start_pos = None;
+            self.dragging_start_pos_from = None;
+            return;
+        };
+        let Some(p) = self.start_positions.iter().find(|p| p.team_id == team_id) else {
+            // Marker was deleted during the drag (RMB clicks fire
+            // concurrently). Nothing to commit.
+            return;
+        };
+        let to = (p.x_elmo, p.z_elmo);
+        if from == to {
+            // Zero-distance drag (click + immediate release). Don't
+            // pollute the undo stack with a no-op move.
+            return;
         }
+        self.history
+            .push_project_diff(ProjectDiff::MoveStartPosition { team_id, from, to });
+    }
+
+    /// Predicate: is any edit drag currently in flight? Brush strokes
+    /// (heightmap channel) and start-position drags (project-diff
+    /// channel) both gate undo/redo so the user can't peel back state
+    /// mid-gesture. B5.
+    fn is_dragging_anything(&self) -> bool {
+        self.history.stroke_open() || self.dragging_start_pos.is_some()
+    }
+
+    /// Remove the position with `team_id`. No-op if absent. B5: pushes a
+    /// `DeleteStartPosition` undo entry holding the full pre-delete
+    /// position so undo can re-add it verbatim.
+    fn delete_start_position(&mut self, team_id: u8) {
+        let removed = self
+            .start_positions
+            .iter()
+            .find(|p| p.team_id == team_id)
+            .copied();
+        let Some(pos) = removed else {
+            return;
+        };
+        self.start_positions.retain(|p| p.team_id != team_id);
+        info!(team_id, "start position deleted");
+        self.history
+            .push_project_diff(ProjectDiff::DeleteStartPosition(pos));
     }
 
     /// Find the start position whose on-screen marker is within `radius_px`
@@ -856,28 +930,132 @@ impl App {
         best.map(|(id, _)| id)
     }
 
-    /// Inverse of `undo_one`.
+    /// Inverse of `undo_one`. Same drag-gating rules.
     fn redo_one(&mut self) {
         self.end_stroke();
-        let Some(hm_state) = self.heightmap.as_mut() else {
+        if self.is_dragging_anything() {
+            trace!("redo: gated by in-flight drag");
             return;
-        };
-        let Some(rect) = self.history.apply_redo(&mut hm_state.data) else {
+        }
+        let Some(entry) = self.history.pop_redo() else {
             trace!("redo: nothing to redo");
             return;
         };
+        let inverse = self.apply_history_entry(entry);
         info!(
-            rect = ?(rect.x, rect.y, rect.w, rect.h),
-            undo_depth = self.history.undo_depth(),
+            undo_depth = self.history.undo_depth() + 1,
             redo_depth = self.history.redo_depth(),
             "redo applied"
         );
-        if let Some(rs) = self.render_state.as_ref() {
-            render::write_heightmap_rect(rs, hm_state.dims, hm_state.data.data(), rect);
+        self.history.push_to_undo(inverse);
+    }
+
+    /// Apply one `HistoryEntry` against the current app state, returning
+    /// the entry that would re-do it. Heightmap variants swap the rect
+    /// in-place and re-upload to the GPU; project variants dispatch
+    /// through [`Self::apply_project_diff`]. Used by both `undo_one`
+    /// (popping from undo, pushing inverse onto redo) and `redo_one`
+    /// (popping from redo, pushing inverse onto undo) — symmetric.
+    fn apply_history_entry(&mut self, entry: HistoryEntry) -> HistoryEntry {
+        match entry {
+            HistoryEntry::Heightmap(mut e) => {
+                if let Some(hm_state) = self.heightmap.as_mut() {
+                    let rect = self.history.apply_heightmap(&mut e, &mut hm_state.data);
+                    if let Some(rs) = self.render_state.as_ref() {
+                        render::write_heightmap_rect(rs, hm_state.dims, hm_state.data.data(), rect);
+                    }
+                    let (mn, mx) = hm_state.data.min_max();
+                    hm_state.min = mn;
+                    hm_state.max = mx;
+                } else {
+                    warn!(
+                        "undo: heightmap entry on stack but no heightmap loaded — \
+                         entry pushed unchanged onto opposite stack"
+                    );
+                }
+                HistoryEntry::Heightmap(e)
+            }
+            HistoryEntry::Project(diff) => HistoryEntry::Project(self.apply_project_diff(diff)),
         }
-        let (mn, mx) = hm_state.data.min_max();
-        hm_state.min = mn;
-        hm_state.max = mx;
+    }
+
+    /// Dispatch a `ProjectDiff` against this `App`'s F8 + wizard state,
+    /// returning the inverse to push onto the opposite stack. The
+    /// inversion is symmetric for Place/Delete (swap variants) and
+    /// Move/ApplyWizard (swap the from↔to and old↔current snapshot
+    /// respectively). B5.
+    fn apply_project_diff(&mut self, diff: ProjectDiff) -> ProjectDiff {
+        match diff {
+            ProjectDiff::PlaceStartPosition(p) => {
+                // Undo: remove p. Redo direction: re-add.
+                self.start_positions.retain(|q| q.team_id != p.team_id);
+                trace!(team_id = p.team_id, "undo: removed placed start position");
+                ProjectDiff::DeleteStartPosition(p)
+            }
+            ProjectDiff::DeleteStartPosition(p) => {
+                self.start_positions.push(p);
+                trace!(team_id = p.team_id, "undo: restored deleted start position");
+                ProjectDiff::PlaceStartPosition(p)
+            }
+            ProjectDiff::MoveStartPosition { team_id, from, to } => {
+                if let Some(p) = self
+                    .start_positions
+                    .iter_mut()
+                    .find(|p| p.team_id == team_id)
+                {
+                    p.x_elmo = from.0;
+                    p.z_elmo = from.1;
+                }
+                trace!(team_id, ?from, ?to, "undo: reverted start position move");
+                ProjectDiff::MoveStartPosition {
+                    team_id,
+                    from: to,
+                    to: from,
+                }
+            }
+            ProjectDiff::ApplyWizard(snap) => {
+                // Capture the *current* (post-wizard) state into the
+                // inverse so redo restores it. Then swap in `*snap`.
+                let current = Box::new(self.capture_wizard_snapshot());
+                self.restore_wizard_snapshot(*snap);
+                info!("undo: reverted F1 wizard apply");
+                ProjectDiff::ApplyWizard(current)
+            }
+        }
+    }
+
+    /// Snapshot the project-level fields the F1 wizard touches so
+    /// `apply_wizard` can push a `ProjectDiff::ApplyWizard` entry
+    /// carrying the pre-wizard state. Does NOT capture the heightmap
+    /// (the wizard barriers the stroke history; see ADR-033). B5.
+    fn capture_wizard_snapshot(&self) -> WizardSnapshot {
+        WizardSnapshot {
+            project_name: self.project_name.clone(),
+            map_size: self.map_size,
+            height_scale: self.height_scale,
+            symmetry: self.symmetry,
+            rotational_fold: self.rotational_fold,
+            start_positions: self.start_positions.clone(),
+            procgen_expr: self.procgen_expr.clone(),
+            procgen_domain: self.procgen_domain,
+        }
+    }
+
+    /// Restore a `WizardSnapshot` over the current app state. Mirror of
+    /// [`Self::capture_wizard_snapshot`]; the camera is reframed from
+    /// the restored map size. B5.
+    fn restore_wizard_snapshot(&mut self, snap: WizardSnapshot) {
+        self.project_name = snap.project_name;
+        self.map_size = snap.map_size;
+        self.height_scale = snap.height_scale;
+        self.symmetry = snap.symmetry;
+        self.rotational_fold = snap.rotational_fold;
+        self.start_positions = snap.start_positions;
+        self.procgen_expr = snap.procgen_expr;
+        self.procgen_domain = snap.procgen_domain;
+        self.revalidate_procgen();
+        let (ex, ez) = self.map_size.elmo_extents();
+        self.camera = OrbitCamera::framing(ex as f32, ez as f32);
     }
 
     /// Compile the current project to a `.sd7` and copy it into BAR's
@@ -1225,7 +1403,10 @@ impl App {
         // Cancel an in-flight start-position drag when leaving
         // StartPositions — otherwise `dragging_start_pos` would linger
         // and a re-entry to the tool would resume an invisible drag.
+        // Drop the captured `from` too; cancelling a drag should not
+        // emit a MoveStartPosition undo entry (no committed move).
         self.dragging_start_pos = None;
+        self.dragging_start_pos_from = None;
     }
 
     /// Keyboard: Ctrl-Z / Ctrl-Shift-Z / Ctrl-Y for undo / redo,
@@ -1914,6 +2095,15 @@ impl App {
                 if response.drag_started_by(egui::PointerButton::Primary) {
                     self.dragging_start_pos =
                         self.hit_test_start_position(cursor, rect, HIT_RADIUS_PX);
+                    // B5: capture the pre-drag coords so drag-stop can
+                    // push a MoveStartPosition undo entry with a real
+                    // `from`. None if the drag didn't begin on a marker.
+                    self.dragging_start_pos_from = self.dragging_start_pos.and_then(|id| {
+                        self.start_positions
+                            .iter()
+                            .find(|p| p.team_id == id)
+                            .map(|p| (p.x_elmo, p.z_elmo))
+                    });
                 }
                 if response.dragged_by(egui::PointerButton::Primary)
                     && let Some(id) = self.dragging_start_pos
@@ -1923,7 +2113,7 @@ impl App {
                     self.move_start_position(id, world.x, world.z);
                 }
                 if response.drag_stopped_by(egui::PointerButton::Primary) {
-                    self.dragging_start_pos = None;
+                    self.finish_start_position_drag();
                 }
                 if response.clicked_by(egui::PointerButton::Primary)
                     && self
@@ -2182,6 +2372,7 @@ mod tests {
             previous_tool: Tool::Sculpt,
             start_positions: Vec::new(),
             dragging_start_pos: None,
+            dragging_start_pos_from: None,
             wizard_open: false,
             wizard: WizardState::default_for_new_project(),
             symmetry_popover_open: false,
@@ -2549,5 +2740,158 @@ mod tests {
         // documenting that the gate is in the UI code; the action
         // mapping itself is variant-only.
         assert!(BuildVariant::Install.to_file_action().is_some());
+    }
+
+    // ----------------------------- B5 -----------------------------
+
+    /// B5 smoke: place a start position, Ctrl-Z → marker removed.
+    /// Push diff happens inside `place_start_position`; `undo_one`
+    /// dispatches it through `apply_project_diff`.
+    #[test]
+    fn b5_place_then_undo_removes_marker() {
+        let mut app = make_test_app();
+        app.place_start_position(100.0, 100.0);
+        assert_eq!(app.start_positions.len(), 1);
+        assert_eq!(app.history.undo_depth(), 1);
+        app.undo_one();
+        assert!(app.start_positions.is_empty());
+        assert_eq!(app.history.undo_depth(), 0);
+        assert_eq!(app.history.redo_depth(), 1, "undo pushes onto redo");
+    }
+
+    /// B5 smoke: place + undo + redo restores the marker.
+    #[test]
+    fn b5_place_then_undo_redo_round_trips() {
+        let mut app = make_test_app();
+        app.place_start_position(50.0, 75.0);
+        let pos_before = app.start_positions[0];
+        app.undo_one();
+        assert!(app.start_positions.is_empty());
+        app.redo_one();
+        assert_eq!(app.start_positions.len(), 1);
+        assert_eq!(app.start_positions[0], pos_before);
+    }
+
+    /// B5 smoke: delete a marker, Ctrl-Z restores it (RMB path).
+    #[test]
+    fn b5_delete_then_undo_restores_marker() {
+        let mut app = make_test_app();
+        app.place_start_position(100.0, 100.0);
+        let id = app.start_positions[0].team_id;
+        // Place pushed one diff; clear redo bookkeeping by deleting.
+        app.delete_start_position(id);
+        assert!(app.start_positions.is_empty());
+        assert_eq!(app.history.undo_depth(), 2, "place + delete pushed");
+        app.undo_one(); // undo the delete
+        assert_eq!(app.start_positions.len(), 1);
+        assert_eq!(app.start_positions[0].team_id, id);
+    }
+
+    /// B5 smoke: F1 wizard apply followed by Ctrl-Z restores the
+    /// pre-wizard project metadata. We construct an app, mutate it,
+    /// then run the wizard, then undo and confirm the metadata
+    /// rolls back.
+    #[test]
+    fn b5_apply_wizard_then_undo_restores_metadata() {
+        let mut app = make_test_app();
+        // Pre-wizard state.
+        app.project_name = "pre".to_string();
+        app.map_size = MapSize { smu_x: 4, smu_z: 6 };
+        app.height_scale = 123.0;
+        app.symmetry = SymmetryAxis::Horizontal;
+        app.start_positions = vec![StartPosition {
+            team_id: 0,
+            x_elmo: 999,
+            z_elmo: 999,
+        }];
+        // Configure wizard for a different post-apply state.
+        app.wizard.project_name = "post-wizard".to_string();
+        app.wizard.smu_x = 8;
+        app.wizard.smu_z = 8;
+        app.wizard.symmetry = SymmetryAxis::Vertical;
+        app.wizard.max_height = 333.0;
+        app.wizard.biome_index = 0;
+        app.apply_wizard();
+        // Post-wizard.
+        assert_eq!(app.project_name, "post-wizard");
+        assert_eq!(app.map_size, MapSize { smu_x: 8, smu_z: 8 });
+        assert!(matches!(app.symmetry, SymmetryAxis::Vertical));
+        assert!(
+            app.start_positions.is_empty(),
+            "new_project cleared positions"
+        );
+        assert_eq!(app.history.undo_depth(), 1, "one ApplyWizard entry");
+        // Undo.
+        app.undo_one();
+        assert_eq!(app.project_name, "pre");
+        assert_eq!(app.map_size, MapSize { smu_x: 4, smu_z: 6 });
+        assert_eq!(app.height_scale, 123.0);
+        assert!(matches!(app.symmetry, SymmetryAxis::Horizontal));
+        assert_eq!(app.start_positions.len(), 1);
+        assert_eq!(app.start_positions[0].x_elmo, 999);
+        assert_eq!(app.history.redo_depth(), 1);
+    }
+
+    /// B5 smoke: undo is gated on `!is_dragging_anything()`. Setting
+    /// `dragging_start_pos` to `Some(_)` prevents undo_one from
+    /// popping an entry — the user is mid-gesture and Ctrl-Z must
+    /// not yank state out from under them.
+    #[test]
+    fn b5_undo_gated_by_in_flight_drag() {
+        let mut app = make_test_app();
+        app.place_start_position(100.0, 100.0);
+        assert_eq!(app.history.undo_depth(), 1);
+        // Simulate a drag-in-progress on the same marker.
+        app.dragging_start_pos = Some(app.start_positions[0].team_id);
+        app.dragging_start_pos_from = Some((100, 100));
+        app.undo_one();
+        // Drag gate held: nothing popped.
+        assert_eq!(
+            app.history.undo_depth(),
+            1,
+            "undo while dragging must be a no-op"
+        );
+        assert_eq!(app.start_positions.len(), 1);
+        // Releasing the drag clears the gate; subsequent undo works.
+        app.dragging_start_pos = None;
+        app.dragging_start_pos_from = None;
+        app.undo_one();
+        assert_eq!(app.history.undo_depth(), 0);
+    }
+
+    /// B5 smoke: `is_dragging_anything()` reflects both gesture
+    /// channels — brush stroke + start-position drag.
+    #[test]
+    fn b5_is_dragging_anything_covers_both_channels() {
+        let mut app = make_test_app();
+        assert!(!app.is_dragging_anything());
+        app.dragging_start_pos = Some(0);
+        assert!(app.is_dragging_anything(), "start-pos drag should gate");
+        app.dragging_start_pos = None;
+        // Heightmap-stroke gate is harder to fake without a heightmap;
+        // we exercise the start-pos branch + the false case here.
+        // The heightmap branch is covered by the existing
+        // `stroke_open()` tests in `barme-core::undo`.
+        assert!(!app.is_dragging_anything());
+    }
+
+    /// B5: a single click-and-immediate-release on a marker (no actual
+    /// move) must NOT push a MoveStartPosition entry — that would
+    /// pollute the undo stack with no-op gestures.
+    #[test]
+    fn b5_zero_distance_drag_does_not_push_undo_entry() {
+        let mut app = make_test_app();
+        app.place_start_position(100.0, 100.0);
+        let depth_after_place = app.history.undo_depth();
+        // Simulate a drag start + drag stop with no movement.
+        let id = app.start_positions[0].team_id;
+        app.dragging_start_pos = Some(id);
+        app.dragging_start_pos_from = Some((100, 100));
+        app.finish_start_position_drag();
+        assert_eq!(
+            app.history.undo_depth(),
+            depth_after_place,
+            "zero-distance drag must not push an undo entry"
+        );
     }
 }
