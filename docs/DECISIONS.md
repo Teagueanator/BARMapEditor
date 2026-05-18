@@ -1434,6 +1434,158 @@ the stroke never touched them), and push that as a single `UndoEntry`.
   drops open stroke, empty stroke no-op, cap eviction, off-rect-pixel
   correctness, bbox-of-set-bits exactness, redo chain.
 
+## ADR-030 — Editor layout shell: five-zone panels + single-active-tool model
+
+**Status:** Accepted (2026-05-18).
+**Context:** The Phase-2 close shipped a working editor inside a single
+280 px `SidePanel::left` stacked with eight unrelated sections —
+project info, heightmap stats, render scale, tool mode, sculpt
+controls, start-position list, procgen form, build & install. By
+ADR-024 (F1 wizard) every Phase-3 feature is queued to plug into that
+same column: symmetry as a "global mode" (B2), splat painting (D5),
+metal/geo placement (C4 / C5), feature placement (C6), `mapinfo.lua`
+form editor (C7), the linter panel (C8), and an enriched F8 allyteam
+tree (B6). Without a layout refactor each one of those lands as
+another section in the same scrolling pile — at six items the column
+already needs vertical scroll on a 1080p display.
+
+The two UX deep-research outputs (Claude + Gemini, both at
+`docs/research/ui/`) converge on a five-zone shell: top action bar +
+bottom status strip + left tool strip + right Inspector + central
+viewport. They diverge on whether the left tool strip should sit
+alongside a *second* "scene Outliner" left panel (Gemini's Unity
+homage) or stay as a single narrow icon strip (Claude's Blender /
+Krita / Photoshop pattern). We adopt **Claude's single-strip stance**
+— Gemini's two-panel left has no strong UX precedent we found, and
+egui's `SidePanel::left` resize handle on the second panel adds a
+learning-curve cost without a clear win. If a real session of
+B2/B3/B4 work proves the Inspector overflows with mixed
+tool-params + project-metadata, the falsifier reopens this decision.
+
+**Single-active-tool model.** The pre-ADR-030 `ToolMode { Sculpt,
+StartPositions }` enum scaled poorly: every new editing surface
+(Procgen, Splat, Metal, Geo, Feature, ...) would need a new variant
+plus parallel state on `App`. Promoting `ToolMode` to `Tool { Select,
+Sculpt, StartPositions, Procgen }` and driving the Inspector contents
+via an exhaustive `match self.tool` builds the safety property
+in: adding a `Tool::Splat` in Phase 4 produces a compile error at
+every dispatch site, which is the failure mode we want. `Tool::ALL`
+is the display-order array — the left tool strip iterates it, and a
+unit test pins the size so new variants nudge the strip too.
+
+**Q / B / S / G accelerators.** One letter per tool, gated on
+`!ctx.wants_keyboard_input()` so typing into the procgen `TextEdit`
+doesn't switch tools and eat the keystroke. Tool changes emit a
+`tracing::info!` line with `from` / `to` so bug reports carry the
+transition history. `App::previous_tool` is the sentinel — initialised
+to `tool` so the first transition logs a real diff, not "??? → X".
+
+**Panel add-order.** egui's documented rule
+(https://docs.rs/egui/latest/egui/containers/panel/) is **top →
+bottom → left(s) → right → CentralPanel LAST**. Reversing the order
+means the CentralPanel eats the rect that a later panel was supposed
+to claim. The new `App::update` body is a slim orchestrator that
+calls one panel method per zone in that exact order, then drains a
+`FileAction` queue, then renders the symmetry popover and the F1
+wizard on top.
+
+**Drag threshold = 8 px.** egui 0.33 exposes the click-vs-drag
+threshold as `InputOptions::max_click_dist` (default 6 px — pointer
+moves within that radius after press still register as clicks).
+Bumping to 8 px restores the click-place vs drag-paint
+disambiguation we need in `Tool::StartPositions` (single LMB-clicks
+near an existing marker must not jiggle into a drag-paint). 8 px is
+the Photoshop / Blender convention.
+
+**Inspector header is global state.** Project name, map size,
+heightmap dims, and max-height live in a persistent block at the top
+of the right Inspector — always visible regardless of active tool.
+They're session metadata, not tool parameters. Below the header, an
+exhaustive `match self.tool` swaps the tool-specific controls. Each
+branch is a private `App::inspector_*` method so they grow
+independently when B2 / B6 / B7 / C4 / C5 / C6 / C7 each touch their
+own tool.
+
+**Symmetry chip as a popover.** Per ADR-019 symmetry replicates every
+spatial edit, not just brush stamps — it's a session property, not a
+Sculpt-section preference. The top-bar chip reads `Sym: <label>`;
+clicking it toggles a small `egui::Window` carrying the existing
+axis combo + rotational fold spinner. ADR-031 (B2) will replace the
+popover with a canvas overlay (dashed axes + ghost brush rings); B1
+just relocates the controls so they don't live inside the Sculpt
+section any more (where they were unreachable in StartPositions /
+Procgen modes).
+
+**Top-bar Build button is a placeholder.** Plain `Button` at the
+right edge of the top action bar (right-aligned via
+`egui::Layout::right_to_left`). ADR-NNN (B4) styles it green +
+adds the `Build / Build + Install / Build + Install + Launch`
+variants `ComboBox`. The Side panel's "Build & Install" section is
+gone — duplicate paths were a UX-research frustration.
+
+**Status strip placeholders.** Bottom strip carries live
+camera-orbit readout, project map dims, validation chip placeholder
+("0 issues" — wired in C8), and a Build-state chip that mirrors
+`last_install`. The "Camera readout" inside the old Sculpt section
+is gone — it's session-global, not a tool parameter.
+
+**Alternatives considered:**
+- **Two-left-panel layout (Gemini's variant).** Reduced Inspector
+  scrolling at the cost of an extra learning curve and an
+  ambiguous "which left panel owns this control" question. Rejected;
+  reopen if B2 / B6 / B7 prove the Inspector overflows.
+- **Dock crate (`egui_dock`).** Adds a maintenance dependency for a
+  one-off UI layout. Rejected — egui's primitive panel set covers
+  the five-zone shell cleanly. Reopen only if multi-document or
+  resizable-tab UX is needed.
+- **Tool state in `ui.memory()` (egui's per-Id keyed store).**
+  Survives tool switches at the cost of restart-loss for brush
+  radius / procgen expression / F8 selection. Rejected — the user
+  would lose their workflow state on every app restart, which is the
+  "immediate-mode state ownership" pitfall called out in
+  phase-3-plan.md B1. All tool-specific state stays on `App`.
+- **Inline panel functions vs an `ui/` module dir.** The
+  phase-3-plan called it a judgement call. Kept inline for B1 — the
+  refactored `main.rs` grew from 1609 → ~2050 lines (about 27 %
+  growth). If B2's symmetry overlay + B3's brush ring push past
+  ~2500 lines, the next session can split `crates/barme-app/src/ui/`
+  with one file per zone.
+
+**Consequence:**
+- `enum Tool { Select, Sculpt, StartPositions, Procgen }` replaces
+  `ToolMode`. Carries `icon()` / `accel()` / `label()` helpers and a
+  `Tool::ALL: [Tool; 4]` const used by the tool strip + tests.
+- New `App` fields: `tool: Tool`, `previous_tool: Tool`,
+  `symmetry_popover_open: bool`. `tool_mode: ToolMode` removed.
+- `App::update` is now a 25-line orchestrator. The body splits into
+  `App::handle_keyboard`, `App::top_bar`, `App::status_strip`,
+  `App::tool_strip`, `App::inspector` (+ private
+  `inspector_header / select / sculpt / start_positions / procgen`
+  branches), `App::central`, `App::drain_action`,
+  `App::symmetry_popover`. Each panel function takes `&mut self` +
+  `&egui::Context` plus `&mut Option<FileAction>` where relevant.
+- `App::set_tool` is the single mutation point: bumps
+  `previous_tool`, emits `tracing::info!`, drops any in-flight
+  heightmap stroke (`end_stroke`), clears any in-flight marker drag
+  (`dragging_start_pos`).
+- 8 unit tests added under `barme-app::tests`:
+  `tool_all_array_has_unique_entries_per_variant`,
+  `tool_helpers_are_distinct_per_variant`,
+  `tool_accelerator_is_a_single_uppercase_letter`,
+  `tool_accelerators_match_adr_030`,
+  `set_tool_is_noop_when_new_matches_current`,
+  `set_tool_updates_current_and_previous`,
+  `set_tool_clears_in_flight_start_position_drag`,
+  `fresh_app_has_consistent_previous_tool_sentinel`. Plus 3
+  smoke tests pinning Phase 2 invariants
+  (`b1_does_not_regress_procgen_apply_phase2`,
+  `b1_does_not_regress_start_position_placement_phase2`,
+  `b1_does_not_regress_undo_with_no_heightmap_phase2`).
+  `barme-app` test count: 18 (was 7 after A4).
+- The drag threshold is set once per frame at the top of
+  `App::update` via `ctx.options_mut(|o| o.input_options.max_click_dist = 8.0)`.
+  Idempotent; cheap.
+
 ## Template for new entries
 
 ```

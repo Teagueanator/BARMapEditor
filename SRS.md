@@ -264,6 +264,27 @@ A single-window, single-executable desktop app that produces a *playable* BAR ma
 > `mapinfo_overrides`) follow the same pattern when each F-feature
 > lands.
 
+> **STATUS UPDATE 2026-05-18 (Editor layout shell — ADR-030, F2/F3/F8/F14
+> UI surfaces re-homed):** The pre-Phase-3 stacked-side-panel UI is gone.
+> The editor now uses a five-zone shell: top action bar (File/Edit/Build
+> menus + symmetry chip + Build & Install), bottom status strip (camera
+> readout + map dims + validation-chip placeholder), left 40 px tool
+> strip (Q Select / B Sculpt / S StartPositions / G Procgen), right
+> 300 px resizable Inspector (persistent project header + tool-specific
+> controls via exhaustive `match`), central wgpu viewport (panel
+> add-order LAST). Tool-specific state stays on `App`, not
+> `ui.memory()`. Single-active-tool `Tool` enum has room for Phase 4
+> Splat / Metal / Feature variants without dispatch-site changes — the
+> exhaustive match enforces handling. Drag threshold raised to 8 px
+> (`InputOptions::max_click_dist`) to disambiguate click-place from
+> drag-paint. Symmetry promotion from Sculpt-only radio to top-bar chip
+> + popover preserves the existing controls (B2 / ADR-031 adds the
+> canvas overlay). All Phase-2 features still reachable: Ctrl-Z undo,
+> F8 placement, F1 wizard via File → New, Procgen Apply, symmetry
+> mirror replication. 8 new unit tests pin the Tool enum and set_tool
+> invariants; 3 more pin Phase 2 smoke paths
+> (`b1_does_not_regress_*`).
+
 ### 3.3 Non-functional requirements
 
 - **NFR-Performance:** Brush stroke latency ≤ 8 ms on a 16×16 map at 60 fps preview on a mid-range 2020 GPU.

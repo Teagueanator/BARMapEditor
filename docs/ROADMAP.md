@@ -61,6 +61,14 @@ Implements SRS F1–F12. Ships a Windows `.exe` and a Linux AppImage.
       snapshots with stroke coalescing + barriers on procgen/load/new
       (ADR-022), Ctrl-Z / Ctrl-Shift-Z keybinds, Edit menu, 100 MB ring
       cap. The exploratory edit→evaluate loop is no longer one-way.
+- [x] **Editor layout shell (Phase 3 / B1, ADR-030)** — five-zone
+      panel structure: top action bar (menus + symmetry chip + Build),
+      bottom status strip (camera readout + map dims), left 40 px tool
+      strip (`Tool { Select / Sculpt / StartPositions / Procgen }` via
+      Q/B/S/G accelerators), right 300 px resizable Inspector
+      (persistent header + exhaustive `match self.tool` on tool params),
+      CentralPanel last. Drag threshold bumped to 8 px. All F2 / F3 /
+      F8 / F14 UI surfaces re-homed; nothing functional removed.
 - [ ] Beherith (or active mapper) reviews `.sd7` byte-for-byte against PyMapConv
       reference output on three test maps
 - [ ] Listed on `beyondallreason.info/guide/mapmaking-resources` as beta
