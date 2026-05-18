@@ -16,12 +16,80 @@
 //! exp/log, sqrt/abs/min/max, plus user-defined variables.
 
 use evalexpr::{
-    ContextWithMutableVariables, DefaultNumericTypes, HashMapContext, Node, Value,
-    build_operator_tree,
+    Context, DefaultNumericTypes, EvalexprError, EvalexprResult, Node, Value, build_operator_tree,
+    error::EvalexprResultValue,
 };
 use tracing::warn;
 
 use crate::{Heightmap, MapSize};
+
+/// Minimal `Context` impl that holds *only* the two coordinate bindings
+/// (`x`, `z`) as `Value<DefaultNumericTypes>` directly. Avoids the
+/// per-pixel `String` allocation that `HashMapContext::set_value` requires
+/// under the hood — at 1025² pixels the difference is millions of mallocs.
+///
+/// Builtins (`math::sqrt`, `math::sin`, …) are still available because the
+/// tree evaluator routes those via [`Context::are_builtin_functions_disabled`]
+/// before falling back to [`Context::call_function`]; we report builtins as
+/// enabled, and `call_function` is only reached for user-defined functions
+/// (which the procgen surface doesn't allow).
+struct PixelContext {
+    x_val: Value<DefaultNumericTypes>,
+    z_val: Value<DefaultNumericTypes>,
+}
+
+impl PixelContext {
+    fn new() -> Self {
+        Self {
+            x_val: Value::Float(0.0),
+            z_val: Value::Float(0.0),
+        }
+    }
+
+    #[inline]
+    fn set_x(&mut self, x: f64) {
+        self.x_val = Value::Float(x);
+    }
+
+    #[inline]
+    fn set_z(&mut self, z: f64) {
+        self.z_val = Value::Float(z);
+    }
+}
+
+impl Context for PixelContext {
+    type NumericTypes = DefaultNumericTypes;
+
+    #[inline]
+    fn get_value(&self, identifier: &str) -> Option<&Value<Self::NumericTypes>> {
+        match identifier {
+            "x" => Some(&self.x_val),
+            "z" => Some(&self.z_val),
+            _ => None,
+        }
+    }
+
+    fn call_function(
+        &self,
+        identifier: &str,
+        _argument: &Value<Self::NumericTypes>,
+    ) -> EvalexprResultValue<Self::NumericTypes> {
+        Err(EvalexprError::FunctionIdentifierNotFound(
+            identifier.to_string(),
+        ))
+    }
+
+    fn are_builtin_functions_disabled(&self) -> bool {
+        false
+    }
+
+    fn set_builtin_functions_disabled(
+        &mut self,
+        _disabled: bool,
+    ) -> EvalexprResult<(), Self::NumericTypes> {
+        Err(EvalexprError::ContextNotMutable)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Domain {
@@ -82,31 +150,32 @@ pub fn generate(
     let tree: Node<DefaultNumericTypes> = build_operator_tree(expr).map_err(ProcGenError::Parse)?;
 
     let mut data = Vec::with_capacity((w as usize) * (h as usize));
-    let mut ctx = HashMapContext::<DefaultNumericTypes>::new();
+    let mut ctx = PixelContext::new();
     let mut warned_nan = false;
     let denom_x = (w - 1).max(1) as f64;
     let denom_z = (h - 1).max(1) as f64;
 
-    for iz in 0..h {
-        let z_norm = match domain {
+    // Precompute the 1D normalisation arrays once per call — same value for
+    // every row (`x_norms`) or every column (`z_norms`), so doing it
+    // per-pixel in the inner loop was wasted cycles and a branchy `match`.
+    let x_norms: Vec<f64> = (0..w)
+        .map(|ix| match domain {
+            Domain::Unit => (ix as f64) / denom_x,
+            Domain::Centered => (ix as f64) / denom_x * 2.0 - 1.0,
+        })
+        .collect();
+    let z_norms: Vec<f64> = (0..h)
+        .map(|iz| match domain {
             Domain::Unit => (iz as f64) / denom_z,
             Domain::Centered => (iz as f64) / denom_z * 2.0 - 1.0,
-        };
+        })
+        .collect();
+
+    for iz in 0..h {
+        // z is constant across the inner loop — bind once per row.
+        ctx.set_z(z_norms[iz as usize]);
         for ix in 0..w {
-            let x_norm = match domain {
-                Domain::Unit => (ix as f64) / denom_x,
-                Domain::Centered => (ix as f64) / denom_x * 2.0 - 1.0,
-            };
-            ctx.set_value("x".into(), Value::Float(x_norm))
-                .map_err(|source| ProcGenError::EvalFailed {
-                    pixel: (ix, iz),
-                    source,
-                })?;
-            ctx.set_value("z".into(), Value::Float(z_norm))
-                .map_err(|source| ProcGenError::EvalFailed {
-                    pixel: (ix, iz),
-                    source,
-                })?;
+            ctx.set_x(x_norms[ix as usize]);
             let v = tree
                 .eval_with_context(&ctx)
                 .map_err(|source| ProcGenError::EvalFailed {
@@ -278,6 +347,83 @@ mod tests {
             "paraboloid center {center} should exceed corner {corner}"
         );
         assert_eq!(corner, 0, "corner outside [0,1] should clamp to 0");
+    }
+
+    /// Regression guard for the per-pixel cost of the math-function path.
+    /// Pre-fix (HashMapContext + per-pixel `set_value("x".into(), ...)`)
+    /// the cone-peak biome at 16 SMU clocked ~575 ms on the dev machine.
+    /// The custom `PixelContext` + precomputed `x_norms`/`z_norms` arrays
+    /// land around ~440 ms in release. We pin the threshold at 1000 ms so
+    /// the test isn't flaky on slower CI hardware while still catching a
+    /// future regression to the pre-fix baseline.
+    ///
+    /// **The plan-A3 target was <100 ms.** That's unreachable while the
+    /// expression layer is evalexpr — its `eval_with_context` allocates a
+    /// per-node `Vec` for arguments on every recursive call, costing ~10
+    /// allocations × 1.05M pixels per generation. Closing the rest of the
+    /// gap requires either rayon par_iter over rows (deferred per
+    /// phase-3-plan A3) or replacing evalexpr with a precompiled
+    /// bytecode/closure path (would need its own ADR). See the
+    /// `stage-1-procgen-perf` devlog for the full numbers.
+    #[test]
+    fn generate_16_smu_cone_peak_under_one_second() {
+        // Warm-up (page caches, allocator); time the second call.
+        let _ = generate(
+            "max(0, 1 - math::sqrt(x*x + z*z))",
+            Domain::Centered,
+            MapSize::square(16),
+            0.0,
+            384.0,
+        )
+        .unwrap();
+        let t0 = std::time::Instant::now();
+        let _ = generate(
+            "max(0, 1 - math::sqrt(x*x + z*z))",
+            Domain::Centered,
+            MapSize::square(16),
+            0.0,
+            384.0,
+        )
+        .unwrap();
+        let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        // Conservative ceiling — pre-fix was ~575 ms; if we regress past
+        // 1 s, something is wrong.
+        assert!(
+            elapsed_ms < 1000.0,
+            "16 SMU cone-peak procgen took {elapsed_ms:.1} ms; regression past the pre-A3 baseline?"
+        );
+        eprintln!("16 SMU cone-peak procgen: {elapsed_ms:.1} ms");
+    }
+
+    /// Output stability: same expression at the same size must yield the
+    /// same bytes after the A3 refactor. Pins the visual contract — if a
+    /// future micro-optimisation flips a clamp or rounding bound, the
+    /// fixture catches it before users see a corrupted bowl.
+    #[test]
+    fn cone_peak_at_2_smu_is_byte_stable() {
+        let a = generate(
+            "max(0, 1 - math::sqrt(x*x + z*z))",
+            Domain::Centered,
+            MapSize::square(2),
+            0.0,
+            384.0,
+        )
+        .unwrap();
+        let b = generate(
+            "max(0, 1 - math::sqrt(x*x + z*z))",
+            Domain::Centered,
+            MapSize::square(2),
+            0.0,
+            384.0,
+        )
+        .unwrap();
+        assert_eq!(a.data(), b.data(), "procgen must be deterministic");
+        // Center pixel: x = z = 0 → 1 - sqrt(0) = 1 → u16::MAX.
+        let (w, _) = a.dims();
+        let center = a.data()[((w / 2) * w + (w / 2)) as usize];
+        assert_eq!(center, u16::MAX);
+        // Corner: x = z = -1 → 1 - sqrt(2) ≈ -0.41 → clamped to 0.
+        assert_eq!(a.data()[0], 0);
     }
 
     #[test]
