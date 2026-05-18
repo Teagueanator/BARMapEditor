@@ -309,6 +309,59 @@ A single-window, single-executable desktop app that produces a *playable* BAR ma
 > for F9's eventual form-edit bag. **F9 itself (form editor + raw Lua
 > tab) is still pending — C7 will wire the UI on top of this schema.**
 
+> **STATUS UPDATE 2026-05-18 (F9 — full BAR-default block, C3):**
+> Sprint 6 / C3 fleshes out `MapInfo::bar_default()` with the digest's
+> full BAR convention values: lighting colours and shadow densities
+> per `Rendering/Env/SunLighting.cpp` defaults, atmosphere wind range
+> (5..25) + fog colour + sky colour + sky direction + cloud density,
+> and a four-entry `terrain_types` array (Default / Rock / Sand /
+> Water) with the canonical `hardness` / `receiveTracks` / `moveSpeeds`
+> values. New `MapInfo::bar_default_with_water()` constructor returns
+> a struct with the `water` sub-table populated (surface / plane /
+> min / base colours, fresnel, perlin params) for projects that opt
+> in via `tidal_strength > 0` or `min_height < 0`. The Lua emitter
+> already wrote `sunDir` (camelCase) — a regression test now also
+> asserts the lowercase `sundir` form does NOT leak out. 11 schema
+> tests + 3 emitter tests pin every named default; the smoke test
+> checks `gravity == 130`, `extractor_radius == 80`, `modtype == 3`,
+> `fog_start != fog_end`, `splats.tex_scales == [0.02; 4]`,
+> `terrain_types.len() == 4`.
+
+> **STATUS UPDATE 2026-05-18 (F14 — procgen UX redesign, B7):**
+> Sprint 6 / B7 reorders the Procgen Inspector to preset-first per
+> the UI research digests: preset dropdown (auto-detects "Custom"
+> when the expression diverges) → `CollapsingHeader` "Custom
+> expression" (collapsed by default) → domain radio → 256² greyscale
+> preview thumbnail → "Apply to heightmap" button + ✓ / ✗ chip.
+> Preview backs to a persistent `egui::TextureHandle` reused via
+> `handle.set(image, options)` so the GPU page count stays flat
+> across keystrokes. New `barme_core::procgen::generate_thumbnail`
+> helper reuses A3's `PixelContext` + precomputed norms; 256²
+> cone-peak lands ~25 ms in release. A 50 ms debounce keyed on
+> `hash(expr, domain)` coalesces multi-keystroke bursts and flips
+> the cache even when the expression string is unchanged but the
+> domain toggles. `ctx.request_repaint_after(remaining)` wakes the
+> UI loop on quiescence so the preview catches up without busy-
+> spinning.
+
+> **STATUS UPDATE 2026-05-18 (F1 — demo state on Create, B8):**
+> Sprint 6 / B8 turns the wizard's Create button into a true
+> "ready to play" handoff. `apply_wizard` now: (1) seeds two start
+> positions in `ally_groups[0]` on N / S strips (15 % / 85 % of map
+> Z) — runs **after** the biome procgen so a valley-finder can
+> dodge the parabolic-dome's peak, falling back to the map
+> quarter-points on a miss; (2) reframes the camera at 35° pitch /
+> 1.6 × diagonal distance from map centre; (3) opens a non-modal
+> `egui::Window` overlay with three accelerator-named bullets
+> (B / S / G) pointing at the demo interactions. Wizard's default
+> symmetry flipped from `None` → `Horizontal` so the markers line
+> up with the symmetry axis without further input. Dismiss
+> persists per-project via a new `Project.next_steps_dismissed`
+> bool (default false, `skip_serializing_if = "std::ops::Not::not"`);
+> a fresh wizard Create on a new project re-shows the hint, by
+> design — the user should not have to opt-back-in across
+> unrelated projects.
+
 > **STATUS UPDATE 2026-05-18 (F11 — Lua AST emitter + three-file
 > convention, ADR-029 / C2):** the ad-hoc string formatter at
 > `barme-pipeline::mapinfo` is gone. New `barme-pipeline::lua_ast`

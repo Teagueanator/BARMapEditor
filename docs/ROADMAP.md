@@ -119,6 +119,33 @@ Implements SRS F1–F12. Ships a Windows `.exe` and a Linux AppImage.
       canvas; cross-tool ghosting at 50 % alpha. Pre-Phase-3
       `.barmeproj` migration via custom `Deserialize`. ADR-013's
       emitter half + ADR-023's data shape are superseded.
+- [x] **Defaults + procgen UX + demo state (Phase 3 / Sprint 6 =
+      C3 + B7 + B8)** — three small finishing-touch items, no new
+      ADRs. **C3:** `MapInfo::bar_default()` now seeds the digest's
+      full BAR-convention block (lighting colours / shadow densities,
+      atmosphere wind / fog / sky / cloud, `terrain_types` as a 4-
+      entry vec — Default / Rock / Sand / Water). New
+      `bar_default_with_water()` constructor for tidal / sub-zero
+      maps. `sunDir` camelCase emission pinned by a regression test
+      that also rejects the lowercase `sundir` form. **B7:** procgen
+      Inspector reordered preset-first (preset dropdown → collapsed
+      "Custom expression" → domain radio → 256² greyscale preview
+      thumbnail → "Apply to heightmap"). Preview backs to a
+      persistent `egui::TextureHandle` reused via `handle.set(...)`
+      so the GPU page count stays flat across keystrokes. New
+      `procgen::generate_thumbnail` helper + 50 ms debounce keyed
+      on `hash(expr, domain)`. **B8:** `apply_wizard` seeds 2 demo
+      start positions on N / S strips (with a valley-finder so
+      parabolic-dome doesn't plant on the peak), reframes the
+      camera at 35° pitch / 1.6 × diagonal, and pops a non-modal
+      "Next steps" `egui::Window`. Wizard's default symmetry flipped
+      from `None` → `Horizontal` so the N / S pair lines up.
+      Dismiss persists per-project (new
+      `Project.next_steps_dismissed` bool, NOT in `EditorConfig` —
+      fresh projects re-show the hint). Test counts:
+      barme-core 122 → 132 (+10), barme-app 114 → 117 (+3,
+      including the moved B5 wizard test) + ui::next_steps (+2);
+      barme-pipeline 49 → 52 (+3).
 - [ ] Beherith (or active mapper) reviews `.sd7` byte-for-byte against PyMapConv
       reference output on three test maps
 - [ ] Listed on `beyondallreason.info/guide/mapmaking-resources` as beta
