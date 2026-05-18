@@ -381,6 +381,30 @@ match) both bear directly on this decision.
     emitter always derives `smtFileName0` from the same `name` field
     the SMT is written with. There is no path that lets them diverge.
 
+**Amendment (2026-05-17, Stage 0 goal #7):** the emitter's field set
+is calibrated to the *intersection of three independent gates*, not
+just engine docs:
+
+1. **Recoil engine scanner** — only `name`, `smf.smtFileName0`, and
+   `teams[*].startPos` strictly required (per the
+   `burnhamrobertp/97cae4d300e675ca261e661fc58266d1` reference gist).
+2. **Chobby map browser** (`beyond-all-reason/BYAR-Chobby` →
+   `LuaMenu/widgets/gui_maplist_panel.lua`) — needs `modtype == 3`;
+   filters unofficial maps from multiplayer lobbies (visible in
+   Skirmish only).
+3. **BAR mod gadgets** (`beyond-all-reason/Beyond-All-Reason` →
+   `luarules/gadgets/*.lua`) — read mapinfo subtables directly without
+   nil-checking; missing subtable → gadget load crash → game hangs at
+   waiting-for-players. First hit: `unit_sunfacing.lua` line 44 reads
+   `mapinfo.lighting.sundir` unconditionally.
+
+The emitter therefore includes `lighting = { sundir = {…} }` even
+though the engine has defaults for everything in the lighting block.
+Expectation: the subtable set will grow as we discover more
+gadget nil-derefs. Add a regression test in `barme-pipeline::mapinfo::tests`
+for each new field, naming the gadget that forced it. See
+`docs/PITFALLS.md` §"BAR Chobby + mod-gadget mapinfo expectations".
+
 ## ADR-014 — Compressonator CLI vendored via `scripts/fetch-compressonator.sh`, pinned to V4.5.52
 
 **Status:** Accepted (2026-05-17). Refines ADR-004; corrects an

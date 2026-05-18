@@ -49,6 +49,14 @@ For a 16×16 BAR map: 8192² texture (~6 GB raw RGBA), 1025² heightmap, 512² m
 
 Single returned Lua table with sections `smf`, `resources`, `splats`, `atmosphere`, `lighting`, `water`, `terrainTypes`, `grass`, `teams`, `custom`. BAR-typical resource entries are PBR-style: `detailTex`, `specularTex`, `splatDistrTex`, `splatDetailTex`, `splatDetailNormalTex1..4` (DNTS — Detail Normal Texture Splatting, in DDS), `detailNormalTex`, `skyReflectModTex`. `splats.texScales` and `texMults` tune each of 4 RGBA channels of the splat distribution map. `voidWater = true` combined with omitting `water.planeColor` produces the popular "space map" look (e.g. *Apophis*, *Quicksilver*). **`splatDetailNormalTex` requires a `specularTex` to be defined or it silently disables.**
 
+**STATUS UPDATE 2026-05-17 (Stage 0 goal #7 findings):** the "required vs optional" calculus has three independent layers, NOT one — see `docs/PITFALLS.md` §"BAR Chobby + mod-gadget mapinfo expectations":
+
+1. **Engine scanner**: only `name`, `smf.smtFileName0`, and `teams[*].startPos` are strictly required (per `burnhamrobertp/97cae4d300e675ca261e661fc58266d1` gist — the de-facto BAR map-format reference).
+2. **Chobby map browser** (`beyond-all-reason/BYAR-Chobby` `LuaMenu/widgets/gui_maplist_panel.lua`): requires `modtype == 3` and the map must be in Chobby's "certified maps" list to appear in multiplayer lobbies. **Unofficial maps only appear in Skirmish / singleplayer.** The `GetMinimapImage not found` warning is benign — auto-extracted from SMF on first scan.
+3. **BAR mod gadgets** (e.g. `luarules/gadgets/unit_sunfacing.lua`): read mapinfo subtables (`lighting`, `atmosphere`, `water`, …) directly without nil-checking. Missing subtables crash gadget load → game hangs at "waiting for players". The emitter MUST include conventional subtables with sensible defaults even though the engine itself would tolerate omission.
+
+The `barme-pipeline::mapinfo` emitter's field set is calibrated to satisfy all three layers, and grows as new gadget nil-derefs are discovered. The list of subtables is not a Lua schema — it's a "minimum set BAR's mod gadgets won't crash on".
+
 ### 1.4 Existing toolchain (active vs. legacy)
 
 | Tool | Stack | Status | Role |
@@ -60,6 +68,7 @@ Single returned Lua table with sections `smf`, `resources`, `splats`, `atmospher
 | **World Machine** | Commercial Windows app | Active | Procedural terrain + texture generator; Beherith ships a `.tmd` template for BAR. CPU/RAM intensive (16 GB RAM for a 16×16 final render) |
 | **hendkai/bar-map-generator** | Web JS UI + Python | Early (2024–2025), self-described unfinished | Procedural generator that shells out to PyMapConv; not an editor |
 | **tebeer/BARMapEdit** | Unity (C#) + Dear ImGui + custom HLSL | Personal/dormant: 22 commits, 0 stars, no LICENSE, no README, not on the official BAR mapmaking-resources page | Earliest-stage standalone GUI attempt. **Not a viable fork base.** |
+| **Jandodev/bar-editor** | Vite + Vue 3 + TypeScript + Three.js (WebGL) | Early but usable (2025+); MIT | In-browser SPA editor. Reads `.smf` natively in TypeScript (no PyMapConv dep), terrain brushes (Add/Remove/Smooth + Flatten/Erode/Terrace), SMF save/export working; package export WIP. Polar-opposite architecture to ours (browser vs native single-binary); their TypeScript SMF parser is a useful reference for our Stage 1+ decompile-import. Found 2026-05-17 during goal #7 work. |
 | Legacy MapConv variants (`spring/MapConv`, `pajohns/MapConv`, `enetheru/smf_tools`) | C++ | Legacy | Original CLI compilers requiring nvdxt.exe |
 | **Feature Placer** | rapid tag `feature-placer:test` | Active | Spring-based 3D feature painter that exports `set.lua` |
 
@@ -282,3 +291,21 @@ If the wgpu compute curve is too steep, Godot 4 exports a single executable for 
 | 8. SRS construction | §3 |
 | 9. Targeted subagent (existing standalone editors) | informed §1.4 and §4 reuse decision |
 | 10. Enrich + complete | done |
+
+---
+
+### External references (curated; checked into SRS so future sessions don't re-derive)
+
+Repos worth keeping eyes on or borrowing patterns from:
+
+| URL | What it is | Why we care |
+|---|---|---|
+| [Beherith/springrts_smf_compiler](https://github.com/Beherith/springrts_smf_compiler) | PyMapConv source (CC0) | Our sidecar (ADR-002 / ADR-011). v0.6.3 vendored. Open issues filed there if we discover bugs. |
+| [GPUOpen-Tools/compressonator](https://github.com/GPUOpen-Tools/compressonator) | AMD's DXT/BC compressor (MIT) | Vendored under `tools/compressonator/` (ADR-014). PyMapConv shells out to `CompressonatorCLI` by name on Linux. |
+| [beyond-all-reason/RecoilEngine](https://github.com/beyond-all-reason/RecoilEngine) | Recoil engine (BAR fork of Spring) | Authoritative source for: SMF binary layout, `CArchiveScanner` map-key rules (`rts/System/FileSystem/ArchiveScanner.cpp`), VFS Lua API. |
+| [beyond-all-reason/BYAR-Chobby](https://github.com/beyond-all-reason/BYAR-Chobby) | BAR's lobby/menu UI in Lua | Source for the unofficial-map filter (`LuaMenu/widgets/gui_maplist_panel.lua`), `GetMinimapImage` (`LuaMenu/widgets/chobby/components/configuration.lua`), and the auto-minimap extraction handler (`LuaMenu/widgets/api_map_handler.lua`). |
+| [beyond-all-reason/Beyond-All-Reason](https://github.com/beyond-all-reason/Beyond-All-Reason) | BAR's game mod (units, gadgets, widgets) | Source for the mapinfo-reading gadgets (`luarules/gadgets/`). When a gadget crashes on missing mapinfo fields, look here. First example we hit: `unit_sunfacing.lua`. |
+| [gist: burnhamrobertp / bar-map-archive-format.md](https://gist.github.com/burnhamrobertp/97cae4d300e675ca261e661fc58266d1) | BAR map archive format reference | Quotes the *engine* minimum mapinfo (`name`, `smf.smtFileName0`, `teams[*].startPos`). Note: does NOT cover BAR-mod gadget requirements — see PITFALLS for the union. |
+| [Jandodev/bar-editor](https://github.com/Jandodev/bar-editor) | Web/WebGL BAR map editor (MIT) | Independent project; Vue + Three.js + TypeScript. Useful as a reference for native-Rust SMF parsing (their TS SMF reader is small and clean) and Stage 2 brush algorithms (Flatten/Erode/Terrace). Different architecture from ours; not a competitor. |
+| Beherith's *Advanced SpringRTS Mapping Guide* (Google Doc, linked from `beyondallreason.info/guide/mapmaking-resources`) | Hand-written map-authoring guide | The canonical BAR mapper onboarding doc. Pipeline: World Machine → PyMapConv → SpringBoard → 7z. |
+| BAR maps directory (per-user) `~/.local/state/Beyond All Reason/maps/` (Linux) | User-installed `.sd7` files | This is the install target for Stage 0 goal #7's launcher. Real-map examples can be copied into `scratch/bar-maps/originals/` for reference. |

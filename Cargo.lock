@@ -349,6 +349,7 @@ dependencies = [
 name = "barme-pipeline"
 version = "0.0.1"
 dependencies = [
+ "anyhow",
  "barme-core",
  "image",
  "tempfile",

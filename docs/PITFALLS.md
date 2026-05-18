@@ -120,3 +120,55 @@ PyMapConv archive and that its SPDX identifier is permissive.
   **Rule:** treat artifact-presence as success and log non-zero exit
   at `warn`. Only fail when artifacts are missing AND exit was
   non-zero.
+
+## BAR Chobby + mod-gadget mapinfo expectations (found in Stage 0, goal #7)
+
+The "engine-documented minimum" mapinfo is **not** the "real-world
+minimum to play a BAR map." Three discrete gates a `.sd7` must clear,
+each with different requirements:
+
+### A. Engine scanner — extremely lax
+
+`name`, `smf.smtFileName0`, and `teams[*].startPos` are the only
+strictly required fields per the BAR map archive format reference (gist:
+`burnhamrobertp/97cae4d300e675ca261e661fc58266d1`, "bare-minimum viable
+map"). Everything else has engine defaults.
+
+### B. Chobby map browser — filters on certification + modtype
+
+`gui_maplist_panel.lua` in `beyond-all-reason/BYAR-Chobby` filters maps
+by `info.modtype == 3` AND by a hardcoded "certified maps" list
+shipped inside Chobby. Maps not in the list get
+`certification = "Unofficial"`.
+
+**Rule:** unofficial maps **only appear in Skirmish / singleplayer
+lobbies**. Multiplayer lobbies hide them entirely. The
+`[Chobby] Warning: GetMinimapImage not found for, <name>` warning is
+benign — `api_map_handler.lua` auto-extracts the minimap from the SMF on
+first scan; the warning fires once before extraction completes.
+
+### C. BAR mod gadgets — fragile reads with no nil guards
+
+BAR's mod-side Lua gadgets read mapinfo fields directly without
+nil-checking the subtables. The first one we hit:
+`luarules/gadgets/unit_sunfacing.lua` line 44:
+```lua
+sundir = mapinfo.lighting.sundir
+```
+With no `lighting` subtable in mapinfo, this throws
+`attempt to index field 'lighting' (a nil value)` during the LuaRules
+load phase — game appears to start but waiting-for-players hangs forever
+because the synced state never completes.
+
+**Rule:** the emitter must include the conventional subtables (at
+minimum `lighting = { sundir = {…} }`, likely also `atmosphere`,
+`water`, `terrainTypes`) even though the *engine* has defaults for
+them. The list of subtables to include grows as we discover more
+gadgets with this pattern — when a new crash surfaces, add the
+required field with a sensible default and a regression test in
+`barme-pipeline::mapinfo::tests`.
+
+Reference: a complete in-the-wild example is
+`scratch/bar-maps/extracted/titanduel/mapinfo.lua` (gitignored — copy
+from `~/.local/state/Beyond All Reason/maps/titanduel_v3.sd7` to
+inspect).
