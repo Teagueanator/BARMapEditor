@@ -19,15 +19,29 @@ use tracing::{error, info, trace, warn};
 
 use crate::render::{OrbitCamera, TerrainCallback};
 
+/// wgpu/vulkan/naga emit a lot of INFO-level chatter at startup (adapter
+/// enumeration, layer loading) that drowns out our own logs. Keep them at
+/// WARN by default; users can override with `RUST_LOG`.
+///
+/// Two submodules are bumped one notch further to ERROR because their
+/// warn-level events are benign cosmetics on Linux/Wayland:
+/// - `wgpu_hal::gles::egl` — "Re-initializing Gles context due to Wayland
+///   window" (egui's surface re-init, every launch).
+/// - `wgpu_hal::vulkan` — "VALIDATION requested, but unable to find layer:
+///   `VK_LAYER_KHRONOS_validation`" (dev-only diagnostic; fires unless
+///   `vulkan-validationlayers` is installed system-wide).
+///
+/// See `docs/RUNTIME-WARNINGS.md` for the rationale and the `RUST_LOG`
+/// recipe to re-enable any suppressed line.
+const DEFAULT_TRACING_FILTER: &str = "info,wgpu=warn,wgpu_core=warn,wgpu_hal=warn,\
+    wgpu_hal::gles::egl=error,wgpu_hal::vulkan=error,\
+    naga=warn,egui_wgpu=warn";
+
 fn main() -> Result<()> {
-    // wgpu/vulkan/naga emit a lot of INFO-level chatter at startup (adapter
-    // enumeration, layer loading) that drowns out our own logs. Keep them at
-    // WARN by default; users can override with RUST_LOG.
-    let default_filter = "info,wgpu=warn,wgpu_core=warn,wgpu_hal=warn,naga=warn,egui_wgpu=warn";
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_filter)),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(DEFAULT_TRACING_FILTER)),
         )
         .init();
 
@@ -1519,5 +1533,35 @@ impl eframe::App for App {
                 None => {}
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Guard against silent regressions to the boot-log filter. If any of
+    /// these directives is dropped, the corresponding warn-level events
+    /// resume flooding stderr on cold boot.
+    #[test]
+    fn default_tracing_filter_parses_and_carries_the_suppressions() {
+        // EnvFilter::new is infallible; use try_new so a malformed string
+        // would surface as a panic here instead of being silently coerced.
+        tracing_subscriber::EnvFilter::try_new(DEFAULT_TRACING_FILTER)
+            .expect("DEFAULT_TRACING_FILTER must be valid env-filter syntax");
+
+        assert!(
+            DEFAULT_TRACING_FILTER.contains("wgpu_hal::gles::egl=error"),
+            "Wayland GLES re-init suppression missing — see RUNTIME-WARNINGS.md §4"
+        );
+        assert!(
+            DEFAULT_TRACING_FILTER.contains("wgpu_hal::vulkan=error"),
+            "Vulkan validation-layer-not-found suppression missing — see \
+             RUNTIME-WARNINGS.md §3"
+        );
+        assert!(
+            DEFAULT_TRACING_FILTER.starts_with("info,"),
+            "filter must leave our own info!-level events visible"
+        );
     }
 }
