@@ -33,7 +33,10 @@ multiplayer browser (Skirmish-only).
 
 Implements SRS F1–F12. Ships a Windows `.exe` and a Linux AppImage.
 
-- [ ] **F1** New-project wizard (size, biome preset, symmetry mode)
+- [x] **F1** New-project wizard — name + rectangular `smu_x × smu_z`
+      + symmetry preset + biome preset (4 procgen-backed presets) +
+      max height. Modal at app launch, re-openable via File → New
+      project (ADR-024).
 - [x] **F2** Real-time heightmap sculpting — raise / lower / smooth shipped via
       plugin-shaped `Brush` trait (ADR-018). Flatten / erode / ramp drop in
       under the same trait as Stage 1.5+ work.
@@ -44,11 +47,20 @@ Implements SRS F1–F12. Ships a Windows `.exe` and a Linux AppImage.
 - [ ] **F5** Metal-spot placement (point + radius → red-channel density)
 - [ ] **F6** Geo-vent placement
 - [ ] **F7** Feature placement (trees, rocks, wreckage) into a Lua gadget
-- [ ] **F8** Start-position editor
+- [x] **F8** Start-position editor — `Project.start_positions:
+      Vec<StartPosition>` round-trips through `.barmeproj`; 2D
+      placement / drag / delete UI in the central rect, with symmetry
+      replication and BAR-side even/odd team-id assignment via
+      `start_pos::assign_team_ids`. mapinfo emitter consumes the vec
+      with 25/75 fallback (ADR-023).
 - [ ] **F9** `mapinfo.lua` editor (form + raw Lua tab)
 - [ ] **F10** Minimap auto-generation
 - [ ] **F11** One-click `.sd7` build via PyMapConv
 - [ ] **F12** "Launch in BAR" button (invokes Recoil with `--map`)
+- [x] **Editor maturity (Phase 2 closer)** — undo/redo over dirty-rect
+      snapshots with stroke coalescing + barriers on procgen/load/new
+      (ADR-022), Ctrl-Z / Ctrl-Shift-Z keybinds, Edit menu, 100 MB ring
+      cap. The exploratory edit→evaluate loop is no longer one-way.
 - [ ] Beherith (or active mapper) reviews `.sd7` byte-for-byte against PyMapConv
       reference output on three test maps
 - [ ] Listed on `beyondallreason.info/guide/mapmaking-resources` as beta

@@ -232,34 +232,37 @@ A single-window, single-executable desktop app that produces a *playable* BAR ma
 > remain Stage 2 — they need their own ADR (noise basis function,
 > erosion solver choice, river network seeding).
 
-> **STATUS UPDATE 2026-05-17 (F8, Phase 2 shape):** Currently
-> `barme_pipeline::mapinfo` emits two hardcoded start positions at
-> 25% / 75% along the map diagonal — sufficient for 1v1 skirmish testing
-> but not for real maps. Reference shape from real BAR maps (e.g.
-> `gecko_isle_remake_v1.2.1.sd7` ships with **12 teams** in two
-> mirror-symmetric halves): start-position placement must integrate
-> with the F3 symmetry system so placing team 0 auto-fills its mirror
-> teammates. F8 implementation should extend `barme_core::Project`
-> with `start_positions: Vec<StartPos { team_id, x_elmo, z_elmo }>` +
-> a 2D placement UI in the central preview rect.
+> **STATUS UPDATE 2026-05-17 (F8 — shipped):** Phase 2 ADR-023 lands a
+> 2D start-position editor in the central preview rect: LMB places /
+> drags, RMB deletes. Symmetry from the F3 system replicates the stamp
+> through mirror counterparts; team ids are assigned alternating
+> even/odd via `barme-core::start_pos::assign_team_ids` (matches BAR's
+> per-side `teams[]` convention). `barme_pipeline::mapinfo` emits
+> authored teams when present, falling back to the 25/75 default pair
+> when the vector is empty. `Project.start_positions` round-trips via
+> `serde(default)`. Multi-position bulk operations + symmetry-grouped
+> drag remain Phase-3 polish; this commit closes the editor surface F8
+> implies.
 
-> **STATUS UPDATE 2026-05-17 (F1, Phase 2 shape):** The app currently
-> opens at a hardcoded "untitled 16×16 SMU" in-memory project.
-> New-project wizard should be the proper entry point: choose
-> map size (SMU x/z — including rectangular sizes like 16×18 used by
-> real maps such as gecko), starting symmetry mode, biome preset
-> (initially: flat / parabolic bowl / cone — drives the procgen
-> baseline), and project name. Biome preset is a thin wrapper around
-> the existing ADR-020 procgen.
+> **STATUS UPDATE 2026-05-17 (F1 — shipped):** Phase 2 ADR-024 lands a
+> modal new-project wizard as the app's entry point — auto-opens on
+> launch, re-opens via File → New project. Fields: project name
+> (sanitised via `sanitize_name`), rectangular `smu_x × smu_z` (2..=64
+> each), symmetry preset (incl. user-editable rotational fold), biome
+> preset (4 presets from `procgen::BIOMES`, each with a sensible
+> `max_height_hint`), max height (64..=4096 elmos). Wires symmetry +
+> max-height + biome procgen on Create. Existing in-memory "untitled
+> 16×16" auto-start is gone; Cancel restores it as the default. App's
+> `map_size_smu: u32` widened to `map_size: MapSize` along the way so
+> rectangular survives outside the wizard too.
 
-> **STATUS UPDATE 2026-05-17 (Project model, Phase 2 shape):** Current
-> `Project` is `{ name, size, min_height, max_height, heightmap }`.
-> Phase 2 expansion needs `start_positions` (F8) and the slot for
-> later additions: `metal_spots` (F5), `geo_vents` (F6),
-> `features: Vec<FeatureInstance>` (F7), `splat_distribution`
-> (F4 — when it lands), and a `mapinfo_overrides` blob (F9). Each
-> addition serialises via `serde` with `#[serde(default)]` so old
-> project files load forward.
+> **STATUS UPDATE 2026-05-17 (Project model — start_positions shipped):**
+> `Project` now carries `start_positions: Vec<StartPosition>` (F8 /
+> ADR-023) with `#[serde(default, skip_serializing_if = "Vec::is_empty")]`
+> so pre-F8 `.barmeproj` files load forward. Remaining Phase-3+ slots
+> (`metal_spots`, `geo_vents`, `features`, `splat_distribution`,
+> `mapinfo_overrides`) follow the same pattern when each F-feature
+> lands.
 
 ### 3.3 Non-functional requirements
 
