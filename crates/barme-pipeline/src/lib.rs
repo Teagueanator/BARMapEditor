@@ -77,11 +77,26 @@ pub fn build_sd7(
         source,
     })?;
 
+    // PITFALL §13 / FINDINGS §5: when the user authored metal spots,
+    // ship an all-zero metalmap so the BAR gadget's
+    // `hasMetalmap == false` branch fires and our Lua spots become
+    // the source of truth. When the project has no metal spots,
+    // skip — PyMapConv's default 1×1 black metalmap applies and we
+    // avoid ballooning the staging tree.
+    let metalmap_path = if project.metal_spots.is_empty() {
+        None
+    } else {
+        let path = work_dir.join(format!("{}_metalmap.png", project.name));
+        write_black_metalmap_png(&path, project)?;
+        Some(path)
+    };
+
     info!(name = %project.name, "build_sd7: compiling SMF/SMT");
     let outputs = driver.compile(CompileInputs {
         project,
         heightmap_png,
         texture_bmp,
+        metalmap_png: metalmap_path.as_deref(),
         out_dir: &compile_out,
     })?;
 
@@ -145,4 +160,84 @@ fn write_lua_file(work_dir: &Path, name: &str, contents: &str) -> Result<PathBuf
         source,
     })?;
     Ok(path)
+}
+
+/// Stage an all-zero grayscale PNG sized to the SMF metalmap
+/// resolution (`(32 * smu_x) × (32 * smu_z)` pixels, half-res of the
+/// type map per SRS §1.2). PyMapConv reads the red channel as metal
+/// amount; an all-zero PNG → zero metal → BAR's
+/// `map_metal_spot_placer.lua` sees an empty engine metalmap and
+/// honours our Lua-spot list instead.
+///
+/// The dimension matters: PyMapConv `--help` says it resizes a
+/// differently-sized input to `xsize/2 × ysize/2`, so a 1×1 PNG
+/// also works in practice — but supplying the canonical-sized PNG
+/// avoids surprises (no nearest-neighbour aliasing, deterministic
+/// bytes on disk for the SD7 hash) and matches what the C8 lint
+/// will eventually verify.
+fn write_black_metalmap_png(path: &Path, project: &Project) -> Result<(), BuildError> {
+    let w = 32u32 * project.size.smu_x;
+    let h = 32u32 * project.size.smu_z;
+    let buf = image::ImageBuffer::<image::Luma<u8>, Vec<u8>>::from_pixel(w, h, image::Luma([0]));
+    buf.save(path).map_err(|e| BuildError::Io {
+        path: path.to_path_buf(),
+        source: std::io::Error::other(e),
+    })?;
+    info!(
+        path = %path.display(),
+        width = w,
+        height = h,
+        "build_sd7: staged all-zero metalmap PNG (PITFALL §13)"
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use barme_core::MetalSpot;
+
+    /// PITFALL §13: the metalmap PNG written by `build_sd7` (when
+    /// `metal_spots` is non-empty) is sized to the SMF metalmap
+    /// resolution (32 × smu_x by 32 × smu_z) and every pixel is
+    /// zero.
+    #[test]
+    fn black_metalmap_png_dimensions_and_all_zero_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut project = Project::new("dim-check", 4); // 4x4 SMU
+        project.metal_spots.push(MetalSpot::new(100, 200));
+        let path = dir.path().join("test_metalmap.png");
+        write_black_metalmap_png(&path, &project).unwrap();
+
+        assert!(path.exists(), "metalmap PNG was not written");
+        let img = image::open(&path).unwrap().to_luma8();
+        assert_eq!(img.width(), 32 * 4, "width should be 32 * smu_x");
+        assert_eq!(img.height(), 32 * 4, "height should be 32 * smu_z");
+        // Every pixel must be zero — `map_metal_spot_placer.lua`
+        // bails if any sample > 0.
+        assert!(
+            img.iter().all(|&b| b == 0),
+            "every metalmap pixel must be zero"
+        );
+    }
+
+    /// Rectangular maps emit a rectangular PNG, not square.
+    #[test]
+    fn black_metalmap_png_handles_rectangular_maps() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut project = Project {
+            size: barme_core::MapSize {
+                smu_x: 8,
+                smu_z: 12,
+            },
+            ..Project::new("rect", 4)
+        };
+        project.metal_spots.push(MetalSpot::new(100, 200));
+        let path = dir.path().join("rect.png");
+        write_black_metalmap_png(&path, &project).unwrap();
+
+        let img = image::open(&path).unwrap().to_luma8();
+        assert_eq!(img.width(), 32 * 8);
+        assert_eq!(img.height(), 32 * 12);
+    }
 }

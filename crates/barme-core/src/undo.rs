@@ -44,7 +44,7 @@ use crate::MapSize;
 use crate::brushes::DirtyRect;
 use crate::heightmap::Heightmap;
 use crate::procgen::Domain;
-use crate::project::{AllyGroup, StartPosition};
+use crate::project::{AllyGroup, GeoVent, MetalSpot, StartPosition};
 use crate::symmetry::SymmetryAxis;
 
 /// One committed undo entry. Either a heightmap stroke (the ADR-033
@@ -122,6 +122,35 @@ pub enum ProjectDiff {
     /// with the *current* (post-wizard) state and pushes the captured
     /// post-wizard snapshot onto the redo stack.
     ApplyWizard(Box<WizardSnapshot>),
+    /// C4 (Sprint 11): a metal-spot source was added. Identity is the
+    /// full `MetalSpot` record (coords + metal value). Undo removes
+    /// the matching source; redo re-adds. Each LMB-click in
+    /// `Tool::MetalSpots` produces one diff per source (symmetry
+    /// mirrors each push their own diff so undo peels mirrors one at
+    /// a time — matches F8 / B5 semantics).
+    PlaceMetalSpot { spot: MetalSpot },
+    /// A metal-spot source was deleted. Holds the full pre-delete
+    /// record so undo can re-add it verbatim.
+    DeleteMetalSpot { spot: MetalSpot },
+    /// A metal-spot source's coordinates and/or metal value changed
+    /// (drag-move on canvas, or DragValue edit in the inspector).
+    /// `from` is the pre-edit record; `to` is post-edit. Identity is
+    /// `from` for undo / `to` for redo. The drag finalizer collapses
+    /// an entire drag gesture into a single entry.
+    MoveMetalSpot { from: MetalSpot, to: MetalSpot },
+    /// The `extractor_radius` global was edited. Symmetric inverse:
+    /// undo restores `from`, redo restores `to`. Inspector edits
+    /// collapse into one entry per commit (slider drag-release).
+    SetExtractorRadius { from: f32, to: f32 },
+    /// C5 (Sprint 11): a geo-vent source was added. See
+    /// [`Self::PlaceMetalSpot`] for the symmetry / per-mirror diff
+    /// semantics — identical.
+    PlaceGeoVent { vent: GeoVent },
+    /// A geo-vent source was deleted.
+    DeleteGeoVent { vent: GeoVent },
+    /// A geo-vent source's coordinates changed (drag-move / inspector
+    /// edit).
+    MoveGeoVent { from: GeoVent, to: GeoVent },
 }
 
 impl ProjectDiff {
@@ -130,7 +159,14 @@ impl ProjectDiff {
         match self {
             ProjectDiff::PlaceStartPosition { .. }
             | ProjectDiff::DeleteStartPosition { .. }
-            | ProjectDiff::MoveStartPosition { .. } => inline,
+            | ProjectDiff::MoveStartPosition { .. }
+            | ProjectDiff::PlaceMetalSpot { .. }
+            | ProjectDiff::DeleteMetalSpot { .. }
+            | ProjectDiff::MoveMetalSpot { .. }
+            | ProjectDiff::SetExtractorRadius { .. }
+            | ProjectDiff::PlaceGeoVent { .. }
+            | ProjectDiff::DeleteGeoVent { .. }
+            | ProjectDiff::MoveGeoVent { .. } => inline,
             ProjectDiff::ApplyWizard(snap) => inline + snap.bytes(),
         }
     }
@@ -607,6 +643,20 @@ mod tests {
                 }
             }
             ProjectDiff::ApplyWizard(_) => unreachable!("not exercised in this test set"),
+            // C4/C5 variants aren't dispatched against AllyGroup —
+            // they target Project's metal_spots / geo_vents lists,
+            // which live outside this helper's scope. The pinned
+            // unit tests for these variants use the bytes() /
+            // history-stack checks instead.
+            ProjectDiff::PlaceMetalSpot { .. }
+            | ProjectDiff::DeleteMetalSpot { .. }
+            | ProjectDiff::MoveMetalSpot { .. }
+            | ProjectDiff::SetExtractorRadius { .. }
+            | ProjectDiff::PlaceGeoVent { .. }
+            | ProjectDiff::DeleteGeoVent { .. }
+            | ProjectDiff::MoveGeoVent { .. } => {
+                unreachable!("metal/geo diffs not exercised through AllyGroup test helper")
+            }
         }
     }
 
@@ -1184,6 +1234,76 @@ mod tests {
             panic!("expected ApplyWizard");
         };
         assert_eq!(*boxed, snap);
+    }
+
+    /// C4 (Sprint 11): metal-spot diffs are inline (no heap),
+    /// matching `PlaceStartPosition`. Verify they account for bytes
+    /// the same way under cap pressure.
+    #[test]
+    fn metal_spot_diff_bytes_match_inline_enum_size() {
+        let inline = std::mem::size_of::<ProjectDiff>();
+        let place = ProjectDiff::PlaceMetalSpot {
+            spot: MetalSpot::new(100, 200),
+        };
+        let delete = ProjectDiff::DeleteMetalSpot {
+            spot: MetalSpot::new(100, 200),
+        };
+        let m = ProjectDiff::MoveMetalSpot {
+            from: MetalSpot::new(100, 100),
+            to: MetalSpot::new(200, 200),
+        };
+        assert_eq!(place.bytes(), inline);
+        assert_eq!(delete.bytes(), inline);
+        assert_eq!(m.bytes(), inline);
+    }
+
+    /// Same for geo-vent diffs.
+    #[test]
+    fn geo_vent_diff_bytes_match_inline_enum_size() {
+        let inline = std::mem::size_of::<ProjectDiff>();
+        let place = ProjectDiff::PlaceGeoVent {
+            vent: GeoVent::new(100, 200),
+        };
+        let delete = ProjectDiff::DeleteGeoVent {
+            vent: GeoVent::new(100, 200),
+        };
+        let m = ProjectDiff::MoveGeoVent {
+            from: GeoVent::new(100, 100),
+            to: GeoVent::new(200, 200),
+        };
+        assert_eq!(place.bytes(), inline);
+        assert_eq!(delete.bytes(), inline);
+        assert_eq!(m.bytes(), inline);
+    }
+
+    /// Setting extractor_radius is also bytes-inline.
+    #[test]
+    fn extractor_radius_diff_is_inline() {
+        let inline = std::mem::size_of::<ProjectDiff>();
+        let d = ProjectDiff::SetExtractorRadius {
+            from: 80.0,
+            to: 120.0,
+        };
+        assert_eq!(d.bytes(), inline);
+    }
+
+    /// C4/C5 diff variants push through history just like the F8
+    /// variants — sanity check the stack accounting and redo
+    /// clearance on a metal-spot place.
+    #[test]
+    fn place_metal_spot_clears_redo_and_grows_undo() {
+        let mut h = History::default();
+        let spot = MetalSpot::new(1, 2);
+        h.push_project_diff(ProjectDiff::PlaceMetalSpot { spot });
+        let popped = h.pop_undo().unwrap();
+        h.push_to_redo(popped);
+        assert!(h.can_redo());
+
+        // A new push must clear redo, same as the F8 path.
+        h.push_project_diff(ProjectDiff::PlaceGeoVent {
+            vent: GeoVent::new(3, 4),
+        });
+        assert!(!h.can_redo());
     }
 
     #[test]

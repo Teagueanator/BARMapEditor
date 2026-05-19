@@ -1315,6 +1315,9 @@ mod tests {
             next_steps_dismissed: false,
             splat_config: crate::SplatConfig::default(),
             splat_distribution: None,
+            metal_spots: vec![],
+            geo_vents: vec![],
+            extractor_radius: crate::project::default_extractor_radius(),
         };
         let info: MapInfo = (&p).into();
         // No top-level smu/dims field exists; the SMF binary carries

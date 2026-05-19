@@ -66,6 +66,10 @@ fn pymapconv_compiles_minimum_legal_map() {
             project: &project,
             heightmap_png: &hm_png,
             texture_bmp: &tex_bmp,
+            // C4 (Sprint 11): existing tests don't author metal spots,
+            // so the metalmap PNG is not staged and PyMapConv's
+            // default 1×1 black applies.
+            metalmap_png: None,
             out_dir: &out_dir,
         })
         .unwrap_or_else(|e| panic!("compile failed:\n{e}"));

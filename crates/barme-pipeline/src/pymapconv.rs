@@ -57,6 +57,15 @@ pub struct CompileInputs<'a> {
     /// `mapx` as `width / 8`, so e.g. 1024-wide BMP ⇒ mapx=128 ⇒ heightmap
     /// dim 129 = BAR 2 SMU.
     pub texture_bmp: &'a Path,
+    /// Optional 8-bit grayscale metalmap PNG. Dimensions are
+    /// `(smu_x * 32, smu_z * 32)` per the SMF spec (SRS §1.2 —
+    /// the metalmap is half-res of the type map = quarter-res of the
+    /// heightmap). When `Some` and `Project.metal_spots` is non-empty
+    /// the build path supplies an all-black PNG: `map_metal_spot_placer.lua`
+    /// (FINDINGS §5 / PITFALL §13) bails if any metalmap pixel is
+    /// non-zero, so we force the Lua-spots-are-source-of-truth path.
+    /// When `None`, PyMapConv's default 1×1 black metalmap applies.
+    pub metalmap_png: Option<&'a Path>,
     /// Directory PyMapConv writes `<name>.smf` and `<name>.smt` into. The
     /// directory must exist; the driver does not create it.
     pub out_dir: &'a Path,
@@ -161,6 +170,7 @@ impl PyMapConvDriver {
             project,
             heightmap_png,
             texture_bmp,
+            metalmap_png,
             out_dir,
         } = inputs;
 
@@ -195,6 +205,15 @@ impl PyMapConvDriver {
             // ADR-012 and the previous session log's flag-table correction.
             .arg("-q")
             .arg("1");
+
+        // C4 / FINDINGS §5: only attach -mm when the caller actually
+        // staged a metalmap PNG. PyMapConv's default (1×1 black) is
+        // fine when `Project.metal_spots` is empty; we override only
+        // to force the all-zero engine metalmap that lets the
+        // `map_metal_spot_placer.lua` gadget pick up our Lua spots.
+        if let Some(mm) = metalmap_png {
+            cmd.arg("-m").arg(mm);
+        }
 
         if let Some(dir) = &self.compressonator_dir {
             let existing = std::env::var_os("PATH").unwrap_or_default();

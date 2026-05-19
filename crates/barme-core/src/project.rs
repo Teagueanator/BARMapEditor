@@ -96,6 +96,32 @@ pub struct Project {
     /// the current editor session.
     #[serde(skip)]
     pub splat_distribution: Option<SplatDistribution>,
+    /// C4 / Sprint 11: F5 metal-spot sources. Mirrors are derived from
+    /// the active `SymmetryAxis` per frame; only the source spots are
+    /// stored. The pipeline expands sources through the active
+    /// symmetry before emission (mirrors the F8 / ADR-032 rule).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub metal_spots: Vec<MetalSpot>,
+    /// C5 / Sprint 11: F6 geo-vent sources. Same symmetry rule as
+    /// `metal_spots`. Emitted only as `geovent` features into
+    /// `mapconfig/featureplacer/features.lua` (PITFALL §14 / FINDINGS
+    /// §5 — there is no `geos = {}` table in BAR).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub geo_vents: Vec<GeoVent>,
+    /// C4 / Sprint 11: BAR-convention extractor radius in elmos. Engine
+    /// default is 500 but BAR overrides it to 80; setting it back to
+    /// 500 silently breaks mex-snap (PITFALL §6). Surfaced to the F5
+    /// inspector with a tooltip; the F9 form editor (Sprint 13) will
+    /// also reach this through `mapinfo.extractor_radius`.
+    #[serde(default = "default_extractor_radius")]
+    pub extractor_radius: f32,
+}
+
+/// BAR-convention default for `Project.extractor_radius`. Engine
+/// default is 500 but BAR overrides to 80 via the mod gadgets, and
+/// every player's UI snaps mexes against this value.
+pub fn default_extractor_radius() -> f32 {
+    80.0
 }
 
 /// One ally team's worth of spawn data (ADR-032).
@@ -138,6 +164,53 @@ impl AllyGroup {
             start_positions: Vec::new(),
             box_polygon: None,
         }
+    }
+}
+
+/// A single metal-spot source in world coordinates (elmos).
+///
+/// `metal` follows BAR's convention: `2.0` is a standard mex, `4.0` a
+/// strong central mex. The engine multiplies by `0.43 × 9 / 21 × 255`
+/// at spawn time (FINDINGS §5 / `map_metal_spot_placer.lua`); the user
+/// sees the BAR-facing scalar in the inspector. Symmetry-derived
+/// mirrors are NOT stored — `Project.metal_spots` is the source set
+/// and the active `SymmetryAxis` recomputes mirrors per frame in the
+/// editor and per build in the pipeline (matches F8 / ADR-032).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct MetalSpot {
+    pub x_elmo: i32,
+    pub z_elmo: i32,
+    pub metal: f32,
+}
+
+impl MetalSpot {
+    /// Default metal value for a fresh spot. Matches BAR's standard
+    /// mex (`spot.metal = 2.0`); the strong central-mex convention is
+    /// 4.0, set by the user.
+    pub const DEFAULT_METAL: f32 = 2.0;
+
+    pub fn new(x_elmo: i32, z_elmo: i32) -> Self {
+        Self {
+            x_elmo,
+            z_elmo,
+            metal: Self::DEFAULT_METAL,
+        }
+    }
+}
+
+/// A single geo-vent source in world coordinates (elmos). Geo vents
+/// carry no `metal` or rotation field — the stock `geovent` FeatureDef
+/// owns its own size and (engine-default-zero) facing. Symmetry rules
+/// match `MetalSpot`: sources stored, mirrors derived per frame.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GeoVent {
+    pub x_elmo: i32,
+    pub z_elmo: i32,
+}
+
+impl GeoVent {
+    pub fn new(x_elmo: i32, z_elmo: i32) -> Self {
+        Self { x_elmo, z_elmo }
     }
 }
 
@@ -191,6 +264,12 @@ struct ProjectWire {
     next_steps_dismissed: bool,
     #[serde(default)]
     splat_config: SplatConfig,
+    #[serde(default)]
+    metal_spots: Vec<MetalSpot>,
+    #[serde(default)]
+    geo_vents: Vec<GeoVent>,
+    #[serde(default = "default_extractor_radius")]
+    extractor_radius: f32,
 }
 
 impl From<ProjectWire> for Project {
@@ -206,6 +285,9 @@ impl From<ProjectWire> for Project {
             next_steps_dismissed: w.next_steps_dismissed,
             splat_config: w.splat_config,
             splat_distribution: None,
+            metal_spots: w.metal_spots,
+            geo_vents: w.geo_vents,
+            extractor_radius: w.extractor_radius,
         };
         if !w.start_positions.is_empty() {
             if p.ally_groups.is_empty() {
@@ -308,6 +390,9 @@ impl Project {
             next_steps_dismissed: false,
             splat_config: SplatConfig::default(),
             splat_distribution: None,
+            metal_spots: Vec::new(),
+            geo_vents: Vec::new(),
+            extractor_radius: default_extractor_radius(),
         }
     }
 
@@ -654,6 +739,101 @@ smu_z = 4
             !s.contains("splat_distribution"),
             "splat_distribution must not serialise; got:\n{s}"
         );
+    }
+
+    /// C4 (Sprint 11): `metal_spots` round-trip through TOML. The
+    /// vec is `skip_serializing_if = "Vec::is_empty"` so pre-C4 files
+    /// load forward without surprise.
+    #[test]
+    fn metal_spots_round_trip_through_toml() {
+        let mut p = Project::new("metals", 8);
+        p.metal_spots.push(MetalSpot {
+            x_elmo: 1024,
+            z_elmo: 1024,
+            metal: 2.0,
+        });
+        p.metal_spots.push(MetalSpot {
+            x_elmo: 3072,
+            z_elmo: 3072,
+            metal: 4.0,
+        });
+        let s = toml::to_string(&p).unwrap();
+        assert!(s.contains("metal_spots"), "got:\n{s}");
+        let p2: Project = toml::from_str(&s).unwrap();
+        assert_eq!(p.metal_spots, p2.metal_spots);
+    }
+
+    /// Empty `metal_spots` should not serialise — keeps fresh-project
+    /// TOML noise-free.
+    #[test]
+    fn metal_spots_omitted_when_empty() {
+        let p = Project::new("clean", 4);
+        let s = toml::to_string(&p).unwrap();
+        assert!(!s.contains("metal_spots"), "got:\n{s}");
+    }
+
+    /// C5 (Sprint 11): `geo_vents` round-trip. Same omit-when-empty
+    /// rule as `metal_spots`.
+    #[test]
+    fn geo_vents_round_trip_through_toml() {
+        let mut p = Project::new("vents", 8);
+        p.geo_vents.push(GeoVent {
+            x_elmo: 4096,
+            z_elmo: 4096,
+        });
+        p.geo_vents.push(GeoVent {
+            x_elmo: 4096,
+            z_elmo: 8192,
+        });
+        let s = toml::to_string(&p).unwrap();
+        assert!(s.contains("geo_vents"), "got:\n{s}");
+        let p2: Project = toml::from_str(&s).unwrap();
+        assert_eq!(p.geo_vents, p2.geo_vents);
+    }
+
+    #[test]
+    fn geo_vents_omitted_when_empty() {
+        let p = Project::new("clean", 4);
+        let s = toml::to_string(&p).unwrap();
+        assert!(!s.contains("geo_vents"), "got:\n{s}");
+    }
+
+    /// PITFALL §6: setting `extractor_radius = 500` (the engine
+    /// default) silently breaks BAR's mex-snap. The Project default
+    /// is 80, the BAR-mod-override convention.
+    #[test]
+    fn extractor_radius_defaults_to_bar_convention_80() {
+        let p = Project::new("default-radius", 4);
+        assert_eq!(p.extractor_radius, 80.0);
+    }
+
+    /// A pre-C4 project file without the `extractor_radius` key loads
+    /// with the BAR default rather than `0.0` (which would crash mex
+    /// snap or default to the engine's 500).
+    #[test]
+    fn pre_c4_project_without_extractor_radius_loads_with_default() {
+        let toml_str = r#"
+name = "pre_c4"
+min_height = 0.0
+max_height = 256.0
+
+[size]
+smu_x = 4
+smu_z = 4
+"#;
+        let p: Project = toml::from_str(toml_str).unwrap();
+        assert_eq!(p.extractor_radius, 80.0);
+        assert!(p.metal_spots.is_empty());
+        assert!(p.geo_vents.is_empty());
+    }
+
+    #[test]
+    fn metal_spot_new_uses_default_metal() {
+        let m = MetalSpot::new(100, 200);
+        assert_eq!(m.x_elmo, 100);
+        assert_eq!(m.z_elmo, 200);
+        assert_eq!(m.metal, MetalSpot::DEFAULT_METAL);
+        assert_eq!(MetalSpot::DEFAULT_METAL, 2.0);
     }
 
     /// Pre-D5 `.barmeproj` files have no `[splat_config]` block —

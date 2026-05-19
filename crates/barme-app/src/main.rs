@@ -7,11 +7,12 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use barme_core::{
-    ALLY_GROUP_PALETTE, AllyGroup, BIOMES, BrushRegistry, BrushStamp, DirtyRect, Heightmap,
-    History, HistoryEntry, MapSize, PROJECT_EXTENSION, Project, ProjectDiff, SplatBrushRegistry,
-    SplatChannel, SplatConfig, SplatDistribution, SplatStamp, StartPosition, SymmetryAxis,
-    WizardSnapshot,
+    ALLY_GROUP_PALETTE, AllyGroup, BIOMES, BrushRegistry, BrushStamp, DirtyRect, GeoVent,
+    Heightmap, History, HistoryEntry, MapSize, MetalSpot, PROJECT_EXTENSION, Project, ProjectDiff,
+    SplatBrushRegistry, SplatChannel, SplatConfig, SplatDistribution, SplatStamp, StartPosition,
+    SymmetryAxis, WizardSnapshot,
     brushes::pixel_bbox,
+    default_extractor_radius,
     procgen::{
         Domain, PRESETS, generate as procgen_generate, generate_thumbnail as procgen_thumbnail_gen,
         validate_expression,
@@ -286,6 +287,31 @@ struct App {
     slot_thumbnails: std::collections::HashMap<u8, egui::TextureHandle>,
     metal_state: MetalState,
     geo_state: GeoState,
+    /// C4 (Sprint 11): F5 metal-spot sources, mirroring
+    /// `barme_core::Project::metal_spots`. Persists across save /
+    /// open through `snapshot_project` / `open_from`.
+    metal_spots: Vec<MetalSpot>,
+    /// C5 (Sprint 11): F6 geo-vent sources, mirroring
+    /// `barme_core::Project::geo_vents`.
+    geo_vents: Vec<GeoVent>,
+    /// C4 (Sprint 11): BAR-convention extractor radius in elmos.
+    /// Edited in the metal-spots inspector; surfaces as
+    /// `mapinfo.extractor_radius` through the F9 form (Sprint 13).
+    /// Default 80 per [`barme_core::default_extractor_radius`] —
+    /// PITFALL §6 (engine default 500 breaks BAR's mex-snap).
+    extractor_radius: f32,
+    /// While LMB is held in `Tool::MetalSpots` on an existing spot,
+    /// holds the source's index in `metal_spots` so the drag moves
+    /// that exact entry. Cleared on release / RMB.
+    dragging_metal_spot: Option<usize>,
+    /// Pre-drag spot record for the metal-spot drag finalizer. On
+    /// drag-stop the original is paired with the now-current spot
+    /// and pushed as `ProjectDiff::MoveMetalSpot`. Mirrors the F8
+    /// `dragging_start_pos_from` pattern.
+    dragging_metal_spot_from: Option<MetalSpot>,
+    /// Mirror of the above for the geo-vent tool.
+    dragging_geo_vent: Option<usize>,
+    dragging_geo_vent_from: Option<GeoVent>,
 }
 
 /// D5: session-only splat brush controls. Persisted brush mode +
@@ -450,96 +476,29 @@ fn load_slot_full_rgba(slot: &SlotMeta) -> Option<image::RgbaImage> {
     Some(rgba)
 }
 
-/// Metal-spot scaffolding. Phase 7 — see TODO(F5).
-#[derive(Debug, Clone)]
+/// View-state for the F5 metal-spots inspector + viewport. Spot data
+/// itself lives on `App::metal_spots` (mirrors `barme_core::Project`);
+/// this holds only the selection / drag state that's session-scoped.
+///
+/// C4 (Sprint 11) replaces the Phase-7 placeholder `MetalState`
+/// (density / min_spacing / max_metal / spots) with the slim shape
+/// the F5 schema work actually needs — the generator-style sliders
+/// were never wired to anything and the spot data now belongs on
+/// the Project.
+#[derive(Debug, Clone, Default)]
 struct MetalState {
-    density: f32,
-    min_spacing: f32,
-    max_metal: f32,
-    spots: Vec<MetalSpot>,
+    /// Index in `App::metal_spots` of the spot the user clicked in
+    /// the Spots table. Drives hover-pulse + inspector scroll. Cleared
+    /// on tool switch.
     selected: Option<usize>,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct MetalSpot {
-    x_elmo: i32,
-    z_elmo: i32,
-    metal: f32,
-}
-
-impl Default for MetalState {
-    fn default() -> Self {
-        Self {
-            density: 0.55,
-            min_spacing: 2048.0,
-            max_metal: 1.8,
-            spots: Vec::new(),
-            selected: None,
-        }
-    }
-}
-
-/// Geo-features scaffolding. Phase 7 — see TODO(F7).
-#[derive(Debug, Clone)]
+/// View-state for the F6 geo-vents inspector + viewport. Mirrors
+/// [`MetalState`]. Geo vents have no metal value or extractor radius,
+/// so the inspector is leaner than metal's.
+#[derive(Debug, Clone, Default)]
 struct GeoState {
-    library: Vec<GeoFeature>,
-    selected: usize,
-    rotation_jitter: f32,
-    scale_jitter: f32,
-    align_to_slope: bool,
-    scatter_density: f32,
-}
-
-#[derive(Debug, Clone)]
-struct GeoFeature {
-    name: String,
-    count: usize,
-    icon: crate::ui::icons::Icon,
-}
-
-impl Default for GeoState {
-    fn default() -> Self {
-        use crate::ui::icons::Icon;
-        Self {
-            library: vec![
-                GeoFeature {
-                    name: "Pine".into(),
-                    count: 124,
-                    icon: Icon::Tree,
-                },
-                GeoFeature {
-                    name: "Birch".into(),
-                    count: 62,
-                    icon: Icon::Tree,
-                },
-                GeoFeature {
-                    name: "Boulder".into(),
-                    count: 88,
-                    icon: Icon::Rock,
-                },
-                GeoFeature {
-                    name: "Spire".into(),
-                    count: 12,
-                    icon: Icon::Crystal,
-                },
-                GeoFeature {
-                    name: "Wreck S".into(),
-                    count: 8,
-                    icon: Icon::Wreck,
-                },
-                GeoFeature {
-                    name: "Wreck L".into(),
-                    count: 3,
-                    icon: Icon::Wreck,
-                },
-            ],
-            selected: 0,
-            rotation_jitter: 45.0,
-            scale_jitter: 0.20,
-            align_to_slope: true,
-            scatter_density: 32.0,
-        }
-    }
+    selected: Option<usize>,
 }
 
 /// Mutable form state for the F1 wizard. Held independently of App state
@@ -855,6 +814,13 @@ impl App {
             slot_thumbnails: std::collections::HashMap::new(),
             metal_state: MetalState::default(),
             geo_state: GeoState::default(),
+            metal_spots: Vec::new(),
+            geo_vents: Vec::new(),
+            extractor_radius: default_extractor_radius(),
+            dragging_metal_spot: None,
+            dragging_metal_spot_from: None,
+            dragging_geo_vent: None,
+            dragging_geo_vent_from: None,
         }
     }
 
@@ -946,6 +912,19 @@ impl App {
         // the prior session's pixels — irrelevant since active_mask = 0
         // suppresses sampling. A full distribution clear happens at
         // first stamp.)
+        // C4/C5 (Sprint 11): metal + geo are project-scoped data; a
+        // fresh project starts with neither and the BAR-default
+        // extractor radius. Drag state clears too — a switch to a
+        // new project mid-drag would be a surprise undo source.
+        self.metal_spots.clear();
+        self.geo_vents.clear();
+        self.extractor_radius = default_extractor_radius();
+        self.metal_state = MetalState::default();
+        self.geo_state = GeoState::default();
+        self.dragging_metal_spot = None;
+        self.dragging_metal_spot_from = None;
+        self.dragging_geo_vent = None;
+        self.dragging_geo_vent_from = None;
         self.dirty = false;
         self.end_stroke();
         self.history.barrier();
@@ -963,6 +942,9 @@ impl App {
             next_steps_dismissed: self.next_steps_dismissed,
             splat_config: self.splat_config.clone(),
             splat_distribution: self.splat_distribution.clone(),
+            metal_spots: self.metal_spots.clone(),
+            geo_vents: self.geo_vents.clone(),
+            extractor_radius: self.extractor_radius,
         }
     }
 
@@ -1869,11 +1851,14 @@ impl App {
     }
 
     /// Predicate: is any edit drag currently in flight? Brush strokes
-    /// (heightmap channel) and start-position drags (project-diff
-    /// channel) both gate undo/redo so the user can't peel back state
-    /// mid-gesture. B5.
+    /// (heightmap channel), start-position drags, metal-spot drags,
+    /// and geo-vent drags all gate undo/redo so the user can't peel
+    /// back state mid-gesture. B5 + C4/C5.
     fn is_dragging_anything(&self) -> bool {
-        self.history.stroke_open() || self.dragging_start_pos.is_some()
+        self.history.stroke_open()
+            || self.dragging_start_pos.is_some()
+            || self.dragging_metal_spot.is_some()
+            || self.dragging_geo_vent.is_some()
     }
 
     /// Remove the position with `team_id`. No-op if absent. B5: pushes a
@@ -1891,6 +1876,268 @@ impl App {
         info!(ally_group_id, source_index, "start position deleted");
         self.history
             .push_project_diff(ProjectDiff::DeleteStartPosition { ally_group_id, pos });
+    }
+
+    // ───────────────────────────────────────────────────────────────
+    // C4 / Sprint 11 — F5 metal-spot helpers. Pattern matches the
+    // F8 start-position helpers above: place / drag-move / delete /
+    // hit-test, each pushing a `ProjectDiff` so Ctrl-Z reverses it.
+    // ───────────────────────────────────────────────────────────────
+
+    /// Place a new metal spot at `(world_x, world_z)`. Symmetry
+    /// replicates the click through `App::symmetry`; mirrors that
+    /// land off-map are dropped. Each placed source pushes its own
+    /// `ProjectDiff::PlaceMetalSpot` so undo peels mirrors one at a
+    /// time (matches F8 / B5 behaviour).
+    fn place_metal_spot(&mut self, world_x: f32, world_z: f32) {
+        let extents = self.world_extents();
+        let (ex, ez) = extents;
+        if world_x < 0.0 || world_x > ex || world_z < 0.0 || world_z > ez {
+            trace!(
+                world_x,
+                world_z,
+                extents = ?extents,
+                "metal-spot click landed off-map; ignored"
+            );
+            return;
+        }
+        self.dirty = true;
+        let centers = self.symmetry.replicate((world_x, world_z), extents);
+        for (cx, cz) in centers {
+            if cx < 0.0 || cx > ex || cz < 0.0 || cz > ez {
+                continue;
+            }
+            let spot = MetalSpot {
+                x_elmo: cx.round().clamp(0.0, ex) as i32,
+                z_elmo: cz.round().clamp(0.0, ez) as i32,
+                metal: MetalSpot::DEFAULT_METAL,
+            };
+            // Skip exact-coord duplicates (a symmetry-replicated stamp
+            // may land on an existing source when the center is on
+            // the axis itself).
+            if self
+                .metal_spots
+                .iter()
+                .any(|m| m.x_elmo == spot.x_elmo && m.z_elmo == spot.z_elmo)
+            {
+                continue;
+            }
+            info!(
+                x_elmo = spot.x_elmo,
+                z_elmo = spot.z_elmo,
+                metal = spot.metal,
+                symmetry = self.symmetry.id(),
+                "metal spot placed"
+            );
+            self.metal_spots.push(spot);
+            self.history
+                .push_project_diff(ProjectDiff::PlaceMetalSpot { spot });
+        }
+    }
+
+    /// Replace the metal spot at `index` with `to`, clamped to the
+    /// map. Frame-by-frame from drag; no undo entry per call. The
+    /// drag finalizer collapses the entire gesture into a single
+    /// `ProjectDiff::MoveMetalSpot`.
+    fn move_metal_spot_to(&mut self, index: usize, to: MetalSpot) {
+        let (ex, ez) = self.world_extents();
+        if let Some(slot) = self.metal_spots.get_mut(index) {
+            slot.x_elmo = (to.x_elmo as f32).clamp(0.0, ex).round() as i32;
+            slot.z_elmo = (to.z_elmo as f32).clamp(0.0, ez).round() as i32;
+            // Generous metal cap — see note on the inspector DragValue
+            // about strategic mex value placement.
+            slot.metal = to.metal.clamp(0.0, 50.0);
+            self.dirty = true;
+        }
+    }
+
+    /// Commit an in-flight metal-spot drag — pushes one
+    /// `MoveMetalSpot` undo entry covering the whole gesture when
+    /// the spot actually moved. Idempotent.
+    fn finish_metal_spot_drag(&mut self) {
+        let (Some(index), Some(from)) = (
+            self.dragging_metal_spot.take(),
+            self.dragging_metal_spot_from.take(),
+        ) else {
+            self.dragging_metal_spot = None;
+            self.dragging_metal_spot_from = None;
+            return;
+        };
+        let Some(&to) = self.metal_spots.get(index) else {
+            return;
+        };
+        if from == to {
+            return;
+        }
+        self.history
+            .push_project_diff(ProjectDiff::MoveMetalSpot { from, to });
+    }
+
+    /// Remove the metal spot at `index`. Pushes a
+    /// `DeleteMetalSpot` undo entry carrying the full pre-delete
+    /// record so undo can re-add it verbatim.
+    fn delete_metal_spot(&mut self, index: usize) {
+        if index >= self.metal_spots.len() {
+            return;
+        }
+        self.dirty = true;
+        let spot = self.metal_spots.remove(index);
+        info!(
+            x_elmo = spot.x_elmo,
+            z_elmo = spot.z_elmo,
+            "metal spot deleted"
+        );
+        // If the user deleted the currently-selected row, drop the
+        // selection (or fix up the index if a later row would now
+        // sit at the same slot).
+        if let Some(sel) = self.metal_state.selected {
+            if sel == index {
+                self.metal_state.selected = None;
+            } else if sel > index {
+                self.metal_state.selected = Some(sel - 1);
+            }
+        }
+        self.history
+            .push_project_diff(ProjectDiff::DeleteMetalSpot { spot });
+    }
+
+    /// Find the metal spot (SOURCE only — mirrors are non-
+    /// interactive, per F8's symmetry contract) whose on-screen
+    /// marker is within `radius_px` of `cursor`.
+    fn hit_test_metal_spot(
+        &self,
+        cursor: egui::Pos2,
+        rect: egui::Rect,
+        radius_px: f32,
+    ) -> Option<usize> {
+        let rect_size = glam::Vec2::new(rect.width(), rect.height());
+        let cursor_in_rect = glam::Vec2::new(cursor.x - rect.min.x, cursor.y - rect.min.y);
+        let mut best: Option<(usize, f32)> = None;
+        for (i, spot) in self.metal_spots.iter().enumerate() {
+            let world = glam::Vec3::new(spot.x_elmo as f32, 0.0, spot.z_elmo as f32);
+            let Some(screen) = render::world_to_screen(world, rect_size, &self.camera) else {
+                continue;
+            };
+            let d = (screen - cursor_in_rect).length();
+            if d <= radius_px && best.map(|(_, bd)| d < bd).unwrap_or(true) {
+                best = Some((i, d));
+            }
+        }
+        best.map(|(i, _)| i)
+    }
+
+    // ───────────────────────────────────────────────────────────────
+    // C5 / Sprint 11 — F6 geo-vent helpers. Mirror of the metal-spot
+    // helpers above; geo vents have no `metal` value, so the API is
+    // a touch leaner.
+    // ───────────────────────────────────────────────────────────────
+
+    fn place_geo_vent(&mut self, world_x: f32, world_z: f32) {
+        let extents = self.world_extents();
+        let (ex, ez) = extents;
+        if world_x < 0.0 || world_x > ex || world_z < 0.0 || world_z > ez {
+            trace!(world_x, world_z, "geo-vent click off-map; ignored");
+            return;
+        }
+        self.dirty = true;
+        let centers = self.symmetry.replicate((world_x, world_z), extents);
+        for (cx, cz) in centers {
+            if cx < 0.0 || cx > ex || cz < 0.0 || cz > ez {
+                continue;
+            }
+            let vent = GeoVent {
+                x_elmo: cx.round().clamp(0.0, ex) as i32,
+                z_elmo: cz.round().clamp(0.0, ez) as i32,
+            };
+            if self
+                .geo_vents
+                .iter()
+                .any(|v| v.x_elmo == vent.x_elmo && v.z_elmo == vent.z_elmo)
+            {
+                continue;
+            }
+            info!(
+                x_elmo = vent.x_elmo,
+                z_elmo = vent.z_elmo,
+                symmetry = self.symmetry.id(),
+                "geo vent placed"
+            );
+            self.geo_vents.push(vent);
+            self.history
+                .push_project_diff(ProjectDiff::PlaceGeoVent { vent });
+        }
+    }
+
+    fn move_geo_vent_to(&mut self, index: usize, to: GeoVent) {
+        let (ex, ez) = self.world_extents();
+        if let Some(slot) = self.geo_vents.get_mut(index) {
+            slot.x_elmo = (to.x_elmo as f32).clamp(0.0, ex).round() as i32;
+            slot.z_elmo = (to.z_elmo as f32).clamp(0.0, ez).round() as i32;
+            self.dirty = true;
+        }
+    }
+
+    fn finish_geo_vent_drag(&mut self) {
+        let (Some(index), Some(from)) = (
+            self.dragging_geo_vent.take(),
+            self.dragging_geo_vent_from.take(),
+        ) else {
+            self.dragging_geo_vent = None;
+            self.dragging_geo_vent_from = None;
+            return;
+        };
+        let Some(&to) = self.geo_vents.get(index) else {
+            return;
+        };
+        if from == to {
+            return;
+        }
+        self.history
+            .push_project_diff(ProjectDiff::MoveGeoVent { from, to });
+    }
+
+    fn delete_geo_vent(&mut self, index: usize) {
+        if index >= self.geo_vents.len() {
+            return;
+        }
+        self.dirty = true;
+        let vent = self.geo_vents.remove(index);
+        info!(
+            x_elmo = vent.x_elmo,
+            z_elmo = vent.z_elmo,
+            "geo vent deleted"
+        );
+        if let Some(sel) = self.geo_state.selected {
+            if sel == index {
+                self.geo_state.selected = None;
+            } else if sel > index {
+                self.geo_state.selected = Some(sel - 1);
+            }
+        }
+        self.history
+            .push_project_diff(ProjectDiff::DeleteGeoVent { vent });
+    }
+
+    fn hit_test_geo_vent(
+        &self,
+        cursor: egui::Pos2,
+        rect: egui::Rect,
+        radius_px: f32,
+    ) -> Option<usize> {
+        let rect_size = glam::Vec2::new(rect.width(), rect.height());
+        let cursor_in_rect = glam::Vec2::new(cursor.x - rect.min.x, cursor.y - rect.min.y);
+        let mut best: Option<(usize, f32)> = None;
+        for (i, vent) in self.geo_vents.iter().enumerate() {
+            let world = glam::Vec3::new(vent.x_elmo as f32, 0.0, vent.z_elmo as f32);
+            let Some(screen) = render::world_to_screen(world, rect_size, &self.camera) else {
+                continue;
+            };
+            let d = (screen - cursor_in_rect).length();
+            if d <= radius_px && best.map(|(_, bd)| d < bd).unwrap_or(true) {
+                best = Some((i, d));
+            }
+        }
+        best.map(|(i, _)| i)
     }
 
     /// Find the SOURCE start position whose on-screen marker is within
@@ -2079,6 +2326,87 @@ impl App {
                 info!("undo: reverted F1 wizard apply");
                 ProjectDiff::ApplyWizard(current)
             }
+
+            // C4 (Sprint 11): metal-spot undo dispatch. Pattern
+            // mirrors the F8 PlaceStartPosition / DeleteStartPosition
+            // pair — symmetric Place/Delete inversion.
+            ProjectDiff::PlaceMetalSpot { spot } => {
+                if let Some(pos) = self
+                    .metal_spots
+                    .iter()
+                    .position(|m| m.x_elmo == spot.x_elmo && m.z_elmo == spot.z_elmo)
+                {
+                    self.metal_spots.remove(pos);
+                }
+                trace!(
+                    x = spot.x_elmo,
+                    z = spot.z_elmo,
+                    "undo: removed placed metal spot"
+                );
+                ProjectDiff::DeleteMetalSpot { spot }
+            }
+            ProjectDiff::DeleteMetalSpot { spot } => {
+                self.metal_spots.push(spot);
+                trace!(
+                    x = spot.x_elmo,
+                    z = spot.z_elmo,
+                    "undo: restored deleted metal spot"
+                );
+                ProjectDiff::PlaceMetalSpot { spot }
+            }
+            ProjectDiff::MoveMetalSpot { from, to } => {
+                if let Some(slot) = self
+                    .metal_spots
+                    .iter_mut()
+                    .find(|m| m.x_elmo == to.x_elmo && m.z_elmo == to.z_elmo)
+                {
+                    *slot = from;
+                }
+                trace!(?from, ?to, "undo: reverted metal-spot move");
+                ProjectDiff::MoveMetalSpot { from: to, to: from }
+            }
+            ProjectDiff::SetExtractorRadius { from, to } => {
+                self.extractor_radius = from;
+                trace!(from, to, "undo: reverted extractor_radius edit");
+                ProjectDiff::SetExtractorRadius { from: to, to: from }
+            }
+
+            // C5 (Sprint 11): geo-vent undo dispatch.
+            ProjectDiff::PlaceGeoVent { vent } => {
+                if let Some(pos) = self
+                    .geo_vents
+                    .iter()
+                    .position(|v| v.x_elmo == vent.x_elmo && v.z_elmo == vent.z_elmo)
+                {
+                    self.geo_vents.remove(pos);
+                }
+                trace!(
+                    x = vent.x_elmo,
+                    z = vent.z_elmo,
+                    "undo: removed placed geo vent"
+                );
+                ProjectDiff::DeleteGeoVent { vent }
+            }
+            ProjectDiff::DeleteGeoVent { vent } => {
+                self.geo_vents.push(vent);
+                trace!(
+                    x = vent.x_elmo,
+                    z = vent.z_elmo,
+                    "undo: restored deleted geo vent"
+                );
+                ProjectDiff::PlaceGeoVent { vent }
+            }
+            ProjectDiff::MoveGeoVent { from, to } => {
+                if let Some(slot) = self
+                    .geo_vents
+                    .iter_mut()
+                    .find(|v| v.x_elmo == to.x_elmo && v.z_elmo == to.z_elmo)
+                {
+                    *slot = from;
+                }
+                trace!(?from, ?to, "undo: reverted geo-vent move");
+                ProjectDiff::MoveGeoVent { from: to, to: from }
+            }
         }
     }
 
@@ -2239,6 +2567,20 @@ impl App {
                 self.splat_picker_open_for = None;
                 self.reupload_bound_slot_diffuses();
                 self.reupload_splat_distribution();
+
+                // C4/C5 (Sprint 11): metal-spot + geo-vent persistence.
+                // The Project model owns the sources; the inspector
+                // view-state (selection) is session-scoped and resets
+                // on every open.
+                self.metal_spots = p.metal_spots;
+                self.geo_vents = p.geo_vents;
+                self.extractor_radius = p.extractor_radius;
+                self.metal_state = MetalState::default();
+                self.geo_state = GeoState::default();
+                self.dragging_metal_spot = None;
+                self.dragging_metal_spot_from = None;
+                self.dragging_geo_vent = None;
+                self.dragging_geo_vent_from = None;
 
                 if let Some(hm_path) = hm_resolved {
                     if hm_path.exists() {
@@ -2674,6 +3016,54 @@ fn expand_symmetry_into_ally_groups(project: &mut Project, symmetry: SymmetryAxi
                 if !g.start_positions.contains(&p) {
                     g.start_positions.push(p);
                 }
+            }
+        }
+    }
+
+    // C4 / C5 (Sprint 11): metal-spot + geo-vent sources expand
+    // through symmetry the same way start positions do — the editor
+    // canvas already paints mirrors live (see `central()`), but
+    // those mirrors aren't stored in `Project.metal_spots` /
+    // `Project.geo_vents`. The build path needs them concrete so
+    // `metal_layout.rs` / `featureplacer.rs` can emit them.
+    let metal_sources: Vec<MetalSpot> = project.metal_spots.clone();
+    for src in &metal_sources {
+        let mirrors = symmetry.replicate((src.x_elmo as f32, src.z_elmo as f32), extents);
+        for (mx, mz) in mirrors.into_iter().skip(1) {
+            if mx < 0.0 || mx > extents.0 || mz < 0.0 || mz > extents.1 {
+                continue;
+            }
+            let m = MetalSpot {
+                x_elmo: mx.round() as i32,
+                z_elmo: mz.round() as i32,
+                metal: src.metal,
+            };
+            if !project
+                .metal_spots
+                .iter()
+                .any(|q| q.x_elmo == m.x_elmo && q.z_elmo == m.z_elmo)
+            {
+                project.metal_spots.push(m);
+            }
+        }
+    }
+    let geo_sources: Vec<GeoVent> = project.geo_vents.clone();
+    for src in &geo_sources {
+        let mirrors = symmetry.replicate((src.x_elmo as f32, src.z_elmo as f32), extents);
+        for (mx, mz) in mirrors.into_iter().skip(1) {
+            if mx < 0.0 || mx > extents.0 || mz < 0.0 || mz > extents.1 {
+                continue;
+            }
+            let v = GeoVent {
+                x_elmo: mx.round() as i32,
+                z_elmo: mz.round() as i32,
+            };
+            if !project
+                .geo_vents
+                .iter()
+                .any(|q| q.x_elmo == v.x_elmo && q.z_elmo == v.z_elmo)
+            {
+                project.geo_vents.push(v);
             }
         }
     }
@@ -4012,311 +4402,307 @@ impl App {
         }
     }
 
-    /// Metal-spots inspector (ADR-035 / Phase 7). State is in-memory
-    /// only; F5 wires schema persistence + viewport placement.
-    // TODO(F5): wire LMB-place / RMB-delete from the central viewport.
+    /// F5 metal-spots inspector (C4 / Sprint 11). Operates directly
+    /// on `App::metal_spots` (mirroring `Project.metal_spots`); each
+    /// edit pushes a `ProjectDiff` so Ctrl-Z reverses it.
+    ///
+    /// Layout:
+    /// - **GLOBAL** — `extractor_radius` (PITFALL §6) with a tooltip
+    ///   explaining the 80-elmo BAR convention.
+    /// - **SPOTS** — table of (index, X / Z `DragValue`, metal
+    ///   `DragValue` 0.5..=8.0, delete button) plus "+ Add spot" at
+    ///   the bottom (places at map centre, metal = 2.0).
     fn inspector_metal(&mut self, ui: &mut egui::Ui) {
         let t = crate::ui::theme::Tokens::DARK;
-        let m = &mut self.metal_state;
-        let spot_count = m.spots.len();
+        let (ex, ez) = self.world_extents();
+
+        // GLOBAL section — extractor_radius. The closure captures
+        // its own working copy so the header chip + body DragValue
+        // don't fight over the App-level field's borrow.
+        let radius_before = self.extractor_radius;
+        let mut radius_edit = radius_before;
+        let is_default = (radius_before - default_extractor_radius()).abs() < 0.01;
         crate::ui::widgets::section(
             ui,
-            "Generator",
+            "Global",
             true,
             |ui| {
-                crate::ui::widgets::chip(ui, crate::ui::theme::ChipTone::Ok, "Mirrored");
+                let tone = if is_default {
+                    crate::ui::theme::ChipTone::Ok
+                } else {
+                    crate::ui::theme::ChipTone::Warn
+                };
+                let label = if is_default { "BAR default" } else { "Custom" };
+                crate::ui::widgets::chip(ui, tone, label);
             },
             |ui| {
-                let density_label = format!("{:.2} spots/SMU²", m.density);
-                crate::ui::widgets::ramp_slider_labelled(
-                    ui,
-                    "Density",
-                    &mut m.density,
-                    0.0..=1.0,
-                    t.amber,
-                    density_label,
-                );
-                ui.add_space(6.0);
-                let spacing_label = format!("{:.0} elmos", m.min_spacing);
-                crate::ui::widgets::ramp_slider_labelled(
-                    ui,
-                    "Min spacing",
-                    &mut m.min_spacing,
-                    256.0..=4096.0,
-                    t.accent,
-                    spacing_label,
-                );
-                ui.add_space(6.0);
-                let max_label = format!("{:.1} m/s", m.max_metal);
-                crate::ui::widgets::ramp_slider_labelled(
-                    ui,
-                    "Max metal",
-                    &mut m.max_metal,
-                    0.5..=3.0,
-                    t.accent,
-                    max_label,
-                );
-                ui.add_space(10.0);
                 ui.horizontal(|ui| {
-                    let _ = ui
-                        .add(egui::Button::new("Reseed"))
-                        .on_hover_text("Resample metal spots (Phase F5)");
-                    let _ = ui
-                        .add(egui::Button::new("Clear all"))
-                        .on_hover_text("Remove every metal spot (Phase F5)");
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        crate::ui::widgets::chip(
-                            ui,
-                            crate::ui::theme::ChipTone::Neutral,
-                            format!("{} spots", spot_count),
-                        );
-                    });
+                    ui.label(
+                        egui::RichText::new("Extractor radius")
+                            .color(t.muted)
+                            .size(11.0),
+                    );
+                    let resp = ui.add(
+                        egui::DragValue::new(&mut radius_edit)
+                            .range(16.0..=200.0)
+                            .speed(1.0)
+                            .suffix(" elmos"),
+                    );
+                    resp.on_hover_text(
+                        "BAR convention is 80 elmos (the BAR mod overrides Spring's 500). \
+                         Setting this to the engine default 500 silently breaks mex-snap \
+                         (PITFALL §6). The F9 form (Sprint 13) will surface the same value as \
+                         mapinfo.extractor_radius.",
+                    );
                 });
             },
         );
+        if (radius_edit - radius_before).abs() > 0.0001 {
+            self.extractor_radius = radius_edit;
+            self.history
+                .push_project_diff(ProjectDiff::SetExtractorRadius {
+                    from: radius_before,
+                    to: radius_edit,
+                });
+            self.mark_dirty();
+        }
 
-        // Spots list.
-        let mut selected = m.selected;
-        let spots = m.spots.clone();
+        // SPOTS section — table with per-row edits + Add button.
+        let mut selected = self.metal_state.selected;
+        let mut to_delete: Option<usize> = None;
+        let mut to_move: Option<(usize, MetalSpot, MetalSpot)> = None;
+        let mut add_clicked = false;
+        let spots_snapshot: Vec<MetalSpot> = self.metal_spots.clone();
+        let spot_count = spots_snapshot.len();
+        let title = format!("Spots · {}", spot_count);
         crate::ui::widgets::section(
             ui,
-            "Spots",
+            &title,
             false,
             |ui| {
-                ui.label(
-                    egui::RichText::new("sorted by metal")
-                        .color(t.muted)
-                        .size(11.0),
-                );
+                if ui
+                    .add(egui::Button::new("+ Add"))
+                    .on_hover_text("Place a new metal spot at the map centre (metal = 2.0)")
+                    .clicked()
+                {
+                    add_clicked = true;
+                }
             },
             |ui| {
-                if spots.is_empty() {
+                if spots_snapshot.is_empty() {
                     ui.label(
-                        egui::RichText::new("No spots yet — generated by the F5 schema work.")
-                            .color(t.dim)
-                            .size(11.0),
+                        egui::RichText::new(
+                            "No metal spots yet. LMB on the canvas to place one, or click + Add.",
+                        )
+                        .color(t.dim)
+                        .size(11.0),
                     );
                 }
-                for (i, spot) in spots.iter().enumerate() {
-                    let hot = spot.metal >= 1.5;
-                    let is_sel = selected == Some(i);
-                    let resp = egui::Frame::new()
-                        .fill(if is_sel { t.hover } else { t.bg })
-                        .stroke(egui::Stroke::new(
-                            1.0,
-                            if is_sel { t.border_hi } else { t.border },
-                        ))
-                        .corner_radius(egui::CornerRadius::same(3))
-                        .inner_margin(egui::Margin::symmetric(8, 4))
-                        .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                let (rect, _) = ui.allocate_exact_size(
-                                    egui::vec2(8.0, 8.0),
-                                    egui::Sense::hover(),
-                                );
-                                let color = if hot {
-                                    egui::Color32::from_rgb(0xF5, 0x9E, 0x0B)
-                                } else {
-                                    egui::Color32::from_rgb(0xA3, 0x73, 0x40)
-                                };
-                                ui.painter().circle_filled(rect.center(), 4.0, color);
-                                ui.label(
-                                    egui::RichText::new(format!("M{:02}", i + 1))
-                                        .color(t.muted)
-                                        .monospace()
-                                        .size(11.0),
-                                );
-                                ui.label(
-                                    egui::RichText::new(format!(
-                                        "{}, {}",
-                                        spot.x_elmo, spot.z_elmo
-                                    ))
-                                    .monospace()
-                                    .size(11.0),
-                                );
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| {
+                egui::ScrollArea::vertical()
+                    .max_height(420.0)
+                    .id_salt("metal_spots_scroll")
+                    .show(ui, |ui| {
+                        for (i, original) in spots_snapshot.iter().enumerate() {
+                            let mut edited = *original;
+                            let is_sel = selected == Some(i);
+                            let row = egui::Frame::new()
+                                .fill(if is_sel { t.hover } else { t.bg })
+                                .stroke(egui::Stroke::new(
+                                    1.0,
+                                    if is_sel { t.border_hi } else { t.border },
+                                ))
+                                .corner_radius(egui::CornerRadius::same(3))
+                                .inner_margin(egui::Margin::symmetric(8, 4))
+                                .show(ui, |ui| {
+                                    ui.horizontal(|ui| {
                                         ui.label(
-                                            egui::RichText::new(format!("{:.2}", spot.metal))
-                                                .color(if hot { t.amber } else { t.text })
-                                                .size(11.0)
-                                                .monospace(),
+                                            egui::RichText::new(format!("M{:02}", i + 1))
+                                                .color(t.muted)
+                                                .monospace()
+                                                .size(11.0),
                                         );
-                                    },
-                                );
-                            });
-                        })
-                        .response
-                        .interact(egui::Sense::click());
-                    if resp.clicked() {
-                        selected = Some(i);
-                    }
-                }
+                                        ui.add(
+                                            egui::DragValue::new(&mut edited.x_elmo)
+                                                .range(0..=(ex as i32))
+                                                .speed(8.0)
+                                                .prefix("x "),
+                                        );
+                                        ui.add(
+                                            egui::DragValue::new(&mut edited.z_elmo)
+                                                .range(0..=(ez as i32))
+                                                .speed(8.0)
+                                                .prefix("z "),
+                                        );
+                                        // PITFALL: don't artificially cap the metal value —
+                                        // BAR maps strategically place high-value central mexes
+                                        // (e.g. 5.2) and low-value perimeter mexes (e.g. 0.5)
+                                        // for asymmetric pressure. Range is generous (0..=50)
+                                        // and the user can type any value in that span.
+                                        ui.add(
+                                            egui::DragValue::new(&mut edited.metal)
+                                                .range(0.0..=50.0)
+                                                .speed(0.1)
+                                                .fixed_decimals(2),
+                                        )
+                                        .on_hover_text(
+                                            "Per-spot metal multiplier. BAR convention: 2.0 \
+                                             standard mex, 4.0 strong central mex. Larger values \
+                                             are valid for high-yield strategic spots; click the \
+                                             field to type any value.",
+                                        );
+                                        if ui
+                                            .small_button("×")
+                                            .on_hover_text("Delete spot")
+                                            .clicked()
+                                        {
+                                            to_delete = Some(i);
+                                        }
+                                    });
+                                })
+                                .response
+                                .interact(egui::Sense::click());
+                            if row.clicked() {
+                                selected = Some(i);
+                            }
+                            if edited != *original {
+                                to_move = Some((i, *original, edited));
+                            }
+                        }
+                    });
             },
         );
         self.metal_state.selected = selected;
+        if let Some(i) = to_delete {
+            self.delete_metal_spot(i);
+        }
+        if let Some((i, from, to)) = to_move {
+            self.move_metal_spot_to(i, to);
+            self.history
+                .push_project_diff(ProjectDiff::MoveMetalSpot { from, to });
+            self.mark_dirty();
+        }
+        if add_clicked {
+            let cx = (ex * 0.5).round() as i32;
+            let cz = (ez * 0.5).round() as i32;
+            self.place_metal_spot(cx as f32, cz as f32);
+        }
     }
 
-    /// Geo-features inspector (ADR-035 / Phase 7). UI scaffolding;
-    /// F7 wires the feature gadget emitter + placement schema.
-    // TODO(F7): persist library selection + transform jitter into
-    // `Project.features` once the schema lands.
+    /// F6 geo-vents inspector (C5 / Sprint 11). Operates on
+    /// `App::geo_vents`. Simpler than metal: no per-spot value, no
+    /// global section (the stock `geovent` FeatureDef carries its
+    /// own size).
+    ///
+    /// Sprint 12 / C6 will add a separate `Tool::Feature` for
+    /// general trees / rocks / wreckage placement; that's the
+    /// scaffolded library / scatter UI's eventual home.
     fn inspector_geo(&mut self, ui: &mut egui::Ui) {
         let t = crate::ui::theme::Tokens::DARK;
-        let g = &mut self.geo_state;
+        let (ex, ez) = self.world_extents();
 
-        // LIBRARY section: 3-column thumbnail grid.
-        let mut new_selected: Option<usize> = None;
-        let selected = g.selected;
-        let library = g.library.clone();
+        // SPOTS section — same row pattern as metal, minus the value
+        // column.
+        let mut selected = self.geo_state.selected;
+        let mut to_delete: Option<usize> = None;
+        let mut to_move: Option<(usize, GeoVent, GeoVent)> = None;
+        let mut add_clicked = false;
+        let vents_snapshot: Vec<GeoVent> = self.geo_vents.clone();
+        let vent_count = vents_snapshot.len();
+        let title = format!("Geo vents · {}", vent_count);
         crate::ui::widgets::section(
             ui,
-            "Feature library",
+            &title,
             true,
             |ui| {
-                let _ = ui
-                    .add(egui::Button::new("+ Import"))
-                    .on_hover_text("Import a custom feature definition (Phase F7)");
+                if ui
+                    .add(egui::Button::new("+ Add"))
+                    .on_hover_text("Place a new geo vent at the map centre")
+                    .clicked()
+                {
+                    add_clicked = true;
+                }
             },
             |ui| {
-                let cols = 3;
-                ui.columns(cols, |col_uis| {
-                    for (i, feat) in library.iter().enumerate() {
-                        let col_ui = &mut col_uis[i % cols];
-                        let is_sel = i == selected;
-                        let (rect, response) = col_ui.allocate_exact_size(
-                            egui::vec2(col_ui.available_width(), 78.0),
-                            egui::Sense::click(),
-                        );
-                        let painter = col_ui.painter();
-                        painter.rect_filled(
-                            rect,
-                            egui::CornerRadius::same(5),
-                            if is_sel { t.hover } else { t.bg },
-                        );
-                        painter.rect_stroke(
-                            rect,
-                            egui::CornerRadius::same(5),
-                            egui::Stroke::new(1.0, if is_sel { t.border_hi } else { t.border }),
-                            egui::StrokeKind::Middle,
-                        );
-                        if is_sel {
-                            let rail = egui::Rect::from_min_size(
-                                egui::pos2(rect.left(), rect.top() + 6.0),
-                                egui::vec2(2.0, rect.height() - 12.0),
-                            );
-                            painter.rect_filled(rail, egui::CornerRadius::same(1), t.accent);
-                        }
-                        let icon_rect = egui::Rect::from_center_size(
-                            egui::pos2(rect.center().x, rect.top() + 30.0),
-                            egui::vec2(26.0, 26.0),
-                        );
-                        crate::ui::icons::paint_icon(
-                            painter,
-                            icon_rect,
-                            feat.icon,
-                            if is_sel { t.text } else { t.muted },
-                            1.4,
-                        );
-                        painter.text(
-                            egui::pos2(rect.center().x, rect.bottom() - 10.0),
-                            egui::Align2::CENTER_CENTER,
-                            &feat.name,
-                            egui::FontId::proportional(10.0),
-                            if is_sel { t.text } else { t.muted },
-                        );
-                        painter.text(
-                            egui::pos2(rect.right() - 4.0, rect.top() + 4.0),
-                            egui::Align2::RIGHT_TOP,
-                            feat.count.to_string(),
-                            egui::FontId::monospace(9.0),
-                            t.muted,
-                        );
-                        if response.clicked() {
-                            new_selected = Some(i);
-                        }
-                    }
-                });
-            },
-        );
-        if let Some(s) = new_selected {
-            g.selected = s;
-        }
-
-        // TRANSFORM section.
-        crate::ui::widgets::section(
-            ui,
-            "Transform",
-            false,
-            |_ui| {},
-            |ui| {
-                let rot_label = format!("± {:.0}°", g.rotation_jitter);
-                crate::ui::widgets::ramp_slider_labelled(
-                    ui,
-                    "Rotation jitter",
-                    &mut g.rotation_jitter,
-                    0.0..=180.0,
-                    t.muted,
-                    rot_label,
-                );
-                ui.add_space(8.0);
-                let scale_label = format!("± {:.0}%", g.scale_jitter * 100.0);
-                crate::ui::widgets::ramp_slider_labelled(
-                    ui,
-                    "Scale jitter",
-                    &mut g.scale_jitter,
-                    0.0..=1.0,
-                    t.muted,
-                    scale_label,
-                );
-                ui.add_space(8.0);
-                ui.checkbox(&mut g.align_to_slope, "Align to slope");
-            },
-        );
-
-        // SCATTER section.
-        crate::ui::widgets::section(
-            ui,
-            "Scatter",
-            false,
-            |ui| {
-                let name = g
-                    .library
-                    .get(g.selected)
-                    .map(|f| f.name.clone())
-                    .unwrap_or_default();
-                crate::ui::widgets::chip(
-                    ui,
-                    crate::ui::theme::ChipTone::Neutral,
-                    format!("{name} · selected"),
-                );
-            },
-            |ui| {
-                let d_label = format!("{:.0} / SMU²", g.scatter_density);
-                crate::ui::widgets::ramp_slider_labelled(
-                    ui,
-                    "Density",
-                    &mut g.scatter_density,
-                    1.0..=128.0,
-                    t.green,
-                    d_label,
-                );
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    let _ = ui
-                        .add(
-                            egui::Button::new("Scatter on selection")
-                                .fill(t.accent)
-                                .min_size(egui::vec2(ui.available_width() - 36.0, 28.0)),
+                if vents_snapshot.is_empty() {
+                    ui.label(
+                        egui::RichText::new(
+                            "No geo vents yet. LMB on the canvas to place one, or click + Add.",
                         )
-                        .on_hover_text("Spawn features under selection (Phase F7)");
-                    let _ = ui
-                        .add(egui::Button::new("⌫"))
-                        .on_hover_text("Clear scattered features");
-                });
+                        .color(t.dim)
+                        .size(11.0),
+                    );
+                }
+                egui::ScrollArea::vertical()
+                    .max_height(420.0)
+                    .id_salt("geo_vents_scroll")
+                    .show(ui, |ui| {
+                        for (i, original) in vents_snapshot.iter().enumerate() {
+                            let mut edited = *original;
+                            let is_sel = selected == Some(i);
+                            let row = egui::Frame::new()
+                                .fill(if is_sel { t.hover } else { t.bg })
+                                .stroke(egui::Stroke::new(
+                                    1.0,
+                                    if is_sel { t.border_hi } else { t.border },
+                                ))
+                                .corner_radius(egui::CornerRadius::same(3))
+                                .inner_margin(egui::Margin::symmetric(8, 4))
+                                .show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.label(
+                                            egui::RichText::new(format!("V{:02}", i + 1))
+                                                .color(t.muted)
+                                                .monospace()
+                                                .size(11.0),
+                                        );
+                                        ui.add(
+                                            egui::DragValue::new(&mut edited.x_elmo)
+                                                .range(0..=(ex as i32))
+                                                .speed(8.0)
+                                                .prefix("x "),
+                                        );
+                                        ui.add(
+                                            egui::DragValue::new(&mut edited.z_elmo)
+                                                .range(0..=(ez as i32))
+                                                .speed(8.0)
+                                                .prefix("z "),
+                                        );
+                                        if ui
+                                            .small_button("×")
+                                            .on_hover_text("Delete geo vent")
+                                            .clicked()
+                                        {
+                                            to_delete = Some(i);
+                                        }
+                                    });
+                                })
+                                .response
+                                .interact(egui::Sense::click());
+                            if row.clicked() {
+                                selected = Some(i);
+                            }
+                            if edited != *original {
+                                to_move = Some((i, *original, edited));
+                            }
+                        }
+                    });
             },
         );
+        self.geo_state.selected = selected;
+        if let Some(i) = to_delete {
+            self.delete_geo_vent(i);
+        }
+        if let Some((i, from, to)) = to_move {
+            self.move_geo_vent_to(i, to);
+            self.history
+                .push_project_diff(ProjectDiff::MoveGeoVent { from, to });
+            self.mark_dirty();
+        }
+        if add_clicked {
+            let cx = (ex * 0.5).round();
+            let cz = (ez * 0.5).round();
+            self.place_geo_vent(cx, cz);
+        }
     }
 
     /// Sculpt inspector (ADR-035): 4-card brush picker (Off / Raise /
@@ -5050,7 +5436,10 @@ impl App {
                 && self.heightmap.is_some();
             let start_pos_active = matches!(self.tool, Tool::StartPositions);
             let splat_active = matches!(self.tool, Tool::SplatPaint) && self.heightmap.is_some();
-            let central_interactive = brush_active || start_pos_active || splat_active;
+            let metal_active = matches!(self.tool, Tool::MetalSpots);
+            let geo_active = matches!(self.tool, Tool::GeoFeatures);
+            let central_interactive =
+                brush_active || start_pos_active || splat_active || metal_active || geo_active;
 
             // ADR-035: the top-right nav-gizmo retires in favour of
             // the mini-map. Reserve its rect so brush/start-pos
@@ -5212,6 +5601,105 @@ impl App {
                     self.hit_test_start_position(cursor, rect, HIT_RADIUS_PX);
             } else {
                 self.hovered_canvas_marker = None;
+            }
+
+            // C4 (Sprint 11): metal-spot pointer dispatch. Same hit
+            // radius + symmetry pattern as start positions. LMB on
+            // empty space places (with symmetry mirrors); LMB drag
+            // on an existing spot moves; RMB deletes; cross-tool
+            // ghost rendering (50 % alpha) handled below.
+            if metal_active
+                && !consumed_click
+                && !cursor_in_gizmo
+                && let Some(cursor) = ctx.pointer_interact_pos()
+            {
+                let cursor_in = glam::Vec2::new(cursor.x - rect.min.x, cursor.y - rect.min.y);
+                let rect_size = glam::Vec2::new(rect.width(), rect.height());
+                const METAL_HIT_RADIUS_PX: f32 = 12.0;
+                if response.clicked_by(egui::PointerButton::Secondary)
+                    && let Some(idx) = self.hit_test_metal_spot(cursor, rect, METAL_HIT_RADIUS_PX)
+                {
+                    self.delete_metal_spot(idx);
+                }
+                if response.drag_started_by(egui::PointerButton::Primary) {
+                    self.dragging_metal_spot =
+                        self.hit_test_metal_spot(cursor, rect, METAL_HIT_RADIUS_PX);
+                    self.dragging_metal_spot_from = self
+                        .dragging_metal_spot
+                        .and_then(|i| self.metal_spots.get(i).copied());
+                }
+                if response.dragged_by(egui::PointerButton::Primary)
+                    && let Some(idx) = self.dragging_metal_spot
+                    && let Some(world) =
+                        render::screen_to_world_y0(cursor_in, rect_size, &self.camera)
+                    && let Some(existing) = self.metal_spots.get(idx).copied()
+                {
+                    let updated = MetalSpot {
+                        x_elmo: world.x.round() as i32,
+                        z_elmo: world.z.round() as i32,
+                        metal: existing.metal,
+                    };
+                    self.move_metal_spot_to(idx, updated);
+                }
+                if response.drag_stopped_by(egui::PointerButton::Primary) {
+                    self.finish_metal_spot_drag();
+                }
+                if response.clicked_by(egui::PointerButton::Primary)
+                    && self
+                        .hit_test_metal_spot(cursor, rect, METAL_HIT_RADIUS_PX)
+                        .is_none()
+                    && let Some(world) =
+                        render::screen_to_world_y0(cursor_in, rect_size, &self.camera)
+                {
+                    self.place_metal_spot(world.x, world.z);
+                }
+            }
+
+            // C5 (Sprint 11): geo-vent pointer dispatch. Mirror of
+            // metal's. Same hit radius. No `metal` value drag.
+            if geo_active
+                && !consumed_click
+                && !cursor_in_gizmo
+                && let Some(cursor) = ctx.pointer_interact_pos()
+            {
+                let cursor_in = glam::Vec2::new(cursor.x - rect.min.x, cursor.y - rect.min.y);
+                let rect_size = glam::Vec2::new(rect.width(), rect.height());
+                const GEO_HIT_RADIUS_PX: f32 = 12.0;
+                if response.clicked_by(egui::PointerButton::Secondary)
+                    && let Some(idx) = self.hit_test_geo_vent(cursor, rect, GEO_HIT_RADIUS_PX)
+                {
+                    self.delete_geo_vent(idx);
+                }
+                if response.drag_started_by(egui::PointerButton::Primary) {
+                    self.dragging_geo_vent =
+                        self.hit_test_geo_vent(cursor, rect, GEO_HIT_RADIUS_PX);
+                    self.dragging_geo_vent_from = self
+                        .dragging_geo_vent
+                        .and_then(|i| self.geo_vents.get(i).copied());
+                }
+                if response.dragged_by(egui::PointerButton::Primary)
+                    && let Some(idx) = self.dragging_geo_vent
+                    && let Some(world) =
+                        render::screen_to_world_y0(cursor_in, rect_size, &self.camera)
+                {
+                    let updated = GeoVent {
+                        x_elmo: world.x.round() as i32,
+                        z_elmo: world.z.round() as i32,
+                    };
+                    self.move_geo_vent_to(idx, updated);
+                }
+                if response.drag_stopped_by(egui::PointerButton::Primary) {
+                    self.finish_geo_vent_drag();
+                }
+                if response.clicked_by(egui::PointerButton::Primary)
+                    && self
+                        .hit_test_geo_vent(cursor, rect, GEO_HIT_RADIUS_PX)
+                        .is_none()
+                    && let Some(world) =
+                        render::screen_to_world_y0(cursor_in, rect_size, &self.camera)
+                {
+                    self.place_geo_vent(world.x, world.z);
+                }
             }
 
             if self.heightmap.is_some() {
@@ -5379,6 +5867,162 @@ impl App {
                                 let mp = egui::Pos2::new(rect.min.x + ms.x, rect.min.y + ms.y);
                                 painter.circle_stroke(mp, 7.0, egui::Stroke::new(1.5, base_color));
                             }
+                        }
+                    }
+                }
+            }
+
+            // C4 (Sprint 11): metal-spot markers. Red filled circle
+            // per source; extractor-radius ring (cyan stroke at
+            // `App::extractor_radius` elmos in world) when the
+            // MetalSpots tool is active. Cross-tool ghost falloff
+            // (50 % alpha) outside MetalSpots (B1 pattern). Symmetry
+            // mirrors render as outline-only rings.
+            if !self.metal_spots.is_empty() {
+                let rect_size = glam::Vec2::new(rect.width(), rect.height());
+                let painter = ui.painter_at(rect);
+                let cross_tool_ghost = !matches!(self.tool, Tool::MetalSpots);
+                let alpha_mul = if cross_tool_ghost { 128 } else { 255 };
+                let extents = self.world_extents();
+                let red_fill = egui::Color32::from_rgba_unmultiplied(0xF1, 0x5C, 0x5C, alpha_mul);
+                let white_stroke = egui::Color32::from_rgba_unmultiplied(255, 255, 255, alpha_mul);
+                let cyan = egui::Color32::from_rgba_unmultiplied(
+                    0x33,
+                    0xD8,
+                    0xE6,
+                    if cross_tool_ghost { 64 } else { 160 },
+                );
+                let radius_world = self.extractor_radius.max(8.0);
+                for (i, spot) in self.metal_spots.iter().enumerate() {
+                    let world = glam::Vec3::new(spot.x_elmo as f32, 0.0, spot.z_elmo as f32);
+                    let Some(screen) = render::world_to_screen(world, rect_size, &self.camera)
+                    else {
+                        continue;
+                    };
+                    let p = egui::Pos2::new(rect.min.x + screen.x, rect.min.y + screen.y);
+                    let dragging = self.dragging_metal_spot == Some(i);
+                    let r = if dragging { 10.0 } else { 7.0 };
+                    painter.circle_filled(p, r, red_fill);
+                    painter.circle_stroke(p, r, egui::Stroke::new(1.5, white_stroke));
+                    // Extractor-radius ring — only when the tool is
+                    // active (otherwise the canvas would be a sea of
+                    // cyan rings from cross-tool ghosts).
+                    if !cross_tool_ghost {
+                        // Project the radius into screen pixels by
+                        // sampling a point one radius east of the
+                        // source — this respects the orbit camera's
+                        // perspective without re-implementing the
+                        // projection.
+                        let east = glam::Vec3::new(
+                            spot.x_elmo as f32 + radius_world,
+                            0.0,
+                            spot.z_elmo as f32,
+                        );
+                        if let Some(east_screen) =
+                            render::world_to_screen(east, rect_size, &self.camera)
+                        {
+                            let radius_px = (east_screen.x - screen.x).abs();
+                            if radius_px > 1.5 {
+                                painter.circle_stroke(p, radius_px, egui::Stroke::new(1.2, cyan));
+                            }
+                        }
+                    }
+                    // Metal-value label above the marker, white text
+                    // with shadow for legibility against the splat
+                    // composite.
+                    painter.text(
+                        p + egui::Vec2::new(0.0, -r - 2.0),
+                        egui::Align2::CENTER_BOTTOM,
+                        format!("{:.1}", spot.metal),
+                        egui::FontId::proportional(11.0),
+                        white_stroke,
+                    );
+                    // Symmetry mirrors as outline-only.
+                    if !matches!(self.symmetry, SymmetryAxis::None) {
+                        let mirrors = self
+                            .symmetry
+                            .replicate((spot.x_elmo as f32, spot.z_elmo as f32), extents);
+                        for (mx, mz) in mirrors.into_iter().skip(1) {
+                            if mx < 0.0 || mx > extents.0 || mz < 0.0 || mz > extents.1 {
+                                continue;
+                            }
+                            let mw = glam::Vec3::new(mx, 0.0, mz);
+                            let Some(ms) = render::world_to_screen(mw, rect_size, &self.camera)
+                            else {
+                                continue;
+                            };
+                            let mp = egui::Pos2::new(rect.min.x + ms.x, rect.min.y + ms.y);
+                            painter.circle_stroke(mp, 6.0, egui::Stroke::new(1.2, red_fill));
+                        }
+                    }
+                }
+            }
+
+            // C5 (Sprint 11): geo-vent markers. Orange triangle with
+            // a faint upward gradient (steam-plume hint). Cross-tool
+            // ghost falloff identical to metal.
+            if !self.geo_vents.is_empty() {
+                let rect_size = glam::Vec2::new(rect.width(), rect.height());
+                let painter = ui.painter_at(rect);
+                let cross_tool_ghost = !matches!(self.tool, Tool::GeoFeatures);
+                let alpha_mul = if cross_tool_ghost { 128 } else { 255 };
+                let extents = self.world_extents();
+                let orange = egui::Color32::from_rgba_unmultiplied(0xF5, 0x9E, 0x0B, alpha_mul);
+                let orange_ghost =
+                    egui::Color32::from_rgba_unmultiplied(0xF5, 0x9E, 0x0B, alpha_mul / 3);
+                for (i, vent) in self.geo_vents.iter().enumerate() {
+                    let world = glam::Vec3::new(vent.x_elmo as f32, 0.0, vent.z_elmo as f32);
+                    let Some(screen) = render::world_to_screen(world, rect_size, &self.camera)
+                    else {
+                        continue;
+                    };
+                    let p = egui::Pos2::new(rect.min.x + screen.x, rect.min.y + screen.y);
+                    let dragging = self.dragging_geo_vent == Some(i);
+                    let size = if dragging { 12.0 } else { 9.0 };
+                    let tri = [
+                        p + egui::Vec2::new(0.0, -size),
+                        p + egui::Vec2::new(-size * 0.85, size * 0.7),
+                        p + egui::Vec2::new(size * 0.85, size * 0.7),
+                    ];
+                    painter.add(egui::Shape::convex_polygon(
+                        tri.to_vec(),
+                        orange,
+                        egui::Stroke::new(
+                            1.4,
+                            egui::Color32::from_rgba_unmultiplied(255, 255, 255, alpha_mul),
+                        ),
+                    ));
+                    // Steam-plume hint: a faint upward chevron.
+                    let plume_top = p + egui::Vec2::new(0.0, -size - 8.0);
+                    painter.line_segment(
+                        [p + egui::Vec2::new(0.0, -size), plume_top],
+                        egui::Stroke::new(1.2, orange_ghost),
+                    );
+                    // Symmetry mirrors as outline-only triangles.
+                    if !matches!(self.symmetry, SymmetryAxis::None) {
+                        let mirrors = self
+                            .symmetry
+                            .replicate((vent.x_elmo as f32, vent.z_elmo as f32), extents);
+                        for (mx, mz) in mirrors.into_iter().skip(1) {
+                            if mx < 0.0 || mx > extents.0 || mz < 0.0 || mz > extents.1 {
+                                continue;
+                            }
+                            let mw = glam::Vec3::new(mx, 0.0, mz);
+                            let Some(ms) = render::world_to_screen(mw, rect_size, &self.camera)
+                            else {
+                                continue;
+                            };
+                            let mp = egui::Pos2::new(rect.min.x + ms.x, rect.min.y + ms.y);
+                            let tri = [
+                                mp + egui::Vec2::new(0.0, -7.0),
+                                mp + egui::Vec2::new(-6.0, 5.0),
+                                mp + egui::Vec2::new(6.0, 5.0),
+                            ];
+                            painter.add(egui::Shape::convex_polygon(
+                                tri.to_vec(),
+                                egui::Color32::TRANSPARENT,
+                                egui::Stroke::new(1.2, orange),
+                            ));
                         }
                     }
                 }
@@ -5636,6 +6280,13 @@ mod tests {
             slot_thumbnails: std::collections::HashMap::new(),
             metal_state: MetalState::default(),
             geo_state: GeoState::default(),
+            metal_spots: Vec::new(),
+            geo_vents: Vec::new(),
+            extractor_radius: default_extractor_radius(),
+            dragging_metal_spot: None,
+            dragging_metal_spot_from: None,
+            dragging_geo_vent: None,
+            dragging_geo_vent_from: None,
         }
     }
 
@@ -6383,37 +7034,215 @@ mod tests {
         assert_eq!(p.splat_config, app.splat_config);
     }
 
+    /// C4 (Sprint 11): `MetalState` is now slim view-state — the spot
+    /// data lives on `App::metal_spots` (which mirrors
+    /// `Project.metal_spots`). The default has nothing selected.
     #[test]
-    fn metal_state_default_has_no_spots() {
+    fn metal_state_default_has_no_selection() {
         let m = MetalState::default();
-        assert!(m.spots.is_empty());
         assert!(m.selected.is_none());
-        // Sane numeric defaults.
-        assert!(m.density > 0.0 && m.density <= 1.0);
-        assert!(m.min_spacing > 0.0);
-        assert!(m.max_metal > 0.0);
     }
 
+    /// C5 (Sprint 11): `GeoState` mirrors `MetalState`'s shape — no
+    /// scaffolded library / scatter knobs anymore. Those will return
+    /// in C6 (Sprint 12) under a dedicated `Tool::Feature` variant.
     #[test]
-    fn geo_state_default_has_library_and_first_selected() {
+    fn geo_state_default_has_no_selection() {
         let g = GeoState::default();
-        assert!(!g.library.is_empty());
-        assert!(g.selected < g.library.len());
-        // Every entry has a name (UI relies on this).
-        for f in &g.library {
-            assert!(!f.name.is_empty());
+        assert!(g.selected.is_none());
+    }
+
+    /// Fresh `App` starts with no metal spots, no geo vents, and the
+    /// BAR-default extractor radius.
+    #[test]
+    fn fresh_app_has_empty_metal_and_geo_state() {
+        let app = make_test_app();
+        assert_eq!(app.splat_config, SplatConfig::default());
+        assert!(app.metal_spots.is_empty());
+        assert!(app.geo_vents.is_empty());
+        assert_eq!(app.extractor_radius, default_extractor_radius());
+        assert_eq!(app.extractor_radius, 80.0);
+        assert!(app.metal_state.selected.is_none());
+        assert!(app.geo_state.selected.is_none());
+    }
+
+    /// C4 (Sprint 11): placing a metal spot pushes the source,
+    /// marks the project dirty, and writes a place-diff onto the
+    /// undo stack. Ctrl-Z removes it.
+    #[test]
+    fn place_metal_spot_writes_undoable_diff() {
+        let mut app = make_test_app();
+        // 2 SMU square map: extent 2 * 512 = 1024 elmos.
+        app.place_metal_spot(256.0, 256.0);
+        assert_eq!(app.metal_spots.len(), 1);
+        assert!(app.dirty);
+        assert_eq!(app.history.undo_depth(), 1);
+        // Undo removes the spot.
+        app.undo_one();
+        assert!(app.metal_spots.is_empty());
+        // Redo re-adds.
+        app.redo_one();
+        assert_eq!(app.metal_spots.len(), 1);
+        assert_eq!(app.metal_spots[0].metal, MetalSpot::DEFAULT_METAL);
+    }
+
+    /// Horizontal symmetry under metal placement yields one source
+    /// per LMB-click, plus the mirror — each pushed as its own
+    /// `ProjectDiff` so undo peels them one at a time (matches F8).
+    #[test]
+    fn place_metal_spot_with_horizontal_symmetry_emits_per_mirror_diffs() {
+        let mut app = make_test_app();
+        app.symmetry = SymmetryAxis::Horizontal;
+        app.place_metal_spot(100.0, 256.0);
+        // Source + horizontal mirror around the map centre — extent
+        // 1024 → mirror at x = 1024 - 100 = 924.
+        assert_eq!(app.metal_spots.len(), 2);
+        let xs: Vec<i32> = app.metal_spots.iter().map(|m| m.x_elmo).collect();
+        assert!(xs.contains(&100));
+        assert!(xs.contains(&924));
+        // Two diffs on the stack (one per source).
+        assert_eq!(app.history.undo_depth(), 2);
+    }
+
+    /// Off-map clicks (negative / past-extent) are ignored without
+    /// pushing diffs — matches the F8 pattern.
+    #[test]
+    fn place_metal_spot_off_map_is_a_noop() {
+        let mut app = make_test_app();
+        app.place_metal_spot(-100.0, 256.0);
+        app.place_metal_spot(256.0, 9999.0);
+        assert!(app.metal_spots.is_empty());
+        assert_eq!(app.history.undo_depth(), 0);
+    }
+
+    /// Delete pushes a `DeleteMetalSpot` diff; undo restores.
+    #[test]
+    fn delete_metal_spot_round_trips() {
+        let mut app = make_test_app();
+        app.metal_spots.push(MetalSpot::new(100, 200));
+        app.delete_metal_spot(0);
+        assert!(app.metal_spots.is_empty());
+        app.undo_one();
+        assert_eq!(app.metal_spots.len(), 1);
+        assert_eq!(app.metal_spots[0], MetalSpot::new(100, 200));
+    }
+
+    /// C5 (Sprint 11): same pattern for geo vents.
+    #[test]
+    fn place_geo_vent_writes_undoable_diff() {
+        let mut app = make_test_app();
+        app.place_geo_vent(256.0, 256.0);
+        assert_eq!(app.geo_vents.len(), 1);
+        assert!(app.dirty);
+        assert_eq!(app.history.undo_depth(), 1);
+        app.undo_one();
+        assert!(app.geo_vents.is_empty());
+    }
+
+    /// Geo placement honours symmetry — extents 1024 → vertical
+    /// mirror is at z = 1024 - 200 = 824.
+    #[test]
+    fn place_geo_vent_with_vertical_symmetry_mirrors() {
+        let mut app = make_test_app();
+        app.symmetry = SymmetryAxis::Vertical;
+        app.place_geo_vent(512.0, 200.0);
+        assert_eq!(app.geo_vents.len(), 2);
+        let zs: Vec<i32> = app.geo_vents.iter().map(|v| v.z_elmo).collect();
+        assert!(zs.contains(&200));
+        assert!(zs.contains(&824));
+    }
+
+    /// `snapshot_project_for_build` expands metal_spots through the
+    /// active symmetry, materialising the mirrors the editor canvas
+    /// paints live. Without this expansion, BAR would only render
+    /// the source spots and the user's symmetric layout would not
+    /// reach the .sd7.
+    #[test]
+    fn snapshot_for_build_expands_metal_through_symmetry() {
+        let mut app = make_test_app();
+        app.symmetry = SymmetryAxis::Horizontal;
+        // Place one source the long way (not via place_metal_spot so
+        // the test isolates the expansion step from the placement
+        // step).
+        app.metal_spots.push(MetalSpot::new(100, 256));
+        let p = app.snapshot_project_for_build();
+        assert_eq!(p.metal_spots.len(), 2, "expansion missing");
+        let xs: Vec<i32> = p.metal_spots.iter().map(|m| m.x_elmo).collect();
+        assert!(xs.contains(&100));
+        assert!(xs.contains(&924));
+        // Metal value rides along on the mirror.
+        for spot in &p.metal_spots {
+            assert_eq!(spot.metal, MetalSpot::DEFAULT_METAL);
         }
     }
 
+    /// `snapshot_project_for_build` also expands geo_vents.
     #[test]
-    fn fresh_app_has_phase_7_default_state() {
-        // App::new wires the scaffolding states. Smoke test that they
-        // survive construction (via make_test_app, which uses the same
-        // initialiser shape).
-        let app = make_test_app();
-        assert_eq!(app.splat_config, SplatConfig::default());
-        assert!(app.metal_state.spots.is_empty());
-        assert!(!app.geo_state.library.is_empty());
+    fn snapshot_for_build_expands_geo_through_symmetry() {
+        let mut app = make_test_app();
+        app.symmetry = SymmetryAxis::Quad;
+        app.geo_vents.push(GeoVent::new(100, 200));
+        let p = app.snapshot_project_for_build();
+        // Quad: 4 entries from one source.
+        assert_eq!(p.geo_vents.len(), 4);
+    }
+
+    /// `SymmetryAxis::None` leaves both vectors untouched.
+    #[test]
+    fn snapshot_for_build_no_op_when_symmetry_off() {
+        let mut app = make_test_app();
+        app.symmetry = SymmetryAxis::None;
+        app.metal_spots.push(MetalSpot::new(100, 100));
+        app.geo_vents.push(GeoVent::new(200, 200));
+        let p = app.snapshot_project_for_build();
+        assert_eq!(p.metal_spots.len(), 1);
+        assert_eq!(p.geo_vents.len(), 1);
+    }
+
+    /// `snapshot_project` round-trips metal + geo + extractor radius
+    /// onto a Project ready for save / build.
+    #[test]
+    fn snapshot_project_carries_metal_geo_and_extractor_radius() {
+        let mut app = make_test_app();
+        app.metal_spots.push(MetalSpot::new(100, 100));
+        app.geo_vents.push(GeoVent::new(200, 200));
+        app.extractor_radius = 95.0;
+        let p = app.snapshot_project();
+        assert_eq!(p.metal_spots.len(), 1);
+        assert_eq!(p.geo_vents.len(), 1);
+        assert_eq!(p.extractor_radius, 95.0);
+    }
+
+    /// `new_project` resets metal + geo + extractor_radius to the
+    /// fresh defaults.
+    #[test]
+    fn new_project_clears_metal_geo_and_resets_extractor_radius() {
+        let mut app = make_test_app();
+        app.metal_spots.push(MetalSpot::new(100, 100));
+        app.geo_vents.push(GeoVent::new(200, 200));
+        app.extractor_radius = 120.0;
+        app.new_project();
+        assert!(app.metal_spots.is_empty());
+        assert!(app.geo_vents.is_empty());
+        assert_eq!(app.extractor_radius, default_extractor_radius());
+    }
+
+    /// SetExtractorRadius diff is reversible.
+    #[test]
+    fn set_extractor_radius_diff_round_trips() {
+        let mut app = make_test_app();
+        let before = app.extractor_radius;
+        app.history
+            .push_project_diff(ProjectDiff::SetExtractorRadius {
+                from: before,
+                to: 150.0,
+            });
+        // Simulate the inspector applying the new value.
+        app.extractor_radius = 150.0;
+        app.undo_one();
+        assert_eq!(app.extractor_radius, before);
+        app.redo_one();
+        assert_eq!(app.extractor_radius, 150.0);
     }
 
     /// `start_positions_balanced` returns true when every allyteam
