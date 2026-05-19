@@ -17,6 +17,7 @@ Cargo.lock.bak
 # Bundled sidecar binaries (large, downloaded by build script)
 /tools/pymapconv/
 /tools/compressonator/
+/tools/textures/
 
 # Test/scratch outputs
 /scratch/

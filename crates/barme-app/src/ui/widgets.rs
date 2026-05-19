@@ -417,8 +417,6 @@ pub fn icon_button(ui: &mut Ui, icon: Icon, size: f32, tooltip: &str) -> Respons
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     /// Pure helper: given a value+range, compute the normalised t in [0,1].
     /// Mirrors the math inside `ramp_slider` so we can unit-test it.
     fn ramp_t(value: f32, range: std::ops::RangeInclusive<f32>) -> f32 {

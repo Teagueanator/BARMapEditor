@@ -219,7 +219,6 @@ pub fn install_style(ctx: &egui::Context) {
     ctx.set_style(style);
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

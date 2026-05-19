@@ -2124,6 +2124,269 @@ team to BAR even though the canvas showed 4 markers.
 - ADR-023 status-updated to scope its supersession (data shape
   superseded; UX surface remains but is rebuilt around the tree).
 
+## ADR-025 — Starter texture pack: 16 ambientCG CC0 slots in 4 biome groups
+
+**Status:** Accepted (2026-05-18)
+
+**Context:** F4 (splat painting) needs a populated tile palette to be
+usable. We do not want first-launch to require a scavenger hunt through
+the Nobiax/Beherith DNTS pack, World Machine licences, or per-author
+ambientCG downloads. Two research sessions produced competing palette
+sketches (Claude — `docs/research/textures/claude-findings-from-research.md`
+— ambientCG-only, 16 slots, synthesise-normals-from-luminance; Gemini —
+`docs/research/textures/Gemini BAR Editor Texture Pack Scoping.md` — 16
+slots, 4 biome groups, mixed ambientCG + Poly Haven, bundle-the-source-
+normal-map). Sprint 7's brief reconciles them: take Gemini's biome
+structure, take Gemini's bundle-the-normal stance, but route every slot
+through ambientCG (no Poly Haven). Poly Haven was excluded because
+(a) per-asset licences vary — not every Poly Haven asset is CC0; (b) 1K
+ZIPs run 77–99 MB per slot due to GL+DX normal pairs + 16-bit
+displacement, blowing out the per-slot disk budget; (c) Poly Haven's
+direct-file UX doesn't map cleanly to the `_1K-<JPG|PNG>.zip` URL
+pattern this script targets. The source audit at
+`docs/research/source-audit-2026-05-18/FINDINGS.md` §7 corrects
+splat-rendering math and informs the format choices below.
+
+**Decision:**
+- **16 slots, 4 biome groups × 4 textures.** Biome groups are
+  `Earth-Temperate`, `Arid`, `Snow-Alpine`, `Alien-Industrial`. Names
+  are short kebab-case strings (`grass-meadow`, `clean-metal-floor`).
+- **Sources are 100 % ambientCG, all CC0-1.0.** Verified per-asset URL
+  status, content, and sha256 on 2026-05-18; pinned in
+  `scripts/fetch-textures.sh`. Per-asset attribution is not required
+  under CC0; `CREDITS.md` credits ambientCG and Beherith as a courtesy.
+- **Pinned 16-slot palette table** (sha256 over the `_1K-PNG.zip`):
+
+| # | Name | Biome | ambientCG asset | sha256 |
+|--:|---|---|---|---|
+| 00 | `grass-meadow` | Earth-Temperate | `Grass002` | `3a51690e1fd2fd6672f8964737091eb52444c1ed90f58f16bf79a50d2e5aa517` |
+| 01 | `forest-floor-pine` | Earth-Temperate | `Ground037` | `cbd75f0660870b3299a68c4fe7fd54efb3951cf992d4295961209619eb284c47` |
+| 02 | `dirt-mud-cracked` | Earth-Temperate | `Ground042` | `2a2e34f68981519f81a6b8cc982a68b51669185971cefa038d8055a02d7c7443` |
+| 03 | `rocky-outcrop-grey` | Earth-Temperate | `Rock030` | `d3e0dc55fc46b093631f4d0009c934003c601e69df9aa4ba41a43db3807056ee` |
+| 04 | `desert-sand-dunes` | Arid | `Ground027` | `03e41b00d17ed28c235cccaa6aba74015b49961e2fe657c75c59b55ccf8fd050` |
+| 05 | `dry-rock-sandstone` | Arid | `Rock023` | `4d6a7d7a36bf6dfbe4fe456cc748bd875c2bb95c3135aff0785f86928ea3b0d2` |
+| 06 | `dusty-hardpan-clay` | Arid | `Ground033` | `b8dbd0105b204863b9b1b6d9e2656fa4f7f77398eebfdef644349140b6da3a72` |
+| 07 | `arid-gravel-pebbles` | Arid | `Gravel018` | `aceb088008927d82085629a7d765abb4c2d704fdbbf5d185669757c4bdfd9616` |
+| 08 | `alpine-snow-powder` | Snow-Alpine | `Snow004` | `ed08bcfdcc0a57e815dba6fc64429d7498773be41381fdf35efc5b771e286472` |
+| 09 | `jagged-ice-frozen` | Snow-Alpine | `Snow006` | `f993019a7e2a59bfdf3ddeb9b4e692bc2a734a5fb71f17581234f24065dbdac5` |
+| 10 | `cold-bare-rock` | Snow-Alpine | `Rock029` | `b8d3517cc73bf317a32ad1c3ca8bb4e4c7b8aed0eab30ee24a00c623374a8764` |
+| 11 | `frozen-permafrost` | Snow-Alpine | `Ground035` | `ed88469c201a41f82776d8651d947a0ea00a9412fca7a2261aa79dc162ffb257` |
+| 12 | `dark-volcanic-lava` | Alien-Industrial | `Rock035` | `e745b558d754962ac44162ccee8805d7dba84ecdc428a543c3e552bcb28f8b85` |
+| 13 | `rusty-metal-plates` | Alien-Industrial | `Metal009` | `ec44086a3bee042418ac2b38a74c8cedfa8313d942bf08c1c91be4ef63c8a97f` |
+| 14 | `clean-metal-floor` | Alien-Industrial | `Metal003` | `b664c3a54bb5e5fc879bb0f69f0f51e2bfd7925c014ca076c779912a72ef2e50` |
+| 15 | `alien-organic-creep` | Alien-Industrial | `Moss001` | `e3745c52f895acf88ce3f28fa83aebc0b7371b68378022f813dcc16ffb0aa8c8` |
+
+- **Format choice — `_1K-PNG.zip`, not `_1K-JPG.zip`.** The JPG-variant
+  ZIPs ship JPG-encoded normals (`*_NormalGL.jpg`). JPEG's 4:2:0 chroma
+  subsampling destroys X/Y vector data in tangent-space normals — this
+  is `docs/PITFALLS.md` rule #2. The PNG-variant ZIPs ship lossless
+  PNG normals at ~6 MB each. We accept the larger network footprint
+  (~16 MB/zip × 16 ≈ 256 MB) for vector-correct normals. Diffuse is
+  also extracted as PNG for the same ZIP, which is slightly larger
+  than JPG but avoids a second download.
+- **Normal-map convention — `_NormalGL` (OpenGL).** Recoil's SMF
+  fragment shader builds the TBN from the per-vertex normal and decodes
+  per-splat normals as `* 2 - 1` (FINDINGS §7.4); the tangent space is
+  OpenGL (+Y up). ambientCG `_NormalGL` is the matching convention.
+  **No Y-flip needed at fetch time.** D2's bake pipeline (ADR-026)
+  surfaces an opt-in Y-flip step for future user-imported DirectX-source
+  normals (F23 / Phase 6); the starter pack flows through with the
+  flip disabled.
+- **Bundle source normal maps (Gemini), don't synthesise them (Claude).**
+  Sobel-from-luminance produces visibly wrong tangent-space data on
+  assets authored with specific micro-relief (brushed metal,
+  cracked clay). Per-slot disk cost is ~8 MB (2 MB diffuse + 6 MB
+  normal); total `tools/textures/` ≈ 115 MB. `tools/textures/` is
+  gitignored (`.gitignore` updated this sprint).
+- **`splatDetailNormalDiffuseAlpha = false` baseline.** Per FINDINGS
+  §7.3 the engine decodes the entire RGBA sample as signed
+  (`* 2 - 1`) and multiplies by `splatCofac`. With `alpha = false`,
+  the alpha channel ships at `0xFF` in every DNTS DDS, contributing
+  nothing observable to the composite. The `true` workflow (alpha
+  carries a signed high-pass diffuse offset) is the visually-richer
+  path but easy to get wrong; deferred to ADR-034 once D4 lands the
+  splat preview shader and we can A/B in-engine. **The fetch script
+  does not bake the high-pass — that lives in D2 (ADR-026).**
+- **`default_tex_scale = 0.02`.** Engine-historical default per
+  `RecoilEngine/cont/base/springcontent/shaders/GLSL/SMFFragProg.glsl:25`
+  (`#define SMF_DETAILTEX_RES 0.02`) and Beherith's DNTS announcement
+  (`https://springrts.com/phpbb/viewtopic.php?t=22564`: "SplatTexScales
+  defaults to (0.02 0.02 0.02 0.02)…lower values mean larger size").
+  Real-world BAR maps run smaller per-channel —
+  `scratch/bar-maps/extracted/comet/mapinfo.lua:116` ships
+  `texScales = {0.004, 0.007, 0.003, 0.0018}` for Comet Catcher Remake.
+  0.02 stays as the meta.toml default for new-user predictability;
+  the D5 splat-tool UI (Sprint 9) surfaces the real-world range
+  `0.0015..=0.05` as the slider span with a tooltip explaining the
+  smaller per-channel norm. `default_tex_mult = 1.0` is the equivalent
+  engine baseline.
+
+**Alternatives:**
+- **Adopt Gemini's table verbatim (mixed ambientCG + Poly Haven).**
+  Rejected per per-asset licence variance, 77–99 MB Poly Haven zips,
+  and the awkward Poly Haven download UX.
+- **Fork the Nobiax/Beherith DNTS pack** (CC0; engine-native). The
+  pack ships pre-baked DNTS DDS (normal-in-RGB, diffuse-in-alpha)
+  which the editor cannot preview as diffuse without an unbake step.
+  Bundling raw CC0 sources is strictly more flexible and yields the
+  same DNTS output via D2's bake pipeline.
+- **Synthesise normals from luminance** (Claude's stance — Sobel on
+  diffuse). Rejected per the Gemini analysis: assets with deliberate
+  micro-relief (brushed metal, cracked clay) Sobel into visually-
+  wrong tangent vectors. Disk cost of bundling source normals is
+  bounded at ~6 MB/slot and gitignored anyway.
+- **First-launch downloader.** Rejected for the starter experience —
+  breaks offline first-run and adds a network-failure UX path. The
+  user-import path (F23 / Phase 6) is the polish path for arbitrary
+  additional slots.
+- **OpenGameArt-sourced textures.** Rejected — mixed CC-BY / CC-BY-SA
+  licences would contaminate the user's `.sd7` with attribution and
+  share-alike obligations.
+- **JPG-variant ambientCG zips.** Rejected per pitfall #2 (JPG normals).
+
+**Substitutions vs Gemini's research** (recorded for traceability):
+- **Slot 3 / 5 / 9 / 13** routed off Poly Haven onto ambientCG per
+  Sprint 7's brief. New IDs: `Rock030`, `Rock023`, `Snow006`,
+  `Metal009`.
+- **Slot 4** (`desert-sand-dunes`): Gemini's `Sand002` is a
+  hallucination — `Sand001-010` all 404 on ambientCG (sand textures
+  live under the `Ground` prefix in ambientCG's taxonomy). Replaced
+  with `Ground027` (Claude's slot 5 "sand-dune-fine").
+- **Slot 10** (`cold-bare-rock`): Gemini routed both slot 3 and slot
+  10 to `Rock030`. After substituting slot 3 to `Rock030`, slot 10
+  collides. Replaced with `Rock029` (adjacent in numbering; same
+  cool-grey weathered-cliff visual register).
+- **Slot 14** (`clean-metal-floor`): Gemini's `Metal042` is a
+  hallucination. Replaced with `Metal003` (clean industrial diamond
+  plate; canonical low-numbered Metal entry).
+- **Slot 15** (`alien-organic-creep`): Gemini's `Organic001` is a
+  hallucination. Replaced with `Moss001` (purpose-built moss texture;
+  matches "organic/lichenoid surface" intent).
+
+**Consequence:**
+- New file `scripts/fetch-textures.sh`. Idempotent (second run is a
+  ~30 ms stat sweep); `--check` mode HEAD-probes each URL without
+  downloading (use this in CI to detect ambientCG asset rot). Bootstrap
+  workflow: replace any slot's sha with the literal `BOOTSTRAP` to make
+  the script print the computed sha + exit non-zero; paste the value
+  back in to re-pin.
+- New file `CREDITS.md` at repo root. Single CC0 banner + per-asset
+  attribution table + Beherith courtesy line.
+- `.gitignore` grows `/tools/textures/`.
+- Per-slot directory layout is the contract D3 (`barme-core::splat`
+  registry) depends on; locked in **ADR-027** below.
+- `cargo` workspace unaffected — this sprint touches no Rust.
+- The starter pack's `splatDetailNormalDiffuseAlpha = false` baseline
+  is the contract D2's bake honours. The high-pass-diffuse-in-alpha
+  workflow lives behind ADR-034.
+
+## ADR-027 — Asset registry on-disk layout (`tools/textures/<NN-slot>/`)
+
+**Status:** Accepted (2026-05-18)
+
+**Context:** ADR-025 locks the **what** of the starter texture pack
+(palette, sources, licences). This ADR locks the **where** and the
+**shape** — the on-disk layout that the future
+`barme-core::splat` registry (D3 / Sprint 8) will scan, and that the
+splat tool inspector (D5 / Sprint 9) will display. Once D3 ships, the
+contract becomes load-bearing; renaming slots or restructuring
+directories becomes a refactor. Better to write it down now.
+
+**Decision:**
+- **Directory layout** rooted at `tools/textures/`:
+
+```
+tools/textures/
+├── 00-grass-meadow/
+│   ├── diffuse.{png,jpg}
+│   ├── normal.png
+│   └── meta.toml
+├── 01-forest-floor-pine/
+│   ├── diffuse.{png,jpg}
+│   ├── normal.png
+│   └── meta.toml
+├── … (14 more) …
+└── 15-alien-organic-creep/
+    ├── diffuse.{png,jpg}
+    ├── normal.png
+    └── meta.toml
+```
+
+- **Slot directory name** is `NN-kebab-name`. `NN` is zero-padded 0..15;
+  it survives the sort order of `std::fs::read_dir` cross-platform.
+  `kebab-name` matches `meta.toml`'s `slot` index + `name` — D3's
+  registry asserts the two agree at scan time and emits a warning on
+  drift.
+- **`meta.toml` schema** (TOML 1.0; serde-friendly):
+  ```toml
+  slot = 0                          # u8, must equal the prefix in the dirname
+  name = "Grass meadow"             # human label (UI)
+  biome = "Earth-Temperate"         # one of: Earth-Temperate, Arid,
+                                    # Snow-Alpine, Alien-Industrial
+  source = "https://ambientcg.com/view?id=Grass002"
+  license = "CC0-1.0"               # SPDX identifier
+  default_tex_scale = 0.02          # initial value for splats.tex_scale
+  default_tex_mult = 1.0            # initial value for splats.tex_mult
+  ```
+- **File contracts**:
+  - `diffuse.{png,jpg}` — sRGB colour. PNG when sourced from
+    `_1K-PNG.zip` (the current default). JPG remains a permitted
+    extension for future user-import (F23) of smaller diffuse-only
+    assets. Either extension is acceptable; the registry probes both
+    when loading.
+  - `normal.png` — OpenGL tangent space (Y up), R=X, G=Y, B=Z. **PNG
+    only.** JPG is rejected; the registry emits an error if it sees
+    `normal.jpg`.
+  - `meta.toml` — UTF-8 TOML, one slot per file. No nested tables.
+- **Idempotency contract**: `meta.toml` is auto-generated by
+  `scripts/fetch-textures.sh`; the file header says so. Hand-edits
+  are overwritten on the next fetch. Per-project overrides (e.g.
+  user dragged a tex_scale slider) live in `Project.splats[]`, not
+  in `meta.toml`.
+- **Why TOML, not JSON / RON?** TOML is the workspace's existing
+  config format (`Cargo.toml`, `.barmeproj` already uses
+  TOML-via-serde). Future D3 registry can deserialise with `toml`
+  (a transitive dep of `cargo` itself; trivial to add).
+
+**Alternatives:**
+- **Flat directory + JSON manifest** (single
+  `tools/textures/manifest.json` with all 16 slots inside).
+  Rejected: pushes every per-slot rename into a single point of
+  edit, complicates F23 user-import (each user-added slot would
+  need a `manifest.json` patch).
+- **Slot-by-name only** (`tools/textures/grass-meadow/`). Rejected:
+  splat distribution textures are indexed by ordinal in mapinfo's
+  `splatDetailNormalTex[1..4]` — the registry needs a stable u8 →
+  slot mapping anyway. Putting the index in the directory name
+  makes the mapping visible without opening files.
+- **Numeric-only directories** (`tools/textures/00/`). Rejected:
+  `ls tools/textures/` becomes opaque; the slot name is too useful
+  to drop.
+- **Folding ADR-027 into ADR-025**. Considered. Kept separate
+  because ADR-025 is the "what's in the pack" decision (could
+  change when we bump assets) and ADR-027 is the "shape on disk"
+  contract (changing this is a breaking refactor for D3). The two
+  evolve at different cadences; keeping them split is cheaper
+  long-term.
+
+**Consequence:**
+- `scripts/fetch-textures.sh` writes the layout above for all 16
+  slots. The script is the canonical writer of `meta.toml`.
+- D3's `barme-core::splat::registry` (Sprint 8) scans
+  `tools/textures/` and yields `Vec<SlotMeta>` ordered by `slot`.
+  Drift checks: dirname prefix must equal `slot`; `slot` must be
+  unique; `slot` must be in `0..=15` (for the starter pack; the
+  registry tolerates higher values for F23 user-imports).
+- D5's splat tool inspector (Sprint 9) reads `name` + `biome` +
+  `default_tex_scale` from each slot's `meta.toml` to populate the
+  4×4 palette grid.
+- The `splatDetailNormalDiffuseAlpha` flag (per-project, set via
+  the F9 form editor at C7) is NOT in `meta.toml` — it's a
+  project-level toggle, not a slot-level one.
+- Future user-import (F23 / Phase 6) reuses the same layout.
+  Out-of-pack slots get index ≥ 16 and skip the dirname-prefix
+  drift check.
+
 ## Template for new entries
 
 ```
