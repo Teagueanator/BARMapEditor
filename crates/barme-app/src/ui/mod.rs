@@ -5,7 +5,11 @@
 //! grows it with `gizmo`, `cheat_sheet`, and `intro`.
 
 pub mod cheat_sheet;
-pub mod gizmo;
+pub mod icons;
 pub mod intro;
+pub mod minimap;
 pub mod next_steps;
 pub mod overlay;
+pub mod theme;
+pub mod viewport_chrome;
+pub mod widgets;

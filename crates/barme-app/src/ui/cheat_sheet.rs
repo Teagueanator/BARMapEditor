@@ -4,7 +4,10 @@
 
 use eframe::egui;
 
-/// One row in the cheat-sheet table.
+/// One row in the cheat-sheet table. Kept for the test harness +
+/// future plain-text export; the runtime renderer now walks the
+/// `*_BINDINGS` tables directly.
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CheatSheetEntry {
     pub keys: String,
@@ -19,19 +22,33 @@ pub type ToolBinding<'a> = (&'a str, &'a str);
 
 /// Camera + global bindings, hand-maintained. New global bindings
 /// (e.g. cheat-sheet `?` itself) must be added here in lockstep
-/// with the keyboard handler.
+/// with the keyboard handler. ADR-035 removed the XYZ nav gizmo —
+/// the mini-map is read-only for camera input at the moment.
 pub const CAMERA_BINDINGS: &[(&str, &str)] = &[
     ("LMB drag", "Sculpt (in Sculpt mode), orbit otherwise"),
     ("RMB drag", "Orbit camera (in tool mode)"),
     ("Scroll wheel", "Zoom in / out"),
-    (
-        "Click nav gizmo axis",
-        "Snap camera to look along that axis",
-    ),
     ("Ctrl+Z", "Undo"),
     ("Ctrl+Shift+Z / Ctrl+Y", "Redo"),
     ("?", "Open this cheat-sheet"),
     ("Esc", "Close cheat-sheet / dismiss intro"),
+];
+
+/// Sculpt-mode bindings (ADR-035). The tool-specific group on the
+/// cheat sheet. Today only the symmetry toggle is bound; the bracket
+/// brush-resize keys are reserved (Phase 9+).
+pub const SCULPT_BINDINGS: &[(&str, &str)] = &[
+    ("X", "Toggle symmetry (reserved)"),
+    ("[", "Brush radius − (reserved)"),
+    ("]", "Brush radius + (reserved)"),
+    ("Shift+drag", "Smooth (reserved)"),
+];
+
+/// Project lifecycle bindings (ADR-035).
+pub const PROJECT_BINDINGS: &[(&str, &str)] = &[
+    ("Ctrl+S", "Save"),
+    ("Ctrl+Shift+S", "Save as…"),
+    ("Ctrl+B", "Build & install (reserved)"),
 ];
 
 /// Build the full keymap table. First comes a "Tools" section
@@ -39,6 +56,7 @@ pub const CAMERA_BINDINGS: &[(&str, &str)] = &[
 ///
 /// Tools render as `(accel, "Switch to <label>")`. Camera entries
 /// render verbatim.
+#[allow(dead_code)]
 pub fn cheat_sheet_entries(tools: &[ToolBinding<'_>]) -> Vec<CheatSheetEntry> {
     let mut out = Vec::with_capacity(tools.len() + CAMERA_BINDINGS.len());
     for (accel, label) in tools {
@@ -66,41 +84,67 @@ pub fn cheat_sheet_entry_count(tool_count: usize) -> usize {
     tool_count + CAMERA_BINDINGS.len()
 }
 
-/// Render the cheat-sheet `egui::Window`. Closes on the X button or
-/// when `open` is set to `false` externally (e.g. via the Esc key
-/// handler in `App::handle_keyboard`).
+/// Render the cheat-sheet `egui::Window` (ADR-035). Two-column grid
+/// of grouped bindings (Camera / Tools / Sculpt / Project) with
+/// `key_combo`-style chips. Closes on the X button or when `open` is
+/// set to `false` externally (e.g. via the Esc key handler in
+/// `App::handle_keyboard`).
 pub fn render_cheat_sheet(ctx: &egui::Context, open: &mut bool, tools: &[ToolBinding<'_>]) {
     if !*open {
         return;
     }
-    let entries = cheat_sheet_entries(tools);
+    let t = crate::ui::theme::Tokens::DARK;
+    let tools_section: Vec<(String, String)> = tools
+        .iter()
+        .map(|(accel, label)| ((*accel).to_string(), (*label).to_string()))
+        .collect();
     let mut local_open = true;
-    egui::Window::new("Keyboard cheat-sheet")
+    egui::Window::new("Keyboard reference")
         .open(&mut local_open)
         .collapsible(false)
         .resizable(false)
-        .default_width(360.0)
+        .default_width(680.0)
         .show(ctx, |ui| {
             ui.label(
-                egui::RichText::new("Press ? at any time to reopen this.")
-                    .small()
-                    .weak(),
+                egui::RichText::new("All shortcuts, grouped by context.")
+                    .color(t.muted)
+                    .size(12.0),
             );
-            ui.separator();
-            egui::Grid::new("cheat_sheet_grid")
-                .num_columns(2)
-                .striped(true)
-                .show(ui, |ui| {
-                    for entry in &entries {
-                        ui.label(egui::RichText::new(&entry.keys).monospace().strong());
-                        ui.label(&entry.action);
-                        ui.end_row();
-                    }
-                });
+            ui.add_space(8.0);
+            ui.columns(2, |cols| {
+                render_group(&mut cols[0], "Camera", CAMERA_BINDINGS);
+                render_group(&mut cols[1], "Tools", &as_str_slice(&tools_section));
+                render_group(&mut cols[0], "Sculpt", SCULPT_BINDINGS);
+                render_group(&mut cols[1], "Project", PROJECT_BINDINGS);
+            });
         });
     if !local_open {
         *open = false;
     }
+}
+
+fn as_str_slice(v: &[(String, String)]) -> Vec<(&str, &str)> {
+    v.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect()
+}
+
+fn render_group(ui: &mut egui::Ui, title: &str, bindings: &[(&str, &str)]) {
+    let t = crate::ui::theme::Tokens::DARK;
+    ui.label(
+        egui::RichText::new(title.to_uppercase())
+            .color(t.muted)
+            .size(10.0)
+            .strong(),
+    );
+    ui.add_space(4.0);
+    for (keys, action) in bindings {
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(*action).color(t.text).size(12.0));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                crate::ui::widgets::key_combo(ui, keys);
+            });
+        });
+    }
+    ui.add_space(12.0);
 }
 
 #[cfg(test)]

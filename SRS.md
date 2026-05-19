@@ -327,6 +327,66 @@ A single-window, single-executable desktop app that produces a *playable* BAR ma
 > `fog_start != fog_end`, `splats.tex_scales == [0.02; 4]`,
 > `terrain_types.len() == 4`.
 
+> **STATUS UPDATE 2026-05-18 (BAR source audit, mapinfo + splat
+> corrections):** Direct read of `RecoilEngine` + `Beyond-All-Reason`
+> + `BYAR-Chobby` clones at HEAD on 2026-05-18 surfaced ten
+> load-bearing pitfalls and dozens of field-level corrections vs the
+> existing research digest. Full write-up at
+> `docs/research/source-audit-2026-05-18/FINDINGS.md`. Highlights
+> that change emitter behaviour:
+>
+> 1. **`lighting.sundir` vs `lighting.sunDir`** — engine reads
+>    camelCase only (`MapInfo.cpp:207`); BAR's active
+>    `unit_sunfacing.lua` (March 2024) reads lowercase only.
+>    Lua tables are case-sensitive — **emitter MUST write BOTH
+>    keys** with the same value. The "regression test asserts
+>    sundir does NOT leak out" claim in the C3 status above is
+>    now incorrect; the test must be inverted to require both
+>    keys present in the rendered output. Sprint 6 follow-up
+>    item; tracked in the FINDINGS doc.
+> 2. **`atmosphere.skyDir` is deprecated** (engine logs
+>    `L_DEPRECATED`); use `atmosphere.skyAxisAngle` (float4: xyz
+>    rotation axis + radians angle). C3 must rename the field
+>    in its `bar_default()` block.
+> 3. **Geo vents are NOT a `geos` array in `map_metal_layout.lua`**
+>    — that's Zero-K convention. BAR derives geo positions from
+>    features with `geoThermal = true`. F6 emits `geovent`
+>    feature placements only; the metal-layout file carries
+>    only `spots = {...}`. The C2 emitter scaffolding is correct
+>    on this point.
+> 4. **SMF metalmap MUST be all-zero when emitting Lua spots** —
+>    `map_metal_spot_placer.lua` (BAR gadget, raaar 2017) bails
+>    if any metalmap pixel is non-zero. F5 must ship a black
+>    metalmap PNG to PyMapConv at build time.
+> 5. **`lighting.sunDir.w = 1.0` by default**, not `1e9` as the
+>    earlier research digest stated. Engine code:
+>    `float4(0.0f, 1.0f, 2.0f, 1.0f)` (`MapInfo.cpp:207`).
+> 6. **`splatDetailNormalTex` subtable form** —
+>    `resources.splatDetailNormalTex = { "a.dds", "b.dds", ...,
+>    alpha = true }` is the modern path; the emitter should
+>    prefer it over the legacy `splatDetailNormalTex1..4` keys.
+> 7. **`modtype` enum** has six values: 0=hidden, 1=primary,
+>    2=unused, 3=map, 4=base, 5=menu (per `ArchiveScanner.cpp:83`).
+> 8. **`gui.minimapRotation` is unused** by current Recoil — engine
+>    reads only `gui.autoShowMetal`. Drop from the C3 emitter
+>    defaults if present.
+> 9. **`map.voidAlphaMin` exists** (default 0.9, voidGround
+>    threshold) and is missing from the current research's field
+>    table. Add to F9 schema.
+> 10. **PyMapConv does NOT touch `mapinfo.lua`** — it emits SMF +
+>     SMT + a `_featureplacement.lua` baked into the SMF feature
+>     header. All `mapinfo.lua` + Lua-sidecar emission is the
+>     editor's responsibility.
+>
+> The splat-rendering ADR (anticipated ADR-035 / F4) also picks up
+> five corrections — most importantly the tangent basis is built
+> from the per-fragment normal (not a static `T=+X / B=+Z`), the
+> base normal decodes from `normalsTex.ra` channels only with Y
+> derived, and the specular exponent is `α × 16` (flat), not a
+> `mix`. See FINDINGS §7 for the full corrected math. The current
+> proposed WGSL in `splat-rendering/claude findings.md` will
+> render visibly wrong if implemented verbatim.
+
 > **STATUS UPDATE 2026-05-18 (F14 — procgen UX redesign, B7):**
 > Sprint 6 / B7 reorders the Procgen Inspector to preset-first per
 > the UI research digests: preset dropdown (auto-detects "Custom"
@@ -445,6 +505,74 @@ A single-window, single-executable desktop app that produces a *playable* BAR ma
 > mirror replication. 8 new unit tests pin the Tool enum and set_tool
 > invariants; 3 more pin Phase 2 smoke paths
 > (`b1_does_not_regress_*`).
+
+> **STATUS UPDATE 2026-05-19 (UI visual overhaul — ADR-035, design-mockup
+> adoption):** Within the same five-zone shell, the editor's visual
+> identity, widget library, and per-panel content were overhauled to
+> match the Claude Design mockup at `docs/research/ui/`. **Structural
+> layout is unchanged** — panel add-order, the exhaustive-`match` tool
+> dispatch, and ADR-030's invariants all still hold. What did change:
+>
+> - **Theme + widget library:** new `crates/barme-app/src/ui/theme.rs`
+>   (single `Tokens::DARK` palette — bg / panel / hover / border /
+>   accent / chip-tone colours) and `crates/barme-app/src/ui/widgets.rs`
+>   (`section`, `chip`, `ramp_slider_labelled`, `pill_toggle`,
+>   `split_button`, `key_combo`, `icon_button`). All panels now read
+>   colours from one source.
+> - **Icon set:** new `crates/barme-app/src/ui/icons.rs` paints ~42
+>   Lucide/Tabler-style line icons directly via `egui::Painter`
+>   (no font dependency). Replaces Unicode glyphs in the tool strip,
+>   top bar, viewport chrome, and modals.
+> - **Tool strip extension:** `Tool::SplatPaint` (T), `Tool::MetalSpots`
+>   (M), `Tool::GeoFeatures` (F) added alongside Select / Sculpt /
+>   StartPositions / Procgen. Tile renders 36 × 36 line-icon + letter
+>   underneath; active state = filled accent bg + 2 px left rail.
+> - **Top action bar:** brand chip, File / Edit / **View** (new — grid /
+>   lighting / wireframe overlay toggles) / Build menus, **centred
+>   symmetry cluster** (pill toggle + mode dropdown + fold spinner —
+>   replaces the popover-only widget), right-aligned **validation chip**
+>   wired to `App::validation_summary()`, **Save button with dirty dot**,
+>   and **split-button Build & install** with caret menu for variants.
+> - **Inspector visual update:** project header now has an editable name
+>   field + size `DragValue`s + saved/unsaved chip; heightmap card is a
+>   2-col grid with a valid/invalid chip. Sculpt panel uses a 4-card
+>   brush picker (Off / Raise / Lower / Smooth) with colour-coded
+>   swatch rings, ramp-slider radius/strength, falloff preview, and a
+>   behaviour chip row (Continuous active; Pressure / Lock-Z reserved).
+>   Procgen panel surfaces presets as chips, syntax-highlights expression
+>   errors with a red wavy outline + error tooltip, and disables Commit
+>   while invalid. Start-positions panel groups controls into a Layout
+>   section (preset dropdown + drag-paint count + Balanced/Asymmetric
+>   chip) and an Allyteams section with collapsible cards.
+> - **Viewport chrome (replaces XYZ nav gizmo):**
+>   `crates/barme-app/src/ui/gizmo.rs` is **deleted**. New
+>   `crates/barme-app/src/ui/minimap.rs` paints a **top-down mini-map**
+>   in the top-right (heightfield biome-ramp thumbnail, symmetry
+>   bisector, allyteam pins, metal spots, camera frustum, tiny N-arrow
+>   compass). New `crates/barme-app/src/ui/viewport_chrome.rs` adds
+>   left + bottom elmo rulers, a floating top-left viewport-options
+>   toolbar (grid / lighting / wireframe + view-mode chip), a
+>   bottom-centre first-launch hint card, and an "empty-state · Create
+>   map" CTA when no heightmap is loaded.
+> - **New project wizard + cheat sheet:** wizard restyled as a split
+>   layout (name / size / max-height on the left; symmetry + biome
+>   preset cards on the right) with a footer info chip and Cancel /
+>   Create buttons. Cheat sheet restyled as a 2 × 2 group grid (Camera /
+>   Tools / Sculpt / Project) using `key_combo` chips.
+> - **Scaffolding for Phase 4 streams:** `inspector_splat`,
+>   `inspector_metal`, and `inspector_geo` now render the full mockup
+>   layout but back onto in-memory state (`App::splat_state` /
+>   `metal_state` / `geo_state`). The F-series schema work (F4 splat,
+>   F5 metal, F7 features) will swap that state for `Project`-persisted
+>   schemas without changing the visual surface.
+>
+> Test count after the overhaul: **318 passing** (149 barme-app,
+> 117 barme-core, 52 barme-pipeline). New tests cover theme palette
+> distinctness, icon catalogue uniqueness, ramp-slider value math,
+> mini-map projection, biome ramp monotonicity, ruler tick count,
+> validation-summary tones, `start_positions_balanced` semantics, the
+> symmetry pill-toggle round-trip, and the Phase-7 default scaffolding
+> state. The deleted XYZ-gizmo's ~20 tests were retired in lockstep.
 
 ### 3.3 Non-functional requirements
 
