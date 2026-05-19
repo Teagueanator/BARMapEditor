@@ -2771,6 +2771,26 @@ screen-edge points; behind-camera (`clip.w <= 0`) still returns `None`.
   hatch documented in `ui/markers.rs` — swap to `rayon::par_sort_by`
   if the final-devlog perf table ever shows the sort exceeding 1 ms.
 
+**STATUS UPDATE 2026-05-19 (hotfix):** live smoke testing surfaced
+two issues that ship as two follow-on commits on `main` without a new
+ADR. (1) PHASE A marker construction in `central()` hard-coded world
+Y = 0; the 2-elmo `MARKER_Y_LIFT_ELMOS` epsilon was sized for h=0
+z-fight, not arbitrary terrain elevations, so any non-flat map
+(parabolic bowl with max_height ≈ 1236 reproduced it) buried metal /
+geo / start-position markers under the surface — `App::terrain_y_at`
+now lifts every PHASE A marker push site (and the geo-plume base) to
+the heightmap-sampled surface, leaving `into_instances`'s lift to add
+the small epsilon on top. (2) `collect_symmetry_segments` overflowed
+the 5 000-vert line buffer at extreme zoom-in (10 000+ projected
+dashes); the symmetry axis is now Liang–Barsky-clipped to the
+visible rect (64 px margin) before dashing, with a per-axis dash cap
+of 256 falling back to a solid segment past the threshold, and
+`LINE_VERTEX_CAPACITY` bumped 5 000 → 8 000 as belt-and-suspenders.
+Brush ring lift and per-vertex terrain Y on the symmetry axes remain
+explicitly deferred (brush wants GPU ray-vs-heightmap picking; axes
+are thin 1-px lines where z-fight is far less visible than missing
+markers). Devlog: `devlog/stage-1-renderer-depth-rework-hotfix/`.
+
 **Pitfalls (operational notes for the renderer-parity arc).**
 
 - `Callback::prepare`'s encoder is shared with egui — do **not**
