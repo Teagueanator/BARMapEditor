@@ -44,6 +44,14 @@ Implements SRS F1–F12. Ships a Windows `.exe` and a Linux AppImage.
       rotational `fold ∈ 2..=12` (ADR-019). Arbitrary-axis line picker
       remains Stage 2.
 - [ ] **F4** Texture painting via DNTS splat channels (4 RGBA, ≤4 splat textures)
+      — **D1 shipped 2026-05-18** (ADR-025 / ADR-027): 16-slot CC0
+      ambientCG starter palette + `scripts/fetch-textures.sh` (sha256
+      pinned, idempotent, `--check` HEAD-probe). Per-slot layout under
+      `tools/textures/<NN-slot>/{diffuse.png, normal.png, meta.toml}`
+      is the contract D3's registry depends on. F4 itself remains
+      gated on D2 (DNTS bake, ADR-026), D3 (`barme-core::splat`),
+      D4 (fragment shader blend), D5 (splat tool inspector), D6
+      (mapinfo emission + `.sd7` bundling).
 - [ ] **F5** Metal-spot placement (point + radius → red-channel density)
 - [ ] **F6** Geo-vent placement
 - [ ] **F7** Feature placement (trees, rocks, wreckage) into a Lua gadget
