@@ -380,6 +380,11 @@ pub struct WaterBlock {
     pub repeat_y: Option<f32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub surface_color: Option<Rgb>,
+    /// Translucency of the rendered water surface from above. Real BAR
+    /// maps cluster `0.1` (clear ocean — *Coastlines Dry*) ↔ `0.4`
+    /// (opaque acid — *Acidic Quarry*). Engine emits as `surfaceAlpha`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub surface_alpha: Option<f32>,
     /// **Must be absent for [`MapInfo::void_water`] = true to work.**
     /// Setting any value defeats voidWater silently.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -419,6 +424,12 @@ pub struct WaterBlock {
     pub perlin_lacunarity: Option<f32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub perlin_amplitude: Option<f32>,
+    /// Foam ring intensity for the shoreline-foam effect. Engine emits
+    /// as `waveFoamIntensity`. Sprint 14 surfaces this in the Inspector
+    /// as "Foam strength"; the MVP water plane ignores it (foam ships
+    /// with the renderer-parity arc).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wave_foam_intensity: Option<f32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub num_tiles: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -666,6 +677,7 @@ impl MapInfo {
             damage: Some(0.0),
             // BAR-style cool grey-blue surface; digest §water defaults.
             surface_color: Some([0.75, 0.8, 0.85]),
+            surface_alpha: Some(0.1),
             // Must be Some(..) for non-void-water; voidWater stays false.
             plane_color: Some([0.2, 0.34, 0.48]),
             base_color: Some([0.4, 0.7, 0.8]),
@@ -685,6 +697,7 @@ impl MapInfo {
             perlin_start_freq: Some(8.0),
             perlin_lacunarity: Some(3.0),
             perlin_amplitude: Some(0.9),
+            wave_foam_intensity: None,
             num_tiles: Some(1),
             shore_waves: Some(true),
             force_rendering: Some(false),
@@ -761,14 +774,32 @@ fn bar_default_terrain_types() -> Vec<TerrainTypeBlock> {
 }
 
 /// Build a [`MapInfo`] from a [`Project`] — name + heights + mapfile
-/// path + teams[] from `start_positions`. Everything else inherits
-/// from [`MapInfo::bar_default`]; F9 (C7) will write project-specific
-/// overrides on top of this.
+/// path + teams[] from `start_positions` + water-block emission
+/// (C9 / ADR-042). Everything else inherits from
+/// [`MapInfo::bar_default`]; F9 (Sprint 18) will write
+/// project-specific overrides on top of this.
 ///
 /// This is the **data shape** part of C1. The Lua-text serializer is
 /// C2's job — DO NOT call this and then string-format here.
+///
+/// ## Water-block flow (C9 / Sprint 14)
+///
+/// 1. Start with `bar_default()` (no `water` sub-table).
+/// 2. If `project.water_mode != None`, fetch the preset's `WaterBlock`
+///    and merge `project.water_overrides` on top (per-field
+///    `override.or(preset)`). Assign to `info.water = Some(merged)`.
+/// 3. Mirror `project.void_water` + `project.tidal_strength` into
+///    the MapInfo top-level fields (PITFALL: `tidal_strength` lives
+///    at top level NOT inside `water`; the inspector co-locates for
+///    UX).
+/// 4. **Mutual-exclusion auto-resolve** (PITFALL §6): if
+///    `info.void_water == true`, force `merged.plane_color = None`
+///    and emit a `warn!`. Setting `planeColor` silently defeats
+///    `voidWater`; the validation chip surfaces the resolution to
+///    the user.
 impl From<&Project> for MapInfo {
     fn from(p: &Project) -> Self {
+        use crate::water_presets::{WaterMode, merge_overrides, preset_water_block};
         let mut info = MapInfo::bar_default();
         info.name = p.name.clone();
         info.shortname = Some(p.name.clone());
@@ -776,6 +807,8 @@ impl From<&Project> for MapInfo {
         info.smf.smt_file_name_0 = format!("maps/{}.smt", p.name);
         info.smf.min_height = Some(p.min_height);
         info.smf.max_height = Some(p.max_height);
+        info.void_water = p.void_water;
+        info.tidal_strength = p.tidal_strength;
         // Teams: flat ordered pool, ally-group id order + within-group
         // order. Emission walks groups sorted by `id` for determinism
         // (NFR-Det); within each group positions emit in the order the
@@ -792,6 +825,30 @@ impl From<&Project> for MapInfo {
                 },
             })
             .collect();
+
+        // Water block emission. `WaterMode::None` leaves `info.water`
+        // alone (None); any other mode merges overrides onto the
+        // preset and assigns the result.
+        if p.water_mode != WaterMode::None {
+            let preset = preset_water_block(p.water_mode).unwrap_or_default();
+            let mut merged = merge_overrides(&preset, &p.water_overrides);
+            // PITFALL §6: voidWater + planeColor are mutually
+            // exclusive. The engine silently drops voidWater if
+            // planeColor is set. Auto-resolve by clearing
+            // plane_color and warning so the user sees the diagnosis
+            // through the validation chip.
+            if info.void_water && merged.plane_color.is_some() {
+                tracing::warn!(
+                    void_water = info.void_water,
+                    dropped_plane_color = ?merged.plane_color,
+                    "PITFALL §6 — voidWater + planeColor are mutually exclusive; \
+                     clearing planeColor so voidWater takes effect"
+                );
+                merged.plane_color = None;
+            }
+            info.water = Some(merged);
+        }
+
         info
     }
 }
@@ -799,7 +856,6 @@ impl From<&Project> for MapInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::MapSize;
 
     // ────── BAR-convention defaults (digest §1 + §6 + §7) ──────
 
@@ -1329,31 +1385,114 @@ mod tests {
     /// future contributor doesn't add a redundant field.
     #[test]
     fn schema_does_not_duplicate_map_size() {
-        let p = Project {
-            name: "dims".to_string(),
-            size: MapSize {
-                smu_x: 16,
-                smu_z: 18,
-            },
-            min_height: 0.0,
-            max_height: 256.0,
-            heightmap: None,
-            ally_groups: vec![],
-            mapinfo_overrides: HashMap::new(),
-            next_steps_dismissed: false,
-            splat_config: crate::SplatConfig::default(),
-            splat_distribution: None,
-            metal_spots: vec![],
-            geo_vents: vec![],
-            features: vec![],
-            specular_tex_path: None,
-            extractor_radius: crate::project::default_extractor_radius(),
-        };
+        let p = Project::new("dims", 16);
         let info: MapInfo = (&p).into();
         // No top-level smu/dims field exists; the SMF binary carries
         // the canonical map size. The schema only echoes name +
         // heights.
         assert_eq!(info.smf.min_height, Some(0.0));
         assert_eq!(info.smf.max_height, Some(256.0));
+    }
+
+    // ────── C9 (Sprint 14 / ADR-042): water emission ──────
+
+    /// `WaterMode::None` projects must NOT emit a water sub-table
+    /// (preserves the pre-Sprint-14 behaviour).
+    #[test]
+    fn water_mode_none_emits_no_water_block() {
+        let p = Project::new("dry", 4);
+        assert_eq!(p.water_mode, crate::water_presets::WaterMode::None);
+        let info: MapInfo = (&p).into();
+        assert!(
+            info.water.is_none(),
+            "WaterMode::None must leave info.water == None"
+        );
+    }
+
+    /// `WaterMode::Ocean` populates `info.water` with Coastlines-style
+    /// values.
+    #[test]
+    fn water_mode_ocean_populates_water_block() {
+        let mut p = Project::new("ocean", 4);
+        p.water_mode = crate::water_presets::WaterMode::Ocean;
+        let info: MapInfo = (&p).into();
+        let w = info.water.expect("Ocean must populate info.water");
+        assert_eq!(w.damage, Some(0.0));
+        assert_eq!(w.surface_color, Some([0.67, 0.8, 1.0]));
+        assert_eq!(w.surface_alpha, Some(0.1));
+        // Coastlines comments out planeColor → ordinary deep ocean.
+        assert!(w.plane_color.is_none());
+    }
+
+    /// Acid preset → Acidic Quarry values, including damage = 200.
+    #[test]
+    fn water_mode_acid_populates_acidic_quarry_values() {
+        let mut p = Project::new("acid", 4);
+        p.water_mode = crate::water_presets::WaterMode::Acid;
+        let info: MapInfo = (&p).into();
+        let w = info.water.unwrap();
+        assert_eq!(w.damage, Some(200.0));
+        assert_eq!(w.surface_color, Some([0.65, 0.8, 0.1]));
+        assert_eq!(w.surface_alpha, Some(0.4));
+    }
+
+    /// Override merge: setting `damage = 30` on top of Ocean keeps
+    /// Ocean's surface color and produces the override's damage.
+    #[test]
+    fn water_overrides_merge_per_field() {
+        let mut p = Project::new("merge", 4);
+        p.water_mode = crate::water_presets::WaterMode::Ocean;
+        p.water_overrides.damage = Some(30.0);
+        let info: MapInfo = (&p).into();
+        let w = info.water.unwrap();
+        // Override wins.
+        assert_eq!(w.damage, Some(30.0));
+        // Preset's surface color bleeds through.
+        assert_eq!(w.surface_color, Some([0.67, 0.8, 1.0]));
+    }
+
+    /// Critical PITFALL §6: `voidWater = true` + `planeColor` set is
+    /// mutually exclusive. The emission path must clear `plane_color`
+    /// before it reaches `info.water`, so the engine actually honours
+    /// `voidWater`.
+    #[test]
+    fn void_water_clears_plane_color_in_emission() {
+        let mut p = Project::new("void", 4);
+        p.water_mode = crate::water_presets::WaterMode::Acid; // Acid has a plane_color
+        p.void_water = true;
+        let info: MapInfo = (&p).into();
+        let w = info.water.unwrap();
+        assert!(
+            w.plane_color.is_none(),
+            "PITFALL §6: voidWater must clear plane_color; got {:?}",
+            w.plane_color
+        );
+        // surface_color still survives — only plane_color is the
+        // conflict.
+        assert_eq!(w.surface_color, Some([0.65, 0.8, 0.1]));
+    }
+
+    /// `tidal_strength` lives at MapInfo top level, NOT inside
+    /// `water = {}`. Pin that an authored value lands on
+    /// `info.tidal_strength` not on the water block.
+    #[test]
+    fn tidal_strength_lands_at_mapinfo_top_level() {
+        let mut p = Project::new("tide", 4);
+        p.tidal_strength = Some(15.0);
+        let info: MapInfo = (&p).into();
+        assert_eq!(info.tidal_strength, Some(15.0));
+    }
+
+    /// Lava preset round-trips with damage at the ground-block
+    /// threshold and a deep-red surface.
+    #[test]
+    fn water_mode_lava_blocks_ground_units() {
+        let mut p = Project::new("lava", 4);
+        p.water_mode = crate::water_presets::WaterMode::Lava;
+        let info: MapInfo = (&p).into();
+        let w = info.water.unwrap();
+        assert_eq!(w.damage, Some(1000.0));
+        assert!(w.damage.unwrap() >= 1e3);
+        assert!(w.damage.unwrap() < 1e4);
     }
 }

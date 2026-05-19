@@ -265,6 +265,7 @@ fn water_block(b: &barme_core::WaterBlock) -> LuaValue {
     push_f32(&mut t, "repeatX", b.repeat_x);
     push_f32(&mut t, "repeatY", b.repeat_y);
     push_rgb(&mut t, "surfaceColor", b.surface_color);
+    push_f32(&mut t, "surfaceAlpha", b.surface_alpha);
     push_rgb(&mut t, "planeColor", b.plane_color);
     push_rgb(&mut t, "absorb", b.absorb);
     push_rgb(&mut t, "baseColor", b.base_color);
@@ -283,6 +284,7 @@ fn water_block(b: &barme_core::WaterBlock) -> LuaValue {
     push_f32(&mut t, "perlinStartFreq", b.perlin_start_freq);
     push_f32(&mut t, "perlinLacunarity", b.perlin_lacunarity);
     push_f32(&mut t, "perlinAmplitude", b.perlin_amplitude);
+    push_f32(&mut t, "waveFoamIntensity", b.wave_foam_intensity);
     if let Some(n) = b.num_tiles {
         t.push((LuaKey::str("numTiles"), LuaValue::Int(n as i64)));
     }
@@ -1060,6 +1062,91 @@ mod tests {
         assert!(
             s.contains(r#"specularTex = "spec_grey.dds""#),
             "specular tex didn't round-trip; got:\n{s}"
+        );
+    }
+
+    /// C9 (Sprint 14 / ADR-042): `WaterMode::Ocean` produces a `water = {
+    /// … }` sub-table in the rendered Lua, carrying `surfaceAlpha` (the
+    /// new field) and Coastlines' `surfaceColor`.
+    #[test]
+    fn water_mode_ocean_emits_water_subtable() {
+        let mut p = Project::new("ocean", 4);
+        p.water_mode = barme_core::WaterMode::Ocean;
+        let s = render(&p);
+        assert!(
+            s.contains("water = {"),
+            "expected water sub-table; got:\n{s}"
+        );
+        assert!(s.contains("surfaceAlpha = 0.1"), "got:\n{s}");
+        // Coastlines surface RGB (0.67, 0.8, 1.0).
+        assert!(s.contains("surfaceColor = {"), "got:\n{s}");
+        assert!(s.contains("0.67"), "got:\n{s}");
+    }
+
+    /// C9: `WaterMode::None` leaves no `water = { … }` block in the
+    /// Lua output (preserves the pre-Sprint-14 behaviour).
+    #[test]
+    fn water_mode_none_emits_no_water_subtable() {
+        let p = Project::new("dry", 4);
+        // Default mode is None.
+        let s = render(&p);
+        assert!(
+            !s.contains("\n  water = {"),
+            "WaterMode::None must NOT emit a water block; got:\n{s}"
+        );
+    }
+
+    /// C9: an authored `wave_foam_intensity` override on top of Ocean
+    /// round-trips through to `waveFoamIntensity` in the rendered Lua.
+    #[test]
+    fn wave_foam_intensity_round_trips_through_emit() {
+        let mut p = Project::new("foamy", 4);
+        p.water_mode = barme_core::WaterMode::Ocean;
+        p.water_overrides.wave_foam_intensity = Some(0.75);
+        let s = render(&p);
+        assert!(s.contains("waveFoamIntensity = 0.75"), "got:\n{s}");
+    }
+
+    /// C9 PITFALL §6: `voidWater = true` clears `planeColor` even when
+    /// the active preset (Acid) carries one — verified at the Lua
+    /// level, not just the schema level.
+    #[test]
+    fn void_water_drops_plane_color_in_rendered_lua() {
+        let mut p = Project::new("voidacid", 4);
+        p.water_mode = barme_core::WaterMode::Acid;
+        p.void_water = true;
+        let s = render(&p);
+        assert!(s.contains("voidWater = true"), "got:\n{s}");
+        // Acid normally writes planeColor = {0.024, 0.03, 0.1}. With
+        // voidWater on, the emission must drop it so voidWater takes
+        // effect.
+        assert!(
+            !s.contains("planeColor = "),
+            "PITFALL §6: planeColor must not emit when voidWater = true; got:\n{s}"
+        );
+    }
+
+    /// C9: `tidal_strength` lives at MapInfo top level — not inside the
+    /// `water = { … }` block. Pin that the rendered Lua has
+    /// `tidalStrength` outside the water subtable.
+    #[test]
+    fn tidal_strength_emits_at_top_level_not_inside_water() {
+        let mut p = Project::new("tide", 4);
+        p.tidal_strength = Some(12.0);
+        p.water_mode = barme_core::WaterMode::Ocean;
+        let s = render(&p);
+        // Top-level key present.
+        assert!(s.contains("tidalStrength = 12.0"), "got:\n{s}");
+        // Find the water subtable bounds.
+        let water_start = s.find("water = {").expect("water subtable present");
+        let water_end = s[water_start..]
+            .find("\n  }")
+            .expect("water subtable closes")
+            + water_start;
+        let water_body = &s[water_start..water_end];
+        assert!(
+            !water_body.contains("tidalStrength"),
+            "tidalStrength must NOT appear inside water = {{ }}; got body:\n{water_body}"
         );
     }
 }

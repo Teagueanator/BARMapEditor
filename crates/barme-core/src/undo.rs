@@ -46,6 +46,7 @@ use crate::heightmap::Heightmap;
 use crate::procgen::Domain;
 use crate::project::{AllyGroup, FeatureInstance, GeoVent, MetalSpot, StartPosition};
 use crate::symmetry::SymmetryAxis;
+use crate::water_presets::WaterMode;
 
 /// One committed undo entry. Either a heightmap stroke (the ADR-033
 /// shape) or a project-level diff.
@@ -166,6 +167,87 @@ pub enum ProjectDiff {
         from: FeatureInstance,
         to: FeatureInstance,
     },
+    /// C9 (Sprint 14 / ADR-042): the active water preset changed.
+    /// Inspector dispatches one diff per preset chip click; undo
+    /// restores `from`, redo restores `to`. `Project.water_overrides`
+    /// is deliberately preserved across the change (Photoshop-style
+    /// behaviour — user tweaks bleed through preset swaps).
+    SetWaterMode { from: WaterMode, to: WaterMode },
+    /// C9 (Sprint 14 / ADR-042): an individual water-block field
+    /// (slider, color picker, toggle) was edited. `field` identifies
+    /// the target; `from` / `to` are the symmetric values for undo +
+    /// redo. The drag finalizer collapses an entire slider drag into
+    /// one entry.
+    ///
+    /// Two `WaterField` variants — `VoidWater` and `TidalStrength` —
+    /// address `Project.void_water` / `Project.tidal_strength`
+    /// rather than fields inside `Project.water_overrides`; the
+    /// inspector co-locates them with the water-block controls but
+    /// the schema field lives at MapInfo top level.
+    EditWaterField {
+        field: WaterField,
+        from: WaterValue,
+        to: WaterValue,
+    },
+}
+
+/// C9 / Sprint 14: which water-related field an [`ProjectDiff::EditWaterField`]
+/// targets. Most variants address fields inside
+/// `Project.water_overrides`; `VoidWater` and `TidalStrength` address
+/// MapInfo top-level fields (`Project.void_water` /
+/// `Project.tidal_strength`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum WaterField {
+    Damage,
+    SurfaceColor,
+    SurfaceAlpha,
+    PlaneColor,
+    Absorb,
+    BaseColor,
+    MinColor,
+    AmbientFactor,
+    DiffuseFactor,
+    SpecularFactor,
+    SpecularColor,
+    SpecularPower,
+    FresnelMin,
+    FresnelMax,
+    FresnelPower,
+    ReflectionDistortion,
+    BlurBase,
+    BlurExponent,
+    PerlinStartFreq,
+    PerlinLacunarity,
+    PerlinAmplitude,
+    WaveFoamIntensity,
+    NumTiles,
+    ShoreWaves,
+    ForceRendering,
+    RepeatX,
+    RepeatY,
+    /// Lives on `Project.void_water` (MapInfo top-level `voidWater`).
+    /// The dispatcher must read/write `Project.void_water: bool`, NOT
+    /// `Project.water_overrides`.
+    VoidWater,
+    /// Lives on `Project.tidal_strength` (MapInfo top-level
+    /// `tidalStrength`). Dispatcher reads/writes
+    /// `Project.tidal_strength: Option<f32>`.
+    TidalStrength,
+}
+
+/// C9 / Sprint 14: tagged-union value carried by
+/// [`ProjectDiff::EditWaterField`]. Wrapping `Option<T>` lets the
+/// diff naturally express "clear this override" (set the field back
+/// to `None` — i.e. fall through to the preset baseline).
+///
+/// `VoidWater` is the one non-optional field; its diffs always use
+/// `Bool(Some(_))` and the dispatcher unwraps.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum WaterValue {
+    Float(Option<f32>),
+    Rgb(Option<[f32; 3]>),
+    Bool(Option<bool>),
+    UInt(Option<u32>),
 }
 
 impl ProjectDiff {
@@ -181,7 +263,9 @@ impl ProjectDiff {
             | ProjectDiff::SetExtractorRadius { .. }
             | ProjectDiff::PlaceGeoVent { .. }
             | ProjectDiff::DeleteGeoVent { .. }
-            | ProjectDiff::MoveGeoVent { .. } => inline,
+            | ProjectDiff::MoveGeoVent { .. }
+            | ProjectDiff::SetWaterMode { .. }
+            | ProjectDiff::EditWaterField { .. } => inline,
             ProjectDiff::ApplyWizard(snap) => inline + snap.bytes(),
             // Feature variants carry a String `name`; the heap cost of
             // its capacity is in addition to the enum inline size.
@@ -680,8 +764,12 @@ mod tests {
             | ProjectDiff::MoveGeoVent { .. }
             | ProjectDiff::PlaceFeature { .. }
             | ProjectDiff::DeleteFeature { .. }
-            | ProjectDiff::MoveFeature { .. } => {
-                unreachable!("metal/geo/feature diffs not exercised through AllyGroup test helper")
+            | ProjectDiff::MoveFeature { .. }
+            | ProjectDiff::SetWaterMode { .. }
+            | ProjectDiff::EditWaterField { .. } => {
+                unreachable!(
+                    "metal/geo/feature/water diffs not exercised through AllyGroup test helper"
+                )
             }
         }
     }
@@ -1351,6 +1439,47 @@ mod tests {
             to: 120.0,
         };
         assert_eq!(d.bytes(), inline);
+    }
+
+    /// C9 / Sprint 14: water diffs are inline — neither variant
+    /// carries a heap allocation, matching the metal/geo pattern.
+    #[test]
+    fn water_diffs_are_inline() {
+        let inline = std::mem::size_of::<ProjectDiff>();
+        let sm = ProjectDiff::SetWaterMode {
+            from: WaterMode::None,
+            to: WaterMode::Ocean,
+        };
+        let ef = ProjectDiff::EditWaterField {
+            field: WaterField::Damage,
+            from: WaterValue::Float(None),
+            to: WaterValue::Float(Some(200.0)),
+        };
+        assert_eq!(sm.bytes(), inline);
+        assert_eq!(ef.bytes(), inline);
+    }
+
+    /// C9 / Sprint 14: SetWaterMode pushes/pops through history like
+    /// any other ProjectDiff. The actual project-side mutation lives
+    /// in `App::apply_project_diff` (main.rs); the core crate's
+    /// contract is just stack accounting + redo clearance.
+    #[test]
+    fn set_water_mode_clears_redo_and_grows_undo() {
+        let mut h = History::default();
+        h.push_project_diff(ProjectDiff::SetWaterMode {
+            from: WaterMode::None,
+            to: WaterMode::Ocean,
+        });
+        let popped = h.pop_undo().unwrap();
+        h.push_to_redo(popped);
+        assert!(h.can_redo());
+        // A new push of any kind clears redo.
+        h.push_project_diff(ProjectDiff::EditWaterField {
+            field: WaterField::SurfaceAlpha,
+            from: WaterValue::Float(None),
+            to: WaterValue::Float(Some(0.4)),
+        });
+        assert!(!h.can_redo());
     }
 
     /// C4/C5 diff variants push through history just like the F8

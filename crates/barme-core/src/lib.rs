@@ -15,6 +15,7 @@ pub mod splat;
 pub mod start_pos;
 pub mod symmetry;
 pub mod undo;
+pub mod water_presets;
 
 pub use brushes::{Brush, BrushRegistry, BrushStamp, DirtyRect};
 pub use heightmap::{DimMismatch, Heightmap};
@@ -35,4 +36,10 @@ pub use splat::{
     SplatBrushRegistry, SplatChannel, SplatConfig, SplatDistribution, SplatStamp,
 };
 pub use symmetry::SymmetryAxis;
-pub use undo::{HeightmapEntry, History, HistoryEntry, ProjectDiff, WizardSnapshot};
+pub use undo::{
+    HeightmapEntry, History, HistoryEntry, ProjectDiff, WaterField, WaterValue, WizardSnapshot,
+};
+pub use water_presets::{
+    BAR_DEFAULT_SURFACE_ALPHA, BAR_DEFAULT_SURFACE_COLOR, WaterMode, merge_overrides,
+    preset_water_block,
+};

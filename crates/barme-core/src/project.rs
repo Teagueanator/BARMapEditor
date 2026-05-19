@@ -25,6 +25,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::warn;
 
+use crate::mapinfo_schema::WaterBlock;
+use crate::water_presets::WaterMode;
 use crate::{MapSize, SplatConfig, SplatDistribution};
 
 /// File extension for the project manifest (no leading dot).
@@ -136,6 +138,51 @@ pub struct Project {
     /// also reach this through `mapinfo.extractor_radius`.
     #[serde(default = "default_extractor_radius")]
     pub extractor_radius: f32,
+    /// C9 / Sprint 14 (ADR-042): active water preset. Drives
+    /// `From<&Project> for MapInfo` — `None` emits no `water` sub-table,
+    /// any other variant emits the preset's `WaterBlock` merged with
+    /// [`Project::water_overrides`].
+    ///
+    /// On first load of a pre-Sprint-14 `.barmeproj` (`schema_v == 0`),
+    /// the `From<ProjectWire>` migration sets `Ocean` when
+    /// `min_height < 0`. Runs exactly once per project — re-saved
+    /// files carry `schema_v == 1` and skip the rule.
+    #[serde(default)]
+    pub water_mode: WaterMode,
+    /// C9 / Sprint 14 (ADR-042): sparse user overrides on top of the
+    /// active preset. All fields `Option<…>` (`WaterBlock`'s shape)
+    /// — `None` everywhere means "use the preset as-is." Switching
+    /// presets does NOT clear this; the user's tweaks persist so a
+    /// per-field `damage = 30` rides through Ocean → Acid → Magma.
+    /// [`WaterMode::Custom`] uses an empty preset, letting overrides
+    /// bleed through verbatim.
+    #[serde(default, skip_serializing_if = "water_block_is_empty")]
+    pub water_overrides: WaterBlock,
+    /// C9 / Sprint 14 (ADR-042): top-level `mapinfo.voidWater` shadow.
+    /// Emitted into `MapInfo.void_water` by `From<&Project>`.
+    /// **Mutually exclusive with `water_overrides.plane_color`** (PITFALL §6):
+    /// when `true`, the emission path forces `plane_color = None`
+    /// and `warn!`s. The inspector co-locates this with the water
+    /// fields for UX even though the schema field lives at MapInfo
+    /// top level.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub void_water: bool,
+    /// C9 / Sprint 14 (ADR-042): top-level `mapinfo.tidalStrength`
+    /// shadow. `Some(0..=30)` enables BAR's tidal-energy economy.
+    /// Lives at MapInfo top level (NOT inside `water = {}`); the
+    /// inspector surfaces it under the Water section purely for UX.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tidal_strength: Option<f32>,
+    /// C9 / Sprint 14: monotonic project-file schema version. Bumped
+    /// every time a load-time migration runs, so subsequent loads of
+    /// the same project skip the migration. Sprint 14 introduced
+    /// `v = 1` — the water-mode migration. Pre-Sprint-14 files load
+    /// as `v = 0`, run the migration, save back as `v = 1`.
+    ///
+    /// Future migrations append: bump the constant in
+    /// [`Project::SCHEMA_V`] and add a step in `From<ProjectWire>`.
+    #[serde(default)]
+    pub schema_v: u32,
 }
 
 /// BAR-convention default for `Project.extractor_radius`. Engine
@@ -143,6 +190,14 @@ pub struct Project {
 /// every player's UI snaps mexes against this value.
 pub fn default_extractor_radius() -> f32 {
     80.0
+}
+
+/// `WaterBlock` test used by `Project.water_overrides`'s
+/// `skip_serializing_if`. Avoids writing an empty `[water_overrides]`
+/// table for the 99 % of projects that haven't touched any water
+/// field.
+fn water_block_is_empty(b: &WaterBlock) -> bool {
+    *b == WaterBlock::default()
 }
 
 /// One ally team's worth of spawn data (ADR-032).
@@ -367,6 +422,16 @@ struct ProjectWire {
     specular_tex_path: Option<PathBuf>,
     #[serde(default = "default_extractor_radius")]
     extractor_radius: f32,
+    #[serde(default)]
+    water_mode: WaterMode,
+    #[serde(default)]
+    water_overrides: WaterBlock,
+    #[serde(default)]
+    void_water: bool,
+    #[serde(default)]
+    tidal_strength: Option<f32>,
+    #[serde(default)]
+    schema_v: u32,
 }
 
 impl From<ProjectWire> for Project {
@@ -387,7 +452,13 @@ impl From<ProjectWire> for Project {
             features: w.features,
             specular_tex_path: w.specular_tex_path,
             extractor_radius: w.extractor_radius,
+            water_mode: w.water_mode,
+            water_overrides: w.water_overrides,
+            void_water: w.void_water,
+            tidal_strength: w.tidal_strength,
+            schema_v: w.schema_v,
         };
+        Project::run_migrations(&mut p);
         if !w.start_positions.is_empty() {
             if p.ally_groups.is_empty() {
                 let positions: Vec<StartPosition> = w
@@ -477,6 +548,16 @@ pub fn sanitize_name(s: &str) -> String {
 }
 
 impl Project {
+    /// Monotonic project-file schema version. Bump when a new
+    /// load-time migration ships; add the migration step to
+    /// [`Project::run_migrations`].
+    ///
+    /// History:
+    /// - `v = 0`: pre-Sprint-14 (no water_mode tracking).
+    /// - `v = 1`: Sprint 14 / C9 — water-mode derivation from
+    ///   `min_height < 0`.
+    pub const SCHEMA_V: u32 = 1;
+
     pub fn new(name: impl Into<String>, smu: u32) -> Self {
         Self {
             name: name.into(),
@@ -494,7 +575,37 @@ impl Project {
             features: Vec::new(),
             specular_tex_path: None,
             extractor_radius: default_extractor_radius(),
+            water_mode: WaterMode::default(),
+            water_overrides: WaterBlock::default(),
+            void_water: false,
+            tidal_strength: None,
+            schema_v: Self::SCHEMA_V,
         }
+    }
+
+    /// Apply load-time migrations in order. Runs exactly once on
+    /// `From<ProjectWire>` after wire fields have been populated.
+    /// Each migration is gated on the current `schema_v` so re-loading
+    /// a migrated project is a no-op.
+    ///
+    /// **Pitfall (PITFALL §6 / C9 prompt):** the water-mode migration
+    /// must NOT fire on subsequent loads — otherwise a user who
+    /// explicitly set `water_mode = None` on a `min_height < 0` map
+    /// would get `Ocean` clobbered every load.
+    fn run_migrations(p: &mut Project) {
+        // v0 -> v1: derive `water_mode = Ocean` when terrain dips below
+        // 0 and the user hasn't already chosen a mode.
+        if p.schema_v < 1 {
+            if p.water_mode == WaterMode::default() && p.min_height < 0.0 {
+                tracing::info!(
+                    min_height = p.min_height,
+                    "project schema migration v0->v1: setting water_mode = Ocean"
+                );
+                p.water_mode = WaterMode::Ocean;
+            }
+            p.schema_v = 1;
+        }
+        // Future migrations append here.
     }
 
     /// Resolve `heightmap` against the project file's parent directory.
@@ -1017,6 +1128,138 @@ smu_z = 4
         let d = crate::SplatConfig::default();
         assert_eq!(p.splat_config, d);
         assert!(p.splat_distribution.is_none());
+    }
+
+    /// C9 (Sprint 14 / ADR-042): pre-Sprint-14 `.barmeproj` files
+    /// carry no `water_mode` and no `schema_v`. Loading them with
+    /// `min_height < 0` must materialise `water_mode = Ocean` (the
+    /// "you were probably expecting an ocean" inference). Re-loads
+    /// of the same project must NOT re-fire — gate on `schema_v`.
+    #[test]
+    fn pre_sprint_14_project_with_negative_min_height_migrates_to_ocean() {
+        let toml_str = r#"
+name = "pre_c9_ocean"
+min_height = -120.0
+max_height = 256.0
+
+[size]
+smu_x = 8
+smu_z = 8
+"#;
+        let p: Project = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            p.water_mode,
+            WaterMode::Ocean,
+            "min_height < 0 should migrate to Ocean"
+        );
+        assert_eq!(
+            p.schema_v,
+            Project::SCHEMA_V,
+            "migration must bump schema_v so re-loads skip it"
+        );
+    }
+
+    /// Pre-Sprint-14 fixtures with `min_height >= 0` stay at the
+    /// default `WaterMode::None` — no water sub-table emits and the
+    /// engine renders nothing (the user wanted a dry map).
+    #[test]
+    fn pre_sprint_14_dry_project_stays_at_water_mode_none() {
+        let toml_str = r#"
+name = "pre_c9_dry"
+min_height = 50.0
+max_height = 256.0
+
+[size]
+smu_x = 4
+smu_z = 4
+"#;
+        let p: Project = toml::from_str(toml_str).unwrap();
+        assert_eq!(p.water_mode, WaterMode::None);
+        assert_eq!(p.schema_v, Project::SCHEMA_V);
+    }
+
+    /// Critical pitfall: the migration must run exactly once per
+    /// project. A user who explicitly sets `water_mode = None` on an
+    /// `min_height < 0` map must keep `None` after save + reload.
+    /// Re-firing the rule would silently overwrite the user's choice.
+    #[test]
+    fn migration_does_not_re_fire_on_subsequent_loads() {
+        // Simulate first load (schema_v = 0, min_height < 0 → Ocean).
+        let toml_first = r#"
+name = "ocean_user"
+min_height = -100.0
+max_height = 256.0
+
+[size]
+smu_x = 4
+smu_z = 4
+"#;
+        let mut p: Project = toml::from_str(toml_first).unwrap();
+        assert_eq!(p.water_mode, WaterMode::Ocean);
+        assert_eq!(p.schema_v, Project::SCHEMA_V);
+
+        // User then explicitly chooses `None` and re-saves.
+        p.water_mode = WaterMode::None;
+        let s = toml::to_string(&p).unwrap();
+        // Re-load — schema_v should be 1, so migration sees the
+        // explicit None and does NOT clobber it.
+        let p2: Project = toml::from_str(&s).unwrap();
+        assert_eq!(
+            p2.water_mode,
+            WaterMode::None,
+            "explicit None must survive re-load"
+        );
+        assert_eq!(p2.schema_v, Project::SCHEMA_V);
+    }
+
+    /// A fresh `Project::new` carries the current schema version, so
+    /// it never triggers a migration on first save+load.
+    #[test]
+    fn fresh_project_carries_current_schema_v() {
+        let p = Project::new("fresh", 4);
+        assert_eq!(p.schema_v, Project::SCHEMA_V);
+        assert_eq!(p.water_mode, WaterMode::None);
+    }
+
+    /// `water_overrides` round-trips through TOML when the user has
+    /// authored fields.
+    #[test]
+    fn water_overrides_round_trip_when_populated() {
+        let mut p = Project::new("overrides", 4);
+        p.water_mode = WaterMode::Ocean;
+        p.water_overrides.damage = Some(30.0);
+        p.water_overrides.surface_alpha = Some(0.5);
+        let s = toml::to_string(&p).unwrap();
+        let p2: Project = toml::from_str(&s).unwrap();
+        assert_eq!(p2.water_mode, WaterMode::Ocean);
+        assert_eq!(p2.water_overrides.damage, Some(30.0));
+        assert_eq!(p2.water_overrides.surface_alpha, Some(0.5));
+    }
+
+    /// Empty `water_overrides` must NOT serialise — keeps fresh-
+    /// project TOML noise-free.
+    #[test]
+    fn water_overrides_omitted_when_empty() {
+        let p = Project::new("clean", 4);
+        let s = toml::to_string(&p).unwrap();
+        assert!(
+            !s.contains("[water_overrides]"),
+            "empty water_overrides must not serialise; got:\n{s}"
+        );
+    }
+
+    /// `void_water` round-trips when set; omitted when false (default).
+    #[test]
+    fn void_water_round_trips_and_omits_when_default() {
+        let mut p = Project::new("void", 4);
+        assert!(!p.void_water);
+        let s = toml::to_string(&p).unwrap();
+        assert!(!s.contains("void_water"));
+        p.void_water = true;
+        let s = toml::to_string(&p).unwrap();
+        assert!(s.contains("void_water = true"));
+        let p2: Project = toml::from_str(&s).unwrap();
+        assert!(p2.void_water);
     }
 
     #[test]

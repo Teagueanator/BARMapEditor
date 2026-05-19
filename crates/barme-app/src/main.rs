@@ -10,7 +10,7 @@ use barme_core::{
     ALLY_GROUP_PALETTE, AllyGroup, BIOMES, BrushRegistry, BrushStamp, DirtyRect, FeatureInstance,
     GeoVent, Heightmap, History, HistoryEntry, MapSize, MetalSpot, PROJECT_EXTENSION, Project,
     ProjectDiff, SplatBrushRegistry, SplatChannel, SplatConfig, SplatDistribution, SplatStamp,
-    StartPosition, SymmetryAxis, WizardSnapshot,
+    StartPosition, SymmetryAxis, WaterBlock, WaterField, WaterMode, WaterValue, WizardSnapshot,
     brushes::pixel_bbox,
     default_extractor_radius,
     procgen::{
@@ -343,6 +343,35 @@ struct App {
     /// `(cursor_x - anchor_x)` and `ROTATE_GAIN_PER_PX` to compute the
     /// in-progress rotation. Cleared on release.
     dragging_feature_start_rot: Option<u16>,
+    /// C9 (Sprint 14 / ADR-042): active water preset. Mirrors
+    /// `Project.water_mode`; round-trips through save/open and drives
+    /// the `mapinfo.water` emission path.
+    water_mode: WaterMode,
+    /// C9 (Sprint 14): sparse per-field overrides applied on top of
+    /// the active preset. Mirrors `Project.water_overrides`. Survives
+    /// preset changes — switching modes only updates `water_mode`,
+    /// never blows away `water_overrides`.
+    water_overrides: WaterBlock,
+    /// C9 (Sprint 14): top-level `voidWater` shadow. Mirrors
+    /// `Project.void_water`. Mutually exclusive with
+    /// `water_overrides.plane_color` (PITFALL §6).
+    void_water: bool,
+    /// C9 (Sprint 14): top-level `tidalStrength` shadow. Mirrors
+    /// `Project.tidal_strength`. Lives at MapInfo top level, NOT
+    /// inside `water = {}` — the inspector co-locates for UX.
+    tidal_strength: Option<f32>,
+    /// C9 (Sprint 14): ephemeral target depth for `Tool::Water`'s
+    /// flood-carve gesture (elmos, negative = lower terrain). NOT
+    /// persisted — same status as `brush_radius` / `brush_strength`
+    /// (per-session tool preference). Default `-80` matches a
+    /// generic flooded basin and the prompt's spec.
+    ///
+    /// Commit 3 (Slice 3) wires this through `apply_brush_at`'s
+    /// dispatch when `Tool::Water` is active; Commit 1 lays the
+    /// session state in advance so save/load + the inspector form
+    /// don't have to ship in lockstep.
+    #[allow(dead_code)]
+    water_carve_depth: f32,
 }
 
 /// View-state for the F7 feature picker + placed-list inspector.
@@ -971,6 +1000,14 @@ impl App {
             dragging_feature_from: None,
             dragging_feature_anchor_x: None,
             dragging_feature_start_rot: None,
+            water_mode: WaterMode::default(),
+            water_overrides: WaterBlock::default(),
+            void_water: false,
+            tidal_strength: None,
+            // Default carve depth — matches the prompt's spec and a
+            // generic flooded basin. Lives on App not Project (per-
+            // session tool preference, same status as brush_radius).
+            water_carve_depth: -80.0,
         }
     }
 
@@ -1088,6 +1125,14 @@ impl App {
         self.dragging_feature_from = None;
         self.dragging_feature_anchor_x = None;
         self.dragging_feature_start_rot = None;
+        // C9 (Sprint 14): a fresh project starts with the engine's
+        // built-in water defaults — no preset, no overrides, no
+        // voidWater, no tidal strength. `water_carve_depth` is a
+        // per-session tool preference that survives "New project."
+        self.water_mode = WaterMode::default();
+        self.water_overrides = WaterBlock::default();
+        self.void_water = false;
+        self.tidal_strength = None;
         self.dirty = false;
         self.end_stroke();
         self.history.barrier();
@@ -1114,6 +1159,13 @@ impl App {
             // a future authored override survives save/open.
             specular_tex_path: None,
             extractor_radius: self.extractor_radius,
+            water_mode: self.water_mode,
+            water_overrides: self.water_overrides.clone(),
+            void_water: self.void_water,
+            tidal_strength: self.tidal_strength,
+            // Re-saved projects always carry the current schema version
+            // so subsequent loads skip migrations.
+            schema_v: Project::SCHEMA_V,
         }
     }
 
@@ -2831,6 +2883,137 @@ impl App {
                 trace!(?from, ?to, "undo: reverted feature move");
                 ProjectDiff::MoveFeature { from: to, to: from }
             }
+
+            // C9 (Sprint 14 / ADR-042): water diff dispatch. SetWaterMode
+            // overwrites `App::water_mode`; EditWaterField targets either
+            // a field on `App::water_overrides` or the MapInfo-top-level
+            // shadows on `App::void_water` / `App::tidal_strength`
+            // depending on the `WaterField` variant.
+            ProjectDiff::SetWaterMode { from, to } => {
+                self.water_mode = from;
+                trace!(?from, ?to, "undo: reverted water mode");
+                ProjectDiff::SetWaterMode { from: to, to: from }
+            }
+            ProjectDiff::EditWaterField { field, from, to } => {
+                self.apply_water_field(field, from);
+                trace!(?field, ?from, ?to, "undo: reverted water field");
+                ProjectDiff::EditWaterField {
+                    field,
+                    from: to,
+                    to: from,
+                }
+            }
+        }
+    }
+
+    /// Write a [`WaterValue`] into the App field identified by
+    /// [`WaterField`]. The dispatcher in [`Self::apply_project_diff`]
+    /// uses this for both the apply (current frame) and revert (undo)
+    /// directions — the same routing logic.
+    ///
+    /// Type-mismatched payloads (e.g. an `Rgb` value targeting a Float
+    /// field) silently no-op with a `warn!`. The diff producer should
+    /// always pair the right `WaterValue` variant with each `WaterField`;
+    /// a mismatch is a programming bug in whoever pushed the diff.
+    fn apply_water_field(&mut self, field: WaterField, value: WaterValue) {
+        macro_rules! float {
+            ($lhs:expr) => {
+                match value {
+                    WaterValue::Float(v) => {
+                        $lhs = v;
+                    }
+                    other => warn!(
+                        ?field,
+                        ?other,
+                        "EditWaterField type mismatch: expected Float"
+                    ),
+                }
+            };
+        }
+        macro_rules! rgb {
+            ($lhs:expr) => {
+                match value {
+                    WaterValue::Rgb(v) => {
+                        $lhs = v;
+                    }
+                    other => warn!(?field, ?other, "EditWaterField type mismatch: expected Rgb"),
+                }
+            };
+        }
+        macro_rules! bool_opt {
+            ($lhs:expr) => {
+                match value {
+                    WaterValue::Bool(v) => {
+                        $lhs = v;
+                    }
+                    other => warn!(
+                        ?field,
+                        ?other,
+                        "EditWaterField type mismatch: expected Bool"
+                    ),
+                }
+            };
+        }
+        macro_rules! uint {
+            ($lhs:expr) => {
+                match value {
+                    WaterValue::UInt(v) => {
+                        $lhs = v;
+                    }
+                    other => warn!(
+                        ?field,
+                        ?other,
+                        "EditWaterField type mismatch: expected UInt"
+                    ),
+                }
+            };
+        }
+        let w = &mut self.water_overrides;
+        match field {
+            WaterField::Damage => float!(w.damage),
+            WaterField::SurfaceColor => rgb!(w.surface_color),
+            WaterField::SurfaceAlpha => float!(w.surface_alpha),
+            WaterField::PlaneColor => rgb!(w.plane_color),
+            WaterField::Absorb => rgb!(w.absorb),
+            WaterField::BaseColor => rgb!(w.base_color),
+            WaterField::MinColor => rgb!(w.min_color),
+            WaterField::AmbientFactor => float!(w.ambient_factor),
+            WaterField::DiffuseFactor => float!(w.diffuse_factor),
+            WaterField::SpecularFactor => float!(w.specular_factor),
+            WaterField::SpecularColor => rgb!(w.specular_color),
+            WaterField::SpecularPower => float!(w.specular_power),
+            WaterField::FresnelMin => float!(w.fresnel_min),
+            WaterField::FresnelMax => float!(w.fresnel_max),
+            WaterField::FresnelPower => float!(w.fresnel_power),
+            WaterField::ReflectionDistortion => float!(w.reflection_distortion),
+            WaterField::BlurBase => float!(w.blur_base),
+            WaterField::BlurExponent => float!(w.blur_exponent),
+            WaterField::PerlinStartFreq => float!(w.perlin_start_freq),
+            WaterField::PerlinLacunarity => float!(w.perlin_lacunarity),
+            WaterField::PerlinAmplitude => float!(w.perlin_amplitude),
+            WaterField::WaveFoamIntensity => float!(w.wave_foam_intensity),
+            WaterField::NumTiles => uint!(w.num_tiles),
+            WaterField::ShoreWaves => bool_opt!(w.shore_waves),
+            WaterField::ForceRendering => bool_opt!(w.force_rendering),
+            WaterField::RepeatX => float!(w.repeat_x),
+            WaterField::RepeatY => float!(w.repeat_y),
+            // MapInfo top-level shadows on App.
+            WaterField::VoidWater => match value {
+                // void_water is a non-Option bool; diffs always use
+                // Bool(Some(_)). Bool(None) is a no-op + warn.
+                WaterValue::Bool(Some(b)) => self.void_water = b,
+                WaterValue::Bool(None) => warn!(
+                    ?field,
+                    "EditWaterField: VoidWater expects Bool(Some(_)) — \
+                     the field is non-optional"
+                ),
+                other => warn!(
+                    ?field,
+                    ?other,
+                    "EditWaterField type mismatch: expected Bool"
+                ),
+            },
+            WaterField::TidalStrength => float!(self.tidal_strength),
         }
     }
 
@@ -3005,6 +3188,17 @@ impl App {
                 self.metal_spots = p.metal_spots;
                 self.geo_vents = p.geo_vents;
                 self.extractor_radius = p.extractor_radius;
+
+                // C9 (Sprint 14): hoist water state. Migration already
+                // ran in `Project::From<ProjectWire>`, so by here
+                // `water_mode` already reflects `Ocean` if the
+                // pre-Sprint-14 project had `min_height < 0`. The
+                // re-save (via `save_to`) writes back `schema_v = 1`
+                // so subsequent opens skip the migration.
+                self.water_mode = p.water_mode;
+                self.water_overrides = p.water_overrides;
+                self.void_water = p.void_water;
+                self.tidal_strength = p.tidal_strength;
                 self.metal_state = MetalState::default();
                 self.geo_state = GeoState::default();
                 self.dragging_metal_spot = None;
@@ -7183,6 +7377,11 @@ mod tests {
             dragging_feature_from: None,
             dragging_feature_anchor_x: None,
             dragging_feature_start_rot: None,
+            water_mode: WaterMode::default(),
+            water_overrides: WaterBlock::default(),
+            void_water: false,
+            tidal_strength: None,
+            water_carve_depth: -80.0,
         }
     }
 
