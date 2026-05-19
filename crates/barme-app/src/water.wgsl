@@ -16,7 +16,9 @@
 // - Blend: PREMULTIPLIED_ALPHA_BLENDING (matches the existing
 //   offscreen target's expectation; CPU pre-multiplies the RGBA
 //   payload before writing the uniform).
-// - Cull: Back. Quad winding is CW seen from +Y (above).
+// - Cull: None — the underside renders too when the camera orbits
+//   below Y=0 (rare but visible). Avoids the winding question for the
+//   MVP; matches the markers pipeline's choice for the same reason.
 //
 // Vertex math: `@builtin(vertex_index)` 0..=3 generates the four
 // corner positions from `extent.xy`. No vertex buffer.

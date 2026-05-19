@@ -41,5 +41,5 @@ pub use undo::{
 };
 pub use water_presets::{
     BAR_DEFAULT_SURFACE_ALPHA, BAR_DEFAULT_SURFACE_COLOR, WaterMode, merge_overrides,
-    preset_water_block,
+    preset_water_block, water_override_count,
 };

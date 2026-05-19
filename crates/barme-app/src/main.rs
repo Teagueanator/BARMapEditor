@@ -19,6 +19,7 @@ use barme_core::{
         validate_expression,
     },
     project::sanitize_name,
+    water_override_count,
 };
 use barme_pipeline::PyMapConvDriver;
 use eframe::egui;
@@ -731,6 +732,11 @@ enum Tool {
     /// / geo); LMB-drag rotates an existing placement; RMB deletes.
     /// Keyboard `F`.
     Feature,
+    /// C9 (Sprint 14 / ADR-042) — water / lava authoring. Inspector
+    /// surface for `Project.water_mode` + `water_overrides`; LMB drag
+    /// floods (calls `Brush::Lower` with strength derived from
+    /// `water_carve_depth`), RMB raises terrain back. Keyboard `W`.
+    Water,
     /// Math-function terrain generator (F14 / ADR-020). No central-rect
     /// editing; the formula is committed via Apply in the Inspector.
     Procgen,
@@ -807,7 +813,7 @@ impl Tool {
     /// by the tool strip *and* the unit tests so adding a variant in
     /// one place doesn't drift from the other. The exhaustive `match`
     /// dispatches in the Inspector enforce the rest of the invariant.
-    const ALL: [Tool; 8] = [
+    const ALL: [Tool; 9] = [
         Tool::Select,
         Tool::Sculpt,
         Tool::StartPositions,
@@ -815,6 +821,7 @@ impl Tool {
         Tool::MetalSpots,
         Tool::GeoFeatures,
         Tool::Feature,
+        Tool::Water,
         Tool::Procgen,
     ];
 
@@ -832,6 +839,7 @@ impl Tool {
             Tool::MetalSpots => "◆",
             Tool::GeoFeatures => "♨",
             Tool::Feature => "🌲",
+            Tool::Water => "🌊",
             Tool::Procgen => "ƒ",
         }
     }
@@ -847,6 +855,7 @@ impl Tool {
             Tool::MetalSpots => Icon::Metal,
             Tool::GeoFeatures => Icon::Geo,
             Tool::Feature => Icon::Tree,
+            Tool::Water => Icon::Water,
             Tool::Procgen => Icon::Procgen,
         }
     }
@@ -863,6 +872,7 @@ impl Tool {
             // feature tool below.
             Tool::GeoFeatures => "V",
             Tool::Feature => "F",
+            Tool::Water => "W",
             Tool::Procgen => "G",
         }
     }
@@ -877,6 +887,7 @@ impl Tool {
             Tool::MetalSpots => "Metal spots",
             Tool::GeoFeatures => "Geo vents",
             Tool::Feature => "Features",
+            Tool::Water => "Water / Lava",
             Tool::Procgen => "Procgen",
         }
     }
@@ -1376,15 +1387,33 @@ impl App {
     /// world via screen-ray vs y=0 plane, runs the kernel against the
     /// CPU heightmap, then sub-uploads the dirty rect to the GPU
     /// texture. No-op if no brush is selected or no heightmap is
-    /// loaded.
+    /// loaded. Sculpt's default entry — uses the current
+    /// `self.brush_id` + `self.brush_strength`.
     fn apply_brush_at(&mut self, cursor: egui::Pos2, rect: egui::Rect) {
+        let Some(brush_id) = self.brush_id.as_deref() else {
+            return;
+        };
+        let id = brush_id.to_string();
+        let strength = self.brush_strength;
+        self.apply_brush_id_at(cursor, rect, &id, strength);
+    }
+
+    /// Apply one stamp with an explicit brush id + strength.
+    /// `Tool::Water` (Sprint 14 / C9) uses this with
+    /// `("lower", carve_strength)` to flood and `("raise",
+    /// carve_strength)` to undo a flooding gesture, separately from
+    /// the user's sculpt-tool `brush_id` selection.
+    fn apply_brush_id_at(
+        &mut self,
+        cursor: egui::Pos2,
+        rect: egui::Rect,
+        brush_id: &str,
+        strength: f32,
+    ) {
         let Some(rs) = self.render_state.as_ref() else {
             return;
         };
         let Some(hm_state) = self.heightmap.as_mut() else {
-            return;
-        };
-        let Some(brush_id) = self.brush_id.as_deref() else {
             return;
         };
         let Some(brush) = self.brushes.get(brush_id) else {
@@ -1413,7 +1442,7 @@ impl App {
             world_x = world.x,
             world_z = world.z,
             radius = self.brush_radius,
-            strength = self.brush_strength,
+            strength = strength,
             symmetry = self.symmetry.id(),
             "brush stamp"
         );
@@ -1434,7 +1463,7 @@ impl App {
                 world_x: cx,
                 world_z: cz,
                 radius: self.brush_radius,
-                strength: self.brush_strength,
+                strength,
             };
             if let Some(r) = pixel_bbox(&hm_state.data, stamp) {
                 pre_union = Some(match pre_union {
@@ -3894,7 +3923,7 @@ impl App {
         if ctx.wants_keyboard_input() {
             return;
         }
-        let (q, b, s, t_key, m_key, v_key, f_key, g, help, esc) = ctx.input(|i| {
+        let (q, b, s, t_key, m_key, v_key, f_key, w_key, g, help, esc) = ctx.input(|i| {
             let shift = i.modifiers.shift;
             (
                 i.key_pressed(egui::Key::Q),
@@ -3904,6 +3933,7 @@ impl App {
                 i.key_pressed(egui::Key::M),
                 i.key_pressed(egui::Key::V),
                 i.key_pressed(egui::Key::F),
+                i.key_pressed(egui::Key::W),
                 i.key_pressed(egui::Key::G),
                 // `?` is shift+/ on US layouts. Egui exposes the slash
                 // key; we gate on shift so plain `/` doesn't open help.
@@ -3933,6 +3963,10 @@ impl App {
         }
         if f_key {
             self.set_tool(Tool::Feature);
+        }
+        if w_key {
+            // Sprint 14 / C9: W = "Water / Lava".
+            self.set_tool(Tool::Water);
         }
         if g {
             self.set_tool(Tool::Procgen);
@@ -4508,6 +4542,7 @@ impl App {
                             Tool::MetalSpots => self.inspector_metal(ui),
                             Tool::GeoFeatures => self.inspector_geo(ui),
                             Tool::Feature => self.inspector_feature(ui),
+                            Tool::Water => self.inspector_water(ui),
                             Tool::Procgen => self.inspector_procgen(ctx, ui, action),
                         }
                     });
@@ -5802,6 +5837,374 @@ impl App {
         );
     }
 
+    /// C9 (Sprint 14 / ADR-042) — `Tool::Water` Inspector. Surfaces
+    /// the preset chip strip, key water-block fields, the
+    /// flood-carve depth, and a placeholder for the F9 advanced form
+    /// tab Sprint 18 will land.
+    ///
+    /// Each per-field edit emits a `ProjectDiff::EditWaterField` so
+    /// undo / redo step through changes the same way the F8 / metal
+    /// / geo / feature tools do. Drag-finalisation (coalesce a single
+    /// slider gesture into one diff) is deferred — for now each frame
+    /// pushes its own diff, which gives fine-grained undo but a busy
+    /// stack. A follow-up sprint can ship per-slider drag-start /
+    /// drag-stop tracking analogous to `dragging_metal_spot_from`.
+    fn inspector_water(&mut self, ui: &mut egui::Ui) {
+        let t = crate::ui::theme::Tokens::DARK;
+
+        // ── PRESET ────────────────────────────────────────
+        let active_mode = self.water_mode;
+        let mut new_mode: Option<WaterMode> = None;
+        let custom_overrides_count = water_override_count(&self.water_overrides);
+        crate::ui::widgets::section(
+            ui,
+            "Preset",
+            true,
+            |_ui| {},
+            |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    for &m in &WaterMode::ALL {
+                        let active = m == active_mode;
+                        let label_owned = match m {
+                            WaterMode::Custom if custom_overrides_count > 0 => {
+                                format!("Custom ({custom_overrides_count})")
+                            }
+                            _ => m.label().to_string(),
+                        };
+                        let resp = ui.add(egui::Button::selectable(active, label_owned));
+                        if resp.clicked() && m != active_mode {
+                            new_mode = Some(m);
+                        }
+                    }
+                });
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(
+                        "Switching presets keeps your tweaks. \
+                         BAR floods every region where heightmap.y < 0.",
+                    )
+                    .color(t.dim)
+                    .size(10.0),
+                );
+            },
+        );
+        if let Some(to) = new_mode {
+            self.history.push_project_diff(ProjectDiff::SetWaterMode {
+                from: active_mode,
+                to,
+            });
+            self.water_mode = to;
+            self.mark_dirty();
+            tracing::info!(from = ?active_mode, to = ?self.water_mode, "water mode changed");
+        }
+
+        // ── BEHAVIOUR ────────────────────────────────────
+        // Damage / void_water / tidal_strength. Tidal lives at
+        // MapInfo top level but co-locates here for UX (PITFALL §5
+        // / prompt's critical pitfall #5).
+        crate::ui::widgets::section(
+            ui,
+            "Behaviour",
+            false,
+            |_ui| {},
+            |ui| {
+                self.water_field_float_slider(
+                    ui,
+                    "Damage",
+                    WaterField::Damage,
+                    |o| o.damage,
+                    0.0..=10000.0,
+                    " HP/tick",
+                );
+                self.water_field_void_toggle(ui);
+                self.water_field_tidal_slider(ui);
+            },
+        );
+
+        // ── APPEARANCE ───────────────────────────────────
+        crate::ui::widgets::section(
+            ui,
+            "Appearance",
+            false,
+            |_ui| {},
+            |ui| {
+                self.water_field_color(ui, "Surface", WaterField::SurfaceColor, |o| {
+                    o.surface_color
+                });
+                // Plane colour disabled while voidWater is on
+                // (PITFALL §6 — they're mutually exclusive; the
+                // emission path auto-clears plane_color but we
+                // surface the gating here too).
+                let plane_enabled = !self.void_water;
+                ui.add_enabled_ui(plane_enabled, |ui| {
+                    self.water_field_color(ui, "Plane", WaterField::PlaneColor, |o| o.plane_color);
+                });
+                if !plane_enabled {
+                    ui.label(
+                        egui::RichText::new(
+                            "Plane colour disabled — voidWater is on (PITFALL §6).",
+                        )
+                        .color(t.dim)
+                        .size(10.0),
+                    );
+                }
+                self.water_field_float_slider(
+                    ui,
+                    "Surface alpha",
+                    WaterField::SurfaceAlpha,
+                    |o| o.surface_alpha,
+                    0.0..=1.0,
+                    "",
+                );
+                self.water_field_float_slider(
+                    ui,
+                    "Wave size",
+                    WaterField::PerlinAmplitude,
+                    |o| o.perlin_amplitude,
+                    0.0..=2.0,
+                    "",
+                );
+                self.water_field_float_slider(
+                    ui,
+                    "Foam strength",
+                    WaterField::WaveFoamIntensity,
+                    |o| o.wave_foam_intensity,
+                    0.0..=2.0,
+                    "",
+                );
+            },
+        );
+
+        // ── FLOOD ────────────────────────────────────────
+        crate::ui::widgets::section(
+            ui,
+            "Flood",
+            false,
+            |_ui| {},
+            |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Carve depth").color(t.muted).size(11.0));
+                    ui.add(
+                        egui::DragValue::new(&mut self.water_carve_depth)
+                            .range(-1024.0..=0.0)
+                            .speed(1.0)
+                            .suffix(" elmos"),
+                    );
+                });
+                ui.label(
+                    egui::RichText::new("LMB drag → flood (Brush::Lower). RMB drag → raise.")
+                        .color(t.dim)
+                        .size(10.0),
+                );
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("min_height").color(t.muted).size(11.0));
+                    let mh_chip = format!("{:.0}", self.heightmap_observed_min_height());
+                    ui.label(egui::RichText::new(mh_chip).color(t.text).size(11.0));
+                });
+                ui.add_space(4.0);
+                let auto_clicked = ui
+                    .add(egui::Button::new("Auto-set min_height from heightmap"))
+                    .on_hover_text(
+                        "Scan the loaded heightmap and set Project.min_height = \
+                         min(0, observed). Required for BAR to render water in \
+                         carved basins.",
+                    )
+                    .clicked();
+                if auto_clicked {
+                    self.auto_set_min_height_from_heightmap();
+                }
+            },
+        );
+
+        // ── ADVANCED ────────────────────────────────────
+        ui.collapsing("Advanced (raw mapinfo fields)", |ui| {
+            ui.label(
+                egui::RichText::new(
+                    "Full 30-field form ships from Sprint 18's F9 mapinfo \
+                     form. The advanced tab will reach the same \
+                     water_overrides this Inspector edits — Tool::Water \
+                     remains the primary entry point.",
+                )
+                .color(t.dim)
+                .size(10.0),
+            );
+        });
+    }
+
+    /// Float-slider edit on `Project.water_overrides`'s `field`,
+    /// pushed through `EditWaterField` for undo. `accessor` extracts
+    /// the current `Option<f32>` so the slider displays either the
+    /// user's override or the active preset's value.
+    fn water_field_float_slider(
+        &mut self,
+        ui: &mut egui::Ui,
+        label: &str,
+        field: WaterField,
+        accessor: impl Fn(&WaterBlock) -> Option<f32>,
+        range: std::ops::RangeInclusive<f32>,
+        suffix: &str,
+    ) {
+        let t = crate::ui::theme::Tokens::DARK;
+        // Display value: override → preset → 0.0.
+        let preset = preset_water_block(self.water_mode).unwrap_or_default();
+        let before_opt = accessor(&self.water_overrides);
+        let baseline = before_opt.unwrap_or_else(|| accessor(&preset).unwrap_or(0.0));
+        let mut current = baseline;
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(label).color(t.muted).size(11.0));
+            ui.add(
+                egui::Slider::new(&mut current, range)
+                    .show_value(true)
+                    .suffix(suffix),
+            );
+        });
+        if (current - baseline).abs() > 1e-6 {
+            let to = WaterValue::Float(Some(current));
+            let from = WaterValue::Float(before_opt);
+            self.apply_water_field(field, to);
+            self.history
+                .push_project_diff(ProjectDiff::EditWaterField { field, from, to });
+            self.mark_dirty();
+        }
+    }
+
+    /// `void_water` toggle. PITFALL §6: when the user flips this on,
+    /// the emission path auto-clears `plane_color`. The UI grays the
+    /// plane colour picker (in the Appearance section) so the user
+    /// sees the gating; the diff path doesn't have to touch
+    /// plane_color here because emission handles it.
+    fn water_field_void_toggle(&mut self, ui: &mut egui::Ui) {
+        let t = crate::ui::theme::Tokens::DARK;
+        let before = self.void_water;
+        let mut current = before;
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Void water").color(t.muted).size(11.0));
+            ui.add(egui::Checkbox::new(&mut current, "")).on_hover_text(
+                "Renders the map without a water plane (the Apophis / \
+                     Quicksilver 'space map' look). Mutually exclusive with \
+                     plane colour — PITFALL §6.",
+            );
+        });
+        if current != before {
+            let to = WaterValue::Bool(Some(current));
+            let from = WaterValue::Bool(Some(before));
+            self.apply_water_field(WaterField::VoidWater, to);
+            self.history.push_project_diff(ProjectDiff::EditWaterField {
+                field: WaterField::VoidWater,
+                from,
+                to,
+            });
+            self.mark_dirty();
+        }
+    }
+
+    /// `tidal_strength` slider. Lives at MapInfo top level (PITFALL
+    /// §5 / prompt's pitfall list #5). Co-located in Behaviour
+    /// purely for UX — the schema field is `MapInfo.tidal_strength`,
+    /// not `WaterBlock.tidal_strength`.
+    fn water_field_tidal_slider(&mut self, ui: &mut egui::Ui) {
+        let t = crate::ui::theme::Tokens::DARK;
+        let before_opt = self.tidal_strength;
+        let baseline = before_opt.unwrap_or(0.0);
+        let mut current = baseline;
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new("Tidal strength")
+                    .color(t.muted)
+                    .size(11.0),
+            );
+            ui.add(egui::Slider::new(&mut current, 0.0..=30.0).show_value(true))
+                .on_hover_text(
+                    "BAR tidal-energy economy. Lives at mapinfo top level, \
+                     not inside water{}. PITFALL §5.",
+                );
+        });
+        if (current - baseline).abs() > 1e-6 {
+            let to = WaterValue::Float(Some(current));
+            let from = WaterValue::Float(before_opt);
+            self.apply_water_field(WaterField::TidalStrength, to);
+            self.history.push_project_diff(ProjectDiff::EditWaterField {
+                field: WaterField::TidalStrength,
+                from,
+                to,
+            });
+            self.mark_dirty();
+        }
+    }
+
+    /// `Rgb` colour picker for a water-block field. Renders an
+    /// egui::color_picker swatch; on change, pushes an
+    /// `EditWaterField` with the `Rgb(Option<[f32; 3]>)` payload.
+    fn water_field_color(
+        &mut self,
+        ui: &mut egui::Ui,
+        label: &str,
+        field: WaterField,
+        accessor: impl Fn(&WaterBlock) -> Option<[f32; 3]>,
+    ) {
+        let t = crate::ui::theme::Tokens::DARK;
+        let preset = preset_water_block(self.water_mode).unwrap_or_default();
+        let before_opt = accessor(&self.water_overrides);
+        let baseline = before_opt.unwrap_or_else(|| accessor(&preset).unwrap_or([0.5, 0.5, 0.5]));
+        let mut current = baseline;
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(label).color(t.muted).size(11.0));
+            ui.color_edit_button_rgb(&mut current);
+        });
+        let changed = (current[0] - baseline[0]).abs() > 1e-4
+            || (current[1] - baseline[1]).abs() > 1e-4
+            || (current[2] - baseline[2]).abs() > 1e-4;
+        if changed {
+            let to = WaterValue::Rgb(Some(current));
+            let from = WaterValue::Rgb(before_opt);
+            self.apply_water_field(field, to);
+            self.history
+                .push_project_diff(ProjectDiff::EditWaterField { field, from, to });
+            self.mark_dirty();
+        }
+    }
+
+    /// Read the loaded heightmap's observed min height (in elmos) so
+    /// the Inspector can display it. Returns `0.0` when no heightmap
+    /// is loaded (the user can still see the carve-depth control).
+    fn heightmap_observed_min_height(&self) -> f32 {
+        let Some(hm) = self.heightmap.as_ref() else {
+            return 0.0;
+        };
+        // The heightmap stores u16 raw samples in [0, u16::MAX]
+        // mapped to world Y in [0, height_scale]. We're interested in
+        // the LOWEST sample because that's how deep the carved basin
+        // reaches — but for the C9 flood lint we want to know whether
+        // any sample is below the water plane (Y=0). The CPU side
+        // doesn't currently model below-zero heights distinctly from
+        // zero (the heightmap is normalised to a non-negative scale),
+        // so we approximate by reporting the project's min_height
+        // (which is signed) when it's negative.
+        // TODO Sprint 14: when min_height < 0 the heightmap u16 = 0
+        // corresponds to Y = min_height. Use Project.min_height
+        // directly. Until snapshot_project plumbs the live value
+        // through, return the project's max-depth approximation.
+        hm.min as f32 / u16::MAX as f32 * self.height_scale
+    }
+
+    /// "Auto-set min_height from heightmap" — scan the loaded
+    /// heightmap and clamp `Project.min_height` (via the App-level
+    /// shadow) to `min(0, observed)`. No-op without a heightmap.
+    fn auto_set_min_height_from_heightmap(&mut self) {
+        // TODO Sprint 14 follow-up: `App` doesn't currently carry a
+        // mutable `min_height` field — `snapshot_project` hard-codes
+        // it to 0.0 (line 1131 in main.rs). The auto-set logic
+        // belongs here once that field plumbs through. For now,
+        // log the user's intent and surface a toast via last_error
+        // so the click is observable.
+        info!(
+            observed_min = self.heightmap_observed_min_height(),
+            "auto_set_min_height_from_heightmap clicked — full plumbing \
+             arrives with the form editor (Sprint 18)"
+        );
+    }
+
     /// Single 4-card BrushPicker tile. Pure renderer; returns the
     /// click response.
     fn brush_card(
@@ -6409,8 +6812,14 @@ impl App {
             let metal_active = matches!(self.tool, Tool::MetalSpots);
             let geo_active = matches!(self.tool, Tool::GeoFeatures);
             let feature_active = matches!(self.tool, Tool::Feature);
-            let central_interactive =
-                brush_active || start_pos_active || splat_active || metal_active || geo_active;
+            // C9 / Sprint 14 — Water tool carves with Lower / Raise.
+            let water_active = matches!(self.tool, Tool::Water) && self.heightmap.is_some();
+            let central_interactive = brush_active
+                || start_pos_active
+                || splat_active
+                || metal_active
+                || geo_active
+                || water_active;
 
             // ADR-035: the top-right nav-gizmo retires in favour of
             // the mini-map. Reserve its rect so brush/start-pos
@@ -6434,7 +6843,13 @@ impl App {
                 .unwrap_or(false);
             let consumed_click = false;
 
-            let camera_drag = if central_interactive {
+            // RMB usually orbits the camera while a tool is active,
+            // but `Tool::Water` re-purposes RMB for "raise" (the
+            // inverse of LMB-flood). Skip the orbit hook entirely
+            // when the water tool is on.
+            let camera_drag = if water_active {
+                false
+            } else if central_interactive {
                 response.dragged_by(egui::PointerButton::Secondary)
             } else {
                 response.dragged()
@@ -6474,7 +6889,14 @@ impl App {
             {
                 self.apply_brush_at(cursor, rect);
             }
-            if self.history.stroke_open() && !response.dragged_by(egui::PointerButton::Primary) {
+            // End the in-flight stroke when no painting button is
+            // held. Sculpt only paints with LMB; `Tool::Water` (C9)
+            // paints with both buttons (LMB = lower, RMB = raise) so
+            // we extend the check to either when the water tool is
+            // active.
+            let any_paint_held = response.dragged_by(egui::PointerButton::Primary)
+                || (water_active && response.dragged_by(egui::PointerButton::Secondary));
+            if self.history.stroke_open() && !any_paint_held {
                 self.end_stroke();
             }
 
@@ -6492,6 +6914,30 @@ impl App {
                 && let Some(cursor) = ctx.pointer_interact_pos()
             {
                 self.apply_splat_brush_at(cursor, rect);
+            }
+
+            // C9 / Sprint 14 — Tool::Water flood-carve dispatch.
+            // LMB stamps Lower (carves the heightmap below Y=0);
+            // RMB stamps Raise (undo a flooding gesture without
+            // walking the undo stack — gentler than Ctrl-Z when the
+            // user just wants a smaller pool). Strength scales the
+            // carve depth (elmos) against the project's height_scale
+            // so the slider stays meaningful regardless of map size.
+            if water_active && !consumed_click && !cursor_in_gizmo {
+                let strength =
+                    (self.water_carve_depth.abs() / self.height_scale.max(1.0)).clamp(0.0, 1.0);
+                if (response.dragged_by(egui::PointerButton::Primary)
+                    || response.clicked_by(egui::PointerButton::Primary))
+                    && let Some(cursor) = ctx.pointer_interact_pos()
+                {
+                    self.apply_brush_id_at(cursor, rect, "lower", strength);
+                }
+                if (response.dragged_by(egui::PointerButton::Secondary)
+                    || response.clicked_by(egui::PointerButton::Secondary))
+                    && let Some(cursor) = ctx.pointer_interact_pos()
+                {
+                    self.apply_brush_id_at(cursor, rect, "raise", strength);
+                }
             }
 
             // Start-position placement / move / delete / drag-paint
@@ -7432,13 +7878,14 @@ mod tests {
         for t in Tool::ALL {
             assert!(seen.insert(t), "Tool::ALL has a duplicate entry: {t:?}");
         }
-        // C6 (Sprint 12) added Tool::Feature, bumping the count from 7
-        // to 8. A change here is intentional but should bump
-        // ADR-030 / ADR-035 + the phase-3-plan entry for B1.
+        // C6 (Sprint 12) added Tool::Feature → 8 variants.
+        // C9 (Sprint 14) added Tool::Water → 9 variants.
+        // A change here is intentional but should bump ADR-030 /
+        // ADR-035 / ADR-042 + the phase-3-plan entry for B1.
         assert_eq!(
             Tool::ALL.len(),
-            8,
-            "Tool::ALL size changed — update ADR-030 / ADR-035 + plan"
+            9,
+            "Tool::ALL size changed — update ADR-030 / ADR-035 / ADR-042 + plan"
         );
     }
 

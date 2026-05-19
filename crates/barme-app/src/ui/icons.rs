@@ -28,6 +28,9 @@ pub enum Icon {
     Metal,
     Geo,
     Procgen,
+    /// Sprint 14 / C9 — `Tool::Water` glyph. Two stacked sine-wave
+    /// strokes; reads as "water / lava authoring" at tool-strip scale.
+    Water,
 
     // UI chrome
     ChevDown,
@@ -87,6 +90,7 @@ pub const ALL: &[Icon] = &[
     Icon::Metal,
     Icon::Geo,
     Icon::Procgen,
+    Icon::Water,
     Icon::ChevDown,
     Icon::ChevRight,
     Icon::Play,
@@ -214,6 +218,19 @@ pub fn paint_icon(
             mapper.curve(painter, stroke, (3, 17), (12, 7), (21, 17));
             mapper.curve(painter, stroke, (3, 12), (10, 4), (16, 8));
             mapper.curve(painter, stroke, (12, 20), (18, 12), (21, 12));
+        }
+        Icon::Water => {
+            // Two stacked "tilde" sine waves — distinct enough from
+            // Procgen's busier 3-wave glyph that the two read
+            // differently in the tool strip. Each wave is two
+            // half-period quadratic-bezier curves meeting at the
+            // midpoint, alternating peak / trough.
+            // Upper wave at y ≈ 9.
+            mapper.curve(painter, stroke, (3, 9), (8, 6), (12, 9));
+            mapper.curve(painter, stroke, (12, 9), (16, 12), (21, 9));
+            // Lower wave at y ≈ 16.
+            mapper.curve(painter, stroke, (3, 16), (8, 13), (12, 16));
+            mapper.curve(painter, stroke, (12, 16), (16, 19), (21, 16));
         }
         Icon::ChevDown => {
             mapper.poly_line(painter, stroke, &[(6, 9), (12, 15), (18, 9)], false);
@@ -708,7 +725,7 @@ mod tests {
     fn all_catalogue_covers_every_variant() {
         // Every named variant should appear in ALL — otherwise the
         // cheat-sheet icon gallery skips icons silently.
-        let expected_variants = 43; // bump when adding icons
+        let expected_variants = 44; // bump when adding icons
         assert_eq!(
             ALL.len(),
             expected_variants,

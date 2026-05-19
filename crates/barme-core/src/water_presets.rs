@@ -194,6 +194,108 @@ pub const BAR_DEFAULT_SURFACE_COLOR: [f32; 3] = [0.75, 0.80, 0.85];
 /// BAR-default `surface_alpha` for the same fallback.
 pub const BAR_DEFAULT_SURFACE_ALPHA: f32 = 0.1;
 
+/// Count the populated fields in a [`WaterBlock`]. Sprint 14's
+/// Inspector uses this to render "Custom (N overrides)" on the
+/// preset chip when the user has tweaks above the active preset.
+/// Counts every `Some(_)` plus a non-empty `caustics` Vec.
+pub fn water_override_count(w: &WaterBlock) -> usize {
+    let mut n = 0;
+    if w.damage.is_some() {
+        n += 1;
+    }
+    if w.repeat_x.is_some() {
+        n += 1;
+    }
+    if w.repeat_y.is_some() {
+        n += 1;
+    }
+    if w.surface_color.is_some() {
+        n += 1;
+    }
+    if w.surface_alpha.is_some() {
+        n += 1;
+    }
+    if w.plane_color.is_some() {
+        n += 1;
+    }
+    if w.absorb.is_some() {
+        n += 1;
+    }
+    if w.base_color.is_some() {
+        n += 1;
+    }
+    if w.min_color.is_some() {
+        n += 1;
+    }
+    if w.ambient_factor.is_some() {
+        n += 1;
+    }
+    if w.diffuse_factor.is_some() {
+        n += 1;
+    }
+    if w.specular_factor.is_some() {
+        n += 1;
+    }
+    if w.specular_color.is_some() {
+        n += 1;
+    }
+    if w.specular_power.is_some() {
+        n += 1;
+    }
+    if w.fresnel_min.is_some() {
+        n += 1;
+    }
+    if w.fresnel_max.is_some() {
+        n += 1;
+    }
+    if w.fresnel_power.is_some() {
+        n += 1;
+    }
+    if w.reflection_distortion.is_some() {
+        n += 1;
+    }
+    if w.blur_base.is_some() {
+        n += 1;
+    }
+    if w.blur_exponent.is_some() {
+        n += 1;
+    }
+    if w.perlin_start_freq.is_some() {
+        n += 1;
+    }
+    if w.perlin_lacunarity.is_some() {
+        n += 1;
+    }
+    if w.perlin_amplitude.is_some() {
+        n += 1;
+    }
+    if w.wave_foam_intensity.is_some() {
+        n += 1;
+    }
+    if w.num_tiles.is_some() {
+        n += 1;
+    }
+    if w.shore_waves.is_some() {
+        n += 1;
+    }
+    if w.force_rendering.is_some() {
+        n += 1;
+    }
+    if w.texture.is_some() {
+        n += 1;
+    }
+    if w.foam_texture.is_some() {
+        n += 1;
+    }
+    if w.normal_texture.is_some() {
+        n += 1;
+    }
+    if !w.caustics.is_empty() {
+        n += 1;
+    }
+    n
+}
+
 // ─────── Preset bodies (anchored to real BAR maps) ───────
 
 /// Coastlines Dry verbatim — the BAR ocean baseline.
