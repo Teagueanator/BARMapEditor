@@ -116,7 +116,17 @@ pub struct MapInfo {
     /// Non-zero on water maps to power Tidal Generators.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tidal_strength: Option<f32>,
-    /// Per-pixel metalmap scale. BAR mostly ignores (Lua spots win).
+    /// Per-pixel metalmap scale (m/s yield at full 1.0 saturation).
+    /// Real BAR maps cluster at 0.93–4.11 (jade_empress 0.99,
+    /// titanduel 1.26, supreme_isthmus 0.93, starwatcher 4.11). A
+    /// 0.02 default — which the editor shipped pre-Sprint 11 —
+    /// makes the F4 income display show ~0.1 m/s for a metal=2.0
+    /// spot (50× too low). The widget formula in
+    /// `luaui/Widgets/gui_metalspots.lua` is roughly
+    /// `spot.worth * incomeMultiplier / 1000` where `spot.worth`
+    /// scales linearly with `maxMetal`. We pick 1.0 — the BAR
+    /// median — so the canonical metal=2.0 spot displays ~2.0 m/s
+    /// without per-project tuning.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_metal: Option<f32>,
     /// Engine-wide mex exclusion radius. **BAR convention: 80**, NOT
@@ -573,7 +583,7 @@ impl MapInfo {
             not_deformable: Some(false),
             gravity: Some(130.0),
             tidal_strength: None,
-            max_metal: Some(0.02),
+            max_metal: Some(1.0),
             extractor_radius: Some(80.0),
             void_water: false,
             void_ground: false,
@@ -1023,8 +1033,14 @@ mod tests {
     }
 
     #[test]
-    fn bar_default_max_metal_is_bar_value() {
-        assert_eq!(MapInfo::bar_default().max_metal, Some(0.02));
+    fn bar_default_max_metal_is_bar_median() {
+        // The BAR convention sits in the 0.93..=4.11 band (jade_empress
+        // 0.99, titanduel 1.26, supreme_isthmus 0.93, starwatcher 4.11).
+        // We default to 1.0 — slightly above the median — so a
+        // canonical metal=2.0 spot displays ~2.0 m/s in F4 without
+        // per-project tuning. The earlier 0.02 default made every
+        // spot read as ~0.1 m/s (50× too low).
+        assert_eq!(MapInfo::bar_default().max_metal, Some(1.0));
     }
 
     #[test]

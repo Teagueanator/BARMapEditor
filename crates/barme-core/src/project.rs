@@ -170,12 +170,21 @@ impl AllyGroup {
 /// A single metal-spot source in world coordinates (elmos).
 ///
 /// `metal` follows BAR's convention: `2.0` is a standard mex, `4.0` a
-/// strong central mex. The engine multiplies by `0.43 × 9 / 21 × 255`
-/// at spawn time (FINDINGS §5 / `map_metal_spot_placer.lua`); the user
-/// sees the BAR-facing scalar in the inspector. Symmetry-derived
-/// mirrors are NOT stored — `Project.metal_spots` is the source set
-/// and the active `SymmetryAxis` recomputes mirrors per frame in the
-/// editor and per build in the pipeline (matches F8 / ADR-032).
+/// strong central mex, `0.5` a perimeter mex. The
+/// `map_metal_spot_placer.lua` gadget multiplies by `0.43 × 9 / 21 × 255`
+/// at spawn time (FINDINGS §5); the user sees the BAR-facing scalar in
+/// the inspector.
+///
+/// **Displayed F4 income** also scales linearly with the project's
+/// `mapinfo.maxMetal` (see [`MapInfo::bar_default`] — `1.0` BAR median).
+/// Setting `metal = 2.0` with `maxMetal = 1.0` gives ~2.0 m/s in F4;
+/// the pre-2026-05-19 `maxMetal = 0.02` made the same spot read as
+/// 0.1 m/s. See PITFALL §22.
+///
+/// Symmetry-derived mirrors are NOT stored — `Project.metal_spots` is
+/// the source set and the active `SymmetryAxis` recomputes mirrors per
+/// frame in the editor and per build in the pipeline (matches F8 /
+/// ADR-032).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub struct MetalSpot {
     pub x_elmo: i32,
@@ -202,6 +211,20 @@ impl MetalSpot {
 /// carry no `metal` or rotation field — the stock `geovent` FeatureDef
 /// owns its own size and (engine-default-zero) facing. Symmetry rules
 /// match `MetalSpot`: sources stored, mirrors derived per frame.
+///
+/// **Emission path:** geo vents reach BAR through the Springboard
+/// featureplacer trio — a vendored `LuaGaia/Gadgets/FP_featureplacer.lua`
+/// (PD-licensed Gnome / Smoth gadget, 2008) + a
+/// `mapconfig/featureplacer/config.lua` redirect + a
+/// `mapconfig/featureplacer/set.lua` data file with `objectlist =
+/// { { name = "geovent", x, z, rot = 0 }, ... }`. See
+/// `barme-pipeline::featureplacer` + PITFALL §21.
+///
+/// **Y-coordinate is intentionally absent.** The FP_featureplacer
+/// gadget calls `Spring.CreateFeature(name, x, GroundHeight(x, z) + 5,
+/// z, rot)` — the vent rides the live terrain. Sculpting the heightmap
+/// after authoring vents does not detach the plume; it re-snaps on
+/// the next map load.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GeoVent {
     pub x_elmo: i32,

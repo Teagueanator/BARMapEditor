@@ -26,6 +26,30 @@
 //! - The 5×5-cross stamp pattern (21 cells) places identical density
 //!   at every cell.
 //!
+//! ## Displayed F4 income depends on `mapinfo.maxMetal`
+//!
+//! BAR's `gui_metalspots.lua` widget (paints the rotating circles +
+//! numeric label per spot) computes displayed income as roughly
+//! `spot.worth * incomeMultiplier / 1000`. `spot.worth` aggregates the
+//! per-cell `Spring.GetGroundInfo` ground-metal value across the spot
+//! cluster, and that value scales linearly with `mapinfo.maxMetal`.
+//! Setting `maxMetal` too low scales every spot's displayed value
+//! linearly down: the editor's pre-2026-05-19 default of `0.02` made
+//! every `metal=2.0` spot read as `~0.1` m/s in F4 (50× too low).
+//! PITFALL §22 documents the new `1.0` default and the BAR-map median
+//! range (`0.93..=4.11`).
+//!
+//! ## Y-coordinate is intentionally absent
+//!
+//! `spot` has only `x`, `z`, `metal` — no `y`. The BAR
+//! `map_metal_spot_placer.lua` gadget paints a 2D metal-map cell
+//! pattern; the extractor unit snap-builds at
+//! `Spring.GetGroundHeight(x, z)` at construction time. Sculpting the
+//! heightmap after authoring metal spots does NOT desync them — the
+//! build height is sampled every spawn. (Same y-snap rule applies to
+//! geo vents through `FP_featureplacer.lua`'s
+//! `Spring.GetGroundHeight(x, z) + 5` — see `featureplacer.rs`.)
+//!
 //! ## Symmetry expansion
 //!
 //! The build path expands `Project.metal_spots` through the active

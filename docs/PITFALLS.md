@@ -226,9 +226,15 @@ convention; BAR's `api_resource_spot_finder.GetSpotsGeo()` scans the
 map for engine features with `FeatureDef.geoThermal = true` (typically
 the stock `geovent` feature).
 
-**Rule:** `Project.geo_vents` emits ONLY into
-`mapconfig/featureplacer/features.lua` with `name = "geovent"`. Never
-write a `geos` array in `map_metal_layout.lua`.
+**Rule:** `Project.geo_vents` emits ONLY into the Springboard
+featureplacer trio (see §21) with `name = "geovent"`. Never write a
+`geos` array in `map_metal_layout.lua` — that file holds `spots`
+only.
+
+> **2026-05-19 correction:** the original wording of this pitfall
+> said "emits into `mapconfig/featureplacer/features.lua`". That
+> path is also wrong — see §21 for the actual Springboard
+> convention BAR maps use.
 
 ### 15. `splatDetailNormalTex` prefers the subtable form
 
@@ -353,3 +359,118 @@ BakeOptions::to_cache_bytes())`. Each new `BakeOptions` field appends
 to `to_cache_bytes` in a fixed position; the `cache_bytes_encode_
 each_flag_in_a_distinct_position` test pins the encoding. Cache
 files live at `tools/textures-cache/<sha>.dds` (gitignored).
+
+
+### 21. Features need the Springboard featureplacer trio, not a bare Lua file
+
+BAR has **no gadget** reading `mapconfig/featureplacer/features.lua`
+(verified by direct grep across the full `Beyond-All-Reason` checkout
+on 2026-05-19 — zero consumers in `luarules/`, `luaui/`, or `common/`).
+Pre-2026-05-19 the editor emitted exactly that path; the file shipped
+inside the `.sd7` and BAR silently ignored it. Geo vents authored in
+the editor never spawned in-game.
+
+Real BAR maps (`gecko_isle_remake_v1.2.1`, `jade_empress_1.3`,
+`titanduel_v3`, …) ship the **Springboard featureplacer trio** —
+the PD-licensed Gnome / Smoth gadget from August 2008, distributed
+as map-bundled cargo because BAR doesn't ship it mod-side:
+
+```
+LuaGaia/Gadgets/FP_featureplacer.lua          ← gadget, map-bundled
+mapconfig/featureplacer/config.lua            ← VFS.Include redirect
+mapconfig/featureplacer/set.lua               ← the data
+```
+
+`config.lua` is a one-liner:
+
+```lua
+return VFS.Include("mapconfig/featureplacer/set.lua")
+```
+
+`set.lua` returns a single keyed table:
+
+```lua
+local setcfg = {
+  unitlist = {},
+  buildinglist = {},
+  objectlist = {
+    { name = "geovent", x = 4096, z = 4096, rot = 0 },
+    { name = "agorm_talltree6", x = 224, z = 3616, rot = -23991 },
+  },
+}
+return setcfg
+```
+
+Notes on the schema:
+
+- **`rot` is an unquoted integer** in Spring heading units
+  (`-32768..32767`). The gadget calls
+  `Spring.CreateFeature(name, x, GroundHeight(x, z) + 5, z, rot)`
+  which expects a number. PyMapConv's `-k` text-file format uses
+  the quoted-string form (`rot = "0"`) but that's a separate
+  codepath we don't use.
+- **No `y` field.** The gadget samples
+  `Spring.GetGroundHeight(x, z) + 5` at spawn so features ride
+  the live terrain — sculpting the heightmap after authoring
+  features does not detach them.
+- **`unitlist` / `buildinglist`** are reserved for map-side
+  pre-placed gaia units (campaign missions). Empty for normal
+  competitive maps.
+
+**Rule:** the build pipeline stages all three files. The gadget
+itself is vendored at `crates/barme-pipeline/assets/FP_featureplacer.lua`
+(PD license verified). `Project.geo_vents` populates `objectlist`
+in `set.lua`; the future general-feature pipeline (C6 / Sprint 12)
+appends to the same list.
+
+### 22. `mapinfo.maxMetal` is a metal-yield scale, not a normalisation cap
+
+The mapinfo field `maxMetal` is the m/s metal yield at full (`1.0`)
+ground-metal saturation. The `gui_metalspots` widget computes
+predicted F4 income as roughly `spot.worth * incomeMultiplier / 1000`
+where `spot.worth` aggregates per-cell ground-metal × `maxMetal`
+across the spot's cluster. Setting `maxMetal` too low scales every
+spot's displayed value linearly down.
+
+Real BAR maps cluster in `0.93..=4.11`:
+
+```
+jade_empress_1.3      maxMetal = 0.99
+titanduel_v3          maxMetal = 1.26
+supreme_isthmus_v2.1  maxMetal = 0.93
+ravaged_remake_v1.2   maxMetal = 1.05
+starwatcher_1.0       maxMetal = 4.11
+```
+
+The editor's pre-2026-05-19 default of `0.02` made a canonical
+metal=2.0 spot display as `~0.1` m/s in F4 (50× too low).
+
+**Rule:** `MapInfo::bar_default().max_metal = Some(1.0)`. The F9
+form should expose this so map authors can match BAR's median
+behaviour without per-project tuning. Linter (C8) warns if user
+overrides drop below `0.5` or rise above `5.0` — outliers are
+valid (e.g. `starwatcher_1.0` is balanced around 4.11) but should
+be a conscious choice.
+
+### 23. Springboard featureplacer rotation is INTEGER, not string
+
+A subtle within-`set.lua` schema detail: even though the C2 emitter
+followed PyMapConv's `-k` flat-text convention (`rot = "0"` quoted)
+through Sprint 11, the Lua-gadget consumer in
+`LuaGaia/Gadgets/FP_featureplacer.lua` calls
+
+```lua
+Spring.CreateFeature(fDef.name, fDef.x, ..., fDef.z, fDef.rot)
+```
+
+`Spring.CreateFeature`'s rotation arg is numeric. A string rot
+would coerce silently in some Lua versions but fail in others;
+real BAR maps verified against
+`gecko_isle_remake_v1.2.1.sd7`'s `set.lua` (`rot = -23991`)
+consistently use the unquoted integer form. Different from PyMapConv's
+`-k` flag — the two codepaths happen to share field names but the
+rotation type differs.
+
+**Rule:** `set.lua` rotation is an unquoted integer. PyMapConv's
+text-file path (currently unused) uses the quoted string form per
+the `-k` `--help` text. Don't conflate them.
