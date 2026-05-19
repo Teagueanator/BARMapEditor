@@ -11,6 +11,7 @@ pub mod map_size;
 pub mod mapinfo_schema;
 pub mod procgen;
 pub mod project;
+pub mod splat;
 pub mod start_pos;
 pub mod symmetry;
 pub mod undo;
@@ -29,6 +30,10 @@ pub use procgen::{
 pub use project::{
     ALLY_GROUP_PALETTE, AllyGroup, PROJECT_EXTENSION, Project, ProjectLoadError, ProjectSaveError,
     StartPosition, sanitize_name,
+};
+pub use splat::{
+    Erase as SplatErase, PaintChannel, SPLAT_DIM, Smooth as SplatSmooth, SplatBrush,
+    SplatBrushRegistry, SplatChannel, SplatDistribution, SplatStamp,
 };
 pub use symmetry::SymmetryAxis;
 pub use undo::{HeightmapEntry, History, HistoryEntry, ProjectDiff, WizardSnapshot};
