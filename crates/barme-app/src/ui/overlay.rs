@@ -26,9 +26,10 @@ const DASH_OFF_PX: f32 = 4.0;
 /// line so very-edge-on projections stay visible.
 const MIN_DASHED_LENGTH_PX: f32 = 32.0;
 
-const AXIS_STROKE_WIDTH: f32 = 1.5;
 /// Premultiplied off-white (alpha ≈ 0.7) so the axis reads against both
-/// bright and dark terrain without dominating.
+/// bright and dark terrain without dominating. The Sprint-13 line
+/// pipeline draws at the GPU's native 1-px line width — the previous
+/// 1.5-px stroke is gone (most platforms ignore line widths anyway).
 const AXIS_COLOUR: egui::Color32 = egui::Color32::from_rgba_premultiplied(180, 180, 180, 180);
 
 /// Pure helper: compute the list of world-space axis segments to paint
@@ -62,17 +63,22 @@ pub fn axis_segments_for(
     }
 }
 
-/// Paint the persistent symmetry overlay (dashed mirror axes for
-/// mirror modes, N spokes for `Rotational`) into `rect`. No-op when
-/// `symmetry == SymmetryAxis::None`.
+/// Collect symmetry axes as dashed world-space `LineVertex` pairs for
+/// the Sprint-13 line pipeline. Each pair forms one short dashed
+/// sub-segment; LineList topology in the pipeline draws them as
+/// individual segments. Lifted to [`crate::ui::markers::MARKER_Y_LIFT_ELMOS`]
+/// so the axes don't z-fight ground terrain at h=0.
 ///
-/// `extents` is the map's world-space size in elmos
-/// (`((dims.x - 1) * 8, (dims.z - 1) * 8)`); axes anchor at
-/// `(extent / 2)` because the engine assumes geometric-centre
-/// symmetry (ADR-019).
-pub fn paint_symmetry_overlay(
-    painter: &egui::Painter,
-    rect: egui::Rect,
+/// Dash cadence matches the legacy screen-space pattern (8 px on /
+/// 4 px off) by computing the dash boundaries in screen space and
+/// then `lerp`-ing world positions back per boundary — preserves the
+/// "dashes don't shrink with zoom-out" behaviour from the old
+/// `paint_symmetry_overlay` (pitfall §B2.1).
+///
+/// Sprint 13 / Phase 5 (ADR-037). Replaces `paint_symmetry_overlay`.
+pub fn collect_symmetry_segments(
+    out: &mut Vec<crate::render::LineVertex>,
+    rect_size: glam::Vec2,
     camera: &OrbitCamera,
     symmetry: SymmetryAxis,
     extents: (f32, f32),
@@ -81,21 +87,34 @@ pub fn paint_symmetry_overlay(
     if segments.is_empty() {
         return;
     }
-    let rect_size = glam::Vec2::new(rect.width(), rect.height());
+    let lift = crate::ui::markers::MARKER_Y_LIFT_ELMOS;
     for ((ax, az), (bx, bz)) in segments {
-        let a_world = glam::Vec3::new(ax, 0.0, az);
-        let b_world = glam::Vec3::new(bx, 0.0, bz);
-        let (Some(a_screen), Some(b_screen)) = (
+        let a_world = glam::Vec3::new(ax, lift, az);
+        let b_world = glam::Vec3::new(bx, lift, bz);
+        // Project both endpoints to screen for the screen-space dash
+        // cadence. If either is behind the camera (`world_to_screen`
+        // returns `None`), skip the segment — cleanly clipping a line
+        // that crosses the camera plane is out of scope for Sprint 13.
+        let (Some(a_s), Some(b_s)) = (
             render::world_to_screen(a_world, rect_size, camera),
             render::world_to_screen(b_world, rect_size, camera),
         ) else {
-            // One endpoint clipped off-screen — skip rather than guess
-            // a clip plane. Pitfall §B2.3 — marginal at sane distances.
             continue;
         };
-        let a = egui::Pos2::new(rect.min.x + a_screen.x, rect.min.y + a_screen.y);
-        let b = egui::Pos2::new(rect.min.x + b_screen.x, rect.min.y + b_screen.y);
-        paint_dashed_segment(painter, a, b);
+        let a_pt = egui::Pos2::new(a_s.x, a_s.y);
+        let b_pt = egui::Pos2::new(b_s.x, b_s.y);
+        let total = (b_pt - a_pt).length();
+        if total < 1e-3 {
+            continue;
+        }
+        for (s_start, s_end) in dash_subsegments(a_pt, b_pt) {
+            let t_start = ((s_start - a_pt).length() / total).clamp(0.0, 1.0);
+            let t_end = ((s_end - a_pt).length() / total).clamp(0.0, 1.0);
+            let w_start = a_world.lerp(b_world, t_start);
+            let w_end = a_world.lerp(b_world, t_end);
+            out.push(crate::render::LineVertex::new(w_start, AXIS_COLOUR));
+            out.push(crate::render::LineVertex::new(w_end, AXIS_COLOUR));
+        }
     }
 }
 
@@ -178,17 +197,6 @@ pub fn dash_subsegments(a: egui::Pos2, b: egui::Pos2) -> Vec<(egui::Pos2, egui::
         t = on_end + DASH_OFF_PX;
     }
     out
-}
-
-/// Render a single dashed-or-solid segment between two screen points.
-/// Dash cadence is in screen pixels (pitfall §B2.1). Below
-/// `MIN_DASHED_LENGTH_PX` the on-segments are too short to read as
-/// dashes — render solid.
-fn paint_dashed_segment(painter: &egui::Painter, a: egui::Pos2, b: egui::Pos2) {
-    let stroke = egui::Stroke::new(AXIS_STROKE_WIDTH, AXIS_COLOUR);
-    for (p0, p1) in dash_subsegments(a, b) {
-        painter.line_segment([p0, p1], stroke);
-    }
 }
 
 /// Colour of the brush ring keyed by the brush's stable id. Raise =
@@ -847,5 +855,98 @@ mod tests {
         let centre = glam::Vec3::new(1.0e10, 0.0, 1.0e10);
         let r = brush_screen_radius(&cam, rect_size, centre, 100.0);
         assert!(r.is_none());
+    }
+
+    // ---------------------- collect_symmetry_segments (Phase 5) -------
+
+    #[test]
+    fn collect_symmetry_segments_none_emits_zero_vertices() {
+        let cam = default_camera();
+        let mut out = Vec::new();
+        collect_symmetry_segments(
+            &mut out,
+            glam::Vec2::new(1024.0, 768.0),
+            &cam,
+            SymmetryAxis::None,
+            EXT,
+        );
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn collect_symmetry_segments_horizontal_emits_paired_vertices() {
+        // Horizontal mirror = one dashed axis. We expect a non-empty
+        // even-length output (LineList = pairs of vertices) when the
+        // axis is on-screen at default camera framing.
+        let cam = OrbitCamera::framing(EXT.0, EXT.1);
+        let mut out = Vec::new();
+        collect_symmetry_segments(
+            &mut out,
+            glam::Vec2::new(1024.0, 768.0),
+            &cam,
+            SymmetryAxis::Horizontal,
+            EXT,
+        );
+        assert!(!out.is_empty(), "expected dashed sub-segments");
+        assert_eq!(
+            out.len() % 2,
+            0,
+            "LineList topology requires paired vertices, got {}",
+            out.len()
+        );
+    }
+
+    #[test]
+    fn collect_symmetry_segments_lifts_vertices_to_marker_y() {
+        // Every emitted vertex should sit at MARKER_Y_LIFT_ELMOS so
+        // axes don't z-fight ground at h=0.
+        let cam = OrbitCamera::framing(EXT.0, EXT.1);
+        let mut out = Vec::new();
+        collect_symmetry_segments(
+            &mut out,
+            glam::Vec2::new(1024.0, 768.0),
+            &cam,
+            SymmetryAxis::Quad,
+            EXT,
+        );
+        assert!(!out.is_empty());
+        let lift = crate::ui::markers::MARKER_Y_LIFT_ELMOS;
+        for v in &out {
+            assert!(
+                (v.pos[1] - lift).abs() < 1e-3,
+                "vertex Y = {} should be {} (MARKER_Y_LIFT_ELMOS)",
+                v.pos[1],
+                lift,
+            );
+        }
+    }
+
+    #[test]
+    fn collect_symmetry_segments_quad_emits_more_than_horizontal() {
+        // Quad (2 axes) should yield more vertices than Horizontal
+        // (1 axis) when both axes are on-screen.
+        let cam = OrbitCamera::framing(EXT.0, EXT.1);
+        let mut quad_out = Vec::new();
+        collect_symmetry_segments(
+            &mut quad_out,
+            glam::Vec2::new(1024.0, 768.0),
+            &cam,
+            SymmetryAxis::Quad,
+            EXT,
+        );
+        let mut horiz_out = Vec::new();
+        collect_symmetry_segments(
+            &mut horiz_out,
+            glam::Vec2::new(1024.0, 768.0),
+            &cam,
+            SymmetryAxis::Horizontal,
+            EXT,
+        );
+        assert!(
+            quad_out.len() > horiz_out.len(),
+            "quad ({}) should yield more vertices than horizontal ({})",
+            quad_out.len(),
+            horiz_out.len(),
+        );
     }
 }

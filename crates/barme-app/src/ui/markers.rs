@@ -39,6 +39,12 @@ pub enum MarkerShape {
     FilledWithStroke,
     /// Upward-pointing equilateral triangle — geo-vent glyph.
     Triangle,
+    /// Outline-only upward triangle — geo-vent mirror glyph (Phase 5).
+    /// The inner ~75 %-scale triangle is discarded so only the ring
+    /// remains. Kept on the marker pipeline (not the line pipeline)
+    /// so it stays screen-space sized — matches the primary Triangle's
+    /// size at every camera distance.
+    OutlineTriangle,
 }
 
 impl MarkerShape {
@@ -48,6 +54,7 @@ impl MarkerShape {
             MarkerShape::OutlineRing => 1,
             MarkerShape::FilledWithStroke => 2,
             MarkerShape::Triangle => 3,
+            MarkerShape::OutlineTriangle => 4,
         }
     }
 }
@@ -317,6 +324,7 @@ mod tests {
         assert_eq!(MarkerShape::OutlineRing.shape_id(), 1);
         assert_eq!(MarkerShape::FilledWithStroke.shape_id(), 2);
         assert_eq!(MarkerShape::Triangle.shape_id(), 3);
+        assert_eq!(MarkerShape::OutlineTriangle.shape_id(), 4);
     }
 
     #[test]

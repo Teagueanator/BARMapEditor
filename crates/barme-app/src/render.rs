@@ -59,6 +59,12 @@ pub const OFFSCREEN_CLAMP: u32 = 2048;
 /// front. ADR-037.
 pub const MARKER_INSTANCE_CAPACITY: u32 = 10_000;
 
+/// Pre-allocated capacity (in `LineVertex` count, NOT segments) of the
+/// GPU vertex buffer used by the Sprint-13 line pipeline. 5 000 verts
+/// = 2 500 line segments — comfortably above the worst-case symmetry-
+/// axes + geo-vent plumes load. 32 B/vertex × 5 000 = 160 KB. ADR-037.
+pub const LINE_VERTEX_CAPACITY: u32 = 5_000;
+
 /// Pixel side of one layer of the slot diffuse texture array. The
 /// starter pack (ADR-025) ships ambientCG `_1K-PNG.zip` at 1024², so
 /// the happy path matches without resizing. Per FINDINGS H2 the
@@ -91,6 +97,37 @@ pub struct MarkerU {
     pub view_proj: [[f32; 4]; 4],
     pub viewport_size: [f32; 2],
     pub _pad: [f32; 2],
+}
+
+/// CPU mirror of `lines.wgsl::VsIn`. One pair per `LineList` segment.
+/// 32 B per vertex: vec3 position (offset 0) + 4 B pad + vec4 color
+/// (offset 16). Premultiplied colour, matches the line pipeline's
+/// `PREMULTIPLIED_ALPHA_BLENDING` blend state.
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable, Debug)]
+pub struct LineVertex {
+    pub pos: [f32; 3],
+    pub _pad0: f32,
+    pub color: [f32; 4],
+}
+
+impl LineVertex {
+    /// Convert a world-space point + `egui::Color32` (already premul
+    /// internally) to a GPU vertex.
+    pub fn new(pos: glam::Vec3, color: egui::Color32) -> Self {
+        let [r, g, b, a] = color.to_array();
+        let inv = 1.0 / 255.0;
+        Self {
+            pos: [pos.x, pos.y, pos.z],
+            _pad0: 0.0,
+            color: [
+                r as f32 * inv,
+                g as f32 * inv,
+                b as f32 * inv,
+                a as f32 * inv,
+            ],
+        }
+    }
 }
 
 /// CPU mirror of the WGSL `SplatU` block. Field order MUST match
@@ -293,6 +330,17 @@ struct MarkerResources {
     instance_buf: wgpu::Buffer,
 }
 
+/// GPU state for the Sprint-13 line pipeline (ADR-037 / Phase 5).
+/// `LineList` topology — each pair of consecutive vertices forms one
+/// segment. Shares `MarkerU::uniform_buf` (only consumes the
+/// `view_proj` prefix). Depth-test only; premul-alpha blend.
+struct LineResources {
+    pipeline: wgpu::RenderPipeline,
+    bind_group: wgpu::BindGroup,
+    /// Pre-allocated [`LINE_VERTEX_CAPACITY`] verts × 32 B = 160 KB.
+    vertex_buf: wgpu::Buffer,
+}
+
 struct SplatResources {
     // `_tex` fields keep the GPU texture alive; only the views are
     // bound. Dead-code allowance is removed in D5 (Sprint 9) once
@@ -329,6 +377,9 @@ pub struct RenderResources {
     /// install time; per-frame uploads write into the pre-allocated
     /// uniform + instance buffers.
     marker: MarkerResources,
+    /// Sprint-13 line pipeline + vertex buffer (ADR-037 / Phase 5).
+    /// Shares the marker's uniform buffer.
+    line: LineResources,
 }
 
 impl RenderResources {
@@ -771,6 +822,115 @@ fn install_marker_resources(device: &wgpu::Device) -> MarkerResources {
     }
 }
 
+/// Build the Sprint-13 line pipeline + bind group + vertex buffer
+/// (ADR-037 / Phase 5). Shares the marker uniform buffer for
+/// `view_proj` (the shader ignores the trailing `viewport_size` /
+/// `_pad` fields of `MarkerU`).
+fn install_line_resources(
+    device: &wgpu::Device,
+    marker_uniform_buf: &wgpu::Buffer,
+) -> LineResources {
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("lines.wgsl"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("lines.wgsl").into()),
+    });
+
+    let vertex_stride = std::mem::size_of::<LineVertex>() as u64;
+    let vertex_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("lines.vertices"),
+        size: vertex_stride * LINE_VERTEX_CAPACITY as u64,
+        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
+    let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("lines.bgl"),
+        entries: &[wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::VERTEX,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        }],
+    });
+
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("lines.bg"),
+        layout: &bgl,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: marker_uniform_buf.as_entire_binding(),
+        }],
+    });
+
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("lines.pl"),
+        bind_group_layouts: &[&bgl],
+        push_constant_ranges: &[],
+    });
+
+    let vertex_buffer_layout = wgpu::VertexBufferLayout {
+        array_stride: vertex_stride,
+        step_mode: wgpu::VertexStepMode::Vertex,
+        attributes: &[
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Float32x3,
+                offset: 0,
+                shader_location: 0,
+            },
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Float32x4,
+                offset: 16,
+                shader_location: 1,
+            },
+        ],
+    };
+
+    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("lines.pipeline"),
+        layout: Some(&pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_main"),
+            compilation_options: Default::default(),
+            buffers: &[vertex_buffer_layout],
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::LineList,
+            ..Default::default()
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: OFFSCREEN_DEPTH_FORMAT,
+            depth_write_enabled: false,
+            depth_compare: wgpu::CompareFunction::Less,
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        }),
+        multisample: wgpu::MultisampleState::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_main"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: OFFSCREEN_COLOR_FORMAT,
+                blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        multiview: None,
+        cache: None,
+    });
+
+    LineResources {
+        pipeline,
+        bind_group,
+        vertex_buf,
+    }
+}
+
 /// Install the pipeline, uniform buffer, splat resources, and a 1×1
 /// dummy heightmap. Called once from `App::new`.
 pub fn install(render_state: &egui_wgpu::RenderState) {
@@ -884,6 +1044,7 @@ pub fn install(render_state: &egui_wgpu::RenderState) {
     });
 
     let marker = install_marker_resources(device);
+    let line = install_line_resources(device, &marker.uniform_buf);
 
     render_state
         .renderer
@@ -900,6 +1061,7 @@ pub fn install(render_state: &egui_wgpu::RenderState) {
             splat,
             offscreen: None,
             marker,
+            line,
         });
 }
 
@@ -1462,9 +1624,13 @@ pub struct TerrainCallback {
     /// glyph into a frame-local `MarkerBatch`, then calling
     /// `sort_back_to_front(view)` + `into_instances()`.
     pub marker_instances: Vec<crate::ui::markers::MarkerInstanceGpu>,
-    /// Physical pixel size of the offscreen RT — drives the marker
-    /// shader's screen-space radius conversion.
+    /// Logical viewport size — drives the marker shader's
+    /// screen-space radius conversion (radius_px is in logical units).
     pub viewport_size: [f32; 2],
+    /// Sprint-13 / Phase 5 — interleaved `LineList` vertex pairs for
+    /// the line pipeline (symmetry axes + geo-vent plumes). Each pair
+    /// of consecutive verts forms one segment.
+    pub line_vertices: Vec<LineVertex>,
 }
 
 impl TerrainCallback {
@@ -1478,6 +1644,7 @@ impl TerrainCallback {
         splat: SplatUniforms,
         marker_instances: Vec<crate::ui::markers::MarkerInstanceGpu>,
         viewport_size: [f32; 2],
+        line_vertices: Vec<LineVertex>,
     ) -> Self {
         let aspect = (rect.width() / rect.height()).max(0.0001);
         Self {
@@ -1488,6 +1655,7 @@ impl TerrainCallback {
             splat,
             marker_instances,
             viewport_size,
+            line_vertices,
         }
     }
 }
@@ -1560,7 +1728,33 @@ impl egui_wgpu::CallbackTrait for TerrainCallback {
                 bytemuck::cast_slice(&self.marker_instances[..marker_count as usize]),
             );
         }
-        trace!(markers = marker_count, "TerrainCallback::prepare");
+
+        // Step 1c — line vertex upload (Sprint 13 / Phase 5). LineList
+        // topology: every consecutive pair is one segment. Cap at the
+        // pre-allocated capacity; the marker uniform buffer also
+        // backs the line pipeline (shared `view_proj`) so we don't
+        // need a separate uniform write.
+        let line_vert_count =
+            (self.line_vertices.len() as u32).min(LINE_VERTEX_CAPACITY);
+        if (self.line_vertices.len() as u32) > LINE_VERTEX_CAPACITY {
+            warn!(
+                requested = self.line_vertices.len(),
+                capacity = LINE_VERTEX_CAPACITY,
+                "line vertex buffer exceeded; tail dropped"
+            );
+        }
+        if line_vert_count > 0 {
+            queue.write_buffer(
+                &res.line.vertex_buf,
+                0,
+                bytemuck::cast_slice(&self.line_vertices[..line_vert_count as usize]),
+            );
+        }
+        trace!(
+            markers = marker_count,
+            line_verts = line_vert_count,
+            "TerrainCallback::prepare"
+        );
 
         // Step 2 — encode the offscreen pass.
         //
@@ -1606,6 +1800,17 @@ impl egui_wgpu::CallbackTrait for TerrainCallback {
         pass.set_bind_group(0, &res.bind_group, &[]);
         pass.set_index_buffer(grid.index_buf.slice(..), wgpu::IndexFormat::Uint32);
         pass.draw_indexed(0..grid.index_count, 0, 0..1);
+
+        // Line pipeline depth-tests against terrain but doesn't write
+        // depth. Drawn before markers so marker glyphs land on top of
+        // any line crossings at the same depth (e.g. a brush ring
+        // through a symmetry axis).
+        if line_vert_count > 0 {
+            pass.set_pipeline(&res.line.pipeline);
+            pass.set_bind_group(0, &res.line.bind_group, &[]);
+            pass.set_vertex_buffer(0, res.line.vertex_buf.slice(..));
+            pass.draw(0..line_vert_count, 0..1);
+        }
 
         // Marker pipeline depth-tests against terrain but doesn't write
         // depth (back-to-front sort owns translucent ordering). Skip

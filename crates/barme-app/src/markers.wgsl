@@ -112,6 +112,21 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
             if (in.uv.y + 1.732 * abs(in.uv.x) > 1.0) { discard; }
             return inst.color;
         }
+        case 4u: {
+            // Outline triangle — same outer shape as case 3u, with the
+            // inner ~75 %-scale triangle carved out so only the ring
+            // remains. Used for geo-vent mirror glyphs (Phase 5).
+            if (in.uv.y < -0.5) { discard; }
+            if (in.uv.y + 1.732 * abs(in.uv.x) > 1.0) { discard; }
+            // Inner inverse test: scale uv by 1/0.75 = 1.333 and check
+            // the same inside-triangle constraints. Inside-inner →
+            // discard so only the outer ring keeps a fragment.
+            let inner = in.uv / 0.75;
+            if (inner.y >= -0.5 && inner.y + 1.732 * abs(inner.x) <= 1.0) {
+                discard;
+            }
+            return inst.color;
+        }
         default: {
             // Unknown shape — emit nothing rather than render garbage.
             discard;

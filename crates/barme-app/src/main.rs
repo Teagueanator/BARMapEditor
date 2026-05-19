@@ -6663,9 +6663,9 @@ impl App {
                 }
             }
 
-            // Geo-vent primary triangles. Plumes + mirror outlines
-            // stay in egui::Painter until Phase 5 migrates them to
-            // the line pipeline.
+            // Geo-vent primary triangles + mirror outline triangles
+            // (Phase 5 / OutlineTriangle marker). Plumes flow through
+            // the line pipeline (`line_vertices` below).
             if !self.geo_vents.is_empty() {
                 let cross_tool_ghost = !matches!(self.tool, Tool::GeoFeatures);
                 let alpha_mul: u8 = if cross_tool_ghost { 128 } else { 255 };
@@ -6682,6 +6682,64 @@ impl App {
                         color: orange,
                         shape: crate::ui::markers::MarkerShape::Triangle,
                     });
+                    if !matches!(self.symmetry, SymmetryAxis::None) {
+                        let mirrors = self.symmetry.replicate(
+                            (vent.x_elmo as f32, vent.z_elmo as f32),
+                            extents,
+                        );
+                        for (mx, mz) in mirrors.into_iter().skip(1) {
+                            if mx < 0.0 || mx > extents.0 || mz < 0.0 || mz > extents.1 {
+                                continue;
+                            }
+                            marker_batch.push(crate::ui::markers::Marker {
+                                world_pos: glam::Vec3::new(mx, 0.0, mz),
+                                radius_px: 7.0,
+                                color: orange,
+                                shape: crate::ui::markers::MarkerShape::OutlineTriangle,
+                            });
+                        }
+                    }
+                }
+            }
+
+            // Sprint 13 / Phase 5 — build the world-space line vertex
+            // buffer: symmetry axes (dashed) + geo-vent plumes
+            // (solid). LineList topology: every consecutive pair is
+            // one segment.
+            let mut line_vertices: Vec<crate::render::LineVertex> = Vec::new();
+            crate::ui::overlay::collect_symmetry_segments(
+                &mut line_vertices,
+                glam::Vec2::new(rect.width(), rect.height()),
+                &self.camera,
+                self.symmetry,
+                extents,
+            );
+            // Geo-vent plumes — vertical 64-elmo line above each vent.
+            // Constant world-space height (not pixel-based) means the
+            // plume scales with zoom like the terrain it sits on,
+            // matching the rest of the 3D content.
+            if !self.geo_vents.is_empty() {
+                const PLUME_HEIGHT_ELMOS: f32 = 64.0;
+                let cross_tool_ghost = !matches!(self.tool, Tool::GeoFeatures);
+                let alpha_mul: u8 = if cross_tool_ghost { 128 } else { 255 };
+                let plume_color = egui::Color32::from_rgba_unmultiplied(
+                    0xF5,
+                    0x9E,
+                    0x0B,
+                    alpha_mul / 3,
+                );
+                let lift = crate::ui::markers::MARKER_Y_LIFT_ELMOS;
+                for vent in &self.geo_vents {
+                    let base = glam::Vec3::new(
+                        vent.x_elmo as f32,
+                        lift,
+                        vent.z_elmo as f32,
+                    );
+                    let top = base + glam::Vec3::new(0.0, PLUME_HEIGHT_ELMOS, 0.0);
+                    line_vertices
+                        .push(crate::render::LineVertex::new(base, plume_color));
+                    line_vertices
+                        .push(crate::render::LineVertex::new(top, plume_color));
                 }
             }
 
@@ -6726,6 +6784,7 @@ impl App {
                     splat_u,
                     instances,
                     viewport_size,
+                    line_vertices,
                 );
                 ui.painter()
                     .add(egui_wgpu::Callback::new_paint_callback(rect, cb));
@@ -6752,16 +6811,11 @@ impl App {
             }
 
             // ----------------------------------------------------------
-            // PHASE C: 2D residue (symmetry overlay → Phase 5)
+            // PHASE C: 2D residue — text labels + viewport chrome.
+            // Symmetry axes now flow through the line pipeline (Phase
+            // 5); geo plumes + geo mirror outlines do too.
             // ----------------------------------------------------------
             let overlay_painter = ui.painter_at(rect);
-            crate::ui::overlay::paint_symmetry_overlay(
-                &overlay_painter,
-                rect,
-                &self.camera,
-                self.symmetry,
-                extents,
-            );
 
             // Overlay start-position markers on top of the terrain
             // pass. ADR-032: cross-tool ghost falloff (50 % alpha) when
@@ -6849,73 +6903,6 @@ impl App {
             // C5 (Sprint 11): geo-vent markers. Orange triangle with
             // a faint upward gradient (steam-plume hint). Cross-tool
             // ghost falloff identical to metal.
-            // Geo-vent PLUMES + MIRROR outline triangles. The primary
-            // triangle fill batches through PHASE A; this loop only
-            // emits the upward steam-plume line and the outline-only
-            // mirror triangles (Phase 5 moves both to the GPU line
-            // pipeline so they depth-test against terrain too).
-            if !self.geo_vents.is_empty() {
-                let rect_size = glam::Vec2::new(rect.width(), rect.height());
-                let cross_tool_ghost = !matches!(self.tool, Tool::GeoFeatures);
-                let alpha_mul: u8 = if cross_tool_ghost { 128 } else { 255 };
-                let orange =
-                    egui::Color32::from_rgba_unmultiplied(0xF5, 0x9E, 0x0B, alpha_mul);
-                let orange_ghost = egui::Color32::from_rgba_unmultiplied(
-                    0xF5,
-                    0x9E,
-                    0x0B,
-                    alpha_mul / 3,
-                );
-                for (i, vent) in self.geo_vents.iter().enumerate() {
-                    let world =
-                        glam::Vec3::new(vent.x_elmo as f32, 0.0, vent.z_elmo as f32);
-                    let Some(screen) =
-                        render::world_to_screen(world, rect_size, &self.camera)
-                    else {
-                        continue;
-                    };
-                    let p = egui::Pos2::new(rect.min.x + screen.x, rect.min.y + screen.y);
-                    let dragging = self.dragging_geo_vent == Some(i);
-                    let size = if dragging { 12.0_f32 } else { 9.0_f32 };
-                    // Steam-plume hint above the primary glyph.
-                    let plume_top = p + egui::Vec2::new(0.0, -size - 8.0);
-                    overlay_painter.line_segment(
-                        [p + egui::Vec2::new(0.0, -size), plume_top],
-                        egui::Stroke::new(1.2, orange_ghost),
-                    );
-                    // Outline mirrors.
-                    if !matches!(self.symmetry, SymmetryAxis::None) {
-                        let mirrors = self.symmetry.replicate(
-                            (vent.x_elmo as f32, vent.z_elmo as f32),
-                            extents,
-                        );
-                        for (mx, mz) in mirrors.into_iter().skip(1) {
-                            if mx < 0.0 || mx > extents.0 || mz < 0.0 || mz > extents.1 {
-                                continue;
-                            }
-                            let mw = glam::Vec3::new(mx, 0.0, mz);
-                            let Some(ms) =
-                                render::world_to_screen(mw, rect_size, &self.camera)
-                            else {
-                                continue;
-                            };
-                            let mp =
-                                egui::Pos2::new(rect.min.x + ms.x, rect.min.y + ms.y);
-                            let tri = [
-                                mp + egui::Vec2::new(0.0, -7.0),
-                                mp + egui::Vec2::new(-6.0, 5.0),
-                                mp + egui::Vec2::new(6.0, 5.0),
-                            ];
-                            overlay_painter.add(egui::Shape::convex_polygon(
-                                tri.to_vec(),
-                                egui::Color32::TRANSPARENT,
-                                egui::Stroke::new(1.2, orange),
-                            ));
-                        }
-                    }
-                }
-            }
-
             // ADR-035 viewport chrome (replaces XYZ nav gizmo):
             // 1. elmo rulers (bottom + left edges)
             // 2. mini-map (top-right)
