@@ -1,31 +1,123 @@
-//! Stage 1 terrain renderer (ADR-017). Heightmap lives on the GPU as an
-//! `r16uint` texture; the vertex shader samples it for Y displacement so
-//! brush edits are texture writes, not full-mesh rebuilds.
+//! Stage 1 terrain renderer (ADR-017 vertex; ADR-036 fragment).
 //!
-//! See ADR-008 for coords (Y-up, left-handed, 8 elmos per heightmap pixel).
-//! Persistent GPU state (pipeline + bind group + grid + heightmap texture)
-//! lives inside `egui_wgpu::CallbackResources` as [`RenderResources`]; the
-//! per-frame [`TerrainCallback`] only carries camera matrix + max_height.
+//! Heightmap lives on the GPU as an `r16uint` texture; the vertex shader
+//! samples it for Y displacement so brush edits are texture writes, not
+//! full-mesh rebuilds. A 4-tap finite difference of neighbouring heights
+//! produces a per-vertex world-space normal used by the fragment stage
+//! for Lambert lighting.
+//!
+//! The fragment stage composites four diffuse layers from a
+//! `texture_2d_array` by the `splatCofac` weight (per FINDINGS §7.3),
+//! falling back to a heightmap-driven biome gradient when no slot is
+//! painted — see `crates/barme-app/src/terrain.wgsl` for the math and
+//! ADR-036 for the rationale.
+//!
+//! See ADR-008 for coords (Y-up, left-handed, 8 elmos per heightmap
+//! pixel). Persistent GPU state (pipeline + bind group + grid + textures)
+//! lives inside `egui_wgpu::CallbackResources` as [`RenderResources`];
+//! the per-frame [`TerrainCallback`] only carries camera matrix +
+//! lighting tunables.
 
-use barme_core::{DirtyRect, Heightmap};
+use barme_core::{DirtyRect, Heightmap, SPLAT_DIM, SplatDistribution};
 use bytemuck::{Pod, Zeroable};
 use eframe::egui_wgpu;
 use eframe::wgpu;
 use glam::{Mat4, Vec3};
-use tracing::{info, warn};
+use tracing::{info, trace, warn};
 use wgpu::util::DeviceExt;
 
 /// 8 elmos per heightmap pixel — `MapSize::ELMOS_PER_SMU / HEIGHTMAP_PER_SMU`.
 pub const ELMOS_PER_PIXEL: f32 = 8.0;
 
 const HEIGHTMAP_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R16Uint;
+const SPLAT_DISTR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+const SLOT_DIFFUSE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+
+/// Pixel side of one layer of the slot diffuse texture array. The
+/// starter pack (ADR-025) ships ambientCG `_1K-PNG.zip` at 1024², so
+/// the happy path matches without resizing. Per FINDINGS H2 the
+/// upload path falls back to `image::imageops::resize` when an
+/// imported slot's PNG is a different size.
+pub const SLOT_DIFFUSE_DIM: u32 = 1024;
+
+/// Fixed-size array bound to the fragment shader. Each layer is one
+/// slot's diffuse. The shader only samples layers whose bit is set in
+/// `SplatU::flags.x` (the active-slot mask).
+pub const SLOT_LAYER_COUNT: u32 = 4;
 
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
 struct Uniforms {
     view_proj: [[f32; 4]; 4],
-    /// [max_height, elmos_per_pixel, _, _]
+    /// `[max_height, elmos_per_pixel, world_extent_x, world_extent_z]`.
+    /// The world extents drive the splat-distribution UV math in the
+    /// fragment stage (`uv = world_pos.xz / extent`).
     params: [f32; 4],
+}
+
+/// CPU mirror of the WGSL `SplatU` block. Field order MUST match
+/// `terrain.wgsl::SplatU` exactly (`bytemuck::Pod` enforces no padding
+/// gymnastics, but order is on us).
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+pub struct SplatUniforms {
+    pub tex_scales: [f32; 4],
+    pub tex_mults: [f32; 4],
+    /// `[active_slot_mask, diffuse_in_alpha, _, _]`. The mask bit `i`
+    /// is set when channel `i` is bound to a slot (mirrors
+    /// `Project.splat_config.channels[i].is_some()` from D5).
+    /// `diffuse_in_alpha` plumbs ADR-034's high-pass workflow toggle
+    /// through the uniform buffer; the shader treats it as a no-op
+    /// this sprint.
+    pub flags: [u32; 4],
+    /// World-space to-sun direction. `.w` unused.
+    pub sun_dir: [f32; 4],
+    /// Pre-dimmed by `SMF_INTENSITY_MULT = 210/255` CPU-side (FINDINGS
+    /// §7.1) so the WGSL stays clean. `.w` unused.
+    pub ground_ambient: [f32; 4],
+    pub ground_diffuse: [f32; 4],
+}
+
+impl Default for SplatUniforms {
+    fn default() -> Self {
+        // Defaults match `splats.texScales = vec4(0.02)` and `splats.
+        // texMults = vec4(1.0)` from MapInfo.cpp::ReadSplats. ADR-025
+        // baseline: no diffuse-in-alpha, no slots bound (mask = 0 →
+        // fallback gradient shows for fresh projects).
+        Self {
+            tex_scales: [0.02; 4],
+            tex_mults: [1.0; 4],
+            flags: [0, 0, 0, 0],
+            sun_dir: default_sun_dir(),
+            ground_ambient: default_ground_ambient(),
+            ground_diffuse: default_ground_diffuse(),
+        }
+    }
+}
+
+/// `lighting.sunDir` BAR-default normalized. Matches
+/// `MapInfo::bar_default()` (FINDINGS §1.4 / pitfall #18 — W = 1.0).
+/// The shader only consumes `.xyz`.
+fn default_sun_dir() -> [f32; 4] {
+    let v = glam::Vec3::new(0.5, 0.7, 0.5).normalize_or_zero();
+    [v.x, v.y, v.z, 1.0]
+}
+
+/// `lighting.groundAmbientColor = (0.5, 0.5, 0.5)` × `SMF_INTENSITY_MULT
+/// = 210/255` per FINDINGS §7.1. Pre-applied CPU-side so the WGSL
+/// stays clean.
+fn default_ground_ambient() -> [f32; 4] {
+    let m = 210.0 / 255.0;
+    [0.5 * m, 0.5 * m, 0.5 * m, 0.0]
+}
+
+/// `lighting.groundDiffuseColor = (0.5, 0.5, 0.5)` × the same intensity
+/// dim. The full Recoil shading is `(diffuseCol + detailCol) *
+/// (ambient + diffuse * NdotL * shadow)`; the preview omits shadow
+/// and replaces the diffuse texture with the splat composite.
+fn default_ground_diffuse() -> [f32; 4] {
+    let m = 210.0 / 255.0;
+    [0.5 * m, 0.5 * m, 0.5 * m, 0.0]
 }
 
 struct Grid {
@@ -41,6 +133,22 @@ struct HeightmapTex {
     dims: (u32, u32),
 }
 
+struct SplatResources {
+    // `_tex` fields keep the GPU texture alive; only the views are
+    // bound. Dead-code allowance is removed in D5 (Sprint 9) once
+    // `upload_*` helpers wire them.
+    #[allow(dead_code)]
+    distr_tex: wgpu::Texture,
+    distr_view: wgpu::TextureView,
+    distr_dims: (u32, u32),
+    distr_samp: wgpu::Sampler,
+    #[allow(dead_code)]
+    slot_array_tex: wgpu::Texture,
+    slot_array_view: wgpu::TextureView,
+    slot_array_samp: wgpu::Sampler,
+    uniform_buf: wgpu::Buffer,
+}
+
 pub struct RenderResources {
     pipeline: wgpu::RenderPipeline,
     bind_group_layout: wgpu::BindGroupLayout,
@@ -52,11 +160,16 @@ pub struct RenderResources {
     _dummy_tex: wgpu::Texture,
     grid: Option<Grid>,
     heightmap: Option<HeightmapTex>,
+    splat: SplatResources,
 }
 
 impl RenderResources {
     fn write_uniforms(&self, queue: &wgpu::Queue, u: &Uniforms) {
         queue.write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(u));
+    }
+
+    fn write_splat_uniforms(&self, queue: &wgpu::Queue, su: &SplatUniforms) {
+        queue.write_buffer(&self.splat.uniform_buf, 0, bytemuck::bytes_of(su));
     }
 
     fn rebind(&mut self, device: &wgpu::Device) {
@@ -66,20 +179,13 @@ impl RenderResources {
             // long-lived dummy view too. See `install()` for setup.
             unreachable!("rebind called with no heightmap and no dummy view")
         });
-        self.bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("terrain.bg"),
-            layout: &self.bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: self.uniform_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(view),
-                },
-            ],
-        });
+        self.bind_group = make_bind_group(
+            device,
+            &self.bind_group_layout,
+            &self.uniform_buf,
+            view,
+            &self.splat,
+        );
     }
 }
 
@@ -111,8 +217,269 @@ fn build_index_buffer(device: &wgpu::Device, dims: (u32, u32)) -> Grid {
     }
 }
 
-/// Install the pipeline, uniform buffer, and a 1×1 dummy heightmap. Called
-/// once from `App::new`.
+fn bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("terrain.bgl"),
+        entries: &[
+            // 0: terrain uniforms (view-proj + params)
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            // 1: heightmap (vertex only — fragment derives normal from
+            // varyings, not from this texture)
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Uint,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            // 2: splat uniforms
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            // 3: splat distribution (rgba8unorm, filterable)
+            wgpu::BindGroupLayoutEntry {
+                binding: 3,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            // 4: splat distribution sampler (clamp)
+            wgpu::BindGroupLayoutEntry {
+                binding: 4,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+            // 5: slot diffuse texture array (4 layers)
+            wgpu::BindGroupLayoutEntry {
+                binding: 5,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2Array,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            // 6: slot diffuse sampler (repeat — tiles across the map)
+            wgpu::BindGroupLayoutEntry {
+                binding: 6,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+        ],
+    })
+}
+
+fn make_bind_group(
+    device: &wgpu::Device,
+    bgl: &wgpu::BindGroupLayout,
+    uniform_buf: &wgpu::Buffer,
+    heightmap_view: &wgpu::TextureView,
+    splat: &SplatResources,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("terrain.bg"),
+        layout: bgl,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: uniform_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(heightmap_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: splat.uniform_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::TextureView(&splat.distr_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: wgpu::BindingResource::Sampler(&splat.distr_samp),
+            },
+            wgpu::BindGroupEntry {
+                binding: 5,
+                resource: wgpu::BindingResource::TextureView(&splat.slot_array_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 6,
+                resource: wgpu::BindingResource::Sampler(&splat.slot_array_samp),
+            },
+        ],
+    })
+}
+
+fn install_splat_resources(device: &wgpu::Device, queue: &wgpu::Queue) -> SplatResources {
+    // Distribution: SPLAT_DIM² rgba8 zeros. ADR-036 — fragment shader
+    // multiplies the sample by `tex_mults * active_slot_mask`, so all-
+    // zero distribution + zero mask = fallback gradient shows.
+    let distr_tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("terrain.splat.distr"),
+        size: wgpu::Extent3d {
+            width: SPLAT_DIM,
+            height: SPLAT_DIM,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: SPLAT_DISTR_FORMAT,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let distr_view = distr_tex.create_view(&wgpu::TextureViewDescriptor::default());
+    let zero_row = vec![0u8; (SPLAT_DIM as usize) * 4];
+    // Cheaper than allocating SPLAT_DIM² zeros up front: write row-by-row.
+    for y in 0..SPLAT_DIM {
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &distr_tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d { x: 0, y, z: 0 },
+                aspect: wgpu::TextureAspect::All,
+            },
+            &zero_row,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(SPLAT_DIM * 4),
+                rows_per_image: Some(1),
+            },
+            wgpu::Extent3d {
+                width: SPLAT_DIM,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+
+    let distr_samp = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("terrain.splat.distr.sampler"),
+        address_mode_u: wgpu::AddressMode::ClampToEdge,
+        address_mode_v: wgpu::AddressMode::ClampToEdge,
+        address_mode_w: wgpu::AddressMode::ClampToEdge,
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        mipmap_filter: wgpu::FilterMode::Nearest,
+        ..Default::default()
+    });
+
+    // Slot diffuse texture array. Allocated at SLOT_DIFFUSE_DIM² × 4
+    // layers, all initialised to a neutral grey so an unbound layer
+    // doesn't render garbage if the user pokes the active mask
+    // manually.
+    let slot_array_tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("terrain.splat.slot_array"),
+        size: wgpu::Extent3d {
+            width: SLOT_DIFFUSE_DIM,
+            height: SLOT_DIFFUSE_DIM,
+            depth_or_array_layers: SLOT_LAYER_COUNT,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: SLOT_DIFFUSE_FORMAT,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let slot_array_view = slot_array_tex.create_view(&wgpu::TextureViewDescriptor {
+        label: Some("terrain.splat.slot_array.view"),
+        dimension: Some(wgpu::TextureViewDimension::D2Array),
+        ..Default::default()
+    });
+    let grey_layer: Vec<u8> =
+        vec![0x80; (SLOT_DIFFUSE_DIM as usize) * (SLOT_DIFFUSE_DIM as usize) * 4];
+    for layer in 0..SLOT_LAYER_COUNT {
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &slot_array_tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: 0,
+                    y: 0,
+                    z: layer,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            &grey_layer,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(SLOT_DIFFUSE_DIM * 4),
+                rows_per_image: Some(SLOT_DIFFUSE_DIM),
+            },
+            wgpu::Extent3d {
+                width: SLOT_DIFFUSE_DIM,
+                height: SLOT_DIFFUSE_DIM,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+
+    let slot_array_samp = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("terrain.splat.slot_array.sampler"),
+        address_mode_u: wgpu::AddressMode::Repeat,
+        address_mode_v: wgpu::AddressMode::Repeat,
+        address_mode_w: wgpu::AddressMode::Repeat,
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        mipmap_filter: wgpu::FilterMode::Nearest,
+        ..Default::default()
+    });
+
+    let uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("terrain.splat.uniforms"),
+        size: std::mem::size_of::<SplatUniforms>() as u64,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    queue.write_buffer(
+        &uniform_buf,
+        0,
+        bytemuck::bytes_of(&SplatUniforms::default()),
+    );
+
+    SplatResources {
+        distr_tex,
+        distr_view,
+        distr_dims: (SPLAT_DIM, SPLAT_DIM),
+        distr_samp,
+        slot_array_tex,
+        slot_array_view,
+        slot_array_samp,
+        uniform_buf,
+    }
+}
+
+/// Install the pipeline, uniform buffer, splat resources, and a 1×1
+/// dummy heightmap. Called once from `App::new`.
 pub fn install(render_state: &egui_wgpu::RenderState) {
     let device = &render_state.device;
     let queue = &render_state.queue;
@@ -129,31 +496,7 @@ pub fn install(render_state: &egui_wgpu::RenderState) {
         mapped_at_creation: false,
     });
 
-    let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("terrain.bgl"),
-        entries: &[
-            wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            },
-            wgpu::BindGroupLayoutEntry {
-                binding: 1,
-                visibility: wgpu::ShaderStages::VERTEX,
-                ty: wgpu::BindingType::Texture {
-                    sample_type: wgpu::TextureSampleType::Uint,
-                    view_dimension: wgpu::TextureViewDimension::D2,
-                    multisampled: false,
-                },
-                count: None,
-            },
-        ],
-    });
+    let bgl = bind_group_layout(device);
 
     // Dummy 1×1 r16uint texture so the bind group is always valid even
     // before a real heightmap loads. Uploaded with a single 0 sample.
@@ -192,20 +535,8 @@ pub fn install(render_state: &egui_wgpu::RenderState) {
     );
     let dummy_view = dummy_tex.create_view(&wgpu::TextureViewDescriptor::default());
 
-    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("terrain.bg"),
-        layout: &bgl,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: uniform_buf.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: wgpu::BindingResource::TextureView(&dummy_view),
-            },
-        ],
-    });
+    let splat = install_splat_resources(device, queue);
+    let bind_group = make_bind_group(device, &bgl, &uniform_buf, &dummy_view, &splat);
 
     let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("terrain.pl"),
@@ -258,6 +589,7 @@ pub fn install(render_state: &egui_wgpu::RenderState) {
             _dummy_tex: dummy_tex,
             grid: None,
             heightmap: None,
+            splat,
         });
 }
 
@@ -504,17 +836,211 @@ pub fn write_heightmap_rect(
     );
 }
 
+/// Replace the GPU splat distribution texture wholesale. Called on
+/// project open / new / wizard-apply where the entire distribution
+/// changes at once; brush strokes go through [`write_splat_rect`]
+/// instead.
+#[allow(dead_code)] // D5 wires this from `Project.splat_distribution`.
+pub fn upload_splat_distribution(render_state: &egui_wgpu::RenderState, dist: &SplatDistribution) {
+    let renderer = render_state.renderer.read();
+    let Some(res) = renderer.callback_resources.get::<RenderResources>() else {
+        warn!("upload_splat_distribution: no RenderResources");
+        return;
+    };
+    let (w, h) = res.splat.distr_dims;
+    if (dist.width, dist.height) != (w, h) {
+        // SPLAT_DIM is a compile-time constant on the core side; if a
+        // future change widens it, we'd need to reallocate the GPU
+        // texture. Loud failure beats silent stretching.
+        warn!(
+            tex_dims = ?(w, h),
+            cpu_dims = ?(dist.width, dist.height),
+            "upload_splat_distribution: dim mismatch; update dropped"
+        );
+        return;
+    }
+    let queue = &render_state.queue;
+    let bytes: &[u8] = bytemuck::cast_slice(&dist.rgba);
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &res.splat.distr_tex,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        bytes,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(w * 4),
+            rows_per_image: Some(h),
+        },
+        wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        },
+    );
+    trace!(
+        width = w,
+        height = h,
+        "upload_splat_distribution: full write"
+    );
+}
+
+/// Sub-upload a dirty rect of the splat distribution. Mirrors
+/// [`write_heightmap_rect`] (ADR-017 / D4 ADR-036): the caller hands
+/// the full RGBA8 array + dims so we can compute the byte offset
+/// without copying.
+#[allow(dead_code)] // D5 wires this from the brush-stroke dispatch.
+pub fn write_splat_rect(
+    render_state: &egui_wgpu::RenderState,
+    full_dims: (u32, u32),
+    full_data: &[[u8; 4]],
+    rect: DirtyRect,
+) {
+    if rect.w == 0 || rect.h == 0 {
+        return;
+    }
+    let renderer = render_state.renderer.read();
+    let Some(res) = renderer.callback_resources.get::<RenderResources>() else {
+        warn!("write_splat_rect: no RenderResources");
+        return;
+    };
+    if res.splat.distr_dims != full_dims {
+        warn!(
+            tex_dims = ?res.splat.distr_dims,
+            caller_dims = ?full_dims,
+            "write_splat_rect: dim mismatch with GPU texture; update dropped"
+        );
+        return;
+    }
+    let queue = &render_state.queue;
+    let bytes: &[u8] = bytemuck::cast_slice(full_data);
+    let row_stride = (full_dims.0 as usize) * 4;
+    let start = (rect.y as usize) * row_stride + (rect.x as usize) * 4;
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &res.splat.distr_tex,
+            mip_level: 0,
+            origin: wgpu::Origin3d {
+                x: rect.x,
+                y: rect.y,
+                z: 0,
+            },
+            aspect: wgpu::TextureAspect::All,
+        },
+        &bytes[start..],
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(full_dims.0 * 4),
+            rows_per_image: Some(rect.h),
+        },
+        wgpu::Extent3d {
+            width: rect.w,
+            height: rect.h,
+            depth_or_array_layers: 1,
+        },
+    );
+    trace!(
+        x = rect.x,
+        y = rect.y,
+        w = rect.w,
+        h = rect.h,
+        bytes = (rect.w as u64) * (rect.h as u64) * 4,
+        "write_splat_rect"
+    );
+}
+
+/// Copy one slot's diffuse image into layer `layer` of the slot
+/// diffuse array. The source `rgba` slice is treated as
+/// `SLOT_DIFFUSE_DIM × SLOT_DIFFUSE_DIM` `Rgba<u8>` pixels — callers
+/// (D5's inspector) resize incoming PNGs to that fixed dim before
+/// invoking. Logs at `info!` per the tracing convention.
+#[allow(dead_code)] // D5 wires this from the inspector's slot picker.
+pub fn upload_diffuse_layer(render_state: &egui_wgpu::RenderState, layer: u32, rgba: &[u8]) {
+    if layer >= SLOT_LAYER_COUNT {
+        warn!(layer, "upload_diffuse_layer: layer out of range");
+        return;
+    }
+    let expected = (SLOT_DIFFUSE_DIM as usize) * (SLOT_DIFFUSE_DIM as usize) * 4;
+    if rgba.len() != expected {
+        warn!(
+            got = rgba.len(),
+            expected, "upload_diffuse_layer: byte length mismatch; resize before calling"
+        );
+        return;
+    }
+    let renderer = render_state.renderer.read();
+    let Some(res) = renderer.callback_resources.get::<RenderResources>() else {
+        warn!("upload_diffuse_layer: no RenderResources");
+        return;
+    };
+    let queue = &render_state.queue;
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &res.splat.slot_array_tex,
+            mip_level: 0,
+            origin: wgpu::Origin3d {
+                x: 0,
+                y: 0,
+                z: layer,
+            },
+            aspect: wgpu::TextureAspect::All,
+        },
+        rgba,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(SLOT_DIFFUSE_DIM * 4),
+            rows_per_image: Some(SLOT_DIFFUSE_DIM),
+        },
+        wgpu::Extent3d {
+            width: SLOT_DIFFUSE_DIM,
+            height: SLOT_DIFFUSE_DIM,
+            depth_or_array_layers: 1,
+        },
+    );
+    info!(layer, "upload_diffuse_layer: slot diffuse written");
+}
+
+/// Push the latest splat uniforms (active mask, scales, mults,
+/// diffuse-in-alpha flag) to the GPU. The TerrainCallback also
+/// writes these every frame via `prepare`, so this helper is only
+/// used when state changes outside the render loop (e.g. an inspector
+/// edit that needs to take effect before the next callback fires).
+#[allow(dead_code)] // D5 may call this; the callback path covers per-frame.
+pub fn update_splat_uniforms(render_state: &egui_wgpu::RenderState, su: &SplatUniforms) {
+    let renderer = render_state.renderer.read();
+    let Some(res) = renderer.callback_resources.get::<RenderResources>() else {
+        warn!("update_splat_uniforms: no RenderResources");
+        return;
+    };
+    res.write_splat_uniforms(&render_state.queue, su);
+}
+
 pub struct TerrainCallback {
     pub view_proj: [[f32; 4]; 4],
     pub max_height: f32,
+    pub world_extent_x: f32,
+    pub world_extent_z: f32,
+    pub splat: SplatUniforms,
 }
 
 impl TerrainCallback {
-    pub fn new(camera: &OrbitCamera, rect: egui::Rect, max_height: f32) -> Self {
+    pub fn new(
+        camera: &OrbitCamera,
+        rect: egui::Rect,
+        max_height: f32,
+        world_extent_x: f32,
+        world_extent_z: f32,
+        splat: SplatUniforms,
+    ) -> Self {
         let aspect = (rect.width() / rect.height()).max(0.0001);
         Self {
             view_proj: camera.view_proj_matrix(aspect).to_cols_array_2d(),
             max_height,
+            world_extent_x,
+            world_extent_z,
+            splat,
         }
     }
 }
@@ -533,9 +1059,15 @@ impl egui_wgpu::CallbackTrait for TerrainCallback {
                 queue,
                 &Uniforms {
                     view_proj: self.view_proj,
-                    params: [self.max_height.max(1.0), ELMOS_PER_PIXEL, 0.0, 0.0],
+                    params: [
+                        self.max_height.max(1.0),
+                        ELMOS_PER_PIXEL,
+                        self.world_extent_x.max(1.0),
+                        self.world_extent_z.max(1.0),
+                    ],
                 },
             );
+            res.write_splat_uniforms(queue, &self.splat);
         }
         Vec::new()
     }
@@ -603,5 +1135,52 @@ mod tests {
         let cy = rect.y * 0.5;
         assert!((screen.x - cx).abs() < 50.0, "screen.x = {}", screen.x);
         assert!((screen.y - cy).abs() < 50.0, "screen.y = {}", screen.y);
+    }
+
+    #[test]
+    fn default_splat_uniforms_match_engine_defaults() {
+        // FINDINGS §1.6 — splats default tex_scales=0.02, tex_mults=1.0.
+        let su = SplatUniforms::default();
+        assert_eq!(su.tex_scales, [0.02; 4]);
+        assert_eq!(su.tex_mults, [1.0; 4]);
+        // No slot bound on a fresh project → shader falls back to the
+        // biome gradient.
+        assert_eq!(su.flags[0], 0);
+        // ADR-034 reserved — placeholder default is off.
+        assert_eq!(su.flags[1], 0);
+    }
+
+    #[test]
+    fn default_ground_ambient_pre_dimmed_by_intensity_mult() {
+        // FINDINGS §7.1 — `SMF_INTENSITY_MULT = 210/255` is applied
+        // CPU-side. Verify the default ambient is the dimmed 0.5 grey.
+        let su = SplatUniforms::default();
+        let expected = 0.5 * (210.0 / 255.0);
+        for c in &su.ground_ambient[..3] {
+            assert!((c - expected).abs() < 1e-6, "got {c}, expected {expected}");
+        }
+    }
+
+    #[test]
+    fn default_sun_dir_w_is_one() {
+        // FINDINGS §1.4 / pitfall #18 — sunDir.w defaults to 1.0, NOT
+        // 1e9. The shader doesn't consume `.w` but pinning the constant
+        // here catches a future regression in `default_sun_dir`.
+        let su = SplatUniforms::default();
+        assert!((su.sun_dir[3] - 1.0).abs() < 1e-6);
+        // Direction itself should be normalized.
+        let m = (su.sun_dir[0].powi(2) + su.sun_dir[1].powi(2) + su.sun_dir[2].powi(2)).sqrt();
+        assert!(
+            (m - 1.0).abs() < 1e-6,
+            "sun_dir.xyz not normalized: |m| = {m}"
+        );
+    }
+
+    #[test]
+    fn slot_layer_count_matches_splat_channel_count() {
+        // The texture array is sized to SLOT_LAYER_COUNT = 4 because
+        // the splat distribution is RGBA (4 channels). A future
+        // mismatch is a load-bearing bug — D5 indexes by channel.
+        assert_eq!(SLOT_LAYER_COUNT, 4);
     }
 }

@@ -2507,6 +2507,160 @@ tools/textures/
 
 ## Template for new entries
 
+## ADR-036 — Terrain fragment shader: splat-blended diffuse composite (Sprint 9 / D4)
+
+**Status:** Accepted 2026-05-18 — superseded the draft research note at
+`docs/research/splat-rendering/claude findings.md` (drafted as
+"ADR-035" before the UI overhaul claimed that slot).
+
+**Context.** The Stage 1 fragment shader at
+`crates/barme-app/src/terrain.wgsl` previously rendered a height-only
+biome gradient (ADR-017). Sprint 8 (D2 + D3) landed the DNTS bake
+pipeline + `SplatDistribution` brushes; Sprint 9's D4 wires those into
+the GPU preview so users see the painted slot diffuse instead of the
+fallback gradient. The Recoil engine source is the authority, sampled
+through `RecoilEngine/cont/base/springcontent/shaders/GLSL/SMFFragProg.glsl`
+(SMF_DETAIL_NORMAL_TEXTURE_SPLATTING branch) — but the editor's
+preview budget is bounded by the 8 ms brush-stroke NFR and there is
+no baked SMT normal texture at edit time, so we adopt a **diffuse-
+only** simplification of the engine composite.
+
+**Decision — composite math.** Mirror the engine's `GetSplatDetailTexture
+Normal` shape (SMFFragProg.glsl:174-198) per FINDINGS §7.3:
+
+```
+splatCofac = textureSample(splatDistr, uv_norm) * texMults * active_mask
+detail_strength = min(1.0, dot(splatCofac, vec4(1.0)))
+splat_rgb =
+      textureSample(slot_diffuse, world.xz * tex_scales.r, 0).rgb * splatCofac.r
+    + textureSample(slot_diffuse, world.xz * tex_scales.g, 1).rgb * splatCofac.g
+    + textureSample(slot_diffuse, world.xz * tex_scales.b, 2).rgb * splatCofac.b
+    + textureSample(slot_diffuse, world.xz * tex_scales.a, 3).rgb * splatCofac.a
+base_rgb = mix(biome_gradient(world.y / max_h), splat_rgb, detail_strength)
+lit = base_rgb * (ground_ambient + ground_diffuse * max(dot(n, sun), 0))
+```
+
+Key fidelity preserved:
+- Per-channel UV stream `worldPos.xz * splatTexScales[i]` (SMFFragProg
+  lines 175-176). NOT a divide.
+- `splatCofac = dist * texMults` applied to the **whole vec4** (not
+  per-RGB).
+- Saturating weight sum `min(1.0, dot(splatCofac, vec4(1.0)))` mirrors
+  `splatDetailStrength.x` (SMFFragProg:180).
+- `splats.texScales` default `vec4(0.02)` and `splats.texMults`
+  default `vec4(1.0)` per FINDINGS §1.6.
+- `SMF_INTENSITY_MULT = 210/255` (FINDINGS §7.1 — with T) pre-applied
+  CPU-side on `ground_ambient` so the WGSL stays clean.
+
+**Decision — texture array.** The four slot diffuse images bind as one
+`texture_2d_array` (`SLOT_LAYER_COUNT = 4`, `SLOT_DIFFUSE_DIM = 1024`,
+`rgba8unorm`). Slot reassignment becomes
+`queue.write_texture(layer = N)` — one frame's stall — rather than a
+bind-group rebuild. Sized to match the ambientCG `_1K-PNG.zip`
+starter pack (ADR-025); F23 user-imports resize-and-cache on the
+upload side.
+
+**Decision — splat distribution upload.** Mirror ADR-017 dirty-rect
+sub-upload via `write_splat_rect(rect, full_data)`. Full-texture
+writes at 4 MB per stamp blow the 8 ms NFR; D3's `SplatBrush::apply`
+already returns a tight `DirtyRect` for each stamp, unioned across
+symmetry replicas (ADR-019 pattern).
+
+**Decision — base normal.** Computed per-vertex from a 4-tap finite
+difference of neighbouring heightmap samples; interpolated to the
+fragment as `world_normal`. The engine path samples a baked SMT
+normal texture per-fragment (`normalsTex.ra` → X / Z, Y derived per
+FINDINGS §7.5); the editor has no SMT bake at preview time, and the
+heightmap-derived normal is sufficient for diffuse Lambert shading.
+
+**Decision — uniforms layout.** New `SplatU` block (binding 2,
+fragment-visible):
+```wgsl
+struct SplatU {
+  tex_scales: vec4<f32>,
+  tex_mults:  vec4<f32>,
+  flags:      vec4<u32>,   // .x = active_slot_mask, .y = diffuse_in_alpha
+  sun_dir:    vec4<f32>,
+  ground_ambient: vec4<f32>,
+  ground_diffuse: vec4<f32>,
+};
+```
+CPU mirror at `render::SplatUniforms` with `#[repr(C)]` and
+`bytemuck::Pod`. The active-slot mask gates per-layer sampling so a
+fresh project (no slots bound) reads 0 from all four layers and falls
+back to the height gradient.
+
+**Alternatives considered.**
+- **DNTS-normal blending in the preview** (full engine path). Rejected:
+  requires a baked SMT normal map the editor doesn't have at preview
+  time, and the per-fragment TBN math (FINDINGS §7.4 — `cross(normal,
+  vec3(-1,0,0))`) doubles fragment cost. Promote to a follow-up ADR
+  if a tested BAR-map screenshot vs the editor preview visibly
+  disagrees on slope shading.
+- **Static `T = +X / B = +Z / N = +Y` TBN basis** (per the draft research
+  WGSL). Rejected: works on flat ground, visibly skews on slopes
+  (FINDINGS §7.4 explicit correction). Moot since this ADR skips DNTS
+  normals entirely.
+- **Verbatim WGSL from `docs/research/splat-rendering/claude findings.md`**
+  (drafted as "ADR-035"). Rejected: that draft has five load-bearing
+  bugs catalogued in FINDINGS §7.1-§7.6 (`SMF_INTENSITY_MUL` typo,
+  static tangent basis, generic RGB normal decode, `mix(16,
+  specularExponent, alpha)` exponent, `(α-0.5)*2*w` diffuse offset
+  sign). This ADR translates from the engine source directly and
+  cites FINDINGS for each delta.
+
+**Consequences.**
+- Bind group grows from 2 entries (uniforms, heightmap) to 7
+  (+ splat uniforms, distribution texture, distribution sampler,
+  slot diffuse array, slot diffuse sampler). Comfortably within
+  wgpu's 16-binding default.
+- `terrain.wgsl` fragment stage gains the splat composite + Lambert
+  lighting (replacing the height-only gradient).
+- `render::TerrainCallback::new` signature gains `world_extent_x`,
+  `world_extent_z`, and `SplatUniforms` parameters. Call site in
+  `App::central` (`main.rs`) updates to pass them.
+- New public APIs: `render::upload_splat_distribution`,
+  `render::write_splat_rect`, `render::upload_diffuse_layer`,
+  `render::update_splat_uniforms`. D5 wires the inspector to call
+  each.
+
+**Editor-preview deferrals (FINDINGS §7 caveats).** Each item lists the
+trigger that should promote it from "deferred" to "implemented":
+1. **No DNTS-normal blend.** Promote when a BAR-map screenshot vs the
+   preview visibly disagrees on slope shading.
+2. **No `splatDetailNormalDiffuseAlpha` (high-pass diffuse offset).**
+   ADR-034 reserved; D5's GLOBAL section surfaces the toggle but the
+   shader treats it as a no-op. Promote with the alpha-encoded
+   high-pass bake.
+3. **No shadows; `groundShadowDensity` collapsed to 1.0.** Promote when
+   the editor gains a one-light shadow-map pass for unit placement
+   preview (Sprint 12+).
+4. **No specular.** A specular texture is not yet authored by the
+   editor; the lint rule from FINDINGS §7.2 surfaces in the validation
+   chip when a slot is bound and no specular is set. Promote when
+   the F4-specular branch (Sprint 14+) lands.
+5. **No `skyReflectModTex` cube modulation, no water absorption blend,
+   no fog blend, no atmospheric scattering.** Out of scope per
+   FINDINGS §7 explicit non-goals.
+
+**Pitfall notes.**
+- **DNTS-normal Y-flip.** The Sprint 8 closing devlog flagged that the
+  DNTS shader composite (when we add it) must NOT add a second Y-flip
+  on top of `BakeOptions::yflip_normal = false`; the bake already
+  preserves OpenGL convention from ambientCG's `*_NormalGL.png`
+  source. This ADR ships the diffuse-only path so the concern is
+  parked until the DNTS-normal branch lands.
+- **No specular gating regression.** Engine current behaviour
+  (`SMFRenderState.cpp:114`, FINDINGS §7.2) gates DNTS on
+  `splatDistrTex && splatDetailNormalTex[].size() > 0` only.
+  `specularTex` is no longer in the gate; the editor's lint stays as
+  a yellow warning per the reworded FINDINGS wording.
+
+**Reference.** `docs/research/source-audit-2026-05-18/FINDINGS.md` §7 +
+`RecoilEngine/cont/base/springcontent/shaders/GLSL/SMFFragProg.glsl`
+lines 146-150, 174-198, 276-278, 412-413, 4 (the `SMF_INTENSITY_MULT`
+macro).
+
 ```
 ## ADR-NNN — One-line decision
 

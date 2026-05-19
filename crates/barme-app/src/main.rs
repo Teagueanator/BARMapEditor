@@ -22,7 +22,7 @@ use eframe::egui;
 use eframe::egui_wgpu;
 use tracing::{error, info, trace, warn};
 
-use crate::render::{OrbitCamera, TerrainCallback};
+use crate::render::{OrbitCamera, SplatUniforms, TerrainCallback};
 
 /// wgpu/vulkan/naga emit a lot of INFO-level chatter at startup (adapter
 /// enumeration, layer loading) that drowns out our own logs. Keep them at
@@ -1325,6 +1325,13 @@ impl App {
             "B8 valley search exhausted; falling back to map quarter-point"
         );
         (qx, qz)
+    }
+
+    /// Build the per-frame splat uniforms passed to the GPU. D5 wires
+    /// this to `Project.splat_config`; until then the defaults render
+    /// the fallback gradient (no slot bound → mask = 0).
+    fn splat_uniforms_for_render(&self) -> SplatUniforms {
+        SplatUniforms::default()
     }
 
     /// World-space extents (elmos) currently active. Derived from the
@@ -4537,7 +4544,13 @@ impl App {
             }
 
             if self.heightmap.is_some() {
-                let cb = TerrainCallback::new(&self.camera, rect, self.height_scale);
+                let (ex, ez) = self.world_extents();
+                // D5 will populate splat uniforms from `Project.splat_config`;
+                // until then the default suppresses every layer (mask = 0)
+                // so the fragment falls back to the biome gradient.
+                let splat_u = self.splat_uniforms_for_render();
+                let cb =
+                    TerrainCallback::new(&self.camera, rect, self.height_scale, ex, ez, splat_u);
                 ui.painter()
                     .add(egui_wgpu::Callback::new_paint_callback(rect, cb));
             } else {
