@@ -110,6 +110,14 @@ fn build_mapinfo(info: &MapInfo) -> LuaValue {
     }
     if info.void_ground {
         t.push((LuaKey::str("voidGround"), LuaValue::Bool(true)));
+        // PITFALL §20: only relevant when voidGround is on; emitting
+        // unconditionally would noise up the 99% of maps that don't
+        // use it. F9 (Sprint 13) will surface the tuner on the same
+        // void_ground gate.
+        t.push((
+            LuaKey::str("voidAlphaMin"),
+            LuaValue::Float(info.void_alpha_min as f64),
+        ));
     }
     if let Some(v) = info.auto_show_metal {
         t.push((LuaKey::str("autoShowMetal"), LuaValue::Bool(v)));
@@ -799,6 +807,56 @@ mod tests {
             s.ends_with("return mapinfo\n"),
             "tail:\n{}",
             &s[s.len() - 80..]
+        );
+    }
+
+    /// PITFALL §20 / FINDINGS §1.1: `voidAlphaMin` only emits when
+    /// `voidGround` is on. Dry maps (the common case) get nothing —
+    /// the engine default 0.9 already applies, and emitting a dead
+    /// key noise-checks the diff.
+    #[test]
+    fn void_alpha_min_omitted_when_void_ground_off() {
+        let p = Project::new("dry", 4);
+        let info: MapInfo = (&p).into();
+        let s = render_mapinfo(&info);
+        assert!(!info.void_ground, "precondition: void_ground off");
+        assert!(
+            !s.contains("voidAlphaMin"),
+            "voidAlphaMin leaked into a dry-map render:\n{s}"
+        );
+    }
+
+    /// PITFALL §20: enabling `voidGround` makes the emitter ship
+    /// `voidAlphaMin` so F9 can tune the threshold. Default value is
+    /// the engine's 0.9.
+    #[test]
+    fn void_alpha_min_emitted_when_void_ground_on() {
+        let p = Project::new("voidy", 4);
+        let mut info: MapInfo = (&p).into();
+        info.void_ground = true;
+        let s = render_mapinfo(&info);
+        assert!(
+            s.contains("voidGround = true"),
+            "precondition: voidGround emits true; got:\n{s}"
+        );
+        assert!(
+            s.contains("voidAlphaMin = 0.9"),
+            "expected voidAlphaMin = 0.9 with void_ground on; got:\n{s}"
+        );
+    }
+
+    /// PITFALL §20: a non-default `void_alpha_min` round-trips into
+    /// the rendered text when `void_ground` is on.
+    #[test]
+    fn void_alpha_min_emits_authored_value_when_void_ground_on() {
+        let p = Project::new("voidy", 4);
+        let mut info: MapInfo = (&p).into();
+        info.void_ground = true;
+        info.void_alpha_min = 0.42;
+        let s = render_mapinfo(&info);
+        assert!(
+            s.contains("voidAlphaMin = 0.42"),
+            "authored voidAlphaMin lost; got:\n{s}"
         );
     }
 }
