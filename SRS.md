@@ -406,6 +406,48 @@ A single-window, single-executable desktop app that produces a *playable* BAR ma
 > proposed WGSL in `splat-rendering/claude findings.md` will
 > render visibly wrong if implemented verbatim.
 
+> **STATUS UPDATE 2026-05-18 (Sprint 10 — mapinfo audit fixes
+> applied):** Sprint 10 closes the emitter-side gap surfaced by
+> the 2026-05-18 source audit above. Five load-bearing fixes
+> shipped as six commits on `main`; devlog at
+> `devlog/stage-1-mapinfo-audit-fix/`. Each fix cites a PITFALL
+> number for traceability:
+>
+> 1. **`sundir` + `sunDir` dual emit (PITFALL §11).** Lighting
+>    block writes BOTH keys with the same 4-float value. The
+>    "regression test asserts sundir does NOT leak out" claim from
+>    the C3 status above is now correctly inverted —
+>    `lighting_emits_both_sundir_keys` requires both.
+> 2. **`skyDir` → `skyAxisAngle` (PITFALL §12).**
+>    `AtmosphereBlock::sky_dir: Option<[f32; 3]>` removed; replaced
+>    with `sky_axis_angle: [f32; 4]` (engine default `[0, 0, 1, 0]`
+>    per `MapInfo.cpp:149`). Custom `Deserialize` migrates legacy
+>    `sky_dir = [x, y, z]` to `[x, y, z, 0]` so pre-Sprint-10
+>    fixtures load forward losslessly.
+> 3. **`sunDir.w = 1.0` (PITFALL §18).** Schema default flipped
+>    from the stale `1e9` sunStartDistance leakage to the engine's
+>    intensity scalar `1.0` per `MapInfo.cpp:213`. The `SunDir`
+>    type alias docstring re-flavours W as "intensity scalar".
+> 4. **`gui.minimapRotation` dropped (PITFALL §19).** Engine reader
+>    at `MapInfo.cpp:119-124` only consumes `autoShowMetal` (which
+>    already lives at top-level `MapInfo`). `GuiBlock` removed
+>    entirely along with `MapInfo::gui` — no `gui = {}` table
+>    emits either.
+> 5. **`voidAlphaMin` added + emitted on `voidGround` (PITFALL §20).**
+>    `MapInfo::void_alpha_min: f32` with engine default `0.9` per
+>    `MapInfo.cpp:107`. Emitter only writes the key when
+>    `void_ground = true` to keep dry maps noise-free; F9 will
+>    surface the tuner on the same gate.
+>
+> 17 new regression tests across `barme-core::mapinfo_schema` and
+> `barme-pipeline::mapinfo` pin every fix; `cargo test --workspace`
+> green at each of the six commits. The two splat-side findings
+> (`splatDetailNormalTex` subtable form, FINDINGS §1.8; spec
+> exponent `α × 16`, FINDINGS §7.6) are out-of-scope for Sprint 10
+> — owned by Sprint 12 / D6 emission wiring + ADR-036 respectively.
+> The C8 lint pass (Sprint 14) will surface user-edited overrides
+> that re-introduce the deprecated keys.
+
 > **STATUS UPDATE 2026-05-18 (F4 — D1, starter texture pack
 > shipped):** Sprint 7 / D1 lands the palette decision +
 > `scripts/fetch-textures.sh` (ADR-025 + ADR-027). 16 CC0 ambientCG

@@ -196,6 +196,19 @@ Implements SRS F1–F12. Ships a Windows `.exe` and a Linux AppImage.
       barme-core 122 → 132 (+10), barme-app 114 → 117 (+3,
       including the moved B5 wizard test) + ui::next_steps (+2);
       barme-pipeline 49 → 52 (+3).
+- [x] **Source audit emitter corrections (Sprint 10, devlog
+      `stage-1-mapinfo-audit-fix`)** — closes the five emitter-side
+      items the 2026-05-18 source audit (FINDINGS.md) flagged.
+      Six surgical commits cite PITFALLS §11 / §12 / §18 / §19 /
+      §20: dual-emit `sundir` + `sunDir` (gadget compat), rename
+      `skyDir` → `skyAxisAngle` with serde migration of legacy
+      `sky_dir` fixtures, fix `sunDir.w` default `1e9` → `1.0`
+      (engine intensity scalar, not sunStartDistance), drop unused
+      `gui.minimapRotation` (+ entire `GuiBlock`), add
+      `voidAlphaMin` schema field with conditional emit on
+      `voidGround`. 17 new regression tests; no behavioural splat
+      churn (D6 / Sprint 12 wires `splatDetailNormalTex` subtable
+      form separately).
 - [ ] Beherith (or active mapper) reviews `.sd7` byte-for-byte against PyMapConv
       reference output on three test maps
 - [ ] Listed on `beyondallreason.info/guide/mapmaking-resources` as beta
