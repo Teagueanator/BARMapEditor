@@ -918,6 +918,10 @@ pub fn ensure_offscreen(
 
 /// Camera state owned by the App; computes a view-projection matrix per
 /// frame. Orbit around `target` at radius `distance`, yaw/pitch in radians.
+///
+/// Phase 3 / ADR-037: near + far planes are no longer struct fields —
+/// they're derived from `distance` by [`OrbitCamera::near_far`] every
+/// frame so depth precision auto-tracks zoom level.
 #[derive(Clone)]
 pub struct OrbitCamera {
     pub target: Vec3,
@@ -925,8 +929,6 @@ pub struct OrbitCamera {
     pub pitch: f32,
     pub distance: f32,
     pub fov_y: f32,
-    pub near: f32,
-    pub far: f32,
 }
 
 impl OrbitCamera {
@@ -939,8 +941,6 @@ impl OrbitCamera {
             pitch: std::f32::consts::FRAC_PI_4,
             distance: max * 1.4,
             fov_y: 60f32.to_radians(),
-            near: 10.0,
-            far: max * 8.0,
         }
     }
 
@@ -951,8 +951,25 @@ impl OrbitCamera {
         self.target + dir * self.distance
     }
 
+    /// Auto-tuned near/far for the Sprint-13 depth pipeline. Picks a
+    /// distance-relative near (1 % of orbit distance, floored at 50
+    /// elmos) and a far that holds the whole map in view even when the
+    /// camera tilts down (4 × distance, with a 100× near/far ratio
+    /// floor so close-up zooms don't blow out depth precision). The
+    /// formula is pinned by `camera_near_far_*` tests.
+    ///
+    /// Phase 3 / ADR-037. The struct's `near` / `far` fields stay (other
+    /// readers still see them); `view_proj_matrix` now reads from this
+    /// helper instead.
+    pub fn near_far(&self) -> (f32, f32) {
+        let near = (self.distance * 0.01).max(50.0);
+        let far = (self.distance * 4.0).max(near * 100.0);
+        (near, far)
+    }
+
     pub fn view_proj_matrix(&self, aspect: f32) -> Mat4 {
-        let proj = Mat4::perspective_lh(self.fov_y, aspect, self.near, self.far);
+        let (near, far) = self.near_far();
+        let proj = Mat4::perspective_lh(self.fov_y, aspect, near, far);
         let view = Mat4::look_at_lh(self.eye(), self.target, Vec3::Y);
         proj * view
     }
@@ -1530,5 +1547,89 @@ mod tests {
             wgpu::TextureFormat::Depth32Float,
             "ADR-037: depth format pinned to Depth32Float"
         );
+    }
+
+    // ---- Phase 3 (Sprint 13 / ADR-037): camera near/far auto-tune ----
+
+    fn at_distance(distance: f32) -> OrbitCamera {
+        let mut c = OrbitCamera::framing(8192.0, 8192.0);
+        c.distance = distance;
+        c
+    }
+
+    #[test]
+    fn camera_near_far_at_typical_distance() {
+        // 16-SMU map default framing → distance ≈ 8192 * 1.4 = 11468.8.
+        // Near = distance * 0.01 = 114.7; Far = distance * 4 = 45875.
+        // Ratio = ~400.
+        let c = OrbitCamera::framing(8192.0, 8192.0);
+        let (near, far) = c.near_far();
+        let expected_near = c.distance * 0.01;
+        let expected_far = c.distance * 4.0;
+        assert!(
+            (near - expected_near).abs() < 1e-3,
+            "near = {near}, expected ≈ {expected_near}"
+        );
+        assert!(
+            (far - expected_far).abs() < 1e-3,
+            "far = {far}, expected ≈ {expected_far}"
+        );
+    }
+
+    #[test]
+    fn camera_near_far_close_zoom_clamps_near_to_50() {
+        // Distance = 100 elmos (zoomed in tight). distance * 0.01 = 1.0
+        // which would shred depth precision; the 50-elmo floor kicks in.
+        let c = at_distance(100.0);
+        let (near, _far) = c.near_far();
+        assert!(
+            (near - 50.0).abs() < 1e-6,
+            "near should be clamped to 50.0, got {near}"
+        );
+    }
+
+    #[test]
+    fn camera_near_far_zoom_out_keeps_ratio() {
+        // Wide pull-back (50 000 elmos). near = 500, far = 200 000;
+        // ratio = 400 — within float depth precision for 32-bit depth.
+        let c = at_distance(50_000.0);
+        let (near, far) = c.near_far();
+        assert!((near - 500.0).abs() < 1e-3, "near = {near}");
+        assert!((far - 200_000.0).abs() < 1e-3, "far = {far}");
+        let ratio = far / near;
+        assert!((ratio - 400.0).abs() < 1e-3, "ratio = {ratio}");
+    }
+
+    #[test]
+    fn camera_near_far_close_zoom_keeps_minimum_far_distance() {
+        // Even when near gets clamped to 50, far stays at >= 100 ×
+        // near so close-up sculpting still sees the whole hill.
+        let c = at_distance(100.0);
+        let (near, far) = c.near_far();
+        assert!(far >= near * 100.0 - 1.0, "far / near ratio too tight");
+    }
+
+    #[test]
+    fn view_proj_matrix_uses_auto_tuned_near_far() {
+        // Regression pin: view_proj_matrix should produce the same
+        // matrix as if you'd manually plugged near_far() into a
+        // perspective_lh call.
+        let c = OrbitCamera::framing(8192.0, 8192.0);
+        let (near, far) = c.near_far();
+        let aspect = 16.0 / 9.0;
+        let expected = Mat4::perspective_lh(c.fov_y, aspect, near, far)
+            * Mat4::look_at_lh(c.eye(), c.target, Vec3::Y);
+        let actual = c.view_proj_matrix(aspect);
+        for (col, (a, e)) in actual
+            .to_cols_array()
+            .iter()
+            .zip(expected.to_cols_array().iter())
+            .enumerate()
+        {
+            assert!(
+                (a - e).abs() < 1e-4,
+                "col {col}: actual = {a}, expected = {e}"
+            );
+        }
     }
 }
