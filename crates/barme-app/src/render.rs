@@ -345,6 +345,34 @@ struct LineResources {
     vertex_buf: wgpu::Buffer,
 }
 
+/// CPU mirror of the WGSL `WaterU` block (C9 / ADR-042 — Sprint 14).
+/// Field order MUST match `water.wgsl::WaterU` exactly. `bytemuck::Pod`
+/// enforces no-padding sanity at compile time.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable)]
+pub struct WaterU {
+    pub view_proj: [[f32; 4]; 4],
+    /// Pre-multiplied RGBA. `(r·a, g·a, b·a, a)`.
+    pub surface_rgba: [f32; 4],
+    /// `[extent_x, extent_z, plane_y, alpha_scale]`. `plane_y` stays
+    /// at `0.0` per the engine's `consteval GetWaterPlaneLevel` — the
+    /// field is plumbed in advance so a future renderer-parity sprint
+    /// can carry it forward without reshuffling the uniform.
+    pub extent: [f32; 4],
+}
+
+/// GPU state for the Sprint-14 water plane pipeline (C9 / ADR-042).
+/// Single 4-vertex `TriangleStrip` quad rendered with depth-test on /
+/// depth-write off + `PREMULTIPLIED_ALPHA_BLENDING`. Draws AFTER the
+/// terrain pipeline (so cliffs occlude the plane through depth) and
+/// BEFORE lines/markers (so brush rings + start-pos markers still
+/// stand on top of the water).
+struct WaterResources {
+    pipeline: wgpu::RenderPipeline,
+    bind_group: wgpu::BindGroup,
+    uniform_buf: wgpu::Buffer,
+}
+
 struct SplatResources {
     // `_tex` fields keep the GPU texture alive; only the views are
     // bound. Dead-code allowance is removed in D5 (Sprint 9) once
@@ -384,6 +412,9 @@ pub struct RenderResources {
     /// Sprint-13 line pipeline + vertex buffer (ADR-037 / Phase 5).
     /// Shares the marker's uniform buffer.
     line: LineResources,
+    /// Sprint-14 water plane pipeline (C9 / ADR-042). Drawn between
+    /// terrain and lines in `TerrainCallback::prepare`.
+    water: WaterResources,
 }
 
 impl RenderResources {
@@ -935,6 +966,108 @@ fn install_line_resources(
     }
 }
 
+/// Build the Sprint-14 water plane pipeline + bind group + uniform
+/// buffer (C9 / ADR-042). One bind-group entry (`WaterU` uniform);
+/// no vertex buffer (the shader generates the 4 quad corners from
+/// `@builtin(vertex_index)` + extent).
+///
+/// Pipeline state:
+/// - Depth TEST: ON (terrain cliffs occlude the plane).
+/// - Depth WRITE: OFF (translucent; CPU-side draw order owns blend
+///   ordering — terrain → water → lines → markers).
+/// - Blend: `PREMULTIPLIED_ALPHA_BLENDING` (matches marker / line
+///   pipelines; CPU pre-multiplies the surface RGBA on its way to
+///   the uniform).
+/// - Cull: `Back`. Quad winding is CW seen from above.
+fn install_water_resources(device: &wgpu::Device) -> WaterResources {
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("water.wgsl"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("water.wgsl").into()),
+    });
+
+    let uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("water.uniforms"),
+        size: std::mem::size_of::<WaterU>() as u64,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
+    let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("water.bgl"),
+        entries: &[wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        }],
+    });
+
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("water.bg"),
+        layout: &bgl,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: uniform_buf.as_entire_binding(),
+        }],
+    });
+
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("water.pl"),
+        bind_group_layouts: &[&bgl],
+        push_constant_ranges: &[],
+    });
+
+    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("water.pipeline"),
+        layout: Some(&pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_main"),
+            compilation_options: Default::default(),
+            buffers: &[],
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleStrip,
+            // No culling — viewing from below the water plane (rare,
+            // but possible during orbit) should still show the
+            // underside. The marker pipeline takes the same call for
+            // camera-aligned billboards (PrimitiveState L793).
+            cull_mode: None,
+            ..Default::default()
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: OFFSCREEN_DEPTH_FORMAT,
+            depth_write_enabled: false,
+            depth_compare: wgpu::CompareFunction::Less,
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        }),
+        multisample: wgpu::MultisampleState::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_main"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: OFFSCREEN_COLOR_FORMAT,
+                blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        multiview: None,
+        cache: None,
+    });
+
+    WaterResources {
+        pipeline,
+        bind_group,
+        uniform_buf,
+    }
+}
+
 /// Install the pipeline, uniform buffer, splat resources, and a 1×1
 /// dummy heightmap. Called once from `App::new`.
 pub fn install(render_state: &egui_wgpu::RenderState) {
@@ -1049,6 +1182,7 @@ pub fn install(render_state: &egui_wgpu::RenderState) {
 
     let marker = install_marker_resources(device);
     let line = install_line_resources(device, &marker.uniform_buf);
+    let water = install_water_resources(device);
 
     render_state
         .renderer
@@ -1066,6 +1200,7 @@ pub fn install(render_state: &egui_wgpu::RenderState) {
             offscreen: None,
             marker,
             line,
+            water,
         });
 }
 
@@ -1621,6 +1756,23 @@ pub fn update_splat_uniforms(render_state: &egui_wgpu::RenderState, su: &SplatUn
     res.write_splat_uniforms(&render_state.queue, su);
 }
 
+/// Sprint-14 / C9 / ADR-042 — water plane draw payload. `None` skips
+/// the water pipeline entirely (matches `WaterMode::None`). When
+/// `Some`, the pre-multiplied RGBA + alpha scale drive the quad's
+/// fragment output; `extent_x` / `extent_z` size the quad.
+#[derive(Debug, Clone, Copy)]
+pub struct WaterDraw {
+    /// Pre-multiplied RGBA — `(r·a, g·a, b·a, a)`.
+    pub surface_rgba: [f32; 4],
+    pub extent_x: f32,
+    pub extent_z: f32,
+    /// `1.0` when `Tool::Water` is active (full opacity); `0.5` for
+    /// cross-tool ghosting. The shader multiplies the fragment output
+    /// by this scalar — pre-multiplied scaling preserves the
+    /// `(kα·c, kα·c, kα·c, kα)` invariant.
+    pub alpha_scale: f32,
+}
+
 pub struct TerrainCallback {
     pub view_proj: [[f32; 4]; 4],
     pub max_height: f32,
@@ -1640,6 +1792,10 @@ pub struct TerrainCallback {
     /// the line pipeline (symmetry axes + geo-vent plumes). Each pair
     /// of consecutive verts forms one segment.
     pub line_vertices: Vec<LineVertex>,
+    /// Sprint-14 / C9 — optional water plane draw. `None` when
+    /// `Project.water_mode == WaterMode::None` (no water sub-table in
+    /// the emitted mapinfo, no plane in the preview).
+    pub water: Option<WaterDraw>,
 }
 
 impl TerrainCallback {
@@ -1654,6 +1810,7 @@ impl TerrainCallback {
         marker_instances: Vec<crate::ui::markers::MarkerInstanceGpu>,
         viewport_size: [f32; 2],
         line_vertices: Vec<LineVertex>,
+        water: Option<WaterDraw>,
     ) -> Self {
         let aspect = (rect.width() / rect.height()).max(0.0001);
         Self {
@@ -1665,6 +1822,7 @@ impl TerrainCallback {
             marker_instances,
             viewport_size,
             line_vertices,
+            water,
         }
     }
 }
@@ -1807,6 +1965,31 @@ impl egui_wgpu::CallbackTrait for TerrainCallback {
         pass.set_bind_group(0, &res.bind_group, &[]);
         pass.set_index_buffer(grid.index_buf.slice(..), wgpu::IndexFormat::Uint32);
         pass.draw_indexed(0..grid.index_count, 0, 0..1);
+
+        // Sprint-14 / C9 — Water plane. Depth-tests against terrain
+        // (cliffs above Y=0 occlude the plane); doesn't write depth
+        // (translucent, blend order owned CPU-side: terrain → water →
+        // lines → markers).
+        if let Some(w) = &self.water {
+            queue.write_buffer(
+                &res.water.uniform_buf,
+                0,
+                bytemuck::bytes_of(&WaterU {
+                    view_proj: self.view_proj,
+                    surface_rgba: w.surface_rgba,
+                    extent: [w.extent_x, w.extent_z, 0.0, w.alpha_scale],
+                }),
+            );
+            pass.set_pipeline(&res.water.pipeline);
+            pass.set_bind_group(0, &res.water.bind_group, &[]);
+            pass.draw(0..4, 0..1);
+            trace!(
+                surface_rgba = ?w.surface_rgba,
+                extent = ?(w.extent_x, w.extent_z),
+                alpha_scale = w.alpha_scale,
+                "water plane drawn"
+            );
+        }
 
         // Line pipeline depth-tests against terrain but doesn't write
         // depth. Drawn before markers so marker glyphs land on top of
@@ -2112,5 +2295,57 @@ mod tests {
                 "col {col}: actual = {a}, expected = {e}"
             );
         }
+    }
+
+    // ─── Sprint 14 / C9 — water plane uniform layout ────────
+
+    /// `WaterU` is `#[repr(C)]` + `bytemuck::Pod`. Its byte size must
+    /// match the WGSL `WaterU` block layout exactly, otherwise the
+    /// uniform write at `prepare()` time uploads garbage data into
+    /// the shader's bindings.
+    ///
+    /// Expected layout:
+    /// - `view_proj`: 64 B (4×4 f32)
+    /// - `surface_rgba`: 16 B (f32×4)
+    /// - `extent`: 16 B (f32×4)
+    ///
+    /// Total: 96 B.
+    #[test]
+    fn water_uniform_size_matches_wgsl_layout() {
+        assert_eq!(
+            std::mem::size_of::<WaterU>(),
+            96,
+            "WaterU layout drift — water.wgsl expects 96 bytes"
+        );
+    }
+
+    /// `WaterU` is `bytemuck::Pod`; constructing one and round-tripping
+    /// it through `bytemuck::bytes_of` should produce 96 bytes whose
+    /// f32 view matches the original.
+    #[test]
+    fn water_uniform_round_trips_through_pod() {
+        let u = WaterU {
+            view_proj: [
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+            surface_rgba: [0.5, 0.4, 0.3, 0.6],
+            extent: [8192.0, 8192.0, 0.0, 1.0],
+        };
+        let bytes = bytemuck::bytes_of(&u);
+        assert_eq!(bytes.len(), 96);
+        let view: &[f32] = bytemuck::cast_slice(bytes);
+        // Cell [3][3] of view_proj is at offset 15 (4*4 - 1 = 15
+        // f32 entries before extent starts).
+        assert_eq!(view[15], 1.0);
+        // surface_rgba starts at offset 16.
+        assert_eq!(view[16], 0.5);
+        assert_eq!(view[19], 0.6);
+        // extent starts at offset 20.
+        assert_eq!(view[20], 8192.0);
+        assert_eq!(view[22], 0.0);
+        assert_eq!(view[23], 1.0);
     }
 }

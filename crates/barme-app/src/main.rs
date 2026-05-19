@@ -7,12 +7,13 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use barme_core::{
-    ALLY_GROUP_PALETTE, AllyGroup, BIOMES, BrushRegistry, BrushStamp, DirtyRect, FeatureInstance,
-    GeoVent, Heightmap, History, HistoryEntry, MapSize, MetalSpot, PROJECT_EXTENSION, Project,
-    ProjectDiff, SplatBrushRegistry, SplatChannel, SplatConfig, SplatDistribution, SplatStamp,
-    StartPosition, SymmetryAxis, WaterBlock, WaterField, WaterMode, WaterValue, WizardSnapshot,
+    ALLY_GROUP_PALETTE, AllyGroup, BAR_DEFAULT_SURFACE_ALPHA, BAR_DEFAULT_SURFACE_COLOR, BIOMES,
+    BrushRegistry, BrushStamp, DirtyRect, FeatureInstance, GeoVent, Heightmap, History,
+    HistoryEntry, MapSize, MetalSpot, PROJECT_EXTENSION, Project, ProjectDiff, SplatBrushRegistry,
+    SplatChannel, SplatConfig, SplatDistribution, SplatStamp, StartPosition, SymmetryAxis,
+    WaterBlock, WaterField, WaterMode, WaterValue, WizardSnapshot,
     brushes::pixel_bbox,
-    default_extractor_radius,
+    default_extractor_radius, merge_overrides, preset_water_block,
     procgen::{
         Domain, PRESETS, generate as procgen_generate, generate_thumbnail as procgen_thumbnail_gen,
         validate_expression,
@@ -24,7 +25,7 @@ use eframe::egui;
 use eframe::egui_wgpu;
 use tracing::{error, info, trace, warn};
 
-use crate::render::{OrbitCamera, SplatUniforms, TerrainCallback};
+use crate::render::{OrbitCamera, SplatUniforms, TerrainCallback, WaterDraw};
 
 /// wgpu/vulkan/naga emit a lot of INFO-level chatter at startup (adapter
 /// enumeration, layer loading) that drowns out our own logs. Keep them at
@@ -1730,6 +1731,41 @@ impl App {
             ground_ambient: base.ground_ambient,
             ground_diffuse: base.ground_diffuse,
         }
+    }
+
+    /// C9 (Sprint 14 / ADR-042) — produce a `WaterDraw` describing the
+    /// frame's water plane, or `None` when `water_mode == None`. The
+    /// MVP returns a flat alpha-blended quad tinted by the active
+    /// preset's `surface_color` + `surface_alpha`. Cross-tool ghost
+    /// (commit 5) flips the `alpha_scale` to 0.5 when `Tool::Water`
+    /// isn't active.
+    fn water_draw_for_frame(&self, extent_x: f32, extent_z: f32) -> Option<WaterDraw> {
+        if self.water_mode == WaterMode::None {
+            return None;
+        }
+        // Build the same merged WaterBlock the emission path produces.
+        // For `Custom` the preset is empty; the user's overrides land
+        // verbatim. For all other modes the preset provides a baseline
+        // surface RGB + alpha which overrides shadow per-field.
+        let preset = preset_water_block(self.water_mode).unwrap_or_default();
+        let merged = merge_overrides(&preset, &self.water_overrides);
+        let [r, g, b] = merged.surface_color.unwrap_or(BAR_DEFAULT_SURFACE_COLOR);
+        let a = merged
+            .surface_alpha
+            .unwrap_or(BAR_DEFAULT_SURFACE_ALPHA)
+            .clamp(0.0, 1.0);
+        // Pre-multiply RGB by alpha — the pipeline uses
+        // `PREMULTIPLIED_ALPHA_BLENDING`, so the shader output must
+        // already be `(r·a, g·a, b·a, a)`.
+        let surface_rgba = [r * a, g * a, b * a, a];
+        // Commit 2 ships `alpha_scale = 1.0`; commit 5 wires the
+        // cross-tool ghost (50%× when Tool::Water is inactive).
+        Some(WaterDraw {
+            surface_rgba,
+            extent_x,
+            extent_z,
+            alpha_scale: 1.0,
+        })
     }
 
     /// Walk `splat_config.channels` and re-upload every bound slot's
@@ -6989,6 +7025,7 @@ impl App {
                     .as_ref()
                     .and_then(|rs| render::ensure_offscreen(rs, requested_phys));
 
+                let water = self.water_draw_for_frame(ex, ez);
                 let cb = TerrainCallback::new(
                     &self.camera,
                     rect,
@@ -6999,6 +7036,7 @@ impl App {
                     instances,
                     viewport_size,
                     line_vertices,
+                    water,
                 );
                 ui.painter()
                     .add(egui_wgpu::Callback::new_paint_callback(rect, cb));
@@ -7969,6 +8007,70 @@ mod tests {
     fn fresh_app_buildable_overlay_default_off() {
         let app = make_test_app();
         assert!(!app.buildable_overlay_on);
+    }
+
+    // ─── Sprint 14 / C9 (Slice 2) — water draw ────────
+
+    /// `WaterMode::None` → no water plane (preserves pre-Sprint-14
+    /// rendering — no translucent quad blocks the heightmap view).
+    #[test]
+    fn water_draw_returns_none_when_water_mode_is_none() {
+        let app = make_test_app();
+        assert_eq!(app.water_mode, WaterMode::None);
+        assert!(app.water_draw_for_frame(8192.0, 8192.0).is_none());
+    }
+
+    /// `WaterMode::Acid` → premultiplied RGBA matches the Acid preset's
+    /// `(0.65, 0.8, 0.1, 0.4)` (surface + alpha). Pre-multiply yields
+    /// `(0.26, 0.32, 0.04, 0.4)`.
+    #[test]
+    fn water_draw_acid_produces_premultiplied_acidic_quarry_rgba() {
+        let mut app = make_test_app();
+        app.water_mode = WaterMode::Acid;
+        let w = app.water_draw_for_frame(8192.0, 8192.0).unwrap();
+        // Acid surface = (0.65, 0.8, 0.1), alpha = 0.4 → premul:
+        // (0.26, 0.32, 0.04, 0.4).
+        let [r, g, b, a] = w.surface_rgba;
+        assert!((r - 0.65 * 0.4).abs() < 1e-5, "r = {r}");
+        assert!((g - 0.80 * 0.4).abs() < 1e-5, "g = {g}");
+        assert!((b - 0.10 * 0.4).abs() < 1e-5, "b = {b}");
+        assert!((a - 0.4).abs() < 1e-5, "a = {a}");
+        assert_eq!(w.extent_x, 8192.0);
+        assert_eq!(w.extent_z, 8192.0);
+        // Commit 2 ships alpha_scale = 1.0; commit 5 wires the ghost.
+        assert!((w.alpha_scale - 1.0).abs() < 1e-6);
+    }
+
+    /// Overrides ride through `water_draw_for_frame` the same way they
+    /// do through emission: tweaking `surface_alpha` over Ocean
+    /// produces the override's alpha, with Ocean's surface RGB.
+    #[test]
+    fn water_draw_honors_per_field_override_on_top_of_preset() {
+        let mut app = make_test_app();
+        app.water_mode = WaterMode::Ocean;
+        app.water_overrides.surface_alpha = Some(0.6);
+        let w = app.water_draw_for_frame(4096.0, 4096.0).unwrap();
+        // Ocean surface RGB (0.67, 0.8, 1.0); override alpha 0.6 →
+        // pre-multiplied (0.402, 0.48, 0.6, 0.6).
+        let [r, g, b, a] = w.surface_rgba;
+        assert!((r - 0.67 * 0.6).abs() < 1e-5);
+        assert!((g - 0.80 * 0.6).abs() < 1e-5);
+        assert!((b - 1.00 * 0.6).abs() < 1e-5);
+        assert!((a - 0.6).abs() < 1e-5);
+        let _ = (r, g, b, a);
+    }
+
+    /// `WaterMode::Custom` with no overrides falls back to the
+    /// engine's default surface colour + alpha — the empty Custom
+    /// preset doesn't crash the renderer.
+    #[test]
+    fn water_draw_custom_with_no_overrides_falls_back_to_bar_default() {
+        let mut app = make_test_app();
+        app.water_mode = WaterMode::Custom;
+        let w = app.water_draw_for_frame(2048.0, 2048.0).unwrap();
+        let [_, _, _, a] = w.surface_rgba;
+        // BAR_DEFAULT_SURFACE_ALPHA = 0.1
+        assert!((a - 0.1).abs() < 1e-5);
     }
 
     #[test]
