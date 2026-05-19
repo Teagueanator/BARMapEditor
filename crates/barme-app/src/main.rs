@@ -6477,37 +6477,256 @@ impl App {
                 }
             }
 
+            // ----------------------------------------------------------
+            // Sprint 13 / ADR-037 — PHASE A: build the marker batch
+            //
+            // Walk every visible marker source (brush rings, start
+            // positions, metal spots, geo vents) and push one
+            // `Marker` per glyph into a frame-local `MarkerBatch`.
+            // Markers render on the GPU through the offscreen pass
+            // encoded by `TerrainCallback::prepare`; the CPU sort
+            // owns translucent ordering, the depth test owns terrain
+            // occlusion.
+            //
+            // What stays in egui::Painter (PHASE C below):
+            // - Symmetry overlay (Phase 5 moves it to the line pipeline)
+            // - Text labels (start-pos index, metal value)
+            // - Geo-vent plume + mirror outline (Phase 5)
+            // - Viewport chrome (rulers, minimap, toolbar, hint card)
+            // ----------------------------------------------------------
+            let extents = self.world_extents();
+            let mut marker_batch = crate::ui::markers::MarkerBatch::default();
+            let now = std::time::Instant::now();
+
+            // Brush rings (primary + symmetry-derived ghosts).
+            if matches!(self.tool, Tool::Sculpt)
+                && self.brush_id.is_some()
+                && response.hovered()
+                && let Some(cursor) = ctx.pointer_interact_pos()
+                && rect.contains(cursor)
+                && !cursor_in_gizmo
+            {
+                let cursor_in = glam::Vec2::new(cursor.x - rect.min.x, cursor.y - rect.min.y);
+                let rect_size_v = glam::Vec2::new(rect.width(), rect.height());
+                if let Some(world) =
+                    render::screen_to_world_y0(cursor_in, rect_size_v, &self.camera)
+                {
+                    let brush_cursor = crate::ui::overlay::BrushCursor {
+                        world,
+                        radius_world: self.brush_radius,
+                        brush_id: self.brush_id.as_deref(),
+                    };
+                    crate::ui::overlay::collect_primary_brush_ring(
+                        &mut marker_batch,
+                        rect,
+                        &self.camera,
+                        crate::ui::overlay::BrushCursor {
+                            world: brush_cursor.world,
+                            radius_world: brush_cursor.radius_world,
+                            brush_id: brush_cursor.brush_id,
+                        },
+                    );
+                    if !matches!(self.symmetry, SymmetryAxis::None) {
+                        crate::ui::overlay::collect_brush_ghosts(
+                            &mut marker_batch,
+                            rect,
+                            &self.camera,
+                            self.symmetry,
+                            brush_cursor,
+                            extents,
+                        );
+                    }
+                }
+            }
+
+            // Start-position markers (cross-tool ghost falloff +
+            // hover-pulse handled here so the batch contains the
+            // animated radius for the current frame).
+            if !self.ally_groups.is_empty() {
+                let cross_tool_ghost = !matches!(self.tool, Tool::StartPositions);
+                let alpha_mul: u8 = if cross_tool_ghost { 128 } else { 255 };
+                for g in &self.ally_groups {
+                    let base_color = egui::Color32::from_rgba_unmultiplied(
+                        g.color[0], g.color[1], g.color[2], alpha_mul,
+                    );
+                    for (i, pos) in g.start_positions.iter().enumerate() {
+                        let dragging = self.dragging_start_pos == Some((g.id, i));
+                        let mut r = if dragging { 10.0_f32 } else { 8.0_f32 };
+                        if let Some((pg, pi, t0)) = self.pulsing_marker
+                            && pg == g.id
+                            && pi == i
+                        {
+                            let dt = now.duration_since(t0).as_secs_f32();
+                            if dt < 1.0 {
+                                let osc = (dt * 2.0 * std::f32::consts::TAU).sin().abs();
+                                r += 3.0 * osc;
+                                ctx.request_repaint();
+                            } else {
+                                self.pulsing_marker = None;
+                            }
+                        }
+                        let world =
+                            glam::Vec3::new(pos.x_elmo as f32, 0.0, pos.z_elmo as f32);
+                        marker_batch.push(crate::ui::markers::Marker {
+                            world_pos: world,
+                            radius_px: r,
+                            color: base_color,
+                            shape: crate::ui::markers::MarkerShape::FilledWithStroke,
+                        });
+                        if !matches!(self.symmetry, SymmetryAxis::None) {
+                            let mirrors = self.symmetry.replicate(
+                                (pos.x_elmo as f32, pos.z_elmo as f32),
+                                extents,
+                            );
+                            for (mx, mz) in mirrors.into_iter().skip(1) {
+                                if mx < 0.0 || mx > extents.0 || mz < 0.0 || mz > extents.1
+                                {
+                                    continue;
+                                }
+                                marker_batch.push(crate::ui::markers::Marker {
+                                    world_pos: glam::Vec3::new(mx, 0.0, mz),
+                                    radius_px: 7.0,
+                                    color: base_color,
+                                    shape: crate::ui::markers::MarkerShape::OutlineRing,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Metal-spot markers + extractor-radius ring (only when
+            // the MetalSpots tool is active — otherwise the canvas
+            // would be a sea of cyan rings).
+            if !self.metal_spots.is_empty() {
+                let rect_size = glam::Vec2::new(rect.width(), rect.height());
+                let cross_tool_ghost = !matches!(self.tool, Tool::MetalSpots);
+                let alpha_mul: u8 = if cross_tool_ghost { 128 } else { 255 };
+                let red_fill =
+                    egui::Color32::from_rgba_unmultiplied(0xF1, 0x5C, 0x5C, alpha_mul);
+                let cyan = egui::Color32::from_rgba_unmultiplied(
+                    0x33,
+                    0xD8,
+                    0xE6,
+                    if cross_tool_ghost { 64 } else { 160 },
+                );
+                let radius_world = self.extractor_radius.max(8.0);
+                for (i, spot) in self.metal_spots.iter().enumerate() {
+                    let world =
+                        glam::Vec3::new(spot.x_elmo as f32, 0.0, spot.z_elmo as f32);
+                    let dragging = self.dragging_metal_spot == Some(i);
+                    let r = if dragging { 10.0_f32 } else { 7.0_f32 };
+                    marker_batch.push(crate::ui::markers::Marker {
+                        world_pos: world,
+                        radius_px: r,
+                        color: red_fill,
+                        shape: crate::ui::markers::MarkerShape::FilledWithStroke,
+                    });
+                    if !cross_tool_ghost {
+                        let east = glam::Vec3::new(
+                            spot.x_elmo as f32 + radius_world,
+                            0.0,
+                            spot.z_elmo as f32,
+                        );
+                        if let (Some(centre_screen), Some(east_screen)) = (
+                            render::world_to_screen(world, rect_size, &self.camera),
+                            render::world_to_screen(east, rect_size, &self.camera),
+                        ) {
+                            let radius_px = (east_screen.x - centre_screen.x).abs();
+                            if radius_px > 1.5 {
+                                marker_batch.push(crate::ui::markers::Marker {
+                                    world_pos: world,
+                                    radius_px,
+                                    color: cyan,
+                                    shape: crate::ui::markers::MarkerShape::OutlineRing,
+                                });
+                            }
+                        }
+                    }
+                    if !matches!(self.symmetry, SymmetryAxis::None) {
+                        let mirrors = self.symmetry.replicate(
+                            (spot.x_elmo as f32, spot.z_elmo as f32),
+                            extents,
+                        );
+                        for (mx, mz) in mirrors.into_iter().skip(1) {
+                            if mx < 0.0 || mx > extents.0 || mz < 0.0 || mz > extents.1 {
+                                continue;
+                            }
+                            marker_batch.push(crate::ui::markers::Marker {
+                                world_pos: glam::Vec3::new(mx, 0.0, mz),
+                                radius_px: 6.0,
+                                color: red_fill,
+                                shape: crate::ui::markers::MarkerShape::OutlineRing,
+                            });
+                        }
+                    }
+                }
+            }
+
+            // Geo-vent primary triangles. Plumes + mirror outlines
+            // stay in egui::Painter until Phase 5 migrates them to
+            // the line pipeline.
+            if !self.geo_vents.is_empty() {
+                let cross_tool_ghost = !matches!(self.tool, Tool::GeoFeatures);
+                let alpha_mul: u8 = if cross_tool_ghost { 128 } else { 255 };
+                let orange =
+                    egui::Color32::from_rgba_unmultiplied(0xF5, 0x9E, 0x0B, alpha_mul);
+                for (i, vent) in self.geo_vents.iter().enumerate() {
+                    let world =
+                        glam::Vec3::new(vent.x_elmo as f32, 0.0, vent.z_elmo as f32);
+                    let dragging = self.dragging_geo_vent == Some(i);
+                    let size = if dragging { 12.0_f32 } else { 9.0_f32 };
+                    marker_batch.push(crate::ui::markers::Marker {
+                        world_pos: world,
+                        radius_px: size,
+                        color: orange,
+                        shape: crate::ui::markers::MarkerShape::Triangle,
+                    });
+                }
+            }
+
+            // ----------------------------------------------------------
+            // PHASE B: terrain callback + offscreen composite
+            // ----------------------------------------------------------
             if self.heightmap.is_some() {
                 let (ex, ez) = self.world_extents();
-                // D5 will populate splat uniforms from `Project.splat_config`;
-                // until then the default suppresses every layer (mask = 0)
-                // so the fragment falls back to the biome gradient.
                 let splat_u = self.splat_uniforms_for_render();
 
-                // Sprint 13 / ADR-037 — ensure the offscreen RT matches
-                // the central viewport's physical pixel size BEFORE the
-                // Callback fires its `prepare()` (which encodes the
-                // offscreen render pass). Composite the colour view
-                // back into the viewport via `painter.image(...)`.
-                //
-                // The Callback's `paint()` is now a no-op; only its
-                // `prepare()` does real work. If `ensure_offscreen`
-                // returns `None` (degenerate rect or `install()` not
-                // run), we still add the Callback (it bails inside
-                // `prepare` on missing RT) and skip the composite —
-                // last frame's image stays on screen for ~16 ms.
+                // Sort the batch back-to-front so translucent markers
+                // blend in correct camera-relative order, then encode
+                // to GPU instances. The view matrix (not view-proj)
+                // gives us LH view-Z directly.
+                let view = self.camera.view_matrix();
+                marker_batch.sort_back_to_front(view);
+                tracing::trace!(markers = marker_batch.len(), "marker batch built");
+                let instances = marker_batch.into_instances();
+
+                // Marker shader uses LOGICAL viewport units so
+                // `radius_px` keeps egui::Painter's px semantics.
+                let viewport_size = [rect.width(), rect.height()];
+
+                // Offscreen RT physical pixel size — clamped to 2048
+                // per axis by `ensure_offscreen` (PITFALLS §1 / iGPU).
                 let pixels_per_point = ctx.pixels_per_point();
-                let requested = (
+                let requested_phys = (
                     (rect.width() * pixels_per_point).round().max(0.0) as u32,
                     (rect.height() * pixels_per_point).round().max(0.0) as u32,
                 );
                 let offscreen_id = self
                     .render_state
                     .as_ref()
-                    .and_then(|rs| render::ensure_offscreen(rs, requested));
+                    .and_then(|rs| render::ensure_offscreen(rs, requested_phys));
 
-                let cb =
-                    TerrainCallback::new(&self.camera, rect, self.height_scale, ex, ez, splat_u);
+                let cb = TerrainCallback::new(
+                    &self.camera,
+                    rect,
+                    self.height_scale,
+                    ex,
+                    ez,
+                    splat_u,
+                    instances,
+                    viewport_size,
+                );
                 ui.painter()
                     .add(egui_wgpu::Callback::new_paint_callback(rect, cb));
 
@@ -6532,11 +6751,9 @@ impl App {
                 );
             }
 
-            // Symmetry canvas overlay (ADR-031 / B2). Paints AFTER the
-            // wgpu terrain pass and BEFORE the start-position markers
-            // so markers stay readable on top of the axes. No-op when
-            // `symmetry == None`.
-            let extents = self.world_extents();
+            // ----------------------------------------------------------
+            // PHASE C: 2D residue (symmetry overlay → Phase 5)
+            // ----------------------------------------------------------
             let overlay_painter = ui.painter_at(rect);
             crate::ui::overlay::paint_symmetry_overlay(
                 &overlay_painter,
@@ -6546,53 +6763,6 @@ impl App {
                 extents,
             );
 
-            // Brush rings — Sculpt + brush selected + cursor over the
-            // central rect + cursor outside the nav gizmo. Cursor world
-            // position reuses the existing y=0 raycast from stamp
-            // placement (pitfall §B3.5 / §B2.5 — no second projection
-            // path). The primary ring (B3) renders at full alpha at
-            // the cursor; mirror ghosts (B2) render at 50 % at each
-            // symmetry-derived centre.
-            if matches!(self.tool, Tool::Sculpt)
-                && self.brush_id.is_some()
-                && response.hovered()
-                && let Some(cursor) = ctx.pointer_interact_pos()
-                && rect.contains(cursor)
-                && !cursor_in_gizmo
-            {
-                let cursor_in = glam::Vec2::new(cursor.x - rect.min.x, cursor.y - rect.min.y);
-                let rect_size_v = glam::Vec2::new(rect.width(), rect.height());
-                if let Some(world) =
-                    render::screen_to_world_y0(cursor_in, rect_size_v, &self.camera)
-                {
-                    let brush_cursor = crate::ui::overlay::BrushCursor {
-                        world,
-                        radius_world: self.brush_radius,
-                        brush_id: self.brush_id.as_deref(),
-                    };
-                    crate::ui::overlay::paint_primary_brush_ring(
-                        &overlay_painter,
-                        rect,
-                        &self.camera,
-                        crate::ui::overlay::BrushCursor {
-                            world: brush_cursor.world,
-                            radius_world: brush_cursor.radius_world,
-                            brush_id: brush_cursor.brush_id,
-                        },
-                    );
-                    if !matches!(self.symmetry, SymmetryAxis::None) {
-                        crate::ui::overlay::paint_brush_ghosts(
-                            &overlay_painter,
-                            rect,
-                            &self.camera,
-                            self.symmetry,
-                            brush_cursor,
-                            extents,
-                        );
-                    }
-                }
-            }
-
             // Overlay start-position markers on top of the terrain
             // pass. ADR-032: cross-tool ghost falloff (50 % alpha) when
             // the StartPositions tool isn't active. Sources render as
@@ -6600,84 +6770,43 @@ impl App {
             // derived mirrors render as outlined rings with a thinner
             // stroke. Hovered-from-Inspector source pulses at 2 Hz for
             // 1 s after the hover event.
+            // Start-position TEXT LABELS only — the marker glyphs
+            // themselves render via the GPU pipeline in PHASE A above.
+            // Mirror outline rings are batched too; only the index
+            // labels remain in 2D (egui::Painter handles text well; a
+            // wgpu SDF text path is out of scope for Sprint 13).
             if !self.ally_groups.is_empty() {
                 let rect_size = glam::Vec2::new(rect.width(), rect.height());
-                let painter = ui.painter_at(rect);
                 let cross_tool_ghost = !matches!(self.tool, Tool::StartPositions);
-                let alpha_mul = if cross_tool_ghost { 128 } else { 255 };
-                let now = std::time::Instant::now();
-                let extents = self.world_extents();
+                let alpha_mul: u8 = if cross_tool_ghost { 128 } else { 255 };
+                let label_color =
+                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, alpha_mul);
                 for g in &self.ally_groups {
-                    let base_color = egui::Color32::from_rgba_unmultiplied(
-                        g.color[0], g.color[1], g.color[2], alpha_mul,
-                    );
                     for (i, pos) in g.start_positions.iter().enumerate() {
-                        let world = glam::Vec3::new(pos.x_elmo as f32, 0.0, pos.z_elmo as f32);
-                        let Some(screen) = render::world_to_screen(world, rect_size, &self.camera)
+                        let world =
+                            glam::Vec3::new(pos.x_elmo as f32, 0.0, pos.z_elmo as f32);
+                        let Some(screen) =
+                            render::world_to_screen(world, rect_size, &self.camera)
                         else {
                             continue;
                         };
-                        let p = egui::Pos2::new(rect.min.x + screen.x, rect.min.y + screen.y);
+                        let p =
+                            egui::Pos2::new(rect.min.x + screen.x, rect.min.y + screen.y);
                         let dragging = self.dragging_start_pos == Some((g.id, i));
-                        let mut r = if dragging { 10.0 } else { 8.0 };
-
-                        // Hover-pulse: thick ring at 2 Hz for 1 s after
-                        // the Inspector row hover instant.
-                        if let Some((pg, pi, t0)) = self.pulsing_marker
-                            && pg == g.id
-                            && pi == i
-                        {
-                            let dt = now.duration_since(t0).as_secs_f32();
-                            if dt < 1.0 {
-                                // 2 Hz triangle wave on radius.
-                                let osc = (dt * 2.0 * std::f32::consts::TAU).sin().abs();
-                                r += 3.0 * osc;
-                                ctx.request_repaint();
-                            } else {
-                                // Time's up — clear so we don't repaint
-                                // forever.
-                                self.pulsing_marker = None;
-                            }
-                        }
-
-                        painter.circle_filled(p, r, base_color);
-                        painter.circle_stroke(
-                            p,
-                            r,
-                            egui::Stroke::new(
-                                2.0,
-                                egui::Color32::from_rgba_unmultiplied(255, 255, 255, alpha_mul),
-                            ),
-                        );
-                        painter.text(
+                        // Match the marker pipeline's idle radius so
+                        // the label sits a constant 2 px above the
+                        // glyph edge. The hover-pulse animation
+                        // (mutated in PHASE A) doesn't oscillate the
+                        // label — minor UX regression, acceptable
+                        // until the GPU SDF text path lands.
+                        let r = if dragging { 10.0 } else { 8.0 };
+                        overlay_painter.text(
                             p + egui::Vec2::new(0.0, -r - 2.0),
                             egui::Align2::CENTER_BOTTOM,
                             format!("{}", i),
                             egui::FontId::proportional(11.0),
-                            egui::Color32::from_rgba_unmultiplied(255, 255, 255, alpha_mul),
+                            label_color,
                         );
-
-                        // Render symmetry-derived mirrors of this
-                        // source as outline-only rings. Idempotent:
-                        // when the source is on a symmetry axis its
-                        // first mirror equals itself (we skip).
-                        if !matches!(self.symmetry, SymmetryAxis::None) {
-                            let mirrors = self
-                                .symmetry
-                                .replicate((pos.x_elmo as f32, pos.z_elmo as f32), extents);
-                            for (mx, mz) in mirrors.into_iter().skip(1) {
-                                if mx < 0.0 || mx > extents.0 || mz < 0.0 || mz > extents.1 {
-                                    continue;
-                                }
-                                let mw = glam::Vec3::new(mx, 0.0, mz);
-                                let Some(ms) = render::world_to_screen(mw, rect_size, &self.camera)
-                                else {
-                                    continue;
-                                };
-                                let mp = egui::Pos2::new(rect.min.x + ms.x, rect.min.y + ms.y);
-                                painter.circle_stroke(mp, 7.0, egui::Stroke::new(1.5, base_color));
-                            }
-                        }
                     }
                 }
             }
@@ -6688,147 +6817,96 @@ impl App {
             // MetalSpots tool is active. Cross-tool ghost falloff
             // (50 % alpha) outside MetalSpots (B1 pattern). Symmetry
             // mirrors render as outline-only rings.
+            // Metal-spot TEXT LABELS only — marker fills + outlines +
+            // extractor-radius ring + mirrors all batch through PHASE A.
             if !self.metal_spots.is_empty() {
                 let rect_size = glam::Vec2::new(rect.width(), rect.height());
-                let painter = ui.painter_at(rect);
                 let cross_tool_ghost = !matches!(self.tool, Tool::MetalSpots);
-                let alpha_mul = if cross_tool_ghost { 128 } else { 255 };
-                let extents = self.world_extents();
-                let red_fill = egui::Color32::from_rgba_unmultiplied(0xF1, 0x5C, 0x5C, alpha_mul);
-                let white_stroke = egui::Color32::from_rgba_unmultiplied(255, 255, 255, alpha_mul);
-                let cyan = egui::Color32::from_rgba_unmultiplied(
-                    0x33,
-                    0xD8,
-                    0xE6,
-                    if cross_tool_ghost { 64 } else { 160 },
-                );
-                let radius_world = self.extractor_radius.max(8.0);
+                let alpha_mul: u8 = if cross_tool_ghost { 128 } else { 255 };
+                let label_color =
+                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, alpha_mul);
                 for (i, spot) in self.metal_spots.iter().enumerate() {
-                    let world = glam::Vec3::new(spot.x_elmo as f32, 0.0, spot.z_elmo as f32);
-                    let Some(screen) = render::world_to_screen(world, rect_size, &self.camera)
+                    let world =
+                        glam::Vec3::new(spot.x_elmo as f32, 0.0, spot.z_elmo as f32);
+                    let Some(screen) =
+                        render::world_to_screen(world, rect_size, &self.camera)
                     else {
                         continue;
                     };
                     let p = egui::Pos2::new(rect.min.x + screen.x, rect.min.y + screen.y);
                     let dragging = self.dragging_metal_spot == Some(i);
                     let r = if dragging { 10.0 } else { 7.0 };
-                    painter.circle_filled(p, r, red_fill);
-                    painter.circle_stroke(p, r, egui::Stroke::new(1.5, white_stroke));
-                    // Extractor-radius ring — only when the tool is
-                    // active (otherwise the canvas would be a sea of
-                    // cyan rings from cross-tool ghosts).
-                    if !cross_tool_ghost {
-                        // Project the radius into screen pixels by
-                        // sampling a point one radius east of the
-                        // source — this respects the orbit camera's
-                        // perspective without re-implementing the
-                        // projection.
-                        let east = glam::Vec3::new(
-                            spot.x_elmo as f32 + radius_world,
-                            0.0,
-                            spot.z_elmo as f32,
-                        );
-                        if let Some(east_screen) =
-                            render::world_to_screen(east, rect_size, &self.camera)
-                        {
-                            let radius_px = (east_screen.x - screen.x).abs();
-                            if radius_px > 1.5 {
-                                painter.circle_stroke(p, radius_px, egui::Stroke::new(1.2, cyan));
-                            }
-                        }
-                    }
-                    // Metal-value label above the marker, white text
-                    // with shadow for legibility against the splat
-                    // composite.
-                    painter.text(
+                    overlay_painter.text(
                         p + egui::Vec2::new(0.0, -r - 2.0),
                         egui::Align2::CENTER_BOTTOM,
                         format!("{:.1}", spot.metal),
                         egui::FontId::proportional(11.0),
-                        white_stroke,
+                        label_color,
                     );
-                    // Symmetry mirrors as outline-only.
-                    if !matches!(self.symmetry, SymmetryAxis::None) {
-                        let mirrors = self
-                            .symmetry
-                            .replicate((spot.x_elmo as f32, spot.z_elmo as f32), extents);
-                        for (mx, mz) in mirrors.into_iter().skip(1) {
-                            if mx < 0.0 || mx > extents.0 || mz < 0.0 || mz > extents.1 {
-                                continue;
-                            }
-                            let mw = glam::Vec3::new(mx, 0.0, mz);
-                            let Some(ms) = render::world_to_screen(mw, rect_size, &self.camera)
-                            else {
-                                continue;
-                            };
-                            let mp = egui::Pos2::new(rect.min.x + ms.x, rect.min.y + ms.y);
-                            painter.circle_stroke(mp, 6.0, egui::Stroke::new(1.2, red_fill));
-                        }
-                    }
                 }
             }
 
             // C5 (Sprint 11): geo-vent markers. Orange triangle with
             // a faint upward gradient (steam-plume hint). Cross-tool
             // ghost falloff identical to metal.
+            // Geo-vent PLUMES + MIRROR outline triangles. The primary
+            // triangle fill batches through PHASE A; this loop only
+            // emits the upward steam-plume line and the outline-only
+            // mirror triangles (Phase 5 moves both to the GPU line
+            // pipeline so they depth-test against terrain too).
             if !self.geo_vents.is_empty() {
                 let rect_size = glam::Vec2::new(rect.width(), rect.height());
-                let painter = ui.painter_at(rect);
                 let cross_tool_ghost = !matches!(self.tool, Tool::GeoFeatures);
-                let alpha_mul = if cross_tool_ghost { 128 } else { 255 };
-                let extents = self.world_extents();
-                let orange = egui::Color32::from_rgba_unmultiplied(0xF5, 0x9E, 0x0B, alpha_mul);
-                let orange_ghost =
-                    egui::Color32::from_rgba_unmultiplied(0xF5, 0x9E, 0x0B, alpha_mul / 3);
+                let alpha_mul: u8 = if cross_tool_ghost { 128 } else { 255 };
+                let orange =
+                    egui::Color32::from_rgba_unmultiplied(0xF5, 0x9E, 0x0B, alpha_mul);
+                let orange_ghost = egui::Color32::from_rgba_unmultiplied(
+                    0xF5,
+                    0x9E,
+                    0x0B,
+                    alpha_mul / 3,
+                );
                 for (i, vent) in self.geo_vents.iter().enumerate() {
-                    let world = glam::Vec3::new(vent.x_elmo as f32, 0.0, vent.z_elmo as f32);
-                    let Some(screen) = render::world_to_screen(world, rect_size, &self.camera)
+                    let world =
+                        glam::Vec3::new(vent.x_elmo as f32, 0.0, vent.z_elmo as f32);
+                    let Some(screen) =
+                        render::world_to_screen(world, rect_size, &self.camera)
                     else {
                         continue;
                     };
                     let p = egui::Pos2::new(rect.min.x + screen.x, rect.min.y + screen.y);
                     let dragging = self.dragging_geo_vent == Some(i);
-                    let size = if dragging { 12.0 } else { 9.0 };
-                    let tri = [
-                        p + egui::Vec2::new(0.0, -size),
-                        p + egui::Vec2::new(-size * 0.85, size * 0.7),
-                        p + egui::Vec2::new(size * 0.85, size * 0.7),
-                    ];
-                    painter.add(egui::Shape::convex_polygon(
-                        tri.to_vec(),
-                        orange,
-                        egui::Stroke::new(
-                            1.4,
-                            egui::Color32::from_rgba_unmultiplied(255, 255, 255, alpha_mul),
-                        ),
-                    ));
-                    // Steam-plume hint: a faint upward chevron.
+                    let size = if dragging { 12.0_f32 } else { 9.0_f32 };
+                    // Steam-plume hint above the primary glyph.
                     let plume_top = p + egui::Vec2::new(0.0, -size - 8.0);
-                    painter.line_segment(
+                    overlay_painter.line_segment(
                         [p + egui::Vec2::new(0.0, -size), plume_top],
                         egui::Stroke::new(1.2, orange_ghost),
                     );
-                    // Symmetry mirrors as outline-only triangles.
+                    // Outline mirrors.
                     if !matches!(self.symmetry, SymmetryAxis::None) {
-                        let mirrors = self
-                            .symmetry
-                            .replicate((vent.x_elmo as f32, vent.z_elmo as f32), extents);
+                        let mirrors = self.symmetry.replicate(
+                            (vent.x_elmo as f32, vent.z_elmo as f32),
+                            extents,
+                        );
                         for (mx, mz) in mirrors.into_iter().skip(1) {
                             if mx < 0.0 || mx > extents.0 || mz < 0.0 || mz > extents.1 {
                                 continue;
                             }
                             let mw = glam::Vec3::new(mx, 0.0, mz);
-                            let Some(ms) = render::world_to_screen(mw, rect_size, &self.camera)
+                            let Some(ms) =
+                                render::world_to_screen(mw, rect_size, &self.camera)
                             else {
                                 continue;
                             };
-                            let mp = egui::Pos2::new(rect.min.x + ms.x, rect.min.y + ms.y);
+                            let mp =
+                                egui::Pos2::new(rect.min.x + ms.x, rect.min.y + ms.y);
                             let tri = [
                                 mp + egui::Vec2::new(0.0, -7.0),
                                 mp + egui::Vec2::new(-6.0, 5.0),
                                 mp + egui::Vec2::new(6.0, 5.0),
                             ];
-                            painter.add(egui::Shape::convex_polygon(
+                            overlay_painter.add(egui::Shape::convex_polygon(
                                 tri.to_vec(),
                                 egui::Color32::TRANSPARENT,
                                 egui::Stroke::new(1.2, orange),

@@ -51,6 +51,14 @@ pub const OFFSCREEN_DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Dep
 /// image.
 pub const OFFSCREEN_CLAMP: u32 = 2048;
 
+/// Pre-allocated capacity (in marker instances) of the GPU storage
+/// buffer used by the Sprint-13 marker pipeline. 10 000 covers Sprint
+/// 13's foreseeable load (a 16-SMU map with the planned Sprint 24
+/// feature density still pushes <2 000 markers in view); resizing the
+/// buffer mid-frame is more painful than over-allocating ~480 KB up
+/// front. ADR-037.
+pub const MARKER_INSTANCE_CAPACITY: u32 = 10_000;
+
 /// Pixel side of one layer of the slot diffuse texture array. The
 /// starter pack (ADR-025) ships ambientCG `_1K-PNG.zip` at 1024², so
 /// the happy path matches without resizing. Per FINDINGS H2 the
@@ -71,6 +79,18 @@ struct Uniforms {
     /// The world extents drive the splat-distribution UV math in the
     /// fragment stage (`uv = world_pos.xz / extent`).
     params: [f32; 4],
+}
+
+/// CPU mirror of `markers.wgsl::MarkerU`. Drives the per-frame
+/// projection inside the marker vertex shader; `viewport_size` is the
+/// offscreen RT's physical pixel dimensions so screen-space radii hold
+/// regardless of DPI scaling. ADR-037.
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable, Debug)]
+pub struct MarkerU {
+    pub view_proj: [[f32; 4]; 4],
+    pub viewport_size: [f32; 2],
+    pub _pad: [f32; 2],
 }
 
 /// CPU mirror of the WGSL `SplatU` block. Field order MUST match
@@ -257,6 +277,22 @@ pub fn resolve_offscreen_size(requested: (u32, u32)) -> Option<(u32, u32)> {
     Some((w.min(OFFSCREEN_CLAMP), h.min(OFFSCREEN_CLAMP)))
 }
 
+/// GPU state for the Sprint-13 marker pipeline (ADR-037). One bind
+/// group, one uniform buffer (`MarkerU`), one pre-allocated storage
+/// buffer for up to [`MARKER_INSTANCE_CAPACITY`] marker instances.
+/// The pipeline depth-tests against terrain (which writes depth) but
+/// doesn't write depth itself — translucent blending order is owned
+/// by the CPU-side back-to-front sort in
+/// `ui::markers::MarkerBatch::sort_back_to_front`.
+struct MarkerResources {
+    pipeline: wgpu::RenderPipeline,
+    bind_group: wgpu::BindGroup,
+    uniform_buf: wgpu::Buffer,
+    /// 10 000 × 48 = 480 KB; sized for the foreseeable Sprint 13-24
+    /// load. Storage-buffer layout matches `markers.wgsl::Instance`.
+    instance_buf: wgpu::Buffer,
+}
+
 struct SplatResources {
     // `_tex` fields keep the GPU texture alive; only the views are
     // bound. Dead-code allowance is removed in D5 (Sprint 9) once
@@ -289,6 +325,10 @@ pub struct RenderResources {
     /// successful [`ensure_offscreen`] call — `central()` allocates it
     /// on the first frame with a real central viewport rect.
     offscreen: Option<OffscreenTarget>,
+    /// Sprint-13 marker pipeline + buffers (ADR-037). Created once at
+    /// install time; per-frame uploads write into the pre-allocated
+    /// uniform + instance buffers.
+    marker: MarkerResources,
 }
 
 impl RenderResources {
@@ -606,6 +646,131 @@ fn install_splat_resources(device: &wgpu::Device, queue: &wgpu::Queue) -> SplatR
     }
 }
 
+/// Build the Sprint-13 marker pipeline + bind group + buffers
+/// (ADR-037). The instance buffer is pre-allocated for
+/// [`MARKER_INSTANCE_CAPACITY`] markers; per-frame uploads write into
+/// it via `queue.write_buffer`. The pipeline shares the offscreen
+/// colour + depth attachments with terrain (drawn back-to-back in
+/// `TerrainCallback::prepare`'s render pass).
+fn install_marker_resources(device: &wgpu::Device) -> MarkerResources {
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("markers.wgsl"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("markers.wgsl").into()),
+    });
+
+    let uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("markers.uniforms"),
+        size: std::mem::size_of::<MarkerU>() as u64,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
+    let instance_stride = std::mem::size_of::<crate::ui::markers::MarkerInstanceGpu>() as u64;
+    let instance_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("markers.instances"),
+        size: instance_stride * MARKER_INSTANCE_CAPACITY as u64,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
+    let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("markers.bgl"),
+        entries: &[
+            // 0: MarkerU uniform — view_proj + viewport_size
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            // 1: instances storage buffer (read-only)
+            // VS reads to project; FS reads to look up colour/shape_id.
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+        ],
+    });
+
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("markers.bg"),
+        layout: &bgl,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: uniform_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: instance_buf.as_entire_binding(),
+            },
+        ],
+    });
+
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("markers.pl"),
+        bind_group_layouts: &[&bgl],
+        push_constant_ranges: &[],
+    });
+
+    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("markers.pipeline"),
+        layout: Some(&pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_main"),
+            compilation_options: Default::default(),
+            buffers: &[], // no vertex buffers — vs_main uses vid + storage
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleStrip,
+            // No back-face culling — markers are camera-aligned billboards.
+            cull_mode: None,
+            ..Default::default()
+        },
+        // Depth-test only — markers DON'T write depth (else they'd
+        // occlude each other in iteration order). Translucent blending
+        // order is owned by the CPU-side back-to-front sort.
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: OFFSCREEN_DEPTH_FORMAT,
+            depth_write_enabled: false,
+            depth_compare: wgpu::CompareFunction::Less,
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        }),
+        multisample: wgpu::MultisampleState::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_main"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: OFFSCREEN_COLOR_FORMAT,
+                blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        multiview: None,
+        cache: None,
+    });
+
+    MarkerResources {
+        pipeline,
+        bind_group,
+        uniform_buf,
+        instance_buf,
+    }
+}
+
 /// Install the pipeline, uniform buffer, splat resources, and a 1×1
 /// dummy heightmap. Called once from `App::new`.
 pub fn install(render_state: &egui_wgpu::RenderState) {
@@ -718,6 +883,8 @@ pub fn install(render_state: &egui_wgpu::RenderState) {
         cache: None,
     });
 
+    let marker = install_marker_resources(device);
+
     render_state
         .renderer
         .write()
@@ -732,6 +899,7 @@ pub fn install(render_state: &egui_wgpu::RenderState) {
             heightmap: None,
             splat,
             offscreen: None,
+            marker,
         });
 }
 
@@ -967,11 +1135,20 @@ impl OrbitCamera {
         (near, far)
     }
 
+    /// Left-handed view matrix. Exposed for the Sprint-13 marker batch
+    /// back-to-front sort (`MarkerBatch::sort_back_to_front` takes
+    /// the view matrix to compute per-marker view-space Z). Production
+    /// always calls `view_proj_matrix` for shader uploads — sharing the
+    /// matrix here means sort + shader projection agree by
+    /// construction.
+    pub fn view_matrix(&self) -> Mat4 {
+        Mat4::look_at_lh(self.eye(), self.target, Vec3::Y)
+    }
+
     pub fn view_proj_matrix(&self, aspect: f32) -> Mat4 {
         let (near, far) = self.near_far();
         let proj = Mat4::perspective_lh(self.fov_y, aspect, near, far);
-        let view = Mat4::look_at_lh(self.eye(), self.target, Vec3::Y);
-        proj * view
+        proj * self.view_matrix()
     }
 }
 
@@ -1279,9 +1456,19 @@ pub struct TerrainCallback {
     pub world_extent_x: f32,
     pub world_extent_z: f32,
     pub splat: SplatUniforms,
+    /// Sprint-13 (ADR-037) — pre-sorted, GPU-encoded marker instances.
+    /// `central()` builds these by walking the start-positions / metal-
+    /// spots / geo-vents / brush rings and pushing one `Marker` per
+    /// glyph into a frame-local `MarkerBatch`, then calling
+    /// `sort_back_to_front(view)` + `into_instances()`.
+    pub marker_instances: Vec<crate::ui::markers::MarkerInstanceGpu>,
+    /// Physical pixel size of the offscreen RT — drives the marker
+    /// shader's screen-space radius conversion.
+    pub viewport_size: [f32; 2],
 }
 
 impl TerrainCallback {
+    #[allow(clippy::too_many_arguments)] // Each arg is load-bearing for the offscreen pass.
     pub fn new(
         camera: &OrbitCamera,
         rect: egui::Rect,
@@ -1289,6 +1476,8 @@ impl TerrainCallback {
         world_extent_x: f32,
         world_extent_z: f32,
         splat: SplatUniforms,
+        marker_instances: Vec<crate::ui::markers::MarkerInstanceGpu>,
+        viewport_size: [f32; 2],
     ) -> Self {
         let aspect = (rect.width() / rect.height()).max(0.0001);
         Self {
@@ -1297,6 +1486,8 @@ impl TerrainCallback {
             world_extent_x,
             world_extent_z,
             splat,
+            marker_instances,
+            viewport_size,
         }
     }
 }
@@ -1325,7 +1516,7 @@ impl egui_wgpu::CallbackTrait for TerrainCallback {
             return Vec::new();
         };
 
-        // Step 1 — uniforms (unchanged from Sprint 12).
+        // Step 1 — terrain uniforms (unchanged from Sprint 12).
         res.write_uniforms(
             queue,
             &Uniforms {
@@ -1339,6 +1530,37 @@ impl egui_wgpu::CallbackTrait for TerrainCallback {
             },
         );
         res.write_splat_uniforms(queue, &self.splat);
+
+        // Step 1b — marker uniforms + instance upload (Sprint 13 /
+        // ADR-037). Cap instance count to the pre-allocated capacity
+        // so we never overrun the storage buffer; log + drop the tail
+        // if exceeded (won't happen at Sprint 13's expected loads).
+        let marker_count =
+            (self.marker_instances.len() as u32).min(MARKER_INSTANCE_CAPACITY);
+        if (self.marker_instances.len() as u32) > MARKER_INSTANCE_CAPACITY {
+            warn!(
+                requested = self.marker_instances.len(),
+                capacity = MARKER_INSTANCE_CAPACITY,
+                "marker instance buffer exceeded; tail dropped"
+            );
+        }
+        queue.write_buffer(
+            &res.marker.uniform_buf,
+            0,
+            bytemuck::bytes_of(&MarkerU {
+                view_proj: self.view_proj,
+                viewport_size: self.viewport_size,
+                _pad: [0.0, 0.0],
+            }),
+        );
+        if marker_count > 0 {
+            queue.write_buffer(
+                &res.marker.instance_buf,
+                0,
+                bytemuck::cast_slice(&self.marker_instances[..marker_count as usize]),
+            );
+        }
+        trace!(markers = marker_count, "TerrainCallback::prepare");
 
         // Step 2 — encode the offscreen pass.
         //
@@ -1379,10 +1601,22 @@ impl egui_wgpu::CallbackTrait for TerrainCallback {
             timestamp_writes: None,
             occlusion_query_set: None,
         });
+        // Terrain pipeline writes depth.
         pass.set_pipeline(&res.pipeline);
         pass.set_bind_group(0, &res.bind_group, &[]);
         pass.set_index_buffer(grid.index_buf.slice(..), wgpu::IndexFormat::Uint32);
         pass.draw_indexed(0..grid.index_count, 0, 0..1);
+
+        // Marker pipeline depth-tests against terrain but doesn't write
+        // depth (back-to-front sort owns translucent ordering). Skip
+        // the draw entirely when the batch is empty — saves a state
+        // change and one bind-group set per idle frame.
+        if marker_count > 0 {
+            pass.set_pipeline(&res.marker.pipeline);
+            pass.set_bind_group(0, &res.marker.bind_group, &[]);
+            pass.draw(0..4, 0..marker_count);
+        }
+
         // `pass` drops here — releases the encoder for egui's own pass
         // and any other callbacks. We share `encoder` with egui per
         // pitfall #1, so we DO NOT `encoder.finish()` ourselves.

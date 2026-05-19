@@ -13,6 +13,7 @@ use barme_core::SymmetryAxis;
 use eframe::egui;
 
 use crate::render::{self, OrbitCamera};
+use crate::ui::markers::{Marker, MarkerBatch, MarkerShape};
 
 /// Dash on/off lengths in *screen pixels*. Pitfall §B2.1: world-unit
 /// dashes shrink with zoom-out and alias to a solid line; screen-pixel
@@ -236,16 +237,16 @@ pub fn ghost_centres(
     centres
 }
 
-/// Paint faint ghost rings at every symmetry-derived centre of
-/// `cursor.world` when `symmetry != None`. Skips the primary centre —
-/// B3 owns the primary brush ring; B2 only adds the mirrors so the
-/// two land in independent commits.
+/// Push faint ghost rings into `batch` at every symmetry-derived
+/// centre of `cursor.world` when `symmetry != None`. Skips the primary
+/// centre — `collect_primary_brush_ring` owns that — so call both per
+/// frame to render the full set.
 ///
-/// `cursor.radius_world` is the brush radius in elmos; we project a
-/// tangent world point `(cx + radius, 0, cz)` per ghost to compute the
-/// screen-space ring radius (pitfall §B2.4).
-pub fn paint_brush_ghosts(
-    painter: &egui::Painter,
+/// Sprint 13 / ADR-037 — replaces the old `paint_brush_ghosts`. The
+/// marker pipeline depth-tests against terrain so ghost rings hide
+/// behind hills naturally.
+pub fn collect_brush_ghosts(
+    batch: &mut MarkerBatch,
     rect: egui::Rect,
     camera: &OrbitCamera,
     symmetry: SymmetryAxis,
@@ -261,23 +262,26 @@ pub fn paint_brush_ghosts(
         .brush_id
         .map(brush_ring_color)
         .unwrap_or(egui::Color32::LIGHT_GRAY);
-    // Ghosts at ~50 % brightness. Premultiplied alpha so blending
-    // against either bright or dark terrain produces the same hue.
+    // Ghosts at ~50 % brightness. egui::Color32 is internally premul.
     let ghost =
         egui::Color32::from_rgba_premultiplied(base.r() / 2, base.g() / 2, base.b() / 2, 128);
 
     for (cx, cz) in centres {
         let centre_world = glam::Vec3::new(cx, 0.0, cz);
-        let Some(centre_screen) = render::world_to_screen(centre_world, rect_size, camera) else {
-            continue;
-        };
         let radius_px = brush_screen_radius(camera, rect_size, centre_world, cursor.radius_world)
             .unwrap_or(8.0);
-        let p = egui::Pos2::new(rect.min.x + centre_screen.x, rect.min.y + centre_screen.y);
-        painter.circle_stroke(p, radius_px, egui::Stroke::new(1.5, ghost));
-        // Inner falloff ring at radius × 0.5 — matches the primary
-        // ring's visual so the rings look like a family.
-        painter.circle_stroke(p, radius_px * 0.5, egui::Stroke::new(1.0, ghost));
+        batch.push(Marker {
+            world_pos: centre_world,
+            radius_px,
+            color: ghost,
+            shape: MarkerShape::OutlineRing,
+        });
+        batch.push(Marker {
+            world_pos: centre_world,
+            radius_px: radius_px * 0.5,
+            color: ghost,
+            shape: MarkerShape::OutlineRing,
+        });
     }
 }
 
@@ -300,36 +304,54 @@ pub fn brush_screen_radius(
     Some((tangent_screen - centre_screen).length().max(2.0))
 }
 
-/// Paint the primary brush ring (B3): outer ring at `radius_world`,
-/// inner falloff ring at `radius_world × 0.5`, centre dot. Full alpha;
-/// the centre dot uses a contrasting "shadow" outline so it reads
-/// against bright terrain. Mirrors are rendered by
-/// [`paint_brush_ghosts`].
-pub fn paint_primary_brush_ring(
-    painter: &egui::Painter,
+/// Push the primary brush ring (outer + falloff + centre dot) into
+/// `batch`. Mirrors are emitted by [`collect_brush_ghosts`].
+///
+/// Sprint 13 / ADR-037 — replaces the old `paint_primary_brush_ring`.
+/// The two centre-dot markers (black halo + coloured fill) rely on
+/// `MarkerBatch::sort_back_to_front` being stable so the coloured fill
+/// always lands on top of the halo at identical view-Z.
+pub fn collect_primary_brush_ring(
+    batch: &mut MarkerBatch,
     rect: egui::Rect,
     camera: &OrbitCamera,
     cursor: BrushCursor<'_>,
 ) {
     let rect_size = glam::Vec2::new(rect.width(), rect.height());
-    let Some(centre_screen) = render::world_to_screen(cursor.world, rect_size, camera) else {
-        return;
-    };
-    let radius_px =
-        brush_screen_radius(camera, rect_size, cursor.world, cursor.radius_world).unwrap_or(12.0);
-    let p = egui::Pos2::new(rect.min.x + centre_screen.x, rect.min.y + centre_screen.y);
-
+    let radius_px = brush_screen_radius(camera, rect_size, cursor.world, cursor.radius_world)
+        .unwrap_or(12.0);
     let base = cursor
         .brush_id
         .map(brush_ring_color)
         .unwrap_or(egui::Color32::LIGHT_GRAY);
 
-    // Outer falloff ring + inner radius × 0.5 (the falloff visual).
-    painter.circle_stroke(p, radius_px, egui::Stroke::new(2.0, base));
-    painter.circle_stroke(p, radius_px * 0.5, egui::Stroke::new(1.0, base));
-    // Centre dot with a faint black halo so it reads on bright terrain.
-    painter.circle_filled(p, 3.0, egui::Color32::BLACK);
-    painter.circle_filled(p, 2.0, base);
+    batch.push(Marker {
+        world_pos: cursor.world,
+        radius_px,
+        color: base,
+        shape: MarkerShape::OutlineRing,
+    });
+    batch.push(Marker {
+        world_pos: cursor.world,
+        radius_px: radius_px * 0.5,
+        color: base,
+        shape: MarkerShape::OutlineRing,
+    });
+    // Centre dot — black halo first (pushed first → lower in stable
+    // sort at identical view-Z → drawn first → behind), then the
+    // coloured fill on top.
+    batch.push(Marker {
+        world_pos: cursor.world,
+        radius_px: 3.0,
+        color: egui::Color32::BLACK,
+        shape: MarkerShape::FilledCircle,
+    });
+    batch.push(Marker {
+        world_pos: cursor.world,
+        radius_px: 2.0,
+        color: base,
+        shape: MarkerShape::FilledCircle,
+    });
 }
 
 #[cfg(test)]
