@@ -33,7 +33,7 @@ pub use project::{
 };
 pub use splat::{
     Erase as SplatErase, PaintChannel, SPLAT_DIM, Smooth as SplatSmooth, SplatBrush,
-    SplatBrushRegistry, SplatChannel, SplatDistribution, SplatStamp,
+    SplatBrushRegistry, SplatChannel, SplatConfig, SplatDistribution, SplatStamp,
 };
 pub use symmetry::SymmetryAxis;
 pub use undo::{HeightmapEntry, History, HistoryEntry, ProjectDiff, WizardSnapshot};

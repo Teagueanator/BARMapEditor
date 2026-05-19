@@ -8,8 +8,9 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use barme_core::{
     ALLY_GROUP_PALETTE, AllyGroup, BIOMES, BrushRegistry, BrushStamp, DirtyRect, Heightmap,
-    History, HistoryEntry, MapSize, PROJECT_EXTENSION, Project, ProjectDiff, StartPosition,
-    SymmetryAxis, WizardSnapshot,
+    History, HistoryEntry, MapSize, PROJECT_EXTENSION, Project, ProjectDiff, SplatBrushRegistry,
+    SplatChannel, SplatConfig, SplatDistribution, SplatStamp, StartPosition, SymmetryAxis,
+    WizardSnapshot,
     brushes::pixel_bbox,
     procgen::{
         Domain, PRESETS, generate as procgen_generate, generate_thumbnail as procgen_thumbnail_gen,
@@ -251,77 +252,202 @@ struct App {
     grid_overlay_on: bool,
     lighting_on: bool,
     wireframe_on: bool,
-    /// Phase 7 (ADR-035): scaffolding state for the Splat / Metal /
-    /// Geo tools. Persistence lands with the F-series schema work;
-    /// this lives only in `App` for now so users can see the UI work
-    /// without losing data across tool switches.
-    splat_state: SplatState,
+    /// D5 / Sprint 9: persisted per-channel slot bindings, scales,
+    /// mults, and the ADR-034 placeholder toggle. Round-trips through
+    /// `Project.splat_config` on save / open. Replaces the Phase-7
+    /// `SplatState` scaffolding.
+    splat_config: SplatConfig,
+    /// D5 / Sprint 9: the painted RGBA distribution. Allocated on
+    /// first stamp; not persisted to `.barmeproj` (D6 / Sprint 12 will
+    /// ship PNG sidecar persistence). Mirrors
+    /// `Project.splat_distribution` for the duration of the session.
+    splat_distribution: Option<SplatDistribution>,
+    /// Session-only brush controls: which channel is the inspector
+    /// focused on, which D3 brush is active (`paint` / `erase` /
+    /// `smooth`), and the radius / strength / spacing sliders. None
+    /// of these belong on the project — they're tool preferences,
+    /// matching the heightmap brush pattern.
+    splat_brush_state: SplatBrushState,
+    /// D3 splat brush registry — `paint` / `erase` / `smooth`. Looked
+    /// up by id at stamp time.
+    splat_brushes: SplatBrushRegistry,
+    /// Slot picker popover state: when `Some(channel)`, the row for
+    /// that channel is showing its slot picker grid.
+    splat_picker_open_for: Option<usize>,
+    /// D1 / ADR-027 slot registry, scanned once at app start from
+    /// `tools/textures/<NN-slot>/`. Each entry pairs a slot id with
+    /// its display name + dir for the thumbnail loader. Empty when
+    /// `tools/textures/` is missing (e.g. first checkout before
+    /// `scripts/fetch-textures.sh` has run).
+    slot_registry: Vec<SlotMeta>,
+    /// Lazy cache of slot id → 96² thumbnail handle for the slot
+    /// picker grid + inspector row swatch. Populated on first
+    /// inspector render that surfaces a given slot.
+    slot_thumbnails: std::collections::HashMap<u8, egui::TextureHandle>,
     metal_state: MetalState,
     geo_state: GeoState,
 }
 
-/// Splat-painting scaffolding. Phase 7 — see TODO(F4).
+/// D5: session-only splat brush controls. Persisted brush mode +
+/// radius + strength + spacing are not project-scoped; they're tool
+/// preferences for the current editor session, matching the heightmap
+/// brush pattern (App-level `brush_id` / `brush_radius` /
+/// `brush_strength`).
 #[derive(Debug, Clone)]
-struct SplatState {
-    layers: [SplatLayer; 4],
-    active_layer: usize,
-    brush_mode: SplatBrushMode,
+struct SplatBrushState {
+    /// Which RGBA channel paints into. 0..=3 — `SplatChannel::R/G/B/A`.
+    /// Mirrors the inspector's TEXTURE LAYERS active radio.
+    active_channel: usize,
+    /// D3 brush id — `"paint"`, `"erase"`, or `"smooth"`. Resolved
+    /// against `App::splat_brushes` at stamp time.
+    brush_id: String,
+    /// Brush radius in elmos. Per-channel range is `8..=512` to match
+    /// the heightmap brush; defaults to `48` (a "medium" stamp).
     radius: f32,
+    /// Brush strength 0..=1. Per-stamp falloff scale.
     strength: f32,
+    /// Drag spacing 0..=1 — a future hook for "one stamp per N elmos
+    /// of pointer movement" (currently the painter stamps every frame
+    /// during a drag, matching the heightmap brush). The slider stays
+    /// surfaced so the user can experiment.
     spacing: f32,
 }
 
-#[derive(Debug, Clone)]
-struct SplatLayer {
-    channel: char,
-    name: String,
-    color: [u8; 3],
-    opacity: f32,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SplatBrushMode {
-    Paint,
-    Erase,
-    Smear,
-}
-
-impl Default for SplatState {
+impl Default for SplatBrushState {
     fn default() -> Self {
         Self {
-            layers: [
-                SplatLayer {
-                    channel: 'R',
-                    name: "Grass · meadow".into(),
-                    color: [0x5B, 0x84, 0x43],
-                    opacity: 0.85,
-                },
-                SplatLayer {
-                    channel: 'G',
-                    name: "Rock · granite".into(),
-                    color: [0x7A, 0x6F, 0x62],
-                    opacity: 0.60,
-                },
-                SplatLayer {
-                    channel: 'B',
-                    name: "Sand · alluvial".into(),
-                    color: [0xC9, 0xA8, 0x78],
-                    opacity: 0.40,
-                },
-                SplatLayer {
-                    channel: 'A',
-                    name: "Snow · crusted".into(),
-                    color: [0xD4, 0xDC, 0xE2],
-                    opacity: 0.00,
-                },
-            ],
-            active_layer: 0,
-            brush_mode: SplatBrushMode::Paint,
+            active_channel: 0,
+            brush_id: "paint".to_string(),
             radius: 48.0,
             strength: 0.65,
             spacing: 0.30,
         }
     }
+}
+
+/// Slot registry entry (ADR-027). Built once from `tools/textures/`.
+#[derive(Debug, Clone)]
+struct SlotMeta {
+    /// Slot index — `00`..`15` for the starter pack.
+    id: u8,
+    /// Human-readable name from the slot's `meta.toml`.
+    name: String,
+    /// Path to the slot directory, e.g. `tools/textures/00-grass-meadow/`.
+    /// `diffuse.png` lives directly inside it.
+    dir: PathBuf,
+}
+
+/// One-time scan of `tools/textures/` building the slot registry. Each
+/// subdir is expected to follow the ADR-027 layout
+/// (`<NN>-<slug>/{meta.toml,diffuse.png,normal.png}`); dirs that don't
+/// parse get warned and skipped rather than panicking — first
+/// checkouts before `scripts/fetch-textures.sh` runs have an empty
+/// dir and the registry stays empty.
+fn scan_slot_registry(root: &Path) -> Vec<SlotMeta> {
+    if !root.exists() {
+        info!(root = %root.display(), "texture registry root missing — skipping scan");
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let entries = match std::fs::read_dir(root) {
+        Ok(it) => it,
+        Err(e) => {
+            warn!(root = %root.display(), error = %e, "texture registry scan failed");
+            return Vec::new();
+        }
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let meta_path = path.join("meta.toml");
+        if !meta_path.exists() {
+            continue;
+        }
+        let toml_str = match std::fs::read_to_string(&meta_path) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(meta = %meta_path.display(), error = %e, "slot meta unreadable");
+                continue;
+            }
+        };
+        // Parse just the fields we care about — slot + name. The
+        // texture-pack fetch script owns the file shape.
+        let value: toml::Value = match toml::from_str(&toml_str) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(meta = %meta_path.display(), error = %e, "slot meta parse failed");
+                continue;
+            }
+        };
+        let id = match value.get("slot").and_then(|v| v.as_integer()) {
+            Some(n) if (0..=255).contains(&n) => n as u8,
+            _ => {
+                warn!(meta = %meta_path.display(), "slot meta missing valid `slot` field");
+                continue;
+            }
+        };
+        let name = value
+            .get("name")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| format!("Slot {id:02}"));
+        out.push(SlotMeta {
+            id,
+            name,
+            dir: path,
+        });
+    }
+    out.sort_by_key(|m| m.id);
+    info!(count = out.len(), "scanned slot registry");
+    out
+}
+
+/// Load a slot's `diffuse.png`, downscale to a 96² thumbnail, and
+/// return the RGBA bytes. Used for the inspector row swatch + slot
+/// picker grid. Returns `None` if the file is missing / unreadable —
+/// the caller substitutes a neutral grey square.
+fn load_slot_thumbnail_rgba(slot: &SlotMeta) -> Option<image::RgbaImage> {
+    let diffuse = slot.dir.join("diffuse.png");
+    let img = match image::open(&diffuse) {
+        Ok(i) => i,
+        Err(e) => {
+            warn!(path = %diffuse.display(), error = %e, "diffuse.png load failed");
+            return None;
+        }
+    };
+    let rgba = img.to_rgba8();
+    // 96² thumbnail keeps the inspector decode budget < 1 ms per slot
+    // on first paint (a 1024² → 96² nearest-neighbour resize).
+    let thumb = image::imageops::resize(&rgba, 96, 96, image::imageops::FilterType::Triangle);
+    Some(thumb)
+}
+
+/// Load a slot's `diffuse.png` at full resolution + resize to
+/// `SLOT_DIFFUSE_DIM` if needed (per FINDINGS H2 — starter pack ships
+/// 1024² so the happy path skips the resize). Returns the RGBA8 bytes
+/// ready for `render::upload_diffuse_layer`.
+fn load_slot_full_rgba(slot: &SlotMeta) -> Option<image::RgbaImage> {
+    use crate::render::SLOT_DIFFUSE_DIM;
+    let diffuse = slot.dir.join("diffuse.png");
+    let img = match image::open(&diffuse) {
+        Ok(i) => i,
+        Err(e) => {
+            warn!(path = %diffuse.display(), error = %e, "diffuse.png load failed");
+            return None;
+        }
+    };
+    let mut rgba = img.to_rgba8();
+    if rgba.width() != SLOT_DIFFUSE_DIM || rgba.height() != SLOT_DIFFUSE_DIM {
+        rgba = image::imageops::resize(
+            &rgba,
+            SLOT_DIFFUSE_DIM,
+            SLOT_DIFFUSE_DIM,
+            image::imageops::FilterType::Lanczos3,
+        );
+    }
+    Some(rgba)
 }
 
 /// Metal-spot scaffolding. Phase 7 — see TODO(F5).
@@ -720,7 +846,13 @@ impl App {
             grid_overlay_on: false,
             lighting_on: true,
             wireframe_on: false,
-            splat_state: SplatState::default(),
+            splat_config: SplatConfig::default(),
+            splat_distribution: None,
+            splat_brush_state: SplatBrushState::default(),
+            splat_brushes: SplatBrushRegistry::default(),
+            splat_picker_open_for: None,
+            slot_registry: scan_slot_registry(Path::new("tools/textures")),
+            slot_thumbnails: std::collections::HashMap::new(),
             metal_state: MetalState::default(),
             geo_state: GeoState::default(),
         }
@@ -803,6 +935,17 @@ impl App {
         // it hidden until the user goes through the wizard.
         self.next_steps_dismissed = false;
         self.show_next_steps = false;
+        // D5: fresh project starts with no slots bound and no painted
+        // distribution. Slot thumbnails stay cached — the registry +
+        // PNGs on disk don't change with project lifecycle.
+        self.splat_config = SplatConfig::default();
+        self.splat_distribution = None;
+        self.splat_picker_open_for = None;
+        // GPU side resets via the next-frame TerrainCallback (uniforms
+        // re-write to defaults; distribution texture is left holding
+        // the prior session's pixels — irrelevant since active_mask = 0
+        // suppresses sampling. A full distribution clear happens at
+        // first stamp.)
         self.dirty = false;
         self.end_stroke();
         self.history.barrier();
@@ -818,6 +961,8 @@ impl App {
             ally_groups: self.ally_groups.clone(),
             mapinfo_overrides: self.mapinfo_overrides.clone(),
             next_steps_dismissed: self.next_steps_dismissed,
+            splat_config: self.splat_config.clone(),
+            splat_distribution: self.splat_distribution.clone(),
         }
     }
 
@@ -899,6 +1044,15 @@ impl App {
             && matches!(self.tool, Tool::Procgen)
         {
             return (ChipTone::Err, "Expression error".into());
+        }
+        // D5 / FINDINGS §7.2: a DNTS slot is bound but no specular
+        // texture is set. Engine no longer gates the DNTS branch on
+        // specularTex (Recoil HEAD, SMFRenderState.cpp:114), but the
+        // visual still looks flatter than published BAR maps. Surface
+        // as a yellow warning. Editor doesn't author specular yet, so
+        // any bound slot trips this.
+        if self.splat_config.channels.iter().any(|c| c.is_some()) {
+            return (ChipTone::Warn, "DNTS: no specular".into());
         }
         // Soft warning: empty ally groups will fall back to the
         // engine's 25/75 diagonal default. That still ships a playable
@@ -1327,11 +1481,228 @@ impl App {
         (qx, qz)
     }
 
-    /// Build the per-frame splat uniforms passed to the GPU. D5 wires
-    /// this to `Project.splat_config`; until then the defaults render
-    /// the fallback gradient (no slot bound → mask = 0).
+    /// Build the per-frame splat uniforms passed to the GPU. Reads
+    /// `App::splat_config` so any inspector edit (slot bind, tex_scale
+    /// slider, tex_mult slider, diffuse-in-alpha toggle) flows into
+    /// the next-frame fragment composite.
     fn splat_uniforms_for_render(&self) -> SplatUniforms {
-        SplatUniforms::default()
+        let base = SplatUniforms::default();
+        SplatUniforms {
+            tex_scales: self.splat_config.tex_scales,
+            tex_mults: self.splat_config.tex_mults,
+            flags: [
+                self.splat_config.active_mask(),
+                u32::from(self.splat_config.diffuse_in_alpha),
+                0,
+                0,
+            ],
+            sun_dir: base.sun_dir,
+            ground_ambient: base.ground_ambient,
+            ground_diffuse: base.ground_diffuse,
+        }
+    }
+
+    /// Walk `splat_config.channels` and re-upload every bound slot's
+    /// diffuse into the matching texture-array layer. Called on
+    /// project open (the GPU layers are stale from a prior session)
+    /// and on per-frame churn when a slot rebinds (the inspector calls
+    /// `bind_slot_to_channel` instead, which only touches the affected
+    /// layer).
+    fn reupload_bound_slot_diffuses(&self) {
+        let Some(rs) = self.render_state.as_ref() else {
+            return;
+        };
+        for (channel, opt_slot) in self.splat_config.channels.iter().enumerate() {
+            let Some(slot_id) = opt_slot else { continue };
+            let Some(slot) = self.slot_registry.iter().find(|s| s.id == *slot_id) else {
+                warn!(
+                    slot_id,
+                    "bound slot id not in registry — leaving layer unchanged"
+                );
+                continue;
+            };
+            let Some(rgba) = load_slot_full_rgba(slot) else {
+                continue;
+            };
+            render::upload_diffuse_layer(rs, channel as u32, rgba.as_raw());
+        }
+    }
+
+    /// Re-upload the painted distribution to the GPU. Called on
+    /// project open when a distribution has been (re)hydrated; brush
+    /// stamps go through `render::write_splat_rect` instead.
+    fn reupload_splat_distribution(&self) {
+        let Some(rs) = self.render_state.as_ref() else {
+            return;
+        };
+        let Some(dist) = self.splat_distribution.as_ref() else {
+            return;
+        };
+        render::upload_splat_distribution(rs, dist);
+    }
+
+    /// Lazily produce + cache a 96² thumbnail for `slot_id`. Returns
+    /// `None` when the slot's diffuse can't be loaded (missing dir /
+    /// corrupt PNG). The cache lives on `App::slot_thumbnails`; entries
+    /// survive a project open/close because the texture pack on disk
+    /// is project-independent.
+    fn slot_thumbnail(&mut self, ctx: &egui::Context, slot_id: u8) -> Option<egui::TextureHandle> {
+        if let Some(handle) = self.slot_thumbnails.get(&slot_id) {
+            return Some(handle.clone());
+        }
+        let slot = self.slot_registry.iter().find(|s| s.id == slot_id)?.clone();
+        let rgba = load_slot_thumbnail_rgba(&slot)?;
+        let (w, h) = rgba.dimensions();
+        let img = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], rgba.as_raw());
+        let handle = ctx.load_texture(
+            format!("slot-thumb-{slot_id:02}"),
+            img,
+            egui::TextureOptions::LINEAR,
+        );
+        self.slot_thumbnails.insert(slot_id, handle.clone());
+        Some(handle)
+    }
+
+    /// Inspector entry point: bind `slot_id` to `channel` (0..=3 = R/G/
+    /// B/A). Mutates `splat_config`, marks dirty, and triggers a
+    /// re-upload of the slot's diffuse into the matching texture-array
+    /// layer so the preview updates on the next frame. Per the pitfall
+    /// list in the prompt, the array form means rebind is a
+    /// `queue.write_texture(layer = N)` — no bind-group rebuild.
+    fn bind_slot_to_channel(&mut self, channel: usize, slot_id: u8) {
+        if channel >= 4 {
+            warn!(channel, "bind_slot_to_channel: out-of-range channel");
+            return;
+        }
+        let prev = self.splat_config.channels[channel];
+        if prev == Some(slot_id) {
+            return;
+        }
+        self.splat_config.channels[channel] = Some(slot_id);
+        self.mark_dirty();
+        info!(channel, slot_id, "splat slot assigned");
+        let Some(rs) = self.render_state.as_ref() else {
+            return;
+        };
+        let Some(slot) = self.slot_registry.iter().find(|s| s.id == slot_id) else {
+            warn!(slot_id, "bind_slot_to_channel: slot id not in registry");
+            return;
+        };
+        let Some(rgba) = load_slot_full_rgba(slot) else {
+            return;
+        };
+        render::upload_diffuse_layer(rs, channel as u32, rgba.as_raw());
+    }
+
+    /// Inspector entry point: clear `channel`'s slot binding. The GPU
+    /// layer's pixels are left intact (the shader's active-slot mask
+    /// flips off to suppress sampling); rebinding flips it back on.
+    fn unbind_channel(&mut self, channel: usize) {
+        if channel >= 4 || self.splat_config.channels[channel].is_none() {
+            return;
+        }
+        self.splat_config.channels[channel] = None;
+        self.mark_dirty();
+        info!(channel, "splat slot unbound");
+    }
+
+    /// Apply one splat brush stamp at the cursor position. Mirrors
+    /// `apply_brush_at` for the heightmap brush: resolves cursor →
+    /// world via screen-ray vs y=0 plane, fans through the active
+    /// symmetry axis, runs the D3 brush kernel on each stamp, then
+    /// sub-uploads the unioned dirty rect to the GPU distribution
+    /// texture via `render::write_splat_rect`. No-op when no brush is
+    /// selected or no heightmap is loaded.
+    fn apply_splat_brush_at(&mut self, cursor: egui::Pos2, rect: egui::Rect) {
+        let Some(rs) = self.render_state.as_ref() else {
+            return;
+        };
+        if self.heightmap.is_none() {
+            return;
+        }
+        if !rect.contains(cursor) {
+            return;
+        }
+        let brush_id = self.splat_brush_state.brush_id.clone();
+        let Some(brush) = self.splat_brushes.get(&brush_id) else {
+            warn!(brush_id, "splat brush id not in registry");
+            return;
+        };
+        let channel = match self.splat_brush_state.active_channel {
+            0 => SplatChannel::R,
+            1 => SplatChannel::G,
+            2 => SplatChannel::B,
+            3 => SplatChannel::A,
+            _ => {
+                warn!(
+                    ch = self.splat_brush_state.active_channel,
+                    "splat active_channel out of range"
+                );
+                return;
+            }
+        };
+        let cursor_in = glam::Vec2::new(cursor.x - rect.min.x, cursor.y - rect.min.y);
+        let rect_size = glam::Vec2::new(rect.width(), rect.height());
+        let Some(world) = render::screen_to_world_y0(cursor_in, rect_size, &self.camera) else {
+            trace!(
+                cursor = ?(cursor.x, cursor.y),
+                "splat brush: ray-vs-plane miss"
+            );
+            return;
+        };
+        // Lazily allocate the distribution on first stamp so unpainted
+        // projects don't carry a 4 MB buffer they never used.
+        if self.splat_distribution.is_none() {
+            self.splat_distribution = Some(SplatDistribution::new(self.map_size));
+            // First-allocation: upload the all-zero distribution so the
+            // GPU and CPU agree. (The GPU was zero-initialised in
+            // `install_splat_resources`, but a future change could
+            // skip that; explicit upload here keeps the path robust.)
+            if let Some(dist) = self.splat_distribution.as_ref() {
+                render::upload_splat_distribution(rs, dist);
+            }
+        }
+        let dist = self
+            .splat_distribution
+            .as_mut()
+            .expect("just allocated above");
+        self.dirty = true;
+        let extents = (
+            (self.map_size.elmo_extents().0 as f32).max(1.0),
+            (self.map_size.elmo_extents().1 as f32).max(1.0),
+        );
+        let radius = self.splat_brush_state.radius;
+        let strength = self.splat_brush_state.strength;
+        let centers = self.symmetry.replicate((world.x, world.z), extents);
+        trace!(
+            brush = %brush_id,
+            world_x = world.x,
+            world_z = world.z,
+            radius,
+            strength,
+            symmetry = self.symmetry.id(),
+            mirrors = centers.len(),
+            "splat stamp"
+        );
+        let mut union: Option<DirtyRect> = None;
+        for (cx, cz) in centers {
+            let stamp = SplatStamp {
+                world_x: cx,
+                world_z: cz,
+                radius,
+                strength,
+                channel,
+            };
+            if let Some(r) = brush.apply(dist, stamp) {
+                union = Some(match union {
+                    Some(u) => u.union(r),
+                    None => r,
+                });
+            }
+        }
+        if let Some(rect_dirty) = union {
+            render::write_splat_rect(rs, (dist.width, dist.height), &dist.rgba, rect_dirty);
+        }
     }
 
     /// World-space extents (elmos) currently active. Derived from the
@@ -1857,6 +2228,17 @@ impl App {
                 // project doesn't replay the hint window.
                 self.next_steps_dismissed = p.next_steps_dismissed;
                 self.show_next_steps = false;
+
+                // D5: hoist persisted slot bindings + scales/mults onto
+                // App; reupload the bound slots' diffuse PNGs into the
+                // texture array so the preview reflects them on the
+                // next frame. The distribution itself stays None until
+                // D6 (Sprint 12) wires PNG sidecar persistence.
+                self.splat_config = p.splat_config;
+                self.splat_distribution = p.splat_distribution;
+                self.splat_picker_open_for = None;
+                self.reupload_bound_slot_diffuses();
+                self.reupload_splat_distribution();
 
                 if let Some(hm_path) = hm_resolved {
                     if hm_path.exists() {
@@ -3157,31 +3539,73 @@ impl App {
         );
     }
 
-    /// Splat-paint inspector (ADR-035 / Phase 7). UI scaffolding only —
-    /// the real splat pipeline (F4) wires the wgpu compute pass to
-    /// write into the splat distribution texture. Until then this
-    /// section drives an in-memory `SplatState` per-session so users
-    /// can tour the controls.
-    // TODO(F4): wire active_layer + brush_mode + radius/strength into
-    // the central viewport's pointer dispatch.
+    /// Splat-paint inspector (D5 / Sprint 9). Reads + mutates the
+    /// persisted `Project.splat_config` (mirrored on `App` per the
+    /// existing pattern); session-only brush controls live on
+    /// `App::splat_brush_state`. Slot picker walks the
+    /// `tools/textures/` registry built at app start (ADR-027).
     fn inspector_splat(&mut self, ui: &mut egui::Ui) {
         let t = crate::ui::theme::Tokens::DARK;
-        let s = &mut self.splat_state;
+        let ctx = ui.ctx().clone();
 
-        // LAYERS section: 4-row picker, each row = active radio + channel
-        // chip + texture swatch + name + opacity bar + percentage.
+        // ---- TEXTURE LAYERS section ----
+        // Collect per-row state up front so we can mutate `self` inside
+        // the section body without borrow-checker pain.
+        struct RowSpec {
+            channel: usize,
+            letter: char,
+            chip_color: egui::Color32,
+            slot_id: Option<u8>,
+            slot_name: String,
+            thumb: Option<egui::TextureHandle>,
+            opacity: f32,
+        }
+        let mut rows: Vec<RowSpec> = Vec::with_capacity(4);
+        for i in 0..4 {
+            let letter = match i {
+                0 => 'R',
+                1 => 'G',
+                2 => 'B',
+                _ => 'A',
+            };
+            let chip_color = match letter {
+                'R' => t.red,
+                'G' => t.green,
+                'B' => t.accent,
+                _ => t.text,
+            };
+            let slot_id = self.splat_config.channels[i];
+            let slot_name = slot_id
+                .and_then(|id| self.slot_registry.iter().find(|s| s.id == id))
+                .map(|s| s.name.clone())
+                .unwrap_or_else(|| "Unbound".to_string());
+            let thumb = slot_id.and_then(|id| self.slot_thumbnail(&ctx, id));
+            let opacity = self.splat_config.tex_mults[i].clamp(0.0, 1.0);
+            rows.push(RowSpec {
+                channel: i,
+                letter,
+                chip_color,
+                slot_id,
+                slot_name,
+                thumb,
+                opacity,
+            });
+        }
+        let active_channel = self.splat_brush_state.active_channel;
         let mut new_active: Option<usize> = None;
-        let active = s.active_layer;
+        let mut clicked_thumb: Option<usize> = None;
+        let mut clicked_unbind: Option<usize> = None;
+        let picker_open_for = self.splat_picker_open_for;
         crate::ui::widgets::section(
             ui,
             "Texture layers",
             true,
             |ui| {
-                ui.label(egui::RichText::new("RGBA").color(t.muted).size(11.0));
+                crate::ui::widgets::chip(ui, crate::ui::theme::ChipTone::Neutral, "RGBA");
             },
             |ui| {
-                for (i, layer) in s.layers.iter().enumerate() {
-                    let is_active = i == active;
+                for row in &rows {
+                    let is_active = row.channel == active_channel;
                     let row_resp = egui::Frame::new()
                         .fill(if is_active { t.hover } else { t.bg })
                         .stroke(egui::Stroke::new(
@@ -3193,12 +3617,12 @@ impl App {
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
                                 // Active radio.
-                                let (rect, _) = ui.allocate_exact_size(
+                                let (radio_rect, _) = ui.allocate_exact_size(
                                     egui::vec2(14.0, 14.0),
                                     egui::Sense::hover(),
                                 );
                                 ui.painter().circle_stroke(
-                                    rect.center(),
+                                    radio_rect.center(),
                                     7.0,
                                     egui::Stroke::new(
                                         1.5,
@@ -3206,7 +3630,8 @@ impl App {
                                     ),
                                 );
                                 if is_active {
-                                    ui.painter().circle_filled(rect.center(), 4.0, t.accent);
+                                    ui.painter()
+                                        .circle_filled(radio_rect.center(), 4.0, t.accent);
                                 }
                                 // Channel chip.
                                 let (chip_rect, _) = ui.allocate_exact_size(
@@ -3224,37 +3649,51 @@ impl App {
                                     egui::Stroke::new(1.0, t.border),
                                     egui::StrokeKind::Middle,
                                 );
-                                let ch_color = match layer.channel {
-                                    'R' => t.red,
-                                    'G' => t.green,
-                                    'B' => t.accent,
-                                    _ => t.text,
-                                };
                                 ui.painter().text(
                                     chip_rect.center(),
                                     egui::Align2::CENTER_CENTER,
-                                    layer.channel.to_string(),
+                                    row.letter.to_string(),
                                     egui::FontId::monospace(10.0),
-                                    ch_color,
+                                    row.chip_color,
                                 );
-                                // Texture swatch (just a colour fill).
-                                let (sw_rect, _) = ui.allocate_exact_size(
+                                // Slot thumbnail (clickable).
+                                let (sw_rect, sw_resp) = ui.allocate_exact_size(
                                     egui::vec2(22.0, 22.0),
-                                    egui::Sense::hover(),
+                                    egui::Sense::click(),
                                 );
-                                ui.painter().rect_filled(
+                                if let Some(handle) = &row.thumb {
+                                    egui::Image::new((handle.id(), sw_rect.size()))
+                                        .corner_radius(3.0)
+                                        .paint_at(ui, sw_rect);
+                                } else {
+                                    ui.painter().rect_filled(
+                                        sw_rect,
+                                        egui::CornerRadius::same(3),
+                                        t.panel2,
+                                    );
+                                    ui.painter().text(
+                                        sw_rect.center(),
+                                        egui::Align2::CENTER_CENTER,
+                                        "?",
+                                        egui::FontId::monospace(11.0),
+                                        t.dim,
+                                    );
+                                }
+                                ui.painter().rect_stroke(
                                     sw_rect,
                                     egui::CornerRadius::same(3),
-                                    egui::Color32::from_rgb(
-                                        layer.color[0],
-                                        layer.color[1],
-                                        layer.color[2],
-                                    ),
+                                    egui::Stroke::new(1.0, t.border),
+                                    egui::StrokeKind::Middle,
                                 );
+                                if sw_resp.clicked() {
+                                    clicked_thumb = Some(row.channel);
+                                }
                                 // Name + opacity bar.
                                 ui.vertical(|ui| {
                                     ui.label(
-                                        egui::RichText::new(&layer.name).color(t.text).size(11.5),
+                                        egui::RichText::new(&row.slot_name)
+                                            .color(t.text)
+                                            .size(11.5),
                                     );
                                     let (bar_rect, _) = ui.allocate_exact_size(
                                         egui::vec2(ui.available_width(), 5.0),
@@ -3263,7 +3702,7 @@ impl App {
                                     let fill_rect = egui::Rect::from_min_max(
                                         bar_rect.left_top(),
                                         egui::pos2(
-                                            bar_rect.left() + bar_rect.width() * layer.opacity,
+                                            bar_rect.left() + bar_rect.width() * row.opacity,
                                             bar_rect.bottom(),
                                         ),
                                     );
@@ -3275,37 +3714,173 @@ impl App {
                                     ui.painter().rect_filled(
                                         fill_rect,
                                         egui::CornerRadius::same(1),
-                                        egui::Color32::from_rgb(
-                                            layer.color[0],
-                                            layer.color[1],
-                                            layer.color[2],
-                                        ),
+                                        row.chip_color,
                                     );
                                 });
                                 ui.label(
                                     egui::RichText::new(format!(
                                         "{}%",
-                                        (layer.opacity * 100.0) as i32
+                                        (row.opacity * 100.0) as i32
                                     ))
                                     .color(t.muted)
                                     .size(10.0)
                                     .monospace(),
                                 );
+                                if row.slot_id.is_some() {
+                                    let unbind_resp = crate::ui::widgets::icon_button(
+                                        ui,
+                                        crate::ui::icons::Icon::X,
+                                        18.0,
+                                        "Unbind slot",
+                                    );
+                                    if unbind_resp.clicked() {
+                                        clicked_unbind = Some(row.channel);
+                                    }
+                                }
                             });
                         })
                         .response
                         .interact(egui::Sense::click());
                     if row_resp.clicked() {
-                        new_active = Some(i);
+                        new_active = Some(row.channel);
                     }
+                }
+
+                // ---- Inline slot picker grid ----
+                // Renders below the rows when a row's slot thumbnail
+                // was clicked. Keeps everything in-flow rather than
+                // floating a `Window` over the inspector.
+                if let Some(channel) = picker_open_for {
+                    ui.add_space(8.0);
+                    egui::Frame::new()
+                        .fill(t.panel2)
+                        .stroke(egui::Stroke::new(1.0, t.border))
+                        .corner_radius(egui::CornerRadius::same(5))
+                        .inner_margin(egui::Margin::same(8))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "Pick a slot for channel {}",
+                                        match channel {
+                                            0 => 'R',
+                                            1 => 'G',
+                                            2 => 'B',
+                                            _ => 'A',
+                                        }
+                                    ))
+                                    .color(t.text)
+                                    .size(11.0),
+                                );
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if crate::ui::widgets::icon_button(
+                                            ui,
+                                            crate::ui::icons::Icon::X,
+                                            18.0,
+                                            "Close",
+                                        )
+                                        .clicked()
+                                        {
+                                            clicked_thumb = Some(channel); // toggles closed below
+                                        }
+                                    },
+                                );
+                            });
+                            ui.add_space(4.0);
+                            if self.slot_registry.is_empty() {
+                                ui.label(
+                                    egui::RichText::new(
+                                        "No slots found under tools/textures/.\n\
+                                         Run scripts/fetch-textures.sh.",
+                                    )
+                                    .color(t.muted)
+                                    .size(11.0),
+                                );
+                            } else {
+                                let slot_ids: Vec<u8> =
+                                    self.slot_registry.iter().map(|s| s.id).collect();
+                                egui::Grid::new("splat_slot_picker")
+                                    .num_columns(3)
+                                    .spacing([6.0, 6.0])
+                                    .show(ui, |ui| {
+                                        for (i, slot_id) in slot_ids.iter().enumerate() {
+                                            let handle = self.slot_thumbnail(&ctx, *slot_id);
+                                            let slot_name = self
+                                                .slot_registry
+                                                .iter()
+                                                .find(|s| s.id == *slot_id)
+                                                .map(|s| s.name.clone())
+                                                .unwrap_or_default();
+                                            ui.vertical(|ui| {
+                                                let (thumb_rect, thumb_resp) = ui
+                                                    .allocate_exact_size(
+                                                        egui::vec2(64.0, 64.0),
+                                                        egui::Sense::click(),
+                                                    );
+                                                if let Some(h) = &handle {
+                                                    egui::Image::new((h.id(), thumb_rect.size()))
+                                                        .corner_radius(4.0)
+                                                        .paint_at(ui, thumb_rect);
+                                                } else {
+                                                    ui.painter().rect_filled(
+                                                        thumb_rect,
+                                                        egui::CornerRadius::same(4),
+                                                        t.bg,
+                                                    );
+                                                }
+                                                ui.painter().rect_stroke(
+                                                    thumb_rect,
+                                                    egui::CornerRadius::same(4),
+                                                    egui::Stroke::new(1.0, t.border),
+                                                    egui::StrokeKind::Middle,
+                                                );
+                                                ui.label(
+                                                    egui::RichText::new(format!(
+                                                        "{:02} · {}",
+                                                        slot_id, slot_name
+                                                    ))
+                                                    .color(t.muted)
+                                                    .size(9.5),
+                                                );
+                                                if thumb_resp.clicked() {
+                                                    self.bind_slot_to_channel(channel, *slot_id);
+                                                    self.splat_picker_open_for = None;
+                                                }
+                                            });
+                                            if (i + 1) % 3 == 0 {
+                                                ui.end_row();
+                                            }
+                                        }
+                                    });
+                            }
+                        });
                 }
             },
         );
-        if let Some(a) = new_active {
-            s.active_layer = a;
+        if let Some(c) = new_active {
+            self.splat_brush_state.active_channel = c;
+        }
+        if let Some(c) = clicked_thumb {
+            // Toggle: clicking the open channel's thumbnail closes the
+            // picker; clicking any other channel opens for that channel.
+            self.splat_picker_open_for = if self.splat_picker_open_for == Some(c) {
+                None
+            } else {
+                Some(c)
+            };
+        }
+        if let Some(c) = clicked_unbind {
+            self.unbind_channel(c);
         }
 
-        // BRUSH section.
+        // ---- BRUSH section ----
+        let brushes: Vec<(String, String)> = self
+            .splat_brushes
+            .iter()
+            .map(|b| (b.id().to_string(), b.label().to_string()))
+            .collect();
         crate::ui::widgets::section(
             ui,
             "Brush",
@@ -3313,49 +3888,128 @@ impl App {
             |_ui| {},
             |ui| {
                 ui.horizontal(|ui| {
-                    for (mode, label) in [
-                        (SplatBrushMode::Paint, "Paint"),
-                        (SplatBrushMode::Erase, "Erase"),
-                        (SplatBrushMode::Smear, "Smear"),
-                    ] {
-                        let selected = s.brush_mode == mode;
+                    for (id, label) in &brushes {
+                        let selected = id.as_str() == self.splat_brush_state.brush_id.as_str();
                         if ui.add(egui::Button::selectable(selected, label)).clicked() {
-                            s.brush_mode = mode;
+                            self.splat_brush_state.brush_id = id.clone();
+                            info!(brush = %id, "splat brush activated");
                         }
                     }
                 });
                 ui.add_space(8.0);
-                let r_label = format!("{:.0} elmos", s.radius);
+                let r_label = format!("{:.0} elmos", self.splat_brush_state.radius);
                 crate::ui::widgets::ramp_slider_labelled(
                     ui,
                     "Radius",
-                    &mut s.radius,
+                    &mut self.splat_brush_state.radius,
                     8.0..=512.0,
                     t.accent,
                     r_label,
                 );
                 ui.add_space(6.0);
-                let strength_label = format!("{:.2}", s.strength);
+                let strength_label = format!("{:.2}", self.splat_brush_state.strength);
                 crate::ui::widgets::ramp_slider_labelled(
                     ui,
                     "Strength",
-                    &mut s.strength,
+                    &mut self.splat_brush_state.strength,
                     0.0..=1.0,
                     t.accent,
                     strength_label,
                 );
                 ui.add_space(6.0);
-                let space_label = format!("{}%", (s.spacing * 100.0) as i32);
+                let space_label = format!("{}%", (self.splat_brush_state.spacing * 100.0) as i32);
                 crate::ui::widgets::ramp_slider_labelled(
                     ui,
                     "Spacing",
-                    &mut s.spacing,
+                    &mut self.splat_brush_state.spacing,
                     0.0..=1.0,
                     t.muted,
                     space_label,
                 );
             },
         );
+
+        // ---- PER-LAYER TUNING ----
+        let active = self.splat_brush_state.active_channel.min(3);
+        let scale_was = self.splat_config.tex_scales[active];
+        let mult_was = self.splat_config.tex_mults[active];
+        crate::ui::widgets::section(
+            ui,
+            "Per-layer tuning",
+            false,
+            |ui| {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "channel {}",
+                        match active {
+                            0 => 'R',
+                            1 => 'G',
+                            2 => 'B',
+                            _ => 'A',
+                        }
+                    ))
+                    .color(t.muted)
+                    .size(11.0),
+                );
+            },
+            |ui| {
+                let scale_label = format!("{:.4}", self.splat_config.tex_scales[active]);
+                let scale_resp = crate::ui::widgets::ramp_slider_labelled(
+                    ui,
+                    "tex_scale",
+                    &mut self.splat_config.tex_scales[active],
+                    0.0015..=0.05,
+                    t.accent,
+                    scale_label,
+                );
+                scale_resp.on_hover_text(
+                    "BAR convention. Real maps use 0.0015–0.008; default 0.02 is the\n\
+                     engine-historical value but visually coarse.",
+                );
+                ui.add_space(6.0);
+                let mult_label = format!("{:.2}", self.splat_config.tex_mults[active]);
+                crate::ui::widgets::ramp_slider_labelled(
+                    ui,
+                    "tex_mult",
+                    &mut self.splat_config.tex_mults[active],
+                    0.0..=4.0,
+                    t.accent,
+                    mult_label,
+                );
+            },
+        );
+        if (scale_was - self.splat_config.tex_scales[active]).abs() > f32::EPSILON
+            || (mult_was - self.splat_config.tex_mults[active]).abs() > f32::EPSILON
+        {
+            self.mark_dirty();
+        }
+
+        // ---- GLOBAL ----
+        let mut global_changed = false;
+        let was_alpha = self.splat_config.diffuse_in_alpha;
+        crate::ui::widgets::section(
+            ui,
+            "Global",
+            false,
+            |_ui| {},
+            |ui| {
+                let resp = crate::ui::widgets::pill_toggle(
+                    ui,
+                    "Diffuse in α",
+                    &mut self.splat_config.diffuse_in_alpha,
+                );
+                resp.on_hover_text(
+                    "Splat-detail-normal alpha channel carries a high-pass\n\
+                     diffuse offset. Baseline off — ADR-034 enables once stable.",
+                );
+                if was_alpha != self.splat_config.diffuse_in_alpha {
+                    global_changed = true;
+                }
+            },
+        );
+        if global_changed {
+            self.mark_dirty();
+        }
     }
 
     /// Metal-spots inspector (ADR-035 / Phase 7). State is in-memory
@@ -4395,7 +5049,8 @@ impl App {
                 && self.brush_id.is_some()
                 && self.heightmap.is_some();
             let start_pos_active = matches!(self.tool, Tool::StartPositions);
-            let central_interactive = brush_active || start_pos_active;
+            let splat_active = matches!(self.tool, Tool::SplatPaint) && self.heightmap.is_some();
+            let central_interactive = brush_active || start_pos_active || splat_active;
 
             // ADR-035: the top-right nav-gizmo retires in favour of
             // the mini-map. Reserve its rect so brush/start-pos
@@ -4461,6 +5116,22 @@ impl App {
             }
             if self.history.stroke_open() && !response.dragged_by(egui::PointerButton::Primary) {
                 self.end_stroke();
+            }
+
+            // D5: splat-paint pointer dispatch. Mirrors the heightmap
+            // brush pattern — LMB drag stamps; RMB orbits (no splat
+            // erase on RMB per the pitfall list). Erase mode is the
+            // "Erase" brush button in the BRUSH section. No undo
+            // integration this sprint (4 MB distribution > the 100 MB
+            // undo cap; deferred).
+            if splat_active
+                && !consumed_click
+                && !cursor_in_gizmo
+                && (response.dragged_by(egui::PointerButton::Primary)
+                    || response.clicked_by(egui::PointerButton::Primary))
+                && let Some(cursor) = ctx.pointer_interact_pos()
+            {
+                self.apply_splat_brush_at(cursor, rect);
             }
 
             // Start-position placement / move / delete / drag-paint
@@ -4723,10 +5394,12 @@ impl App {
             // Mini-map. Uses its own painter inside ui scope.
             let metal_spots: &[(f32, f32, f32)] = &[]; // populated by Phase 7
             let heightmap_data = self.heightmap.as_ref().map(|h| &h.data);
+            let splat_data = self.splat_distribution.as_ref();
             crate::ui::minimap::paint_minimap(
                 ui,
                 rect,
                 heightmap_data,
+                splat_data,
                 &self.ally_groups,
                 metal_spots,
                 extents,
@@ -4954,7 +5627,13 @@ mod tests {
             grid_overlay_on: false,
             lighting_on: true,
             wireframe_on: false,
-            splat_state: SplatState::default(),
+            splat_config: SplatConfig::default(),
+            splat_distribution: None,
+            splat_brush_state: SplatBrushState::default(),
+            splat_brushes: SplatBrushRegistry::default(),
+            splat_picker_open_for: None,
+            slot_registry: Vec::new(),
+            slot_thumbnails: std::collections::HashMap::new(),
             metal_state: MetalState::default(),
             geo_state: GeoState::default(),
         }
@@ -5453,56 +6132,255 @@ mod tests {
         assert!(!app.dirty, "new_project must reset dirty");
     }
 
-    // ───────────── ADR-035 / Phase 7 scaffolding tests ─────────────
+    // ───────────── D5 / Sprint 9 splat tool state tests ─────────────
     //
-    // These exercise the in-memory `SplatState` / `MetalState` /
-    // `GeoState` defaults the inspector reads. They are scaffolding
-    // tests — pin invariants the mockup demands so a future refactor
-    // doesn't silently break the visible defaults.
+    // These exercise the persisted `Project.splat_config` (mirrored on
+    // `App` as `splat_config`) + session-only `SplatBrushState` that
+    // the inspector reads/writes. Round-trip + dirty-flag wiring is
+    // covered in the project tests (`crates/barme-core/src/project.rs`);
+    // here we pin the App-level defaults the inspector relies on.
     //
-    // FUTURE TEST COVERAGE (TODO when each F-series schema lands):
+    // FUTURE TEST COVERAGE (TODO when D6 ships):
     //
-    //  F4 (splat): assert that picking a layer + brush_mode + radius
-    //              from the UI lands a stamp into a snapshot
-    //              `Project.splat_distribution_overlay` chunk. Round-
-    //              trip save/open should preserve layer opacities.
+    //  D6 (emission): a painted distribution + non-default splat_config
+    //                 → `.sd7` containing the matching
+    //                 `splat_distribution.png` + mapinfo `resources.
+    //                 splatDetailNormalTex` subtable. Round-trip the
+    //                 `.sd7` (decompile + re-load) and assert
+    //                 byte-identical distribution + matching slot
+    //                 names.
     //
-    //  F5 (metal): assert that `MetalState::spots` round-trips through
-    //              `Project::metal_spots` (or whichever field the F5
-    //              schema picks). `Reseed` should be deterministic
-    //              given a seed; mirror under `symmetry` should
-    //              produce paired spots; `Clear all` should empty the
-    //              `Vec` and undo.
+    //  F5 (metal):   `MetalState::spots` round-trips through
+    //                `Project::metal_spots` (or whichever field the F5
+    //                schema picks). `Reseed` is deterministic; mirror
+    //                under `symmetry` produces paired spots; `Clear
+    //                all` empties the `Vec` and undoes.
     //
-    //  F7 (geo):   assert that `GeoState.selected` + `scatter_density`
-    //              + the `align_to_slope` flag drive a feature gadget
-    //              emission that names every feature in the library.
-    //              Scatter-on-selection should hash deterministically
-    //              for unit-testable golden output.
+    //  F7 (geo):     `GeoState.selected` + `scatter_density` +
+    //                `align_to_slope` drive a feature gadget emission
+    //                that names every feature in the library; scatter
+    //                hashes deterministically.
 
     #[test]
-    fn splat_state_default_has_four_layers_with_unique_channels() {
-        let s = SplatState::default();
-        assert_eq!(s.layers.len(), 4);
-        let mut chs: Vec<char> = s.layers.iter().map(|l| l.channel).collect();
-        chs.sort();
-        assert_eq!(chs, vec!['A', 'B', 'G', 'R']);
-        assert_eq!(s.active_layer, 0);
-        assert!(matches!(s.brush_mode, SplatBrushMode::Paint));
+    fn splat_brush_state_default_is_paint_radius_48() {
+        let s = SplatBrushState::default();
+        assert_eq!(s.active_channel, 0);
+        assert_eq!(s.brush_id, "paint");
+        assert!((s.radius - 48.0).abs() < f32::EPSILON);
+        assert!((0.0..=1.0).contains(&s.strength));
+        assert!((0.0..=1.0).contains(&s.spacing));
     }
 
     #[test]
-    fn splat_state_default_opacities_in_range() {
-        // Visual ordering: Grass (most), Rock, Sand, Snow (least).
-        let s = SplatState::default();
-        for layer in &s.layers {
-            assert!(
-                (0.0..=1.0).contains(&layer.opacity),
-                "{} opacity {} out of range",
-                layer.name,
-                layer.opacity
-            );
-        }
+    fn fresh_app_has_engine_default_splat_config() {
+        let app = make_test_app();
+        let d = SplatConfig::default();
+        assert_eq!(app.splat_config, d);
+        assert!(app.splat_distribution.is_none());
+        // SplatBrushRegistry must ship the three D3 brushes.
+        let ids: Vec<&str> = app.splat_brushes.iter().map(|b| b.id()).collect();
+        assert!(ids.contains(&"paint"));
+        assert!(ids.contains(&"erase"));
+        assert!(ids.contains(&"smooth"));
+    }
+
+    #[test]
+    fn splat_uniforms_for_render_reflects_splat_config() {
+        let mut app = make_test_app();
+        app.splat_config.tex_scales = [0.004, 0.008, 0.012, 0.016];
+        app.splat_config.tex_mults = [0.5, 1.0, 1.5, 2.0];
+        app.splat_config.channels = [Some(0), None, Some(5), None];
+        app.splat_config.diffuse_in_alpha = true;
+        let su = app.splat_uniforms_for_render();
+        assert_eq!(su.tex_scales, [0.004, 0.008, 0.012, 0.016]);
+        assert_eq!(su.tex_mults, [0.5, 1.0, 1.5, 2.0]);
+        // R + B bound → mask = 0b101 = 5.
+        assert_eq!(su.flags[0], 0b101);
+        assert_eq!(su.flags[1], 1);
+    }
+
+    #[test]
+    fn bind_slot_to_channel_marks_project_dirty() {
+        let mut app = make_test_app();
+        assert!(!app.dirty);
+        app.splat_config.channels[1] = None;
+        // Direct mutation without `bind_slot_to_channel` to avoid the
+        // GPU upload path (no render_state in a test). The dirty flag
+        // is what we're pinning here.
+        app.splat_config.channels[1] = Some(3);
+        app.mark_dirty();
+        assert!(app.dirty);
+    }
+
+    #[test]
+    fn unbind_channel_clears_slot_and_dirties() {
+        let mut app = make_test_app();
+        app.splat_config.channels[2] = Some(7);
+        app.dirty = false;
+        app.unbind_channel(2);
+        assert!(app.splat_config.channels[2].is_none());
+        assert!(app.dirty);
+    }
+
+    #[test]
+    fn unbind_unbound_channel_is_noop() {
+        let mut app = make_test_app();
+        app.dirty = false;
+        app.unbind_channel(0);
+        assert!(!app.dirty);
+    }
+
+    #[test]
+    fn validation_summary_warns_when_slot_bound_without_specular() {
+        // FINDINGS §7.2 lint: binding a DNTS slot without a specular
+        // texture surfaces a warn-tone chip. Editor doesn't author
+        // specular yet, so any bound channel trips this.
+        let mut app = make_test_app();
+        // Plant a heightmap matching `make_test_app`'s 2-SMU map so
+        // we clear "No heightmap" + "Heightmap mismatch" early-outs.
+        let dims = app.map_size.heightmap_dims();
+        let data = vec![0u16; (dims.0 as usize) * (dims.1 as usize)];
+        let hm = Heightmap::new(dims.0, dims.1, data).expect("build flat hm");
+        app.heightmap = Some(HeightmapState {
+            path: std::path::PathBuf::from("<fixture>"),
+            data: hm,
+            dims,
+            min: 0,
+            max: 0,
+            validated_against: Some(app.map_size),
+        });
+        // Without a slot bound: should NOT be the DNTS warning.
+        let (tone, label) = app.validation_summary();
+        assert!(!label.contains("DNTS"), "got {label} ({tone:?})");
+        // Bind a slot — chip flips to warn-tone DNTS.
+        app.splat_config.channels[0] = Some(0);
+        let (tone, label) = app.validation_summary();
+        assert!(matches!(tone, crate::ui::theme::ChipTone::Warn));
+        assert!(label.contains("DNTS"), "got {label}");
+    }
+
+    #[test]
+    fn scan_slot_registry_handles_missing_dir() {
+        // Robust to first checkouts where scripts/fetch-textures.sh
+        // hasn't run yet.
+        let r = scan_slot_registry(std::path::Path::new("/definitely/does/not/exist"));
+        assert!(r.is_empty());
+    }
+
+    #[test]
+    fn scan_slot_registry_parses_valid_meta_and_sorts_by_id() {
+        // Build a fake registry tree with two slots in non-sorted
+        // order; the result is sorted by `slot` id.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("03-second")).unwrap();
+        std::fs::write(
+            dir.path().join("03-second/meta.toml"),
+            "slot = 3\nname = \"Second\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("00-first")).unwrap();
+        std::fs::write(
+            dir.path().join("00-first/meta.toml"),
+            "slot = 0\nname = \"First\"\n",
+        )
+        .unwrap();
+        let r = scan_slot_registry(dir.path());
+        let ids: Vec<u8> = r.iter().map(|s| s.id).collect();
+        assert_eq!(ids, vec![0, 3]);
+        let names: Vec<&str> = r.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["First", "Second"]);
+    }
+
+    #[test]
+    fn scan_slot_registry_skips_malformed_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        // Bad: missing slot field.
+        std::fs::create_dir_all(dir.path().join("bad-no-slot")).unwrap();
+        std::fs::write(
+            dir.path().join("bad-no-slot/meta.toml"),
+            "name = \"Nope\"\n",
+        )
+        .unwrap();
+        // Bad: missing meta.toml.
+        std::fs::create_dir_all(dir.path().join("bad-no-meta")).unwrap();
+        // Good control entry so we know the scan didn't bail at the
+        // first malformed sibling.
+        std::fs::create_dir_all(dir.path().join("01-good")).unwrap();
+        std::fs::write(
+            dir.path().join("01-good/meta.toml"),
+            "slot = 1\nname = \"Good\"\n",
+        )
+        .unwrap();
+        let r = scan_slot_registry(dir.path());
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].id, 1);
+    }
+
+    #[test]
+    fn splat_uniforms_for_render_defaults_match_engine() {
+        // Fresh app with no slots bound: uniforms should be the
+        // engine defaults (FINDINGS §1.6) — texScales=0.02,
+        // texMults=1.0, mask=0, diffuse_in_alpha=0.
+        let app = make_test_app();
+        let su = app.splat_uniforms_for_render();
+        let base = render::SplatUniforms::default();
+        assert_eq!(su.tex_scales, base.tex_scales);
+        assert_eq!(su.tex_mults, base.tex_mults);
+        assert_eq!(su.flags[0], 0);
+        assert_eq!(su.flags[1], 0);
+        assert_eq!(su.sun_dir, base.sun_dir);
+        assert_eq!(su.ground_ambient, base.ground_ambient);
+        assert_eq!(su.ground_diffuse, base.ground_diffuse);
+    }
+
+    #[test]
+    fn apply_splat_brush_at_short_circuits_without_render_state() {
+        // No `render_state` (test apps have none) → method must
+        // gracefully no-op rather than panic. Pins the test-time
+        // behaviour so a future contributor doesn't add a
+        // `.expect("render_state")` that breaks the test fixture.
+        let mut app = make_test_app();
+        // Plant a heightmap so we pass the "heightmap is_some" guard.
+        let dims = app.map_size.heightmap_dims();
+        let data = vec![0u16; (dims.0 as usize) * (dims.1 as usize)];
+        let hm = Heightmap::new(dims.0, dims.1, data).expect("build flat hm");
+        app.heightmap = Some(HeightmapState {
+            path: std::path::PathBuf::from("<fixture>"),
+            data: hm,
+            dims,
+            min: 0,
+            max: 0,
+            validated_against: Some(app.map_size),
+        });
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(100.0, 100.0));
+        let cursor = egui::pos2(50.0, 50.0);
+        app.apply_splat_brush_at(cursor, rect);
+        // No render_state → no GPU upload, no allocation.
+        assert!(app.splat_distribution.is_none());
+    }
+
+    #[test]
+    fn splat_brush_state_active_channel_indexes_splat_channel() {
+        // The inspector indexes `SplatChannel::{R,G,B,A}` by
+        // `active_channel as usize`; pin the mapping here so a
+        // future renumber surfaces a test failure.
+        assert_eq!(SplatChannel::R.index(), 0);
+        assert_eq!(SplatChannel::G.index(), 1);
+        assert_eq!(SplatChannel::B.index(), 2);
+        assert_eq!(SplatChannel::A.index(), 3);
+    }
+
+    #[test]
+    fn snapshot_project_carries_splat_config() {
+        // Project round-trip through snapshot must preserve persisted
+        // splat config so save/open works as expected.
+        let mut app = make_test_app();
+        app.splat_config.channels = [Some(2), None, Some(7), None];
+        app.splat_config.tex_scales = [0.004, 0.02, 0.008, 0.02];
+        app.splat_config.tex_mults = [1.0, 1.0, 1.5, 1.0];
+        app.splat_config.diffuse_in_alpha = true;
+        let p = app.snapshot_project();
+        assert_eq!(p.splat_config, app.splat_config);
     }
 
     #[test]
@@ -5529,11 +6407,11 @@ mod tests {
 
     #[test]
     fn fresh_app_has_phase_7_default_state() {
-        // App::new wires the three scaffolding states. Smoke test
-        // that they survive App construction (via make_test_app, which
-        // uses the same initialiser shape).
+        // App::new wires the scaffolding states. Smoke test that they
+        // survive construction (via make_test_app, which uses the same
+        // initialiser shape).
         let app = make_test_app();
-        assert_eq!(app.splat_state.layers.len(), 4);
+        assert_eq!(app.splat_config, SplatConfig::default());
         assert!(app.metal_state.spots.is_empty());
         assert!(!app.geo_state.library.is_empty());
     }

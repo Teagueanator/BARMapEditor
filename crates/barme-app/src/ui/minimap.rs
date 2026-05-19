@@ -15,7 +15,7 @@ use eframe::egui::{
     self, Align2, Color32, CornerRadius, FontId, Pos2, Rect, Sense, Stroke, StrokeKind, Ui,
 };
 
-use barme_core::{AllyGroup, Heightmap};
+use barme_core::{AllyGroup, Heightmap, SplatDistribution};
 
 use crate::render::OrbitCamera;
 use crate::ui::icons::{self, Icon};
@@ -35,10 +35,16 @@ impl Minimap {
 /// the rect the mini-map occupies (so the caller can hit-test pointer
 /// events against it). Heightmap is sampled at most 48 × 48 cells; if
 /// the source resolution is lower, the body shows a checker pattern.
+///
+/// `splat_distribution`, when supplied, is composited over the
+/// heightfield thumbnail at 50 % opacity so the user can see at a
+/// glance where they've painted (D5 / Sprint 9).
+#[allow(clippy::too_many_arguments)] // pure-rendering helper, easier to read than a struct
 pub fn paint_minimap(
     ui: &mut Ui,
     viewport_rect: Rect,
     heightmap: Option<&Heightmap>,
+    splat_distribution: Option<&SplatDistribution>,
     ally_groups: &[AllyGroup],
     metal_spots: &[(f32, f32, f32)],
     extents: (f32, f32),
@@ -94,6 +100,16 @@ pub fn paint_minimap(
     // Heightfield thumbnail. Sampled coarsely for paint speed.
     if let Some(h) = heightmap {
         paint_heightfield(painter, body_rect, h);
+    }
+
+    // D5: splat distribution overlay (50 % opacity over the
+    // heightfield) so the user can see at-a-glance where they've
+    // painted. Same coarse 48-tap sampling as the heightfield. R/G/B
+    // channels drive red/green/blue overlays; alpha is desaturated
+    // (white) since "snow"-style A-channel maps want a brightness
+    // bump rather than a hue.
+    if let Some(d) = splat_distribution {
+        paint_splat_overlay(painter, body_rect, d);
     }
 
     // Symmetry guide line — caller has already decided whether to
@@ -229,6 +245,53 @@ pub fn world_to_mini(body: Rect, world: (f32, f32), extents: (f32, f32)) -> Pos2
     )
 }
 
+/// Sample the splat distribution at a coarse grid and paint each cell
+/// as a translucent RGBA overlay on top of the heightfield thumbnail.
+/// D5 overlay rule (see module docs): R/G/B channels drive R/G/B
+/// colour bumps; alpha drives a desaturated brightness bump so "snow"
+/// reads as a white wash rather than transparent.
+fn paint_splat_overlay(painter: &egui::Painter, body: Rect, d: &SplatDistribution) {
+    let n = 48u32.min(d.width.min(d.height));
+    if n == 0 {
+        return;
+    }
+    let cell_w = body.width() / n as f32;
+    let cell_h = body.height() / n as f32;
+    for y in 0..n {
+        for x in 0..n {
+            let sx = (x as f32 / n as f32 * d.width as f32) as u32;
+            let sy = (y as f32 / n as f32 * d.height as f32) as u32;
+            let Some(px) = d.get(sx, sy) else { continue };
+            // Skip empty pixels — overdraw of zero RGBA does nothing
+            // visually but burns paint commands.
+            if px == [0; 4] {
+                continue;
+            }
+            // R/G/B as direct channels; A as desaturated bright wash.
+            // Each channel weighted 0..=128 alpha so layered overlays
+            // don't oversaturate the heightfield.
+            let r = px[0] as u32;
+            let g = px[1] as u32;
+            let b = px[2] as u32;
+            let a = px[3] as u32;
+            let max = r.max(g).max(b).max(a) as f32 / 255.0;
+            let alpha = (max * 128.0).clamp(0.0, 128.0) as u8;
+            let mix_r = ((r + a) / 2).min(255) as u8;
+            let mix_g = ((g + a) / 2).min(255) as u8;
+            let mix_b = ((b + a) / 2).min(255) as u8;
+            let color = Color32::from_rgba_premultiplied(mix_r, mix_g, mix_b, alpha);
+            let cell_rect = Rect::from_min_size(
+                Pos2::new(
+                    body.left() + x as f32 * cell_w,
+                    body.top() + y as f32 * cell_h,
+                ),
+                egui::vec2(cell_w + 0.5, cell_h + 0.5),
+            );
+            painter.rect_filled(cell_rect, CornerRadius::ZERO, color);
+        }
+    }
+}
+
 /// Sample the heightmap at a coarse grid and paint each cell as a
 /// biome-coloured square. Cells are 1×1 in viewBox space; egui will
 /// rasterise them at the body's pixel resolution.
@@ -357,5 +420,64 @@ mod tests {
         let c1 = biome_ramp(99.0);
         assert_eq!(c0, biome_ramp(0.0));
         assert_eq!(c1, biome_ramp(1.0));
+    }
+
+    // D5 / Sprint 9: splat overlay tests — exercise the pure mixing
+    // math from `paint_splat_overlay` indirectly via small helpers.
+    // The actual paint commands go through `egui::Painter`, which
+    // needs a `Context`; the math we care about (per-channel mix +
+    // alpha) is small enough to pin directly.
+
+    /// Mirror of the per-pixel mix in `paint_splat_overlay` so we can
+    /// unit-test the colour blend without an `egui::Painter`.
+    fn overlay_mix(px: [u8; 4]) -> Option<(u8, u8, u8, u8)> {
+        if px == [0; 4] {
+            return None;
+        }
+        let r = px[0] as u32;
+        let g = px[1] as u32;
+        let b = px[2] as u32;
+        let a = px[3] as u32;
+        let max = r.max(g).max(b).max(a) as f32 / 255.0;
+        let alpha = (max * 128.0).clamp(0.0, 128.0) as u8;
+        let mix_r = ((r + a) / 2).min(255) as u8;
+        let mix_g = ((g + a) / 2).min(255) as u8;
+        let mix_b = ((b + a) / 2).min(255) as u8;
+        Some((mix_r, mix_g, mix_b, alpha))
+    }
+
+    #[test]
+    fn overlay_mix_zero_pixel_returns_none() {
+        // Zero RGBA pixels are skipped to avoid burning paint
+        // commands on invisible squares.
+        assert!(overlay_mix([0, 0, 0, 0]).is_none());
+    }
+
+    #[test]
+    fn overlay_mix_full_red_drives_red_alpha_128() {
+        // Pure-R channel: red component dominates, alpha caps at 128.
+        let m = overlay_mix([255, 0, 0, 0]).unwrap();
+        assert_eq!(m.0, 127); // (255 + 0) / 2 = 127
+        assert_eq!(m.1, 0);
+        assert_eq!(m.2, 0);
+        assert_eq!(m.3, 128);
+    }
+
+    #[test]
+    fn overlay_mix_full_alpha_white_washes_evenly() {
+        // Pure-A channel: alpha desaturates to (a/2) on all three
+        // colour outs — reads as white wash on the heightfield.
+        let m = overlay_mix([0, 0, 0, 255]).unwrap();
+        assert_eq!(m.0, 127);
+        assert_eq!(m.1, 127);
+        assert_eq!(m.2, 127);
+        assert_eq!(m.3, 128);
+    }
+
+    #[test]
+    fn overlay_mix_alpha_scales_with_channel_intensity() {
+        // 50 %-green pixel: alpha ≈ (128/255) * 128 = 64.
+        let m = overlay_mix([0, 128, 0, 0]).unwrap();
+        assert!(m.3 >= 60 && m.3 <= 70, "got alpha {}", m.3);
     }
 }

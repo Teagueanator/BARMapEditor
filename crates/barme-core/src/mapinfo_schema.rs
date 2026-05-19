@@ -1134,6 +1134,8 @@ mod tests {
             ally_groups: vec![],
             mapinfo_overrides: HashMap::new(),
             next_steps_dismissed: false,
+            splat_config: crate::SplatConfig::default(),
+            splat_distribution: None,
         };
         let info: MapInfo = (&p).into();
         // No top-level smu/dims field exists; the SMF binary carries

@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::warn;
 
-use crate::MapSize;
+use crate::{MapSize, SplatConfig, SplatDistribution};
 
 /// File extension for the project manifest (no leading dot).
 pub const PROJECT_EXTENSION: &str = "barmeproj";
@@ -83,6 +83,19 @@ pub struct Project {
     /// click.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub next_steps_dismissed: bool,
+    /// D5 / Sprint 9: per-channel splat slot bindings, scales, mults,
+    /// and the ADR-034 placeholder toggle. Round-trips through TOML;
+    /// `#[serde(default)]` materialises the engine defaults for
+    /// pre-Sprint-9 `.barmeproj` files.
+    #[serde(default)]
+    pub splat_config: SplatConfig,
+    /// D5 / Sprint 9: the painted RGBA distribution. Allocated on
+    /// first stamp; `#[serde(skip)]` because 4 MB does not belong in
+    /// a TOML manifest. D6 (Sprint 12) will ship the PNG sidecar
+    /// persistence path; until then the distribution lives only for
+    /// the current editor session.
+    #[serde(skip)]
+    pub splat_distribution: Option<SplatDistribution>,
 }
 
 /// One ally team's worth of spawn data (ADR-032).
@@ -176,6 +189,8 @@ struct ProjectWire {
     mapinfo_overrides: HashMap<String, toml::Value>,
     #[serde(default)]
     next_steps_dismissed: bool,
+    #[serde(default)]
+    splat_config: SplatConfig,
 }
 
 impl From<ProjectWire> for Project {
@@ -189,6 +204,8 @@ impl From<ProjectWire> for Project {
             ally_groups: w.ally_groups,
             mapinfo_overrides: w.mapinfo_overrides,
             next_steps_dismissed: w.next_steps_dismissed,
+            splat_config: w.splat_config,
+            splat_distribution: None,
         };
         if !w.start_positions.is_empty() {
             if p.ally_groups.is_empty() {
@@ -289,6 +306,8 @@ impl Project {
             ally_groups: Vec::new(),
             mapinfo_overrides: HashMap::new(),
             next_steps_dismissed: false,
+            splat_config: SplatConfig::default(),
+            splat_distribution: None,
         }
     }
 
@@ -607,6 +626,54 @@ smu_z = 4
             assert!(!s.contains(':'));
             assert!(!s.contains(' '));
         }
+    }
+
+    /// D5 / Sprint 9: per-channel splat slot bindings persist across
+    /// save / open. Round-trip a non-default config through TOML.
+    #[test]
+    fn splat_config_round_trips() {
+        let mut p = Project::new("splat", 8);
+        p.splat_config.channels = [Some(0), Some(2), None, Some(8)];
+        p.splat_config.tex_scales = [0.02, 0.004, 0.02, 0.0015];
+        p.splat_config.tex_mults = [1.0, 1.5, 1.0, 0.8];
+        p.splat_config.diffuse_in_alpha = true;
+        let s = toml::to_string(&p).unwrap();
+        let p2: Project = toml::from_str(&s).unwrap();
+        assert_eq!(p.splat_config, p2.splat_config);
+    }
+
+    /// `splat_distribution` is `#[serde(skip)]` — the 4 MB RGBA buffer
+    /// stays out of the TOML manifest (D6 ships PNG sidecar
+    /// persistence). Confirm the field is never written.
+    #[test]
+    fn splat_distribution_omitted_from_serialization() {
+        let mut p = Project::new("no-splat-blob", 4);
+        p.splat_distribution = Some(crate::SplatDistribution::new(p.size));
+        let s = toml::to_string(&p).unwrap();
+        assert!(
+            !s.contains("splat_distribution"),
+            "splat_distribution must not serialise; got:\n{s}"
+        );
+    }
+
+    /// Pre-D5 `.barmeproj` files have no `[splat_config]` block —
+    /// loading must materialise the engine defaults rather than
+    /// failing.
+    #[test]
+    fn pre_d5_project_without_splat_config_loads_with_defaults() {
+        let toml_str = r#"
+name = "pre_d5"
+min_height = 0.0
+max_height = 256.0
+
+[size]
+smu_x = 4
+smu_z = 4
+"#;
+        let p: Project = toml::from_str(toml_str).unwrap();
+        let d = crate::SplatConfig::default();
+        assert_eq!(p.splat_config, d);
+        assert!(p.splat_distribution.is_none());
     }
 
     #[test]

@@ -26,10 +26,9 @@
 //! rect.
 //!
 //! Channel ordering ([`SplatChannel`]) is `R, G, B, A` to match the
-//! inspector's row order in `crates/barme-app/src/main.rs::SplatState`.
-//! Brush ids (`paint`, `erase`, `smooth`) match what the inspector's
-//! `SplatBrushMode` chips will dispatch on once D5 (Sprint 9) wires
-//! them up.
+//! inspector's row order (D5 / Sprint 9). Brush ids (`paint`, `erase`,
+//! `smooth`) match the BRUSH-section chip ids the inspector dispatches
+//! on at stamp time.
 //!
 //! TODO(splat-undo): the distribution is 4 MB at 1024² — too large
 //! to snapshot per stroke against the existing 100 MB undo cap
@@ -40,10 +39,105 @@
 
 use crate::MapSize;
 use crate::brushes::{DirtyRect, smoothstep};
+use serde::{Deserialize, Serialize};
 
 /// Fixed pixel side of the splat distribution texture. See module
 /// docs for the rationale.
 pub const SPLAT_DIM: u32 = 1024;
+
+/// Persisted per-channel splat config (D5 / Sprint 9). Maps directly
+/// to the `mapinfo.splats` block and the `mapinfo.resources.
+/// splatDetailNormalTex[]` subtable form (D6 emission, Sprint 12).
+///
+/// `channels[i] = Some(slot_id)` binds slot `slot_id` (an index into
+/// the `tools/textures/<NN-slot>/` registry — D1 / ADR-027) to the
+/// corresponding RGBA channel of the splat distribution:
+/// - channels[0] → R
+/// - channels[1] → G
+/// - channels[2] → B
+/// - channels[3] → A
+///
+/// `None` = the channel is unbound. The GPU shader gates per-layer
+/// sampling on an active-slot mask derived from these `Option`s
+/// (D4 / ADR-036).
+///
+/// `tex_scales` / `tex_mults` mirror `mapinfo.splats.texScales` /
+/// `texMults` exactly — float4, defaults `0.02` / `1.0` per FINDINGS
+/// §1.6.
+///
+/// `diffuse_in_alpha` mirrors `mapinfo.resources.
+/// splatDetailNormalDiffuseAlpha`. ADR-034 is the open ADR for the
+/// high-pass diffuse-offset workflow; baseline is `false` per
+/// ADR-025.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SplatConfig {
+    /// Per-channel slot bindings. Serialized as a 4-element array of
+    /// signed ints (`-1` = unbound, `0..=255` = slot id) because TOML
+    /// arrays have no null variant. The Rust API stays `Option<u8>`
+    /// for type safety; the wire conversion lives in [`channels_wire`].
+    #[serde(with = "channels_wire")]
+    pub channels: [Option<u8>; 4],
+    pub tex_scales: [f32; 4],
+    pub tex_mults: [f32; 4],
+    #[serde(default)]
+    pub diffuse_in_alpha: bool,
+}
+
+/// Serde shim for `[Option<u8>; 4]` ↔ `[i16; 4]`. TOML arrays cannot
+/// hold a null sentinel, so we encode `None` as `-1`. `u8::MAX` would
+/// be ambiguous with a real slot id once the registry exceeds 256
+/// entries (unlikely but the math is cheap).
+mod channels_wire {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(v: &[Option<u8>; 4], s: S) -> Result<S::Ok, S::Error> {
+        let wire: [i16; 4] = [
+            v[0].map(|x| x as i16).unwrap_or(-1),
+            v[1].map(|x| x as i16).unwrap_or(-1),
+            v[2].map(|x| x as i16).unwrap_or(-1),
+            v[3].map(|x| x as i16).unwrap_or(-1),
+        ];
+        wire.serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[Option<u8>; 4], D::Error> {
+        let wire: [i16; 4] = <[i16; 4]>::deserialize(d)?;
+        let mut out = [None; 4];
+        for (o, w) in out.iter_mut().zip(wire.iter()) {
+            *o = if *w < 0 { None } else { Some(*w as u8) };
+        }
+        Ok(out)
+    }
+}
+
+impl Default for SplatConfig {
+    fn default() -> Self {
+        // Defaults match `splats.texScales = vec4(0.02)` and
+        // `splats.texMults = vec4(1.0)` from MapInfo.cpp::ReadSplats
+        // (FINDINGS §1.6). All channels unbound — fresh projects
+        // render the fallback gradient until the user paints.
+        Self {
+            channels: [None; 4],
+            tex_scales: [0.02; 4],
+            tex_mults: [1.0; 4],
+            diffuse_in_alpha: false,
+        }
+    }
+}
+
+impl SplatConfig {
+    /// Bit `i` set iff `channels[i].is_some()`. The D4 shader gates
+    /// per-layer sampling on this mask.
+    pub fn active_mask(&self) -> u32 {
+        let mut m = 0u32;
+        for (i, c) in self.channels.iter().enumerate() {
+            if c.is_some() {
+                m |= 1 << i;
+            }
+        }
+        m
+    }
+}
 
 /// RGBA splat distribution. Channel weights — not transparency —
 /// drive which DNTS slot lights each fragment. The engine multiplies
@@ -51,7 +145,7 @@ pub const SPLAT_DIM: u32 = 1024;
 /// total to `≤ 1.0`; the editor's normalisation rule (per
 /// [`PaintChannel`]) keeps `R + G + B + A ≤ 255` so the live preview
 /// matches the engine's downstream behaviour.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SplatDistribution {
     pub width: u32,
     pub height: u32,
@@ -62,8 +156,8 @@ pub struct SplatDistribution {
 }
 
 /// One of the four splat distribution channels. Order matches the
-/// inspector's row order (`crates/barme-app/src/main.rs::SplatState
-/// ::layers[..]`) so D5 doesn't need a translation layer.
+/// inspector's TEXTURE LAYERS row order (D5 / Sprint 9) so the App's
+/// `splat_brush_state.active_channel` indexes into this enum directly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SplatChannel {
     R,
@@ -808,5 +902,42 @@ mod tests {
         // the GPU texture at this size); pin it as a test rather than
         // a doc-only assertion so a typo can't silently break things.
         assert_eq!(SPLAT_DIM, 1024);
+    }
+
+    #[test]
+    fn splat_config_default_matches_engine_defaults() {
+        // FINDINGS §1.6 — splats default texScales=0.02, texMults=1.0.
+        let c = SplatConfig::default();
+        assert_eq!(c.channels, [None; 4]);
+        assert_eq!(c.tex_scales, [0.02; 4]);
+        assert_eq!(c.tex_mults, [1.0; 4]);
+        // ADR-025 baseline — diffuse_in_alpha workflow stays off
+        // until ADR-034 lands.
+        assert!(!c.diffuse_in_alpha);
+    }
+
+    #[test]
+    fn splat_config_active_mask_reflects_bound_channels() {
+        let mut c = SplatConfig::default();
+        assert_eq!(c.active_mask(), 0);
+        c.channels[0] = Some(5);
+        c.channels[2] = Some(3);
+        // R + B bound → bits 0 and 2 = 0b101 = 5.
+        assert_eq!(c.active_mask(), 0b101);
+        c.channels[3] = Some(9);
+        assert_eq!(c.active_mask(), 0b1101);
+    }
+
+    #[test]
+    fn splat_config_round_trips_through_toml() {
+        let c = SplatConfig {
+            channels: [Some(0), Some(2), None, Some(8)],
+            tex_scales: [0.02, 0.004, 0.02, 0.0015],
+            tex_mults: [1.0, 1.5, 1.0, 0.8],
+            diffuse_in_alpha: true,
+        };
+        let s = toml::to_string(&c).unwrap();
+        let c2: SplatConfig = toml::from_str(&s).unwrap();
+        assert_eq!(c, c2);
     }
 }
