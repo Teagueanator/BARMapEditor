@@ -60,10 +60,14 @@ pub const OFFSCREEN_CLAMP: u32 = 2048;
 pub const MARKER_INSTANCE_CAPACITY: u32 = 10_000;
 
 /// Pre-allocated capacity (in `LineVertex` count, NOT segments) of the
-/// GPU vertex buffer used by the Sprint-13 line pipeline. 5 000 verts
-/// = 2 500 line segments — comfortably above the worst-case symmetry-
-/// axes + geo-vent plumes load. 32 B/vertex × 5 000 = 160 KB. ADR-037.
-pub const LINE_VERTEX_CAPACITY: u32 = 5_000;
+/// GPU vertex buffer used by the Sprint-13 line pipeline. Belt-and-
+/// suspenders alongside the per-axis dash cap in
+/// `overlay::collect_symmetry_segments`: 256 dashes × 2 verts × 4
+/// axes (worst case Quad symmetry + one geo-vent plume) ≈ 2 050 verts;
+/// 8 000 leaves comfortable headroom and removes the warn-spam path
+/// even if a future renderer-parity sprint expands the line workload.
+/// 32 B/vertex × 8 000 = 256 KB. ADR-037 / Sprint 13 hotfix.
+pub const LINE_VERTEX_CAPACITY: u32 = 8_000;
 
 /// Pixel side of one layer of the slot diffuse texture array. The
 /// starter pack (ADR-025) ships ambientCG `_1K-PNG.zip` at 1024², so

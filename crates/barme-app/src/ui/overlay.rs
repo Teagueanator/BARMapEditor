@@ -26,6 +26,21 @@ const DASH_OFF_PX: f32 = 4.0;
 /// line so very-edge-on projections stay visible.
 const MIN_DASHED_LENGTH_PX: f32 = 32.0;
 
+/// Hard ceiling on the number of dashes emitted per symmetry axis
+/// (Sprint 13 hotfix). At extreme zoom-in the projected axis length
+/// can span hundreds of thousands of screen pixels, producing 10 000+
+/// dashes — well past the line pipeline's pre-allocated vertex buffer.
+/// When the predicted dash count crosses this cap we fall back to a
+/// single solid segment over the on-screen portion of the axis;
+/// individual dashes wouldn't read at that zoom level anyway.
+const MAX_DASHES_PER_AXIS: usize = 256;
+
+/// Margin (in screen pixels) added when clipping symmetry-axis
+/// endpoints to the viewport rect, so a dash that straddles the edge
+/// isn't half-missing. Generously larger than `DASH_ON_PX + DASH_OFF_PX`
+/// so even a long edge-of-rect dash survives the clip intact.
+const AXIS_CLIP_MARGIN_PX: f32 = 64.0;
+
 /// Premultiplied off-white (alpha ≈ 0.7) so the axis reads against both
 /// bright and dark terrain without dominating. The Sprint-13 line
 /// pipeline draws at the GPU's native 1-px line width — the previous
@@ -107,7 +122,34 @@ pub fn collect_symmetry_segments(
         if total < 1e-3 {
             continue;
         }
-        for (s_start, s_end) in dash_subsegments(a_pt, b_pt) {
+        // Sprint 13 hotfix: clip the projected axis to the visible
+        // rect (plus a small margin) before dashing. At extreme
+        // zoom-in the off-screen tails dwarf the on-screen middle —
+        // dashing those is wasted vertex-buffer pressure.
+        let Some((clip_a, clip_b)) =
+            clip_segment_to_rect(a_pt, b_pt, rect_size, AXIS_CLIP_MARGIN_PX)
+        else {
+            continue;
+        };
+        let clip_len = (clip_b - clip_a).length();
+        // One dash "cycle" = on + off pixels; predict the count and
+        // fall back to a single solid segment if it exceeds the cap.
+        let predicted_dashes = ((clip_len / (DASH_ON_PX + DASH_OFF_PX)) as usize).max(1);
+        if predicted_dashes > MAX_DASHES_PER_AXIS {
+            // Solid fallback — one segment over the clipped portion.
+            let t_start = ((clip_a - a_pt).length() / total).clamp(0.0, 1.0);
+            let t_end = ((clip_b - a_pt).length() / total).clamp(0.0, 1.0);
+            let w_start = a_world.lerp(b_world, t_start);
+            let w_end = a_world.lerp(b_world, t_end);
+            out.push(crate::render::LineVertex::new(w_start, AXIS_COLOUR));
+            out.push(crate::render::LineVertex::new(w_end, AXIS_COLOUR));
+            continue;
+        }
+        for (s_start, s_end) in dash_subsegments(clip_a, clip_b) {
+            // `t` is measured along the ORIGINAL `(a_pt, b_pt)` so the
+            // dashes stay locked to the true axis even when only the
+            // clipped middle is visible — pan the camera and the
+            // pattern moves with the world, not with the rect.
             let t_start = ((s_start - a_pt).length() / total).clamp(0.0, 1.0);
             let t_end = ((s_end - a_pt).length() / total).clamp(0.0, 1.0);
             let w_start = a_world.lerp(b_world, t_start);
@@ -142,6 +184,80 @@ fn rotational_spoke_segments(
         segs.push(((mx, mz), (cx, cz)));
     }
     segs
+}
+
+/// Liang–Barsky clip of segment `(a, b)` to the axis-aligned screen
+/// rect `[0, rect_size.x] × [0, rect_size.y]` expanded by `margin_px`
+/// on each side. Returns `Some((a', b'))` with both endpoints inside
+/// the expanded rect, or `None` if the entire segment lies outside.
+///
+/// Sprint 13 hotfix: bounds the dash count in
+/// [`collect_symmetry_segments`] when the camera zooms in far enough
+/// that the projected axis spans hundreds of thousands of pixels.
+/// Off-screen dashes wouldn't render anyway (the GPU rasterizer
+/// clips them) — clipping CPU-side just stops us from feeding the
+/// line vertex buffer a wave of garbage.
+fn clip_segment_to_rect(
+    a: egui::Pos2,
+    b: egui::Pos2,
+    rect_size: glam::Vec2,
+    margin_px: f32,
+) -> Option<(egui::Pos2, egui::Pos2)> {
+    let x_min = -margin_px;
+    let y_min = -margin_px;
+    let x_max = rect_size.x + margin_px;
+    let y_max = rect_size.y + margin_px;
+    let dx = b.x - a.x;
+    let dy = b.y - a.y;
+    let mut t_enter = 0.0_f32;
+    let mut t_exit = 1.0_f32;
+    // `p` = direction sign, `q` = signed distance to the boundary.
+    // `t = q / p` is the parameter where the segment crosses the
+    // boundary; we tighten `[t_enter, t_exit]` until we have the
+    // sub-segment inside the rect, or reject when the interval
+    // collapses.
+    let clip = |p: f32, q: f32, t_enter: &mut f32, t_exit: &mut f32| -> bool {
+        if p.abs() < 1e-6 {
+            // Segment parallel to this boundary; accept iff it's
+            // inside the half-plane.
+            return q >= 0.0;
+        }
+        let t = q / p;
+        if p < 0.0 {
+            // Entering through this boundary.
+            if t > *t_exit {
+                return false;
+            }
+            if t > *t_enter {
+                *t_enter = t;
+            }
+        } else {
+            // Exiting through this boundary.
+            if t < *t_enter {
+                return false;
+            }
+            if t < *t_exit {
+                *t_exit = t;
+            }
+        }
+        true
+    };
+    if !clip(-dx, a.x - x_min, &mut t_enter, &mut t_exit) {
+        return None;
+    }
+    if !clip(dx, x_max - a.x, &mut t_enter, &mut t_exit) {
+        return None;
+    }
+    if !clip(-dy, a.y - y_min, &mut t_enter, &mut t_exit) {
+        return None;
+    }
+    if !clip(dy, y_max - a.y, &mut t_enter, &mut t_exit) {
+        return None;
+    }
+    Some((
+        egui::Pos2::new(a.x + dx * t_enter, a.y + dy * t_enter),
+        egui::Pos2::new(a.x + dx * t_exit, a.y + dy * t_exit),
+    ))
 }
 
 /// Clip the ray starting at `a` in the direction `b - a` to the
@@ -947,6 +1063,128 @@ mod tests {
             "quad ({}) should yield more vertices than horizontal ({})",
             quad_out.len(),
             horiz_out.len(),
+        );
+    }
+
+    // ------------------- clip_segment_to_rect (hotfix) -------------------
+    //
+    // Bug 2: zoomed-in symmetry axes blew past the 5_000-vertex line
+    // buffer because the projected axis length spanned hundreds of
+    // thousands of pixels. The Liang–Barsky clip caps the dash count
+    // by the on-screen portion of the axis.
+
+    const ZERO_MARGIN: f32 = 0.0;
+    const RECT_SIZE: glam::Vec2 = glam::Vec2::new(800.0, 600.0);
+
+    #[test]
+    fn clip_segment_to_rect_passes_fully_inside() {
+        let a = egui::Pos2::new(100.0, 100.0);
+        let b = egui::Pos2::new(700.0, 500.0);
+        let (ca, cb) = clip_segment_to_rect(a, b, RECT_SIZE, ZERO_MARGIN)
+            .expect("segment fully inside should return Some");
+        assert!((ca - a).length() < 1e-3, "a unchanged");
+        assert!((cb - b).length() < 1e-3, "b unchanged");
+    }
+
+    #[test]
+    fn clip_segment_to_rect_clips_one_endpoint_outside() {
+        // a inside (400, 300); b outside the right edge (1200, 300).
+        // Clipped endpoint should land on x = 800 at y = 300.
+        let a = egui::Pos2::new(400.0, 300.0);
+        let b = egui::Pos2::new(1200.0, 300.0);
+        let (ca, cb) = clip_segment_to_rect(a, b, RECT_SIZE, ZERO_MARGIN).expect("partial overlap");
+        assert!((ca - a).length() < 1e-3, "a stays inside");
+        assert!((cb.x - 800.0).abs() < 1e-3, "b clipped to right edge");
+        assert!((cb.y - 300.0).abs() < 1e-3, "y preserved on horizontal seg");
+    }
+
+    #[test]
+    fn clip_segment_to_rect_rejects_fully_outside() {
+        // Segment entirely to the right of the rect.
+        let a = egui::Pos2::new(900.0, 300.0);
+        let b = egui::Pos2::new(1500.0, 400.0);
+        assert!(clip_segment_to_rect(a, b, RECT_SIZE, ZERO_MARGIN).is_none());
+        // Entirely above the rect.
+        let a2 = egui::Pos2::new(100.0, -200.0);
+        let b2 = egui::Pos2::new(500.0, -50.0);
+        assert!(clip_segment_to_rect(a2, b2, RECT_SIZE, ZERO_MARGIN).is_none());
+    }
+
+    #[test]
+    fn clip_segment_to_rect_passes_segment_straddling_two_edges() {
+        // Both endpoints outside the rect but the segment line crosses
+        // through it (left edge → right edge). Both clipped endpoints
+        // should land ON the rect edges.
+        let a = egui::Pos2::new(-200.0, 300.0);
+        let b = egui::Pos2::new(1000.0, 300.0);
+        let (ca, cb) = clip_segment_to_rect(a, b, RECT_SIZE, ZERO_MARGIN)
+            .expect("straddling segment should clip");
+        assert!((ca.x - 0.0).abs() < 1e-3, "ca on left edge");
+        assert!((cb.x - 800.0).abs() < 1e-3, "cb on right edge");
+        // Vertical case — segment crosses bottom edge from top.
+        let a2 = egui::Pos2::new(400.0, -100.0);
+        let b2 = egui::Pos2::new(400.0, 900.0);
+        let (ca2, cb2) =
+            clip_segment_to_rect(a2, b2, RECT_SIZE, ZERO_MARGIN).expect("vertical clip");
+        assert!((ca2.y - 0.0).abs() < 1e-3, "ca2 on top edge");
+        assert!((cb2.y - 600.0).abs() < 1e-3, "cb2 on bottom edge");
+    }
+
+    #[test]
+    fn clip_segment_to_rect_respects_margin() {
+        // Endpoint just outside the rect (5 px past the right edge).
+        // With margin = 0 it gets clipped; with margin = 10 it passes
+        // through unchanged.
+        let a = egui::Pos2::new(100.0, 300.0);
+        let b = egui::Pos2::new(805.0, 300.0);
+        let (_, cb_no_margin) =
+            clip_segment_to_rect(a, b, RECT_SIZE, 0.0).expect("partial overlap with margin=0");
+        assert!(
+            (cb_no_margin.x - 800.0).abs() < 1e-3,
+            "expected clip at 800.0 with margin=0, got {}",
+            cb_no_margin.x,
+        );
+        let (_, cb_with_margin) = clip_segment_to_rect(a, b, RECT_SIZE, 10.0)
+            .expect("segment inside expanded rect with margin=10");
+        assert!(
+            (cb_with_margin.x - 805.0).abs() < 1e-3,
+            "expected b unchanged at 805.0 with margin=10, got {}",
+            cb_with_margin.x,
+        );
+    }
+
+    #[test]
+    fn collect_symmetry_segments_caps_dashes_when_zoomed_in() {
+        // Pull the camera in tight so the axis projects across the
+        // full rect at a multi-thousand-pixel length. The cap (256
+        // dashes per axis → 512 verts) plus the solid-fallback path
+        // must keep the output bounded for a single Horizontal axis
+        // (1 axis ⇒ at most 2 verts solid, or up to MAX_DASHES_PER_AXIS
+        // × 2 = 512 dashed).
+        let mut cam = OrbitCamera::framing(EXT.0, EXT.1);
+        cam.distance = 50.0; // far inside the framing default
+        let mut out = Vec::new();
+        collect_symmetry_segments(
+            &mut out,
+            glam::Vec2::new(1024.0, 768.0),
+            &cam,
+            SymmetryAxis::Horizontal,
+            EXT,
+        );
+        // One axis → bound is MAX_DASHES_PER_AXIS * 2 verts (when
+        // dashed) or 2 verts (when solid-fallback triggers).
+        assert!(
+            out.len() <= MAX_DASHES_PER_AXIS * 2,
+            "expected ≤{} verts, got {}",
+            MAX_DASHES_PER_AXIS * 2,
+            out.len(),
+        );
+        // And NOT bigger than the line vertex buffer cap (8 000) —
+        // explicit guard against a future regression that re-introduces
+        // the pre-hotfix unbounded behaviour.
+        assert!(
+            out.len() < crate::render::LINE_VERTEX_CAPACITY as usize,
+            "exceeded LINE_VERTEX_CAPACITY"
         );
     }
 }
