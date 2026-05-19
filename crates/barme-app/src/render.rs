@@ -1346,9 +1346,16 @@ pub fn screen_to_world_y0(
 }
 
 /// Project a world-space point onto the central preview rect. Returns
-/// `None` if the point is behind the camera (clip-space `w <= 0`) or
-/// projects outside `[-1, 1]` NDC (off-screen). Used by the F8 / ADR-023
-/// start-position overlay so 2D markers track their 3D positions.
+/// `None` only when the point is behind the camera (`clip.w <= 0`);
+/// off-screen points (NDC outside `[-1, 1]`) still return their
+/// projected position — let the caller clip via `ui.painter_at(rect)`
+/// or compare distance against a hit-test radius.
+///
+/// Sprint 13 / Phase 6 (ADR-037): relaxed off-screen rejection so
+/// label projection agrees with the GPU marker pipeline on screen-edge
+/// points (the GPU rasterizer naturally discards off-RT fragments).
+/// Previously rejected any NDC outside `[-1, 1]`, which made labels
+/// disappear when the marker was a few pixels past the rect edge.
 pub fn world_to_screen(
     world: glam::Vec3,
     rect_size: glam::Vec2,
@@ -1359,13 +1366,11 @@ pub fn world_to_screen(
     if clip.w <= 0.0 {
         return None;
     }
-    let ndc = glam::Vec3::new(clip.x / clip.w, clip.y / clip.w, clip.z / clip.w);
-    if !(-1.0..=1.0).contains(&ndc.x) || !(-1.0..=1.0).contains(&ndc.y) {
-        return None;
-    }
+    let ndc_x = clip.x / clip.w;
+    let ndc_y = clip.y / clip.w;
     Some(glam::Vec2::new(
-        (ndc.x + 1.0) * 0.5 * rect_size.x,
-        (1.0 - ndc.y) * 0.5 * rect_size.y,
+        (ndc_x + 1.0) * 0.5 * rect_size.x,
+        (1.0 - ndc_y) * 0.5 * rect_size.y,
     ))
 }
 
@@ -1868,11 +1873,46 @@ mod tests {
     }
 
     #[test]
-    fn world_to_screen_off_screen_returns_none() {
+    fn world_to_screen_returns_none_for_behind_camera_point() {
+        // Phase 6 (Sprint 13 / ADR-037): the only None case is
+        // behind-camera (clip.w <= 0). Pick a world point behind the
+        // camera eye by walking back along the look direction.
         let camera = cam();
         let rect = glam::Vec2::new(800.0, 600.0);
-        let world = glam::Vec3::new(-100000.0, 0.0, -100000.0);
-        assert!(world_to_screen(world, rect, &camera).is_none());
+        let eye = camera.eye();
+        let look_dir = (camera.target - eye).normalize();
+        // 100 elmos behind the eye, opposite the look direction.
+        let behind = eye - look_dir * 100.0;
+        assert!(
+            world_to_screen(behind, rect, &camera).is_none(),
+            "behind-camera should project to None"
+        );
+    }
+
+    #[test]
+    fn world_to_screen_returns_some_for_off_screen_in_front_of_camera() {
+        // Phase 6 (Sprint 13 / ADR-037): off-screen points (NDC
+        // outside [-1, 1]) are no longer rejected — only behind-camera.
+        // Default framing puts the eye in the +x+y+z octant looking
+        // back toward the map centre; a point past the origin
+        // (negative side, opposite to the eye) is well in front of
+        // the camera but projects to NDC well outside the rect.
+        let camera = cam();
+        let rect = glam::Vec2::new(800.0, 600.0);
+        let off = glam::Vec3::new(-200_000.0, 0.0, 0.0);
+        let r = world_to_screen(off, rect, &camera);
+        assert!(
+            r.is_some(),
+            "off-screen-but-in-front-of-camera should return Some"
+        );
+        // Sanity: the result should be well outside [0, 800] × [0,
+        // 600] — the relaxed semantics let callers receive the
+        // projected coordinate and clip via painter_at(rect).
+        let p = r.unwrap();
+        assert!(
+            p.x < 0.0 || p.x > 800.0 || p.y < 0.0 || p.y > 600.0,
+            "off-screen result {p:?} should be outside the rect"
+        );
     }
 
     #[test]
