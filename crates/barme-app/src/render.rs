@@ -1708,8 +1708,7 @@ impl egui_wgpu::CallbackTrait for TerrainCallback {
         // ADR-037). Cap instance count to the pre-allocated capacity
         // so we never overrun the storage buffer; log + drop the tail
         // if exceeded (won't happen at Sprint 13's expected loads).
-        let marker_count =
-            (self.marker_instances.len() as u32).min(MARKER_INSTANCE_CAPACITY);
+        let marker_count = (self.marker_instances.len() as u32).min(MARKER_INSTANCE_CAPACITY);
         if (self.marker_instances.len() as u32) > MARKER_INSTANCE_CAPACITY {
             warn!(
                 requested = self.marker_instances.len(),
@@ -1739,8 +1738,7 @@ impl egui_wgpu::CallbackTrait for TerrainCallback {
         // pre-allocated capacity; the marker uniform buffer also
         // backs the line pipeline (shared `view_proj`) so we don't
         // need a separate uniform write.
-        let line_vert_count =
-            (self.line_vertices.len() as u32).min(LINE_VERTEX_CAPACITY);
+        let line_vert_count = (self.line_vertices.len() as u32).min(LINE_VERTEX_CAPACITY);
         if (self.line_vertices.len() as u32) > LINE_VERTEX_CAPACITY {
             warn!(
                 requested = self.line_vertices.len(),

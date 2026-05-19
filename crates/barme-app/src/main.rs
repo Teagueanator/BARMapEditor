@@ -6565,8 +6565,7 @@ impl App {
                                 self.pulsing_marker = None;
                             }
                         }
-                        let world =
-                            glam::Vec3::new(pos.x_elmo as f32, 0.0, pos.z_elmo as f32);
+                        let world = glam::Vec3::new(pos.x_elmo as f32, 0.0, pos.z_elmo as f32);
                         marker_batch.push(crate::ui::markers::Marker {
                             world_pos: world,
                             radius_px: r,
@@ -6574,13 +6573,11 @@ impl App {
                             shape: crate::ui::markers::MarkerShape::FilledWithStroke,
                         });
                         if !matches!(self.symmetry, SymmetryAxis::None) {
-                            let mirrors = self.symmetry.replicate(
-                                (pos.x_elmo as f32, pos.z_elmo as f32),
-                                extents,
-                            );
+                            let mirrors = self
+                                .symmetry
+                                .replicate((pos.x_elmo as f32, pos.z_elmo as f32), extents);
                             for (mx, mz) in mirrors.into_iter().skip(1) {
-                                if mx < 0.0 || mx > extents.0 || mz < 0.0 || mz > extents.1
-                                {
+                                if mx < 0.0 || mx > extents.0 || mz < 0.0 || mz > extents.1 {
                                     continue;
                                 }
                                 marker_batch.push(crate::ui::markers::Marker {
@@ -6602,8 +6599,7 @@ impl App {
                 let rect_size = glam::Vec2::new(rect.width(), rect.height());
                 let cross_tool_ghost = !matches!(self.tool, Tool::MetalSpots);
                 let alpha_mul: u8 = if cross_tool_ghost { 128 } else { 255 };
-                let red_fill =
-                    egui::Color32::from_rgba_unmultiplied(0xF1, 0x5C, 0x5C, alpha_mul);
+                let red_fill = egui::Color32::from_rgba_unmultiplied(0xF1, 0x5C, 0x5C, alpha_mul);
                 let cyan = egui::Color32::from_rgba_unmultiplied(
                     0x33,
                     0xD8,
@@ -6612,8 +6608,7 @@ impl App {
                 );
                 let radius_world = self.extractor_radius.max(8.0);
                 for (i, spot) in self.metal_spots.iter().enumerate() {
-                    let world =
-                        glam::Vec3::new(spot.x_elmo as f32, 0.0, spot.z_elmo as f32);
+                    let world = glam::Vec3::new(spot.x_elmo as f32, 0.0, spot.z_elmo as f32);
                     let dragging = self.dragging_metal_spot == Some(i);
                     let r = if dragging { 10.0_f32 } else { 7.0_f32 };
                     marker_batch.push(crate::ui::markers::Marker {
@@ -6644,10 +6639,9 @@ impl App {
                         }
                     }
                     if !matches!(self.symmetry, SymmetryAxis::None) {
-                        let mirrors = self.symmetry.replicate(
-                            (spot.x_elmo as f32, spot.z_elmo as f32),
-                            extents,
-                        );
+                        let mirrors = self
+                            .symmetry
+                            .replicate((spot.x_elmo as f32, spot.z_elmo as f32), extents);
                         for (mx, mz) in mirrors.into_iter().skip(1) {
                             if mx < 0.0 || mx > extents.0 || mz < 0.0 || mz > extents.1 {
                                 continue;
@@ -6669,11 +6663,9 @@ impl App {
             if !self.geo_vents.is_empty() {
                 let cross_tool_ghost = !matches!(self.tool, Tool::GeoFeatures);
                 let alpha_mul: u8 = if cross_tool_ghost { 128 } else { 255 };
-                let orange =
-                    egui::Color32::from_rgba_unmultiplied(0xF5, 0x9E, 0x0B, alpha_mul);
+                let orange = egui::Color32::from_rgba_unmultiplied(0xF5, 0x9E, 0x0B, alpha_mul);
                 for (i, vent) in self.geo_vents.iter().enumerate() {
-                    let world =
-                        glam::Vec3::new(vent.x_elmo as f32, 0.0, vent.z_elmo as f32);
+                    let world = glam::Vec3::new(vent.x_elmo as f32, 0.0, vent.z_elmo as f32);
                     let dragging = self.dragging_geo_vent == Some(i);
                     let size = if dragging { 12.0_f32 } else { 9.0_f32 };
                     marker_batch.push(crate::ui::markers::Marker {
@@ -6683,10 +6675,9 @@ impl App {
                         shape: crate::ui::markers::MarkerShape::Triangle,
                     });
                     if !matches!(self.symmetry, SymmetryAxis::None) {
-                        let mirrors = self.symmetry.replicate(
-                            (vent.x_elmo as f32, vent.z_elmo as f32),
-                            extents,
-                        );
+                        let mirrors = self
+                            .symmetry
+                            .replicate((vent.x_elmo as f32, vent.z_elmo as f32), extents);
                         for (mx, mz) in mirrors.into_iter().skip(1) {
                             if mx < 0.0 || mx > extents.0 || mz < 0.0 || mz > extents.1 {
                                 continue;
@@ -6722,24 +6713,14 @@ impl App {
                 const PLUME_HEIGHT_ELMOS: f32 = 64.0;
                 let cross_tool_ghost = !matches!(self.tool, Tool::GeoFeatures);
                 let alpha_mul: u8 = if cross_tool_ghost { 128 } else { 255 };
-                let plume_color = egui::Color32::from_rgba_unmultiplied(
-                    0xF5,
-                    0x9E,
-                    0x0B,
-                    alpha_mul / 3,
-                );
+                let plume_color =
+                    egui::Color32::from_rgba_unmultiplied(0xF5, 0x9E, 0x0B, alpha_mul / 3);
                 let lift = crate::ui::markers::MARKER_Y_LIFT_ELMOS;
                 for vent in &self.geo_vents {
-                    let base = glam::Vec3::new(
-                        vent.x_elmo as f32,
-                        lift,
-                        vent.z_elmo as f32,
-                    );
+                    let base = glam::Vec3::new(vent.x_elmo as f32, lift, vent.z_elmo as f32);
                     let top = base + glam::Vec3::new(0.0, PLUME_HEIGHT_ELMOS, 0.0);
-                    line_vertices
-                        .push(crate::render::LineVertex::new(base, plume_color));
-                    line_vertices
-                        .push(crate::render::LineVertex::new(top, plume_color));
+                    line_vertices.push(crate::render::LineVertex::new(base, plume_color));
+                    line_vertices.push(crate::render::LineVertex::new(top, plume_color));
                 }
             }
 
@@ -6793,10 +6774,7 @@ impl App {
                     ui.painter().image(
                         id,
                         rect,
-                        egui::Rect::from_min_max(
-                            egui::pos2(0.0, 0.0),
-                            egui::pos2(1.0, 1.0),
-                        ),
+                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                         egui::Color32::WHITE,
                     );
                 }
@@ -6833,19 +6811,15 @@ impl App {
                 let rect_size = glam::Vec2::new(rect.width(), rect.height());
                 let cross_tool_ghost = !matches!(self.tool, Tool::StartPositions);
                 let alpha_mul: u8 = if cross_tool_ghost { 128 } else { 255 };
-                let label_color =
-                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, alpha_mul);
+                let label_color = egui::Color32::from_rgba_unmultiplied(255, 255, 255, alpha_mul);
                 for g in &self.ally_groups {
                     for (i, pos) in g.start_positions.iter().enumerate() {
-                        let world =
-                            glam::Vec3::new(pos.x_elmo as f32, 0.0, pos.z_elmo as f32);
-                        let Some(screen) =
-                            render::world_to_screen(world, rect_size, &self.camera)
+                        let world = glam::Vec3::new(pos.x_elmo as f32, 0.0, pos.z_elmo as f32);
+                        let Some(screen) = render::world_to_screen(world, rect_size, &self.camera)
                         else {
                             continue;
                         };
-                        let p =
-                            egui::Pos2::new(rect.min.x + screen.x, rect.min.y + screen.y);
+                        let p = egui::Pos2::new(rect.min.x + screen.x, rect.min.y + screen.y);
                         let dragging = self.dragging_start_pos == Some((g.id, i));
                         // Match the marker pipeline's idle radius so
                         // the label sits a constant 2 px above the
@@ -6877,13 +6851,10 @@ impl App {
                 let rect_size = glam::Vec2::new(rect.width(), rect.height());
                 let cross_tool_ghost = !matches!(self.tool, Tool::MetalSpots);
                 let alpha_mul: u8 = if cross_tool_ghost { 128 } else { 255 };
-                let label_color =
-                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, alpha_mul);
+                let label_color = egui::Color32::from_rgba_unmultiplied(255, 255, 255, alpha_mul);
                 for (i, spot) in self.metal_spots.iter().enumerate() {
-                    let world =
-                        glam::Vec3::new(spot.x_elmo as f32, 0.0, spot.z_elmo as f32);
-                    let Some(screen) =
-                        render::world_to_screen(world, rect_size, &self.camera)
+                    let world = glam::Vec3::new(spot.x_elmo as f32, 0.0, spot.z_elmo as f32);
+                    let Some(screen) = render::world_to_screen(world, rect_size, &self.camera)
                     else {
                         continue;
                     };

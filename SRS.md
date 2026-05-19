@@ -124,6 +124,21 @@ PA's in-game system designer is the cited gold standard. It does the following w
     > kept on the SRS as a historical anchor — the new policy
     > supersedes "do not pretend WYSIWYG" with "reproduce within a
     > documented ΔE budget."
+    >
+    > **STATUS UPDATE 2026-05-19 (Sprint 13 / ADR-037 — renderer-parity
+    > foundation shipped):** the planner-arc renumbering pushed the
+    > renderer rework from Sprint 15 forward to Sprint 13 (painter
+    > 15–17 and water 14 inserted ahead per `phase-3-plan.md`). Sprint
+    > 13 landed the foundation: an offscreen `Rgba8UnormSrgb` /
+    > `Depth32Float` render target encoded via `Callback::prepare`, a
+    > GPU marker pipeline (depth-test + premul-alpha, 5 SDF shapes)
+    > driven by `ui::markers::MarkerBatch::sort_back_to_front`, and a
+    > GPU line pipeline (LineList) for symmetry axes + geo-vent
+    > plumes. Markers now occlude against terrain and blend correctly
+    > under orbit. The remaining arc (terrain DNTS + atmosphere +
+    > water polish + shadows + features + grass + emission + parity
+    > validation) is **Sprints 20–27** in the new numbering; the
+    > "reproduce within ΔE < 5.0" target carries over unchanged.
 12. **Decompilation fidelity.** Round-tripping an existing `.sd7` loses information: the recovered diffuse PNG has been through DXT1 (color precision loss); heightmap, metal, and type maps are exact; mapinfo.lua is exact; auxiliary splat textures survive untouched. Reuse PyMapConv's decompile path.
 13. **GPU brush latency.** Spring/Recoil maps can theoretically reach 96×96 SMUs. Sub-millisecond brush response at 32×32+ requires the heightmap to live on the GPU as a storage texture, edited by compute shaders. Read-back to CPU happens only at save.
 

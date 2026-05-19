@@ -265,6 +265,35 @@ Implements SRS F1–F12. Ships a Windows `.exe` and a Linux AppImage.
       `voidGround`. 17 new regression tests; no behavioural splat
       churn (D6 / Sprint 12 wires `splatDetailNormalTex` subtable
       form separately).
+- [x] **Renderer-parity foundation (Sprint 13 / ADR-037, devlog
+      `stage-1-renderer-depth-rework`)** — opens the renderer-parity
+      arc (Sprints 13 + 20–27, per
+      `docs/research/renderer-bar-parity/ROADMAP.md`) by retiring the
+      depth-less "2D-painter-on-flat-wgpu-pass" architecture. Seven
+      commits: (1) offscreen `Rgba8UnormSrgb` colour + `Depth32Float`
+      depth `OffscreenTarget` capped at 2048² per axis with
+      egui-side texture registration; (2) terrain pipeline writes
+      depth and rasterises into the offscreen RT via
+      `Callback::prepare` (composited back as `ui.painter().image`);
+      (3) `OrbitCamera::near_far` auto-tunes the depth window from
+      orbit distance; (4) GPU marker pipeline + `MarkerBatch`
+      (`crates/barme-app/src/markers.wgsl` + `ui/markers.rs`) with
+      5 SDF shapes, premul blending, depth-test-only, back-to-front
+      sort; start positions / metal spots / geo vents (incl. F7
+      hit-tested but unrendered features) / brush rings all batch
+      through it; (5) GPU line pipeline (`lines.wgsl`) for symmetry
+      axes (world-space dashed) + geo-vent plumes + geo-vent mirror
+      outlines (via `MarkerShape::OutlineTriangle`); (6)
+      `world_to_screen` relaxed to only reject behind-camera so
+      label projection agrees with the GPU rasterizer at the rect
+      edge; (7) ADR-037 + this STATUS UPDATE. Test counts: barme-app
+      157 → 211 (+54 over the sprint — marker batch + camera near_far
+      + offscreen size resolution + world_to_screen relaxation +
+      symmetry-segment collection). Markers now occlude against
+      terrain; translucent markers blend in correct camera-relative
+      order under orbit. Remaining parity work (DNTS lighting,
+      atmosphere, water polish, shadows, S3O features, grass,
+      emission, validation) is **Sprints 20–27**.
 - [ ] Beherith (or active mapper) reviews `.sd7` byte-for-byte against PyMapConv
       reference output on three test maps
 - [ ] Listed on `beyondallreason.info/guide/mapmaking-resources` as beta

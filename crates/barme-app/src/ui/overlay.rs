@@ -326,8 +326,8 @@ pub fn collect_primary_brush_ring(
     cursor: BrushCursor<'_>,
 ) {
     let rect_size = glam::Vec2::new(rect.width(), rect.height());
-    let radius_px = brush_screen_radius(camera, rect_size, cursor.world, cursor.radius_world)
-        .unwrap_or(12.0);
+    let radius_px =
+        brush_screen_radius(camera, rect_size, cursor.world, cursor.radius_world).unwrap_or(12.0);
     let base = cursor
         .brush_id
         .map(brush_ring_color)

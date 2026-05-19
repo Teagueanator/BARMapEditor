@@ -2661,6 +2661,144 @@ trigger that should promote it from "deferred" to "implemented":
 lines 146-150, 174-198, 276-278, 412-413, 4 (the `SMF_INTENSITY_MULT`
 macro).
 
+## ADR-037 — Offscreen render target + GPU markers + line pipeline (Sprint 13)
+
+**Status:** Accepted (2026-05-19). Foundation of the renderer-parity
+arc (Sprints 13 + 20-27, sketched at
+`docs/research/renderer-bar-parity/ROADMAP.md`).
+
+**Context.** Through Sprint 12 the editor renderer (`crates/barme-app/src/render.rs`)
+created the terrain pipeline with `depth_stencil: None` and rendered
+directly into the egui surface via `egui_wgpu::Callback::paint`. Every
+3D-positioned UI element (start positions, metal spots, geo vents,
+brush rings, mirror ghosts, symmetry axes) was CPU-projected via
+`render::world_to_screen` and painted as flat `egui::Painter` shapes on
+top of the terrain pass. Two visible defects followed (renderer audit,
+`devlog/stage-1-sprint-prompts-audit/notes.md`):
+
+1. **Translucent markers blended in iteration order, not depth order.**
+   Orbit the camera 180° and a marker that should be behind still drew
+   on top.
+2. **Markers could not be occluded by terrain.** A start position
+   behind a mountain showed through.
+
+The 2026-05-18 user direction reversed SRS §2.1 #11 (3D preview ≠
+in-game rendering): the editor must visually reproduce what Recoil
+renders for terrain, atmosphere, water, shadows, features, grass, and
+emission. Sprint 13 ships the foundation for that arc; the depth +
+GPU-marker plumbing it lays down is a prerequisite for every
+subsequent renderer-parity sprint.
+
+**Decision.** Three coupled pieces:
+
+1. **Offscreen render target** (`render::OffscreenTarget`):
+   `Rgba8UnormSrgb` colour + `Depth32Float` depth, allocated lazily by
+   `render::ensure_offscreen` on the first frame with a real central
+   viewport rect. Sized to `min(rect_physical, 2048²)` per axis
+   (PITFALLS §1 — iGPU memory budget at 4K × DPR=2 caps the offscreen
+   RT at ~32 MB instead of 256 MB). Re-registered with
+   `egui_wgpu::Renderer::register_native_texture` on every size change
+   (old id freed first to avoid handle leaks).
+2. **GPU marker pipeline** (`crates/barme-app/src/markers.wgsl` +
+   `crates/barme-app/src/ui/markers.rs`): a `TriangleStrip` shader
+   that draws billboarded screen-space markers (filled circle, outline
+   ring, filled-with-stroke, filled triangle, outline triangle) from a
+   pre-allocated 10 000-instance storage buffer. Depth-test against
+   terrain (which writes depth) but no depth-write of its own —
+   translucent ordering is owned by `MarkerBatch::sort_back_to_front`'s
+   CPU sort each frame.
+3. **GPU line pipeline** (`crates/barme-app/src/lines.wgsl`): a
+   `LineList` shader for world-space dashed symmetry axes and geo-vent
+   plumes. Depth-test only, premultiplied-alpha blend, shares the
+   marker pipeline's uniform buffer (only consumes the `view_proj`
+   prefix).
+
+All three pipelines encode into a single `wgpu::RenderPass` inside
+`TerrainCallback::prepare` (not `paint`) so the depth attachment is
+provisioned by us — egui's own pass has no depth target. The
+Callback's `paint` is a no-op; `central()` composites the offscreen
+colour into the viewport via `ui.painter().image(offscreen_id, rect,
+...)` immediately after adding the Callback. 2D residue (text labels,
+viewport chrome, rulers, minimap) paints on top using the standard
+egui painter.
+
+`OrbitCamera::near_far` was added in the same sprint (Phase 3) to
+auto-tune the depth-precision window from `distance` (near = 1 % of
+distance floored at 50, far = 4 × distance with a 100× ratio floor).
+`world_to_screen` was relaxed to drop the `|ndc.xy| > 1` rejection
+(Phase 6) so label projection agrees with the GPU rasterizer on
+screen-edge points; behind-camera (`clip.w <= 0`) still returns `None`.
+
+**Alternatives considered.**
+
+- **Sort markers in `egui::Painter` (CPU 2D).** Rejected — solves the
+  blending defect but not terrain occlusion (would need a CPU-side
+  depth read or world raycast per marker, both more expensive than a
+  GPU depth-test) and leaves no GPU foundation for Sprints 20-27.
+- **Fork `egui-wgpu` to provision a depth target on its own pass.**
+  Rejected — ties us to a specific eframe version and fights the
+  upstream model (egui's painter is intentionally depth-agnostic).
+- **MSAA on the offscreen RT.** Deferred to a future polish item;
+  needs `sample_count > 1` on every pipeline + a resolve attachment.
+  Not blocking parity; can land any time once Phase 1 is stable.
+- **HDR (`Rgba16Float` + tone-map).** Stage-2 ask; format change here
+  would ripple through the entire renderer-parity arc.
+
+**Consequences.**
+
+- Terrain occludes markers correctly; translucent markers blend in
+  correct camera-relative order during orbit.
+- Memory: +16 MB / Mpixel offscreen colour + +16 MB / Mpixel depth =
+  ~32 MB at the 2048² clamp. At 1080p (~1.3 MB / pixel = ~24 MB) the
+  cap doesn't engage.
+- Code: `crates/barme-app/src/render.rs` gains `OffscreenTarget`,
+  `MarkerResources`, `LineResources`, `MarkerU`, `LineVertex`. New
+  shaders `markers.wgsl` (130 LoC) + `lines.wgsl` (43 LoC). New
+  module `crates/barme-app/src/ui/markers.rs` (~400 LoC) owning the
+  CPU-side `Marker` / `MarkerBatch` / `MarkerInstanceGpu` /
+  `project_to_screen`.
+- `crates/barme-app/src/main.rs::central` restructured: PHASE A builds
+  the marker + line batches by walking every visible marker source;
+  PHASE B adds the Callback + image composite; PHASE C paints the 2D
+  residue (text labels, viewport chrome) on top.
+- `overlay.rs`: `paint_brush_ghosts`, `paint_primary_brush_ring`,
+  `paint_symmetry_overlay`, and `paint_dashed_segment` retired in
+  favour of `collect_brush_ghosts`, `collect_primary_brush_ring`, and
+  `collect_symmetry_segments` (push into a `MarkerBatch` / line
+  vertex `Vec` instead of into an `egui::Painter`).
+- Multithreading: not used in Sprint 13's path. Marker counts are
+  <10k and the stable `Vec::sort_by` runs sub-millisecond. Escape
+  hatch documented in `ui/markers.rs` — swap to `rayon::par_sort_by`
+  if the final-devlog perf table ever shows the sort exceeding 1 ms.
+
+**Pitfalls (operational notes for the renderer-parity arc).**
+
+- `Callback::prepare`'s encoder is shared with egui — do **not**
+  `encoder.finish()` ourselves; return `Vec::new()`.
+- Pipeline colour-target format must match the offscreen view's
+  format (`Rgba8UnormSrgb`), **not** `render_state.target_format`.
+  Mismatches surface as a pipeline-creation validation error.
+- Depth texture must have `RENDER_ATTACHMENT` usage (`TEXTURE_BINDING`
+  alone is rejected).
+- `Depth32Float` works on every modern desktop adapter; fall back to
+  `Depth32FloatStencil8` only if a future ARM/Linux target lacks it.
+- Premultiplied alpha is mandatory across the marker + line
+  pipelines (blend = `PREMULTIPLIED_ALPHA_BLENDING`, shader outputs
+  premul colour, `egui::Color32` is internally premul).
+- Markers are lifted by `MARKER_Y_LIFT_ELMOS = 2.0` in world space
+  before the GPU upload (`MarkerBatch::into_instances`) so a marker
+  at terrain h=0 doesn't z-fight the ground.
+- `egui_wgpu::Renderer::register_native_texture` returns a fresh
+  `TextureId` per call. Re-register **only** when the offscreen RT
+  size changes; the old id is freed via `Renderer::free_texture`
+  before allocating the new one to prevent handle leaks.
+
+**Reference.** Renderer audit:
+`devlog/stage-1-sprint-prompts-audit/notes.md`. Arc roadmap:
+`docs/research/renderer-bar-parity/ROADMAP.md`. Sprint 13 prompt +
+phase log: `docs/prompts/sprint-13-renderer-depth-rework.md`,
+`devlog/stage-1-renderer-depth-rework/`.
+
 ```
 ## ADR-NNN — One-line decision
 
