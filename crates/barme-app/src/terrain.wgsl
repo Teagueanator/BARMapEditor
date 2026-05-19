@@ -150,13 +150,16 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // hasn't bound so a fresh project doesn't sample a stale layer.
     let dist = textureSample(splat_distr, splat_distr_samp, in.uv_norm);
     let mask = sp.flags.x;
-    let active = vec4<f32>(
+    // `active` is a reserved keyword in WGSL since wgpu 27; using
+    // `active_mask` keeps the same semantics (per-channel 1.0/0.0
+    // gate from active_slot_mask) without tripping the parser.
+    let active_mask = vec4<f32>(
         f32((mask >> 0u) & 1u),
         f32((mask >> 1u) & 1u),
         f32((mask >> 2u) & 1u),
         f32((mask >> 3u) & 1u),
     );
-    let splat_cofac = dist * sp.tex_mults * active;
+    let splat_cofac = dist * sp.tex_mults * active_mask;
     // Saturated sum used as the diffuse-blend strength (mirrors the
     // engine's `splatDetailStrength.x = min(1.0, dot(splatCofac,
     // vec4(1.0)))` from SMFFragProg.glsl:180).
