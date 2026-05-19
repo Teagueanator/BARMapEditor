@@ -12,7 +12,10 @@
 //!   supersedes ADR-013).
 //! - [`metal_layout`] — `mapconfig/map_metal_layout.lua` (spots + geos).
 //! - [`startboxes`] — `mapconfig/map_startboxes.lua` (per-ally polygons).
-//! - [`featureplacer`] — `mapconfig/featureplacer/features.lua`.
+//! - [`featureplacer`] — Springboard feature-placer trio:
+//!   `LuaGaia/Gadgets/FP_featureplacer.lua` (PD-licensed gadget) +
+//!   `mapconfig/featureplacer/config.lua` (redirect) +
+//!   `mapconfig/featureplacer/set.lua` (data).
 //! - [`sd7`] — non-solid `.sd7` packager around system 7-Zip (ADR-013).
 //!
 //! The end-to-end orchestrator is [`build_sd7`].
@@ -111,7 +114,21 @@ pub fn build_sd7(
     )?;
     let startboxes_path =
         write_lua_file(work_dir, "map_startboxes.lua", &startboxes::render(project))?;
-    let features_path = write_lua_file(work_dir, "features.lua", &featureplacer::render(project))?;
+    // Springboard feature-placer trio (PITFALL §14 fix, Sprint 11):
+    // 1. The gadget itself, bundled as `LuaGaia/Gadgets/FP_featureplacer.lua`
+    //    so BAR auto-loads it on map start.
+    // 2. `mapconfig/featureplacer/config.lua` — one-liner redirect.
+    // 3. `mapconfig/featureplacer/set.lua` — the actual data
+    //    (`objectlist`/`unitlist`/`buildinglist` with C5's geo vents
+    //    in `objectlist`).
+    let fp_gadget_path = write_lua_file(
+        work_dir,
+        "FP_featureplacer.lua",
+        featureplacer::FP_GADGET_SOURCE,
+    )?;
+    let fp_config_path =
+        write_lua_file(work_dir, "fp_config.lua", &featureplacer::render_config())?;
+    let fp_set_path = write_lua_file(work_dir, "fp_set.lua", &featureplacer::render_set(project))?;
 
     let staging = work_dir.join("staging");
     std::fs::create_dir_all(&staging).map_err(|source| BuildError::Io {
@@ -142,9 +159,23 @@ pub fn build_sd7(
             src: &startboxes_path,
             archive_rel: "mapconfig/map_startboxes.lua",
         },
+        // Springboard feature-placer trio. PITFALL §14: a bare
+        // `mapconfig/featureplacer/features.lua` is NOT a BAR path —
+        // there's no consumer in BAR's source. The Springboard
+        // gadget pattern (FP_featureplacer.lua + config.lua + set.lua)
+        // is what real BAR maps ship (verified against gecko_isle_
+        // remake_v1.2.1.sd7 + jade_empress_1.3.sd7 at HEAD).
         StagedFile {
-            src: &features_path,
-            archive_rel: "mapconfig/featureplacer/features.lua",
+            src: &fp_gadget_path,
+            archive_rel: "LuaGaia/Gadgets/FP_featureplacer.lua",
+        },
+        StagedFile {
+            src: &fp_config_path,
+            archive_rel: "mapconfig/featureplacer/config.lua",
+        },
+        StagedFile {
+            src: &fp_set_path,
+            archive_rel: "mapconfig/featureplacer/set.lua",
         },
     ];
 

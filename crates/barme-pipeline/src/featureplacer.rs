@@ -1,50 +1,78 @@
-//! `mapconfig/featureplacer/features.lua` emitter (ADR-029).
+//! Springboard feature-placer integration (`LuaGaia/Gadgets/FP_featureplacer.lua`
+//! + `mapconfig/featureplacer/{config,set}.lua`).
 //!
-//! Path is at the **archive root** under `mapconfig/featureplacer/` —
-//! NOT inside `LuaGaia/` (PITFALL — easy to confuse with the engine's
-//! `FeatureDef` lookup path). Consumed by BAR's feature-placer gadget
-//! and Springboard's exporter (see research §5).
+//! ## Why this isn't a single Lua file
 //!
-//! ## Shape (per research)
+//! Pre-Sprint-11 the editor emitted a flat
+//! `mapconfig/featureplacer/features.lua` returning a feature array.
+//! **BAR has no gadget that reads that path** — verified against the
+//! `Beyond-All-Reason` HEAD by direct grep (no consumer in
+//! `luarules/`, `luaui/`, or `common/`). Features in BAR-compatible
+//! maps reach the engine via the Springboard featureplacer pattern:
+//!
+//! 1. `LuaGaia/Gadgets/FP_featureplacer.lua` — the PD-licensed
+//!    "FeaturePlacer" gadget by Gnome / Smoth (August 2008). Bundled
+//!    into the `.sd7` as map-side cargo; BAR auto-loads
+//!    `LuaGaia/Gadgets/*.lua` on map start.
+//! 2. `mapconfig/featureplacer/config.lua` — one-liner redirect
+//!    returning `VFS.Include("mapconfig/featureplacer/set.lua")`.
+//! 3. `mapconfig/featureplacer/set.lua` — the actual data,
+//!    `return { objectlist = {...}, unitlist = {...},
+//!    buildinglist = {...} }`. Features get added to `objectlist`;
+//!    `unitlist` and `buildinglist` are reserved for map-side stock
+//!    units (e.g. a campaign mission's pre-placed gaia commander).
+//!
+//! See `/tmp/sd7-inspect/LuaGaia/Gadgets/FP_featureplacer.lua` (extracted
+//! from `gecko_isle_remake_v1.2.1.sd7`) for the canonical gadget body;
+//! we vendor a verbatim copy under `assets/FP_featureplacer.lua` and
+//! `lib.rs::build_sd7` stages it on every build.
+//!
+//! ## Schema in `set.lua`
 //!
 //! ```lua
-//! return {
-//!   { name = "geovent",                x = 2048, z = 4096, rot = "0" },
-//!   { name = "allpinesb_ad0_greena_m", x = 2100, z = 2200, rot = "16384" },
+//! local setcfg = {
+//!   unitlist = {},
+//!   buildinglist = {},
+//!   objectlist = {
+//!     { name = "geovent", x = 4096, z = 4096, rot = 0 },
+//!     { name = "agorm_talltree6", x = 224, z = 3616, rot = -23991 },
+//!   },
 //! }
+//! return setcfg
 //! ```
 //!
-//! - `name`: FeatureDef name in the BAR mod (or a bundled
-//!   `features/`-relative entry for map-custom features).
-//! - `x`, `z`: elmos, integer. `y` is intentionally absent — the
-//!   engine samples ground height at spawn so features float
-//!   correctly under water-level changes.
-//! - `rot`: **string-typed** integer in Spring heading units
-//!   (`"0"` … `"65535"` representing 0–360°). The legacy string form is
-//!   what the parser expects; Gemini's report incorrectly typed this
-//!   as a float — adopt Claude's finding (PITFALL §6).
+//! Rotation is an **unquoted integer** (Spring heading units,
+//! `-32768..32767`). The PyMapConv `-k` text-file format uses the
+//! quoted-string form per FINDINGS §6 but that's a different
+//! codepath; **for the Lua-gadget path the value must be a number**
+//! because the gadget calls `Spring.CreateFeature(..., fDef.rot)`
+//! which expects a numeric rotation.
 //!
-//! ## C5 (Sprint 11): geo vents land here
+//! ## Y-coordinate behaviour
 //!
-//! `Project.geo_vents` emits as `name = "geovent"` features —
-//! PITFALL §14 / FINDINGS §5–§6: BAR's
-//! `api_resource_spot_finder.GetSpotsGeo()` scans
-//! `Spring.GetAllFeatures()` for `FeatureDef.geoThermal = true`
-//! (the stock `geovent` carries that flag), so the steam-plume
-//! visual + the GG["resource_spot_finder"].geoSpotsList registration
-//! both come from a single feature placement. The legacy `geos = {}`
-//! array in `map_metal_layout.lua` is Zero-K convention and does
-//! NOT apply to BAR — `metal_layout.rs` therefore emits only
-//! `spots`.
+//! `y` is intentionally absent. The gadget calls
+//! `Spring.GetGroundHeight(fDef.x, fDef.z) + 5` at spawn time so
+//! features ride the live terrain rather than baking a stale y from
+//! editor-time. Sculpting the heightmap after authoring vents does
+//! not break the placement — the engine re-samples on every load.
 //!
-//! C6 (Sprint 12) will land general feature placement on top of
-//! the same `feature_entry` helper; the order they end up in the
-//! emitted list is (geo vents) first, sorted by (z, x), then
-//! whatever C6 ships, sorted by (name, z, x) for determinism.
+//! ## C5 → C6 evolution
+//!
+//! Sprint 11 / C5 ships geo vents only. Sprint 12 / C6 lands general
+//! feature placement (trees / rocks / wreckage) on top of the same
+//! seam: the public `feature_entry_int` helper builds one Lua entry
+//! that C6 will reuse.
 
 use barme_core::{GeoVent, Project};
 
-use crate::lua_ast::{LuaKey, LuaValue, serialize, sort_table_by_key};
+use crate::lua_ast::{LuaKey, LuaValue, serialize};
+
+/// PD-licensed Springboard feature-placer gadget, vendored verbatim
+/// from `gecko_isle_remake_v1.2.1.sd7` (which itself sourced it from
+/// the 2008 release by Gnome / Smoth). Bundled into every `.sd7` at
+/// `LuaGaia/Gadgets/FP_featureplacer.lua` so BAR auto-loads it on
+/// map start.
+pub const FP_GADGET_SOURCE: &str = include_str!("../assets/FP_featureplacer.lua");
 
 /// Canonical name of BAR's stock geothermal-vent FeatureDef. The
 /// `api_resource_spot_finder` upget looks for
@@ -53,58 +81,67 @@ use crate::lua_ast::{LuaKey, LuaValue, serialize, sort_table_by_key};
 /// §5. Map-bundled custom geos are Stage 2 (own ADR).
 pub const GEOVENT_NAME: &str = "geovent";
 
-/// Render the canonical `return { … }` feature list. Empty array when
-/// no features are authored.
-pub fn render(project: &Project) -> String {
-    let items = feature_instances(project);
-    let body = serialize(&LuaValue::Seq(items));
+/// Render `mapconfig/featureplacer/config.lua` — a one-liner that
+/// re-exports `set.lua` so the Springboard gadget's
+/// `VFS.Include("mapconfig/featureplacer/config.lua")` call ends up
+/// reading our data.
+pub fn render_config() -> String {
+    "-- Auto-generated by barme-pipeline (ADR-029); do not hand-edit.\n\
+     return VFS.Include(\"mapconfig/featureplacer/set.lua\")\n"
+        .to_string()
+}
+
+/// Render `mapconfig/featureplacer/set.lua` — the actual data the
+/// FP_featureplacer gadget consumes: a single table-valued local
+/// with `objectlist` / `unitlist` / `buildinglist` keys, returned at
+/// the end. C5 populates `objectlist` from `Project.geo_vents`;
+/// `unitlist` and `buildinglist` are empty until a map-side-units
+/// feature lands (out of scope for Stage 1).
+pub fn render_set(project: &Project) -> String {
+    let objectlist = LuaValue::Seq(object_entries(project));
+    let unitlist = LuaValue::Seq(Vec::new());
+    let buildinglist = LuaValue::Seq(Vec::new());
+    // We render the local cfg block by hand rather than wrapping it
+    // in our LuaValue::Table — preserves the
+    // `local setcfg = { ... }; return setcfg` shape that matches
+    // existing BAR maps verbatim, so a future map authored in our
+    // editor diffs cleanly against a hand-authored one.
+    let entries = vec![
+        (LuaKey::str("buildinglist"), buildinglist),
+        (LuaKey::str("objectlist"), objectlist),
+        (LuaKey::str("unitlist"), unitlist),
+    ];
+    let body = serialize(&LuaValue::Table(entries));
     format!(
         "-- Auto-generated by barme-pipeline (ADR-029); do not hand-edit.\n\
-         return {body}\n"
+         local setcfg = {body}\n\
+         return setcfg\n"
     )
 }
 
-/// Build one feature entry as a Lua table. Kept public-in-module so
-/// C5 (geo vents) and C6 (general feature placement) can reuse it
-/// when they wire up their writes.
-pub(crate) fn feature_entry(name: &str, x: i32, z: i32, rot_heading: u16) -> LuaValue {
-    let mut t = vec![
+/// Build one entry for the `set.lua` `objectlist`. Rotation is a
+/// numeric Lua integer (NOT the quoted-string form PyMapConv's `-k`
+/// flag uses) because the gadget calls
+/// `Spring.CreateFeature(..., fDef.rot)` which expects a number.
+pub(crate) fn feature_entry_int(name: &str, x: i32, z: i32, rot_heading: i16) -> LuaValue {
+    LuaValue::Table(vec![
         (LuaKey::str("name"), LuaValue::str(name)),
+        (LuaKey::str("rot"), LuaValue::Int(rot_heading as i64)),
         (LuaKey::str("x"), LuaValue::Int(x as i64)),
         (LuaKey::str("z"), LuaValue::Int(z as i64)),
-        // rot is STRING-typed per BAR convention — Claude's source
-        // audit (FINDINGS §6) confirms the parser expects the quoted
-        // form. Test-pinned by `feature_entry_carries_*_rot_as_string`.
-        (LuaKey::str("rot"), LuaValue::str(rot_heading.to_string())),
-    ];
-    sort_table_by_key(&mut t);
-    LuaValue::Table(t)
+    ])
 }
 
-/// Build one geovent feature entry from a [`GeoVent`]. Rotation is
-/// always `"0"` (Spring heading units) — the stock geovent FeatureDef
-/// is rotationally symmetric, so the heading doesn't matter visually
-/// and zero is the BAR-mapper convention.
-fn geovent_entry(v: &GeoVent) -> LuaValue {
-    feature_entry(GEOVENT_NAME, v.x_elmo, v.z_elmo, 0)
-}
-
-/// Walk the project's feature list and emit one [`LuaValue::Table`]
-/// per instance. C5 ships the geo-vent path; C6 will append general
-/// features after them.
-fn feature_instances(project: &Project) -> Vec<LuaValue> {
-    let mut out: Vec<LuaValue> = Vec::with_capacity(project.geo_vents.len());
-    // Sort sources by (z, x) for stable diffs. We must not sort the
-    // canonical `project.geo_vents` — App-side identity is index-
-    // based — so we clone into a local vec before sorting.
+/// Walk `Project.geo_vents` and emit one feature entry per vent in
+/// `(z, x)`-sorted order. C6 will append generic features after
+/// the geo-vent block (sorted by `(name, z, x)`).
+fn object_entries(project: &Project) -> Vec<LuaValue> {
     let mut sorted: Vec<GeoVent> = project.geo_vents.clone();
     sorted.sort_by_key(|v| (v.z_elmo, v.x_elmo));
-    for v in &sorted {
-        out.push(geovent_entry(v));
-    }
-    // C6 hook-point: append `project.features` here, sorted by
-    // (name, z, x) for stable diffs.
-    out
+    sorted
+        .into_iter()
+        .map(|v| feature_entry_int(GEOVENT_NAME, v.x_elmo, v.z_elmo, 0))
+        .collect()
 }
 
 #[cfg(test)]
@@ -112,113 +149,106 @@ mod tests {
     use super::*;
 
     #[test]
-    fn empty_features_emit_empty_seq() {
+    fn fp_gadget_is_bundled_with_expected_marker() {
+        // `include_str!` would fail to compile if the asset's path
+        // wasn't right; this test is a runtime sanity check that the
+        // gadget body is what we expect (a contributor moving the
+        // asset would catch the failure here).
+        assert!(
+            FP_GADGET_SOURCE.contains("FP_featureplacer")
+                || FP_GADGET_SOURCE.contains("feature placer"),
+            "FP_featureplacer.lua asset doesn't look like the Springboard gadget"
+        );
+        assert!(FP_GADGET_SOURCE.contains("VFS.Include"));
+        assert!(FP_GADGET_SOURCE.contains("mapconfig/featureplacer/config.lua"));
+        assert!(FP_GADGET_SOURCE.contains("CreateFeature"));
+    }
+
+    #[test]
+    fn config_redirects_to_set() {
+        let s = render_config();
+        assert!(s.contains("return VFS.Include"));
+        assert!(s.contains("mapconfig/featureplacer/set.lua"));
+    }
+
+    #[test]
+    fn empty_project_emits_empty_objectlist() {
         let p = Project::new("blank", 4);
-        let s = render(&p);
-        assert!(s.contains("return {}"), "got:\n{s}");
-        assert!(s.starts_with("-- Auto-generated"), "header missing");
+        let s = render_set(&p);
+        assert!(s.contains("local setcfg ="));
+        assert!(s.contains("return setcfg"));
+        assert!(s.contains("buildinglist = {}"));
+        assert!(s.contains("objectlist = {}"));
+        assert!(s.contains("unitlist = {}"));
     }
 
+    /// C5: two geo vents → two `name = "geovent"` entries in
+    /// `objectlist`. PITFALL §14 / FINDINGS §5–§6 path verified
+    /// against the BAR source.
     #[test]
-    fn feature_entry_carries_name_x_z_rot_as_string() {
-        let v = feature_entry("geovent", 2048, 4096, 0);
-        let s = serialize(&v);
-        assert!(s.contains(r#"name = "geovent""#), "got:\n{s}");
-        assert!(s.contains("x = 2048"), "got:\n{s}");
-        assert!(s.contains("z = 4096"), "got:\n{s}");
-        // rot must be STRING-typed per BAR convention.
-        assert!(s.contains(r#"rot = "0""#), "rot must be string; got:\n{s}");
-    }
-
-    #[test]
-    fn feature_entry_rotation_renders_as_quoted_heading() {
-        // 16384 heading units = 90°. BAR convention: emit as the
-        // string "16384" so the parser doesn't reject it as a number.
-        let v = feature_entry("rock_a", 2000, 3000, 16384);
-        let s = serialize(&v);
-        assert!(s.contains(r#"rot = "16384""#), "got:\n{s}");
-    }
-
-    #[test]
-    fn determinism_repeated_render_byte_identical() {
-        let p = Project::new("det", 4);
-        let a = render(&p);
-        let b = render(&p);
-        assert_eq!(a, b);
-    }
-
-    /// C5: a project with two geo vents emits two `name = "geovent"`
-    /// entries. Field shape verified against FINDINGS §5–§6 +
-    /// PITFALL §14 (no `geos` array — features only).
-    #[test]
-    fn geo_vents_emit_geovent_features() {
+    fn geo_vents_emit_geovent_objects() {
         let mut p = Project::new("vents", 8);
         p.geo_vents.push(GeoVent::new(2048, 4096));
         p.geo_vents.push(GeoVent::new(2048, 8192));
-        let s = render(&p);
-        // Two entries.
+        let s = render_set(&p);
         let count = s.matches(r#"name = "geovent""#).count();
         assert_eq!(count, 2, "expected 2 geovent entries; got:\n{s}");
-        // Both coords surface.
         assert!(s.contains("z = 4096"), "got:\n{s}");
         assert!(s.contains("z = 8192"), "got:\n{s}");
-        // X coordinate is shared across both.
         assert!(s.contains("x = 2048"), "got:\n{s}");
     }
 
-    /// PITFALL §6 / FINDINGS §6: `rot` must be a STRING-quoted
-    /// Spring heading integer. Default geo-vent rotation is `"0"`.
+    /// Rotation is an UNQUOTED integer in `set.lua` (the gadget
+    /// passes it straight to `Spring.CreateFeature(..., fDef.rot)`
+    /// which expects a number). Confirmed against a real map
+    /// (`gecko_isle_remake_v1.2.1.sd7`'s set.lua uses `rot = -23991`,
+    /// not `rot = "-23991"`).
     #[test]
-    fn geo_rotation_default_zero_string() {
-        let mut p = Project::new("rotstr", 8);
+    fn rotation_emits_as_unquoted_integer() {
+        let mut p = Project::new("rotint", 8);
         p.geo_vents.push(GeoVent::new(100, 200));
-        let s = render(&p);
+        let s = render_set(&p);
         assert!(
-            s.contains(r#"rot = "0""#),
-            "rot must be STRING-quoted; got:\n{s}"
+            s.contains("rot = 0,") || s.contains("rot = 0\n"),
+            "rot must be an UNQUOTED integer for the Lua gadget path; got:\n{s}"
         );
-        // Defensive: make sure we didn't slip out the unquoted form
-        // (which would silently work in the engine but break BAR's
-        // mapper conventions + the C8 lint).
         assert!(
-            !s.contains("rot = 0,") && !s.contains("rot = 0\n"),
-            "no unquoted `rot = 0` allowed; got:\n{s}"
+            !s.contains(r#"rot = "0""#),
+            "rot must NOT be a string in set.lua (that's PyMapConv's -k format); got:\n{s}"
         );
     }
 
-    /// Sources are sorted by (z, x) for stable diffs even when the
-    /// user authored them in another order.
+    /// Stable diff order: sources are sorted by `(z, x)` even when
+    /// authored out-of-order.
     #[test]
     fn geo_vents_emit_sorted_by_z_then_x() {
         let mut p = Project::new("sorted", 8);
-        // Insertion order intentionally not (z, x)-sorted.
         p.geo_vents.push(GeoVent::new(500, 800));
         p.geo_vents.push(GeoVent::new(100, 200));
         p.geo_vents.push(GeoVent::new(900, 200));
-        let s = render(&p);
-        // (200, 100) → (200, 900) → (800, 500): rendered z entries
-        // must appear in that order.
-        let z200_a = s.find("z = 200").expect("z=200 present");
+        let s = render_set(&p);
+        let z200 = s.find("z = 200").expect("z=200 present");
         let z800 = s.find("z = 800").expect("z=800 present");
-        assert!(
-            z200_a < z800,
-            "smaller-z entries should sort before larger-z; got:\n{s}"
-        );
+        assert!(z200 < z800, "smaller-z entries first; got:\n{s}");
     }
 
-    /// An empty `geo_vents` vec yields the existing C2-shape empty
-    /// table (no surprise regressions for projects without any
-    /// vents).
+    /// Repeat render = byte-identical. Determinism gate for the SD7
+    /// archive hash.
     #[test]
-    fn empty_geo_vents_emit_empty_seq() {
-        let p = Project::new("blank-vents", 4);
-        let s = render(&p);
-        assert!(s.contains("return {}"), "got:\n{s}");
+    fn render_set_is_deterministic() {
+        let mut p = Project::new("det", 4);
+        p.geo_vents.push(GeoVent::new(100, 100));
+        p.geo_vents.push(GeoVent::new(200, 200));
+        let a = render_set(&p);
+        let b = render_set(&p);
+        assert_eq!(a, b);
     }
 
-    /// Verify the geovent name constant: typo here would render the
-    /// vents as non-existent features and BAR would silently skip
-    /// them with `[GetFeatureDef] could not find FeatureDef`.
+    #[test]
+    fn render_config_is_deterministic() {
+        assert_eq!(render_config(), render_config());
+    }
+
     #[test]
     fn geovent_name_constant_matches_bar_featuredef() {
         assert_eq!(GEOVENT_NAME, "geovent");
