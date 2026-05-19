@@ -191,7 +191,16 @@ fn smf_block(b: &SmfBlock) -> LuaValue {
 }
 
 fn lighting_block(b: &LightingBlock) -> LuaValue {
-    let mut t = vec![(LuaKey::str("sunDir"), sundir(b.sun_dir))];
+    // PITFALL §11 / FINDINGS §1.4 — emit BOTH `sunDir` (engine
+    // canonical, `MapInfo.cpp:207`) and `sundir` (BAR's
+    // `unit_sunfacing.lua:43` reads this via VFS.Include, bypassing
+    // the engine's case-folding). Lua tables are case-sensitive;
+    // writing only one breaks half the consumer set.
+    let sundir_val = sundir(b.sun_dir);
+    let mut t = vec![
+        (LuaKey::str("sunDir"), sundir_val.clone()),
+        (LuaKey::str("sundir"), sundir_val),
+    ];
     push_rgb(&mut t, "groundAmbientColor", b.ground_ambient_color);
     push_rgb(&mut t, "groundDiffuseColor", b.ground_diffuse_color);
     push_rgb(&mut t, "groundSpecularColor", b.ground_specular_color);
@@ -751,24 +760,39 @@ mod tests {
         assert!(block.contains(r#"name = "Water""#), "got:\n{block}");
     }
 
-    /// Regression: `lighting.sun_dir` is `sunDir` (camelCase) in Lua,
-    /// not `sundir` (lowercase). Mod gadgets read both historically;
-    /// the digest says camelCase is the current canonical form
-    /// (`Rendering/Env/SunLighting.cpp`).
+    /// PITFALL §11 / FINDINGS §1.4: the lighting block ships BOTH
+    /// keys with the same 4-float value. Engine reads `sunDir`
+    /// (`MapInfo.cpp:207`); BAR's `unit_sunfacing.lua:43` gadget
+    /// reads `sundir` directly via VFS.Include and bypasses the
+    /// engine's case-folding path. Either key alone breaks half the
+    /// consumer set. Inverted from the pre-audit test that asserted
+    /// only camelCase — the source-audit (2026-05-18) collapsed
+    /// that premise.
     #[test]
-    fn lighting_sundir_key_is_camel_case_not_lowercase() {
+    fn lighting_emits_both_sundir_keys() {
         let p = Project::new("camelsun", 4);
         let s = render(&p);
         assert!(
             s.contains("sunDir = {"),
             "expected camelCase sunDir; got:\n{s}"
         );
-        // Also defensively assert the lowercase form is NOT emitted —
-        // a future refactor that accidentally lowercases the key would
-        // break BAR-mod gadgets that read `mapinfo.lighting.sunDir`.
         assert!(
-            !s.contains("sundir = {"),
-            "lowercase sundir leaked into output; got:\n{s}"
+            s.contains("sundir = {"),
+            "expected lowercase sundir alongside camelCase; got:\n{s}"
+        );
+        // Both must point at the same 4-float value. Extract each
+        // brace-delimited body and assert string-equal.
+        let extract = |needle: &str| -> String {
+            let start = s.find(needle).expect(needle);
+            let body_start = start + needle.len();
+            let close = s[body_start..].find('}').expect("closing brace");
+            s[body_start..body_start + close].to_string()
+        };
+        let sun_dir_body = extract("sunDir = {");
+        let sundir_body = extract("sundir = {");
+        assert_eq!(
+            sun_dir_body, sundir_body,
+            "sunDir vs sundir values diverged:\nsunDir =>{sun_dir_body}\nsundir =>{sundir_body}"
         );
     }
 
