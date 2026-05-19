@@ -59,8 +59,16 @@ fn build_sd7_end_to_end() {
 
     let out_sd7 = work.join("smoke.sd7");
 
-    let result = build_sd7(&driver, &project, &hm_png, &tex_bmp, work, &out_sd7)
-        .unwrap_or_else(|e| panic!("build failed:\n{e}"));
+    let result = build_sd7(
+        &driver,
+        &project,
+        &hm_png,
+        &tex_bmp,
+        barme_pipeline::SplatBakeInputs::default(),
+        work,
+        &out_sd7,
+    )
+    .unwrap_or_else(|e| panic!("build failed:\n{e}"));
 
     assert_eq!(result, out_sd7);
     assert!(out_sd7.is_file(), "sd7 missing at {}", out_sd7.display());

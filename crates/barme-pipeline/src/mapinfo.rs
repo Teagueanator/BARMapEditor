@@ -41,7 +41,17 @@ use crate::lua_ast::{LuaKey, LuaValue, serialize, sort_table_by_key};
 /// alphabetically keyed). On empty `teams[]`, the 25/75 default pair
 /// is materialised before emission.
 pub fn render(project: &Project) -> String {
-    let mut info: MapInfo = project.into();
+    let info: MapInfo = project.into();
+    render_with(project, info)
+}
+
+/// Like [`render`] but takes an already-built `MapInfo` so external
+/// builders (e.g. D6's splat pipeline) can populate fields the
+/// `From<&Project>` conversion alone can't reach (the splat staging
+/// step depends on disk paths the pipeline writes after compile).
+/// Still applies the empty-teams 25/75 fallback so a project with
+/// no authored start positions still produces a playable archive.
+pub fn render_with(project: &Project, mut info: MapInfo) -> String {
     if info.teams.is_empty() {
         info.teams = default_team_pair(project);
     }
@@ -325,13 +335,32 @@ fn resources_block(b: &barme_core::ResourcesBlock) -> LuaValue {
     push_str_opt(&mut t, "specularTex", b.specular_tex.as_deref());
     push_str_opt(&mut t, "splatDetailTex", b.splat_detail_tex.as_deref());
     push_str_opt(&mut t, "splatDistrTex", b.splat_distr_tex.as_deref());
+    // PITFALL §15 / FINDINGS §1.8 — emit the SUBTABLE form
+    // (`splatDetailNormalTex = { "a.dds", ..., alpha = false, }`)
+    // whenever paths are populated. The engine prefers this over the
+    // legacy `splatDetailNormalTex1..4` numbered keys + top-level
+    // `splatDetailNormalDiffuseAlpha`; mixing both is noisy in the
+    // diff (the subtable wins).
     if !b.splat_detail_normal_tex.is_empty() {
+        let values: Vec<LuaValue> = b
+            .splat_detail_normal_tex
+            .iter()
+            .map(LuaValue::str)
+            .collect();
+        let keyed: Vec<(LuaKey, LuaValue)> = match b.splat_detail_normal_tex_alpha {
+            Some(a) => vec![(LuaKey::str("alpha"), LuaValue::Bool(a))],
+            None => vec![],
+        };
         t.push((
             LuaKey::str("splatDetailNormalTex"),
-            str_seq(&b.splat_detail_normal_tex),
+            LuaValue::Mixed { values, keyed },
         ));
     }
     if let Some(v) = b.splat_detail_normal_diffuse_alpha {
+        // Legacy top-level form. D6 stops emitting this in favour of
+        // the subtable's `alpha` key, but the field stays in the
+        // schema for backwards-compat with hand-authored mapinfo.lua
+        // imports (F2 / Stage 2).
         t.push((
             LuaKey::str("splatDetailNormalDiffuseAlpha"),
             LuaValue::Int(v as i64),
@@ -952,6 +981,85 @@ mod tests {
         assert!(
             s.contains("voidAlphaMin = 0.42"),
             "authored voidAlphaMin lost; got:\n{s}"
+        );
+    }
+
+    /// D6 (Sprint 12) / PITFALL §15: when DNTS paths are populated
+    /// the emitter writes the SUBTABLE form
+    /// `splatDetailNormalTex = { "a.dds", ..., alpha = false, }`,
+    /// NEVER the legacy numbered-keys form. The engine prefers the
+    /// subtable; mixing the two silently shadows the numbered keys.
+    /// Hand-authored maps importing into the editor may carry the
+    /// legacy form — that survives in the schema's
+    /// `splat_detail_normal_diffuse_alpha` field but D6 doesn't
+    /// emit `splatDetailNormalTex1..4`.
+    #[test]
+    fn resources_subtable_form_not_legacy() {
+        let p = Project::new("dnts", 4);
+        let mut info: MapInfo = (&p).into();
+        info.resources.splat_detail_normal_tex = vec![
+            "a.dds".into(),
+            "b.dds".into(),
+            "c.dds".into(),
+            "d.dds".into(),
+        ];
+        info.resources.splat_detail_normal_tex_alpha = Some(false);
+        let s = render_mapinfo(&info);
+        assert!(
+            s.contains("splatDetailNormalTex = {"),
+            "expected subtable form; got:\n{s}"
+        );
+        assert!(
+            !s.contains("splatDetailNormalTex1 ="),
+            "PITFALL §15 — legacy numbered-keys form leaked into output; got:\n{s}"
+        );
+        assert!(
+            !s.contains("splatDetailNormalTex2 ="),
+            "PITFALL §15 — legacy numbered-keys form leaked into output; got:\n{s}"
+        );
+        // alpha key embedded inside the subtable.
+        assert!(
+            s.contains("alpha = false,"),
+            "expected alpha companion inside subtable; got:\n{s}"
+        );
+        // Four positional DDS entries.
+        for f in &["a.dds", "b.dds", "c.dds", "d.dds"] {
+            assert!(s.contains(&format!(r#""{}""#, f)), "missing {f} in:\n{s}");
+        }
+    }
+
+    /// D6: when the alpha companion isn't set, the subtable emits
+    /// the bare four-path form (no `alpha = …` line). That's the
+    /// shape ADR-025 ships by default.
+    #[test]
+    fn resources_subtable_without_alpha_omits_the_key() {
+        let p = Project::new("noalpha", 4);
+        let mut info: MapInfo = (&p).into();
+        info.resources.splat_detail_normal_tex = vec!["a.dds".into(), "b.dds".into()];
+        info.resources.splat_detail_normal_tex_alpha = None;
+        let s = render_mapinfo(&info);
+        assert!(s.contains("splatDetailNormalTex = {"), "got:\n{s}");
+        // No `alpha = …` inside the subtable body.
+        let sub_start = s.find("splatDetailNormalTex = {").unwrap();
+        let sub_end_rel = s[sub_start..].find('}').unwrap();
+        let sub_body = &s[sub_start..sub_start + sub_end_rel];
+        assert!(
+            !sub_body.contains("alpha ="),
+            "alpha key emitted with no value set; got:\n{sub_body}"
+        );
+    }
+
+    /// D6: `specularTex` round-trips through the resources block
+    /// when populated.
+    #[test]
+    fn resources_specular_tex_round_trips() {
+        let p = Project::new("spec", 4);
+        let mut info: MapInfo = (&p).into();
+        info.resources.specular_tex = Some("spec_grey.dds".to_string());
+        let s = render_mapinfo(&info);
+        assert!(
+            s.contains(r#"specularTex = "spec_grey.dds""#),
+            "specular tex didn't round-trip; got:\n{s}"
         );
     }
 }

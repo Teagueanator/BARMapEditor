@@ -24,7 +24,7 @@
 use std::path::{Path, PathBuf};
 
 use barme_core::Project;
-use barme_pipeline::{PyMapConvDriver, build_sd7};
+use barme_pipeline::{PyMapConvDriver, SplatBakeInputs, build_sd7};
 use image::{ImageBuffer, Rgb};
 use tracing::{info, warn};
 
@@ -170,11 +170,18 @@ pub fn install_sd7(src: &Path, dst_dir: &Path) -> Result<PathBuf, LauncherError>
 /// `texture_bmp = None` → synthesize a flat grey BMP at the project's
 /// texture dimensions. This is the v0 fallback so the UI can ship without
 /// a texture-import flow; replace once F4 (DNTS splat painting) lands.
+///
+/// `splat_inputs` carries per-channel slot directories the splat
+/// pipeline (Sprint 12 / D6) bakes DNTS from. The app resolves each
+/// `Project.splat_config.channels[i]: Option<u8>` to its
+/// `tools/textures/<NN-slug>/` path via the slot registry; unbound
+/// channels are `None` and the pipeline skips them.
 pub fn build_and_install(
     driver: &PyMapConvDriver,
     project: &Project,
     heightmap_png: &Path,
     texture_bmp: Option<&Path>,
+    splat_inputs: SplatBakeInputs,
     dst_dir: &Path,
 ) -> Result<PathBuf, LauncherError> {
     let workdir = tempfile::tempdir().map_err(|source| LauncherError::Io {
@@ -228,7 +235,15 @@ pub fn build_and_install(
 
     let out_sd7 = work.join(format!("{}.sd7", project.name));
     info!(name = %project.name, ?dst_dir, "build_and_install: compiling");
-    let built = build_sd7(driver, project, heightmap_png, tex, work, &out_sd7)?;
+    let built = build_sd7(
+        driver,
+        project,
+        heightmap_png,
+        tex,
+        splat_inputs,
+        work,
+        &out_sd7,
+    )?;
 
     let installed = install_sd7(&built, dst_dir)?;
     info!(?installed, "build_and_install ok");

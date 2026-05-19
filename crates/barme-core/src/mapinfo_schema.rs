@@ -461,11 +461,23 @@ pub struct ResourcesBlock {
     pub splat_detail_tex: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub splat_distr_tex: Option<String>,
-    /// Up to 4 detail-normal textures (DNTS). The engine also accepts
-    /// an `alpha = true` flag on this table; mappers wanting that
-    /// behaviour set [`splat_detail_normal_diffuse_alpha`] to 1.
+    /// Up to 4 detail-normal textures (DNTS). The engine's preferred
+    /// subtable form embeds an `alpha = bool` companion (see
+    /// [`splat_detail_normal_tex_alpha`]); the legacy
+    /// `splatDetailNormalTex1..4` numbered keys + top-level
+    /// `splatDetailNormalDiffuseAlpha` are silently shadowed when both
+    /// forms are present (PITFALL §15 / FINDINGS §1.8). D6 / Sprint 12
+    /// emits the subtable form only.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub splat_detail_normal_tex: Vec<String>,
+    /// D6 / Sprint 12: the subtable's embedded `alpha` flag — the
+    /// modern equivalent of the legacy
+    /// [`splat_detail_normal_diffuse_alpha`] top-level key. Emit when
+    /// the alpha companion belongs in the `splatDetailNormalTex`
+    /// table. ADR-034 is the deferred high-pass workflow; until then
+    /// the baseline value is `false`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub splat_detail_normal_tex_alpha: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub splat_detail_normal_diffuse_alpha: Option<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

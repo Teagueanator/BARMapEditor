@@ -66,8 +66,16 @@ fn main() -> Result<()> {
     }
     let out_sd7 = bar_dir.join(format!("{MAP_NAME}.sd7"));
 
-    let sd7 = build_sd7(&driver, &project, &hm_png, &tex_bmp, work, &out_sd7)
-        .context("build_sd7 end-to-end")?;
+    let sd7 = build_sd7(
+        &driver,
+        &project,
+        &hm_png,
+        &tex_bmp,
+        barme_pipeline::SplatBakeInputs::default(),
+        work,
+        &out_sd7,
+    )
+    .context("build_sd7 end-to-end")?;
 
     let bytes = std::fs::metadata(&sd7)?.len();
     println!("\nwrote {} ({bytes} bytes)", sd7.display());

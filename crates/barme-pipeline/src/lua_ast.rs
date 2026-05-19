@@ -62,6 +62,22 @@ pub enum LuaValue {
     /// Sequence (array-style) table: emits as `{ v1, v2, v3 }`. No
     /// keys are rendered. Ordering is the builder's responsibility.
     Seq(Vec<LuaValue>),
+    /// Mixed Lua table — positional sequence entries followed by
+    /// keyed entries. Emits as
+    /// `{ v1, v2, v3, key1 = w1, key2 = w2, }`. Lua's table model
+    /// assigns positional entries to integer keys `1..N` implicitly
+    /// and the keyed entries on top; both shapes coexist in one
+    /// table.
+    ///
+    /// Sprint 12 / D6 uses this for the `splatDetailNormalTex`
+    /// subtable: four positional DDS paths + an `alpha` boolean
+    /// (FINDINGS §1.8 — the engine's preferred form, distinct from
+    /// the legacy `splatDetailNormalTex1..4` numbered-keys form
+    /// PITFALL §15 calls out as silently shadowed).
+    Mixed {
+        values: Vec<LuaValue>,
+        keyed: Vec<(LuaKey, LuaValue)>,
+    },
 }
 
 impl LuaValue {
@@ -111,6 +127,7 @@ fn write_value(out: &mut String, v: &LuaValue, indent: usize) {
         LuaValue::Str(s) => write_string(out, s),
         LuaValue::Table(items) => write_table(out, items, indent),
         LuaValue::Seq(items) => write_seq(out, items, indent),
+        LuaValue::Mixed { values, keyed } => write_mixed(out, values, keyed, indent),
     }
 }
 
@@ -146,6 +163,38 @@ fn write_seq(out: &mut String, items: &[LuaValue], indent: usize) {
     let close = "  ".repeat(indent);
     for v in items {
         out.push_str(&inner);
+        write_value(out, v, indent + 1);
+        out.push(',');
+        out.push('\n');
+    }
+    out.push_str(&close);
+    out.push('}');
+}
+
+/// Render a mixed table: positional `values` first (bare, no keys),
+/// then `keyed` entries (each `key = value,`). Empty table when both
+/// are empty. Both empty + a single positional value = inline a
+/// braced single-element form for diff-friendliness with the keyed-
+/// only and seq-only paths.
+fn write_mixed(out: &mut String, values: &[LuaValue], keyed: &[(LuaKey, LuaValue)], indent: usize) {
+    if values.is_empty() && keyed.is_empty() {
+        out.push_str("{}");
+        return;
+    }
+    out.push('{');
+    out.push('\n');
+    let inner = "  ".repeat(indent + 1);
+    let close = "  ".repeat(indent);
+    for v in values {
+        out.push_str(&inner);
+        write_value(out, v, indent + 1);
+        out.push(',');
+        out.push('\n');
+    }
+    for (k, v) in keyed {
+        out.push_str(&inner);
+        write_key(out, k);
+        out.push_str(" = ");
         write_value(out, v, indent + 1);
         out.push(',');
         out.push('\n');
@@ -449,5 +498,81 @@ mod tests {
         assert_eq!(format_float(f), "0.1");
         let f = 0.02f32 as f64;
         assert_eq!(format_float(f), "0.02");
+    }
+
+    /// D6 (Sprint 12): `LuaValue::Mixed` renders positional entries
+    /// first (bare), then keyed entries. Matches FINDINGS §1.8's
+    /// modern `splatDetailNormalTex` form: `{ "a.dds", "b.dds",
+    /// alpha = false, }`.
+    #[test]
+    fn mixed_table_emits_positional_then_keyed() {
+        let m = LuaValue::Mixed {
+            values: vec![LuaValue::str("a.dds"), LuaValue::str("b.dds")],
+            keyed: vec![(LuaKey::str("alpha"), LuaValue::Bool(false))],
+        };
+        let s = serialize(&m);
+        // Positional entries come before the keyed `alpha` field.
+        let pos_a = s.find(r#""a.dds""#).unwrap();
+        let pos_b = s.find(r#""b.dds""#).unwrap();
+        let pos_alpha = s.find("alpha = false").unwrap();
+        assert!(pos_a < pos_b);
+        assert!(pos_b < pos_alpha);
+        // Positional entries DO NOT carry a key prefix.
+        assert!(
+            !s.contains(r#"[1] = "a.dds""#),
+            "positional entry must not emit a key prefix; got:\n{s}"
+        );
+    }
+
+    /// `Mixed` with both vecs empty renders as `{}`.
+    #[test]
+    fn mixed_table_empty_emits_inline_braces() {
+        let m = LuaValue::Mixed {
+            values: vec![],
+            keyed: vec![],
+        };
+        assert_eq!(serialize(&m), "{}");
+    }
+
+    /// `Mixed` with only positional entries collapses to the same
+    /// rendered text as a `Seq` (modulo trivial differences) — both
+    /// produce the bare positional form. Pin the equivalence on the
+    /// minimal four-string DDS case.
+    #[test]
+    fn mixed_table_with_no_keyed_matches_seq_emission() {
+        let strs = vec![
+            LuaValue::str("a.dds"),
+            LuaValue::str("b.dds"),
+            LuaValue::str("c.dds"),
+        ];
+        let mixed = LuaValue::Mixed {
+            values: strs.clone(),
+            keyed: vec![],
+        };
+        let seq = LuaValue::Seq(strs);
+        assert_eq!(
+            serialize(&mixed),
+            serialize(&seq),
+            "Mixed with empty keyed should match Seq exactly"
+        );
+    }
+
+    /// `Mixed` nests with proper indentation under a parent table.
+    #[test]
+    fn mixed_table_indents_under_parent_table() {
+        let t = LuaValue::Table(vec![(
+            LuaKey::str("resources"),
+            LuaValue::Table(vec![(
+                LuaKey::str("splatDetailNormalTex"),
+                LuaValue::Mixed {
+                    values: vec![LuaValue::str("a.dds"), LuaValue::str("b.dds")],
+                    keyed: vec![(LuaKey::str("alpha"), LuaValue::Bool(true))],
+                },
+            )]),
+        )]);
+        let s = serialize(&t);
+        assert!(s.contains("splatDetailNormalTex = {"), "got:\n{s}");
+        assert!(s.contains(r#""a.dds","#), "got:\n{s}");
+        assert!(s.contains("alpha = true,"), "got:\n{s}");
     }
 }

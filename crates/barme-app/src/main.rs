@@ -1132,6 +1132,33 @@ impl App {
         p
     }
 
+    /// D6 (Sprint 12): translate `Project.splat_config.channels`
+    /// (slot ids 0..=255) to per-channel directories under
+    /// `tools/textures/<NN-slug>/`. Unbound channels stay `None`;
+    /// bound channels resolve to the slot registry entry the user
+    /// picked in the F4 splat inspector. The splat pipeline calls
+    /// `bake_dnts` only for `Some(_)` entries that ALSO have non-
+    /// zero distribution pixels — see
+    /// `splat_pipeline::compute_active_channels`.
+    fn resolve_splat_bake_inputs(&self, project: &Project) -> barme_pipeline::SplatBakeInputs {
+        let mut out = barme_pipeline::SplatBakeInputs::default();
+        for (ch, binding) in project.splat_config.channels.iter().enumerate() {
+            let Some(slot_id) = binding else {
+                continue;
+            };
+            if let Some(slot) = self.slot_registry.iter().find(|m| m.id == *slot_id) {
+                out.channel_slot_dirs[ch] = Some(slot.dir.clone());
+            } else {
+                warn!(
+                    channel = ch,
+                    slot_id = slot_id,
+                    "splat channel binding references missing slot in registry"
+                );
+            }
+        }
+        out
+    }
+
     fn save_to(&mut self, path: PathBuf) {
         let mut p = self.snapshot_project();
         let abs_before = p.heightmap.clone();
@@ -2861,6 +2888,11 @@ impl App {
             }
         };
         let project = self.snapshot_project_for_build();
+        // D6 (Sprint 12): resolve each bound splat channel to its slot
+        // directory inside `tools/textures/` so the pipeline can call
+        // `bake_dnts` per active channel. Unbound channels stay None;
+        // the splat pipeline skips them.
+        let splat_inputs = self.resolve_splat_bake_inputs(&project);
         info!(
             name = %project.name,
             smu_x = self.map_size.smu_x,
@@ -2870,7 +2902,8 @@ impl App {
             dst = %dst_dir.display(),
             "build & install requested"
         );
-        match launcher::build_and_install(&driver, &project, &hm_path, None, &dst_dir) {
+        match launcher::build_and_install(&driver, &project, &hm_path, None, splat_inputs, &dst_dir)
+        {
             Ok(installed) => {
                 let bytes = std::fs::metadata(&installed).map(|m| m.len()).unwrap_or(0);
                 info!(

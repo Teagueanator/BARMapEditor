@@ -32,11 +32,15 @@ pub mod mapinfo;
 pub mod metal_layout;
 pub mod pymapconv;
 pub mod sd7;
+pub mod splat_pipeline;
 pub mod startboxes;
 
 pub use dnts::{BakeOptions, DntsBakeError, bake_dnts};
 pub use pymapconv::{CompileInputs, CompileOutputs, PyMapConvDriver, PyMapConvError};
 pub use sd7::{Sd7Error, StagedFile};
+pub use splat_pipeline::{
+    SplatBakeInputs, SplatPipelineError, StagedSplatAssets, stage_splat_assets,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum BuildError {
@@ -45,6 +49,9 @@ pub enum BuildError {
 
     #[error(transparent)]
     Sd7(#[from] Sd7Error),
+
+    #[error(transparent)]
+    Splat(#[from] SplatPipelineError),
 
     #[error("io error on {path}: {source}")]
     Io {
@@ -64,6 +71,12 @@ pub enum BuildError {
 /// `out_sd7` is the final archive path. Existing files at this path are
 /// overwritten.
 ///
+/// `splat_inputs` carries the per-channel slot directories the splat
+/// pipeline bakes DNTS from. The caller (typically `barme-app`'s
+/// launcher) resolves `Project.splat_config.channels[i]: Option<u8>` to
+/// a `tools/textures/<NN-slug>/` path via its slot registry. Inactive
+/// channels pass `None`; the pipeline skips them.
+///
 /// On success returns `out_sd7`. On failure, returns a typed `BuildError`
 /// with the underlying subprocess streams attached (via the variant chain).
 pub fn build_sd7(
@@ -71,6 +84,7 @@ pub fn build_sd7(
     project: &Project,
     heightmap_png: &Path,
     texture_bmp: &Path,
+    splat_inputs: SplatBakeInputs,
     work_dir: &Path,
     out_sd7: &Path,
 ) -> Result<PathBuf, BuildError> {
@@ -103,10 +117,38 @@ pub fn build_sd7(
         out_dir: &compile_out,
     })?;
 
+    // D6 (Sprint 12): stage the splat-side artefacts before rendering
+    // mapinfo.lua so the resources block reflects the staged paths.
+    // The baked DNTS DDS files + splat distribution PNG + specular
+    // fallback all flow into the .sd7 alongside SMF/SMT. PyMapConv
+    // does NOT touch any of these files (FINDINGS §10).
+    let splat_staged = splat_pipeline::stage_splat_assets(
+        project,
+        &splat_inputs,
+        work_dir,
+        BakeOptions {
+            yflip_normal: false,
+            // ADR-025 baseline — `splatDetailNormalDiffuseAlpha = false`.
+            // ADR-034 (high-pass workflow) flips this when it lands.
+            diffuse_in_alpha: project.splat_config.diffuse_in_alpha,
+        },
+    )?;
+
+    // Build the typed `MapInfo`, then let the splat pipeline populate
+    // its resources block with the staged file references. This is
+    // the seam C8 (Sprint 14) plugs its lint pass into; D6 just
+    // produces the data.
+    let mut info: barme_core::MapInfo = project.into();
+    splat_pipeline::populate_resources(&mut info, project, &splat_staged);
+
     // Lua sidecars — written to scratch paths under work_dir, then
     // staged into the archive at their canonical layout (mapinfo.lua at
     // root; the rest under `mapconfig/`).
-    let mapinfo_path = write_lua_file(work_dir, "mapinfo.lua", &mapinfo::render(project))?;
+    let mapinfo_path = write_lua_file(
+        work_dir,
+        "mapinfo.lua",
+        &mapinfo::render_with(project, info),
+    )?;
     let metal_path = write_lua_file(
         work_dir,
         "map_metal_layout.lua",
@@ -209,6 +251,45 @@ pub fn build_sd7(
         staged.push(StagedFile {
             src: path,
             archive_rel: "mapconfig/map_startboxes.lua",
+        });
+    }
+
+    // D6 (Sprint 12): bundle the splat distribution PNG + per-active-
+    // slot DDS files + specular fallback. Paths inside the archive
+    // mirror what the resources block emits in mapinfo.lua:
+    //   - `maps/<projectname>_splatdistr.png`
+    //   - `maps/textures/<slot-dir-name>_dnts.dds`
+    //   - `maps/<projectname>_specular.dds`
+    let mut splat_archive_paths: Vec<(PathBuf, String)> = Vec::new();
+    if let Some(p) = splat_staged.splat_distr_png.as_ref() {
+        let basename = p
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("splatdistr.png")
+            .to_string();
+        splat_archive_paths.push((p.clone(), format!("maps/{basename}")));
+    }
+    for dds in &splat_staged.per_slot_dds {
+        splat_archive_paths.push((
+            dds.disk_path.clone(),
+            format!("maps/textures/{}", dds.filename),
+        ));
+    }
+    if let Some(p) = splat_staged.specular_dds.as_ref() {
+        let basename = p
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("specular.dds")
+            .to_string();
+        splat_archive_paths.push((p.clone(), format!("maps/{basename}")));
+    }
+    // Borrow + push as `StagedFile`s after we own the path strings.
+    // Keep a vec of (path, rel) outlives the staged vec for the
+    // duration of the pack call.
+    for (path, rel) in &splat_archive_paths {
+        staged.push(StagedFile {
+            src: path,
+            archive_rel: rel,
         });
     }
 
