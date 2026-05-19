@@ -94,8 +94,35 @@ Implements SRS F1–F12. Ships a Windows `.exe` and a Linux AppImage.
       **F4 itself remains gated on D6** (mapinfo emission + `.sd7`
       bundling, Sprint 12) — until then the painted distribution
       shows in the editor preview only, not in BAR.
-- [ ] **F5** Metal-spot placement (point + radius → red-channel density)
-- [ ] **F6** Geo-vent placement
+- [x] **F5** Metal-spot placement — Sprint 11 / C4 lands `Project.metal_spots:
+      Vec<MetalSpot>` + the BAR-convention `extractor_radius` (80 elmos
+      default; PITFALL §6 surface). Inspector renders a per-spot table with
+      X / Z / metal `DragValue`s (metal range 0..=50 so the user can type any
+      strategic value — 0.5 perimeter, 2.0 standard, 4.0 / 5.2 central — not
+      capped to a slider). Canvas LMB places, LMB-drags moves, RMB deletes,
+      with one `ProjectDiff::PlaceMetalSpot` per symmetry-replicated source so
+      undo peels mirrors one at a time. Markers render as red filled circles
+      with a cyan extractor-radius ring when the tool is active; ghost at
+      50 % alpha when other tools are active (B1 cross-tool pattern).
+      Pipeline emits `mapconfig/map_metal_layout.lua` `spots = { [N] = { x,
+      z, metal } }` (integer-keyed for diff-friendliness) plus an all-zero
+      `(32 * smu_x) × (32 * smu_z)` metalmap PNG passed to PyMapConv via
+      `-m` — PITFALL §13 + FINDINGS §5: the BAR
+      `map_metal_spot_placer.lua` gadget bails on any non-zero metalmap
+      pixel, so this forces our Lua spots to be the source of truth.
+- [x] **F6** Geo-vent placement — Sprint 11 / C5 lands `Project.geo_vents:
+      Vec<GeoVent>` and the inspector / canvas plumbing mirroring F5's
+      pattern. Pipeline emits each vent as a `{ name = "geovent", x, z,
+      rot = "0" }` entry in `mapconfig/featureplacer/features.lua` —
+      PITFALL §14 + FINDINGS §5–§6: BAR's `api_resource_spot_finder.
+      GetSpotsGeo()` scans `Spring.GetAllFeatures()` for
+      `FeatureDef.geoThermal = true`, so the stock `geovent` FeatureDef
+      simultaneously renders the steam plume AND registers the spot with
+      the resource-spot-finder upget. The Zero-K-style `geos = {}` array
+      in `map_metal_layout.lua` is NOT a BAR convention and the metal-
+      layout emitter explicitly suppresses it (regression-tested).
+      `rot` is string-quoted per PITFALL §6 (FINDINGS §6 confirms the
+      BAR-mapper convention).
 - [ ] **F7** Feature placement (trees, rocks, wreckage) into a Lua gadget
 - [x] **F8** Start-position editor — Phase 2 ADR-023 shipped the flat
       `Vec<StartPosition>` model; Phase 3 ADR-032 (B6) supersedes the
