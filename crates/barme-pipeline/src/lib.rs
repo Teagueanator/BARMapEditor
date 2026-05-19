@@ -4,6 +4,9 @@
 //!
 //! - [`pymapconv`] — subprocess driver around the vendored PyMapConv binary
 //!   (ADR-012). Produces `.smf` + `.smt`.
+//! - [`dnts`] — `splatDetailNormalTex` bake pipeline (ADR-026); turns
+//!   a slot's `normal.png` (+ optional diffuse) into a BC3 / DXT5 DDS
+//!   via the vendored Compressonator (ADR-014).
 //! - [`lua_ast`] — typed Lua AST + pretty-printer (ADR-029).
 //! - [`mapinfo`] — `mapinfo.lua` emitter built on the AST (ADR-029,
 //!   supersedes ADR-013).
@@ -19,6 +22,7 @@ use std::path::{Path, PathBuf};
 use barme_core::Project;
 use tracing::info;
 
+pub mod dnts;
 pub mod featureplacer;
 pub mod lua_ast;
 pub mod mapinfo;
@@ -27,6 +31,7 @@ pub mod pymapconv;
 pub mod sd7;
 pub mod startboxes;
 
+pub use dnts::{BakeOptions, DntsBakeError, bake_dnts};
 pub use pymapconv::{CompileInputs, CompileOutputs, PyMapConvDriver, PyMapConvError};
 pub use sd7::{Sd7Error, StagedFile};
 

@@ -40,6 +40,9 @@ which = "8"
 # Math-function terrain generator (procgen)
 evalexpr = "13"
 
+# DNTS bake cache key (sha256 over inputs + BakeOptions)
+sha2 = "0.10"
+
 # Cross-platform user directories (BAR maps-dir lookup; see ADR-015)
 directories = "6"
 

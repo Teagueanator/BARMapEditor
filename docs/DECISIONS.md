@@ -2280,6 +2280,124 @@ splat-rendering math and informs the format choices below.
   is the contract D2's bake honours. The high-pass-diffuse-in-alpha
   workflow lives behind ADR-034.
 
+## ADR-026 — DNTS bake pipeline: `splatDetailNormalTex` BC3 emit with sha256 cache
+
+**Status:** Accepted (2026-05-18)
+
+**Context:** F4 (splat painting) needs a `splatDetailNormalTex`-format
+DDS per slot at `.sd7` build time. The starter pack (ADR-025) ships
+raw diffuse + normal PNGs; the bake step composes them into a single
+RGBA8 image and BC3-compresses to DDS. Up to 16 slots × N builds
+amounts to a lot of repeat compression — a content-addressed cache
+keeps incremental builds fast.
+
+The shader-math facts that constrain the bake:
+- The engine builds the TBN from the per-vertex normal and decodes
+  splat normals as `* 2 - 1` (FINDINGS §7.4, `SMFFragProg.glsl:174-198`).
+  Y-flip must match source convention — ambientCG `*_NormalGL.png` is
+  already OpenGL; Substance / Quixel exports are DirectX-source. Both
+  paths need to round-trip.
+- The full RGBA of a DNTS sample is decoded as signed; alpha
+  contributes to the per-pixel diffuse offset
+  (`splatDetailStrength.y = clamp(splatDetailNormal.a, -1, 1)` when
+  `SMF_DETAIL_NORMAL_DIFFUSE_ALPHA` is defined; otherwise alpha is
+  unused). With `splatDetailNormalDiffuseAlpha = false` (ADR-025's
+  baseline) the alpha can be solid 0xFF without changing the
+  rendered result.
+- BC3 carries 8-bit alpha; BC1 doesn't. We pick BC3 unconditionally
+  so the upgrade path to ADR-034's high-pass alpha workflow stays
+  open without re-baking the BCn format.
+
+**Decision:**
+- New module `crates/barme-pipeline/src/dnts.rs`. Public surface:
+  ```rust
+  pub struct BakeOptions {
+      pub yflip_normal: bool,    // default false; starter pack is _NormalGL
+      pub diffuse_in_alpha: bool, // default false; ADR-025 baseline
+  }
+  pub fn bake_dnts(slot_dir: &Path, out_dds: &Path, opts: BakeOptions) -> Result<()>;
+  ```
+- **Y-flip is a runtime knob**, default OFF. The D1-shipped starter pack
+  ships ambientCG `*_NormalGL.png` (OpenGL convention) → no flip needed.
+  F23 user-imports of DirectX-source normals (Substance / Quixel) flip
+  the G channel via `255 - g`. A unit test pins a synthetic normal map
+  through both branches.
+- **JPG normals rejected at the entry point.** PITFALLS rule #2 — JPEG
+  chroma subsampling destroys X/Y vector data. A `normal.jpg` present
+  without `normal.png` returns a typed error (`NormalNotPng`).
+- **Compose RGBA8**: RGB = (possibly flipped) normal RGB; A = 0xFF
+  when `diffuse_in_alpha == false` (ADR-025 baseline), else the
+  Rec.709 luma of the diffuse pixel. The luma path ships untested in
+  BAR — high-pass tuning is ADR-034.
+- **BC3 / DXT5 always** via the vendored `compressonatorcli-bin`
+  (ADR-014). The wrapper shell script ships as `CompressonatorCLI` →
+  `compressonatorcli`; we invoke the underlying ELF directly with
+  `LD_LIBRARY_PATH` set to the wrapper's exact entries
+  (`compressonator/`, `compressonator/qt/`, `compressonator/pkglibs/`).
+  Direct ELF invocation avoids a fork-exec ENOEXEC the Rust subprocess
+  path hits on the bash wrapper inside `cargo test`'s harness. The
+  `CompressonatorCLI` symlink is kept as the fetch-script-ran canary.
+- **Subprocess pattern** mirrors ADR-012 (PyMapConv driver): capture
+  stdout + stderr, stream both to `tracing::trace!`, trust artifact
+  presence as the success contract (warn-and-accept on non-zero exit
+  if the DDS landed).
+- **Cache** lives at `tools/textures-cache/<sha>.dds`. The cache key
+  is `sha256(diffuse_bytes ‖ normal_bytes ‖ opts.to_cache_bytes())`.
+  Identical inputs → cache hit → copy. Different bytes OR different
+  opts → cache miss → bake. `.gitignore` grows `/tools/textures-cache/`.
+- **Compressonator flags**: `-fd BC3 -nomipmap` plus the input PNG +
+  output DDS paths. No mip generation (mipmaps come downstream when
+  the .sd7 is loaded; the DDS itself only needs base-level data).
+- **Discovery**: `bake_dnts` walks up two parents from `slot_dir`
+  (typically `tools/textures/<NN-slot>/`) to find `tools/`, then
+  resolves `tools/compressonator/compressonatorcli-bin` and
+  `tools/textures-cache/`. Tests use an internal `BakeEnv` struct
+  to redirect both paths for hermetic runs.
+
+**Alternatives:**
+- **BC1 when `diffuse_in_alpha == false`.** Saves ~50 % per-DDS disk
+  vs BC3. Rejected: would re-bake every slot the day ADR-034 lands,
+  and BC3 at 1024² is ~1 MB compressed — well under the 50 MB
+  total budget the texture pack pre-paid.
+- **Bake mipmaps.** Compressonator can generate them with `-miplevels`.
+  Rejected: the engine generates its own mip chain at load time per
+  the SMF tile format; an extra in-DDS mip chain just inflates the
+  archive.
+- **Invoke the `compressonatorcli` bash wrapper directly.** Hits
+  ENOEXEC ("Exec format error") under `cargo test`'s subprocess
+  spawn — the test harness rejects the kernel-level shebang
+  interpretation for the wrapper script. Workaround: invoke the
+  ELF directly with the wrapper's LD_LIBRARY_PATH set.
+- **Synthesise normals from diffuse luminance (Sobel).** Rejected at
+  ADR-025: visibly wrong on assets with deliberate micro-relief
+  (brushed metal, cracked clay). The starter pack ships source
+  normals; the bake just reformats them.
+- **Cache key on file mtime instead of content.** Rejected: file
+  systems with second-resolution mtime would false-positive a cache
+  hit on edits within the same second. Content-addressed sha256 is
+  the standard choice and the cost (a single 1024² PNG hash) is
+  negligible against a BC3 compress.
+- **Per-build temp dir instead of `tools/textures-cache/`.** Rejected:
+  the cache persists across builds, across project switches, and
+  across `git clean` (it's gitignored, not tracked, but stays through
+  normal dev). The disk cost is bounded at `slots × BakeOptions
+  variants × 1 MB`.
+
+**Consequence:**
+- `barme-pipeline` gains a new `sha2` dep (workspace-level).
+- `.gitignore` lists `/tools/textures-cache/`.
+- D6 (Sprint 12) consumes `bake_dnts` from the build orchestrator to
+  produce `<slot>_dnts.dds` per active splat slot.
+- Future D5 splat-tool-UI previews can reuse the same composed
+  RGBA8 (without the BC3 step) — the helper is internal but
+  promotable.
+- The bake is reusable for F23 user-imports: same API surface,
+  flip the `yflip_normal` flag when the user identifies a DirectX
+  source. The cache key folds `BakeOptions`, so toggling the flip
+  on the same source bytes is a clean re-bake.
+- `diffuse_in_alpha = true` is plumbed but UNTESTED in BAR; the
+  in-engine A/B that confirms the high-pass path is ADR-034.
+
 ## ADR-027 — Asset registry on-disk layout (`tools/textures/<NN-slot>/`)
 
 **Status:** Accepted (2026-05-18)
