@@ -33,6 +33,28 @@ const HEIGHTMAP_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R16Uint;
 const SPLAT_DISTR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 const SLOT_DIFFUSE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 
+/// Colour format of the Sprint-13 offscreen render target. Plain sRGB
+/// matches the typical swapchain on desktop and lets egui composite the
+/// result without colour-space surprises. ADR-037.
+// Wired by Phase 2 (terrain pipeline color target). Phase 1 only ships
+// the constant + RT plumbing.
+#[allow(dead_code)]
+pub const OFFSCREEN_COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
+
+/// Depth format of the Sprint-13 offscreen render target. 32-bit float
+/// keeps z-precision tight enough for the auto-tuned near/far range
+/// (Phase 3). Universally supported on desktop wgpu; a future fall-back
+/// to `Depth32FloatStencil8` is documented in ADR-037.
+#[allow(dead_code)] // wired Phase 2
+pub const OFFSCREEN_DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+
+/// Maximum offscreen RT edge length. At 4K display × pixels_per_point=2
+/// = 8K pixels across the viewport rect, an unclamped RT would burn
+/// 256 MB (8 B/pixel × 8K × 4K) — too much for an iGPU budget per
+/// PITFALLS §1. We cap each axis and let egui upscale the composite
+/// image.
+pub const OFFSCREEN_CLAMP: u32 = 2048;
+
 /// Pixel side of one layer of the slot diffuse texture array. The
 /// starter pack (ADR-025) ships ambientCG `_1K-PNG.zip` at 1024², so
 /// the happy path matches without resizing. Per FINDINGS H2 the
@@ -137,6 +159,112 @@ struct HeightmapTex {
     dims: (u32, u32),
 }
 
+/// GPU-side colour + depth pair the Sprint-13 renderer encodes terrain,
+/// lines, and markers into. The egui composite samples `color_view`
+/// through `egui_texture_id`; the offscreen pass clears `depth_view` to
+/// 1.0 every frame so markers depth-test against terrain (ADR-037).
+///
+/// The `color` / `depth` fields keep the GPU textures alive while the
+/// views are bound to the pipelines. Re-allocated when the central
+/// viewport rect changes physical pixel size; see [`ensure_offscreen`].
+// All fields are consumed by Phase 2 (color_view / depth_view in the
+// render-pass attachments) and `central()` (egui_texture_id / size for
+// the composite). Phase 1 only ships the alloc / resize plumbing.
+#[allow(dead_code)]
+pub struct OffscreenTarget {
+    color: wgpu::Texture,
+    color_view: wgpu::TextureView,
+    depth: wgpu::Texture,
+    depth_view: wgpu::TextureView,
+    /// egui-side handle registered with `Renderer::register_native_texture`
+    /// so `ui.painter().image(id, rect, ...)` can sample the offscreen
+    /// colour. Re-registered on every resize; the old id is freed
+    /// before the new one is created.
+    pub egui_texture_id: egui::TextureId,
+    /// Physical pixel dimensions of the textures. Compared against the
+    /// requested size each frame to decide whether to re-allocate.
+    pub size: (u32, u32),
+}
+
+impl OffscreenTarget {
+    /// Borrow the colour view (used by the offscreen render-pass
+    /// attachment in Phase 2).
+    #[allow(dead_code)] // Wired by Phase 2.
+    pub fn color_view(&self) -> &wgpu::TextureView {
+        &self.color_view
+    }
+
+    /// Borrow the depth view (used by the offscreen render-pass
+    /// attachment in Phase 2).
+    #[allow(dead_code)] // Wired by Phase 2.
+    pub fn depth_view(&self) -> &wgpu::TextureView {
+        &self.depth_view
+    }
+}
+
+/// Allocate the colour + depth textures for an offscreen target at the
+/// given physical pixel size. Kept private; callers go through
+/// [`ensure_offscreen`].
+#[allow(dead_code)] // wired Phase 2 via ensure_offscreen
+fn allocate_offscreen_textures(
+    device: &wgpu::Device,
+    size: (u32, u32),
+) -> (
+    wgpu::Texture,
+    wgpu::TextureView,
+    wgpu::Texture,
+    wgpu::TextureView,
+) {
+    let color = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("offscreen.color"),
+        size: wgpu::Extent3d {
+            width: size.0,
+            height: size.1,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: OFFSCREEN_COLOR_FORMAT,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::RENDER_ATTACHMENT
+            | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let color_view = color.create_view(&wgpu::TextureViewDescriptor::default());
+    let depth = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("offscreen.depth"),
+        size: wgpu::Extent3d {
+            width: size.0,
+            height: size.1,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: OFFSCREEN_DEPTH_FORMAT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    let depth_view = depth.create_view(&wgpu::TextureViewDescriptor::default());
+    (color, color_view, depth, depth_view)
+}
+
+/// Clamp and validate a requested offscreen size. Returns `None` when
+/// the request is degenerate (either axis < 2 px) so callers skip the
+/// frame instead of allocating a useless 1-px texture.
+///
+/// Pure / GPU-free — exercised by unit tests. The clamp policy lives in
+/// [`OFFSCREEN_CLAMP`] (PITFALLS §1: iGPU memory budget on 4K displays).
+#[allow(dead_code)] // wired Phase 2 via ensure_offscreen + central()
+pub fn resolve_offscreen_size(requested: (u32, u32)) -> Option<(u32, u32)> {
+    let (w, h) = requested;
+    if w < 2 || h < 2 {
+        return None;
+    }
+    Some((w.min(OFFSCREEN_CLAMP), h.min(OFFSCREEN_CLAMP)))
+}
+
 struct SplatResources {
     // `_tex` fields keep the GPU texture alive; only the views are
     // bound. Dead-code allowance is removed in D5 (Sprint 9) once
@@ -165,6 +293,11 @@ pub struct RenderResources {
     grid: Option<Grid>,
     heightmap: Option<HeightmapTex>,
     splat: SplatResources,
+    /// Sprint-13 offscreen RT (ADR-037). `None` until the first
+    /// successful [`ensure_offscreen`] call — `central()` allocates it
+    /// on the first frame with a real central viewport rect.
+    #[allow(dead_code)] // wired Phase 2
+    offscreen: Option<OffscreenTarget>,
 }
 
 impl RenderResources {
@@ -594,6 +727,7 @@ pub fn install(render_state: &egui_wgpu::RenderState) {
             grid: None,
             heightmap: None,
             splat,
+            offscreen: None,
         });
 }
 
@@ -679,6 +813,104 @@ pub fn upload_heightmap(render_state: &egui_wgpu::RenderState, heightmap: &Heigh
     if need_grid {
         res.grid = Some(build_index_buffer(device, dims));
     }
+}
+
+/// Allocate (or re-allocate) the Sprint-13 offscreen render target so it
+/// matches the central viewport's physical pixel size. Returns the
+/// `egui::TextureId` `central()` should hand to `ui.painter().image(...)`
+/// when compositing the offscreen colour into the viewport rect.
+///
+/// Returns `None` on degenerate inputs (`requested < 2 px on either
+/// axis`) or when [`install`] hasn't run; in either case `central()`
+/// should skip the composite that frame (the prior frame's image stays
+/// on screen — less jarring than a green flash).
+///
+/// Idempotency: if the offscreen RT is already at `resolve_offscreen_size
+/// (requested)`, this is a no-op aside from returning the cached id.
+/// Re-registers the egui texture only on actual size change; the old id
+/// is freed first to prevent renderer handle leaks (pitfall #5).
+///
+/// ADR-037.
+#[allow(dead_code)] // wired Phase 2 by central()
+pub fn ensure_offscreen(
+    render_state: &egui_wgpu::RenderState,
+    requested: (u32, u32),
+) -> Option<egui::TextureId> {
+    let size = resolve_offscreen_size(requested)?;
+    let was_clamped = size != requested;
+
+    let device = render_state.device.clone();
+    let mut renderer = render_state.renderer.write();
+
+    // Step 1: decide whether to re-allocate, and if so take out the old
+    // target so we can drop the `get_mut` borrow before calling
+    // `renderer.free_texture` (which needs its own &mut Renderer).
+    let (needs_realloc, old_id) = {
+        let Some(res) = renderer.callback_resources.get_mut::<RenderResources>() else {
+            warn!("ensure_offscreen: no RenderResources (install() not run)");
+            return None;
+        };
+        let same_size = matches!(&res.offscreen, Some(rt) if rt.size == size);
+        if same_size {
+            return Some(
+                res.offscreen
+                    .as_ref()
+                    .expect("matched on Some above")
+                    .egui_texture_id,
+            );
+        }
+        let old = res.offscreen.take().map(|rt| rt.egui_texture_id);
+        (true, old)
+    };
+
+    if let Some(id) = old_id {
+        renderer.free_texture(&id);
+    }
+
+    if needs_realloc {
+        if was_clamped {
+            warn!(
+                requested = ?requested,
+                clamped = ?size,
+                cap = OFFSCREEN_CLAMP,
+                "offscreen RT size clamped (PITFALLS §1)"
+            );
+        }
+        let (color, color_view, depth, depth_view) = allocate_offscreen_textures(&device, size);
+        // Register the colour view as an egui-side texture so the
+        // painter can sample it. Linear filter so any DPI / clamp-driven
+        // upscale doesn't look pixellated.
+        let egui_texture_id =
+            renderer.register_native_texture(&device, &color_view, wgpu::FilterMode::Linear);
+        info!(
+            width = size.0,
+            height = size.1,
+            color_format = ?OFFSCREEN_COLOR_FORMAT,
+            depth_format = ?OFFSCREEN_DEPTH_FORMAT,
+            "offscreen RT (re)allocated"
+        );
+
+        let Some(res) = renderer.callback_resources.get_mut::<RenderResources>() else {
+            // Renderer state vanished between the two borrows — almost
+            // impossible (we hold the write lock the whole way), but
+            // bail cleanly rather than panic if it ever does.
+            renderer.free_texture(&egui_texture_id);
+            return None;
+        };
+        res.offscreen = Some(OffscreenTarget {
+            color,
+            color_view,
+            depth,
+            depth_view,
+            egui_texture_id,
+            size,
+        });
+        return Some(egui_texture_id);
+    }
+
+    // Unreachable: we either returned early (same size) or set
+    // needs_realloc = true above.
+    None
 }
 
 /// Camera state owned by the App; computes a view-projection matrix per
@@ -1186,5 +1418,59 @@ mod tests {
         // the splat distribution is RGBA (4 channels). A future
         // mismatch is a load-bearing bug — D5 indexes by channel.
         assert_eq!(SLOT_LAYER_COUNT, 4);
+    }
+
+    // ---- Phase 1 (Sprint 13 / ADR-037): offscreen RT size resolution ----
+
+    #[test]
+    fn offscreen_size_passes_through_in_range() {
+        // Typical 720p viewport — well under the clamp.
+        assert_eq!(resolve_offscreen_size((1280, 720)), Some((1280, 720)));
+    }
+
+    #[test]
+    fn offscreen_size_clamps_each_axis_to_2048() {
+        // 4K display × pixels_per_point=2 = 8K wide; clamp engages.
+        assert_eq!(resolve_offscreen_size((8192, 8192)), Some((2048, 2048)));
+        // Asymmetric: only the over-cap axis is clamped.
+        assert_eq!(resolve_offscreen_size((4096, 1080)), Some((2048, 1080)));
+        assert_eq!(resolve_offscreen_size((1024, 3000)), Some((1024, 2048)));
+    }
+
+    #[test]
+    fn offscreen_size_skips_degenerate_inputs() {
+        // Zero on either axis = no allocation.
+        assert_eq!(resolve_offscreen_size((0, 720)), None);
+        assert_eq!(resolve_offscreen_size((1280, 0)), None);
+        assert_eq!(resolve_offscreen_size((0, 0)), None);
+        // Single-pixel axis also rejected (a 1-px depth target produces
+        // no useful image and risks driver corner cases on some
+        // backends).
+        assert_eq!(resolve_offscreen_size((1, 100)), None);
+        assert_eq!(resolve_offscreen_size((100, 1)), None);
+        // Two pixels is the smallest accepted size.
+        assert_eq!(resolve_offscreen_size((2, 2)), Some((2, 2)));
+    }
+
+    #[test]
+    fn offscreen_size_clamp_constant_is_2048() {
+        // Sprint 13 perf budget on iGPU caps each axis at 2048 px to
+        // hold the offscreen RT under ~32 MB. Pinning here so a change
+        // to OFFSCREEN_CLAMP is forced through code review.
+        assert_eq!(OFFSCREEN_CLAMP, 2048);
+    }
+
+    #[test]
+    fn offscreen_formats_match_adr_037() {
+        assert_eq!(
+            OFFSCREEN_COLOR_FORMAT,
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            "ADR-037: colour format pinned to Rgba8UnormSrgb"
+        );
+        assert_eq!(
+            OFFSCREEN_DEPTH_FORMAT,
+            wgpu::TextureFormat::Depth32Float,
+            "ADR-037: depth format pinned to Depth32Float"
+        );
     }
 }
