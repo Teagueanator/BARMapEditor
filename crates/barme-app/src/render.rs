@@ -36,16 +36,12 @@ const SLOT_DIFFUSE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm
 /// Colour format of the Sprint-13 offscreen render target. Plain sRGB
 /// matches the typical swapchain on desktop and lets egui composite the
 /// result without colour-space surprises. ADR-037.
-// Wired by Phase 2 (terrain pipeline color target). Phase 1 only ships
-// the constant + RT plumbing.
-#[allow(dead_code)]
 pub const OFFSCREEN_COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 
 /// Depth format of the Sprint-13 offscreen render target. 32-bit float
 /// keeps z-precision tight enough for the auto-tuned near/far range
 /// (Phase 3). Universally supported on desktop wgpu; a future fall-back
 /// to `Depth32FloatStencil8` is documented in ADR-037.
-#[allow(dead_code)] // wired Phase 2
 pub const OFFSCREEN_DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
 /// Maximum offscreen RT edge length. At 4K display × pixels_per_point=2
@@ -167,13 +163,13 @@ struct HeightmapTex {
 /// The `color` / `depth` fields keep the GPU textures alive while the
 /// views are bound to the pipelines. Re-allocated when the central
 /// viewport rect changes physical pixel size; see [`ensure_offscreen`].
-// All fields are consumed by Phase 2 (color_view / depth_view in the
-// render-pass attachments) and `central()` (egui_texture_id / size for
-// the composite). Phase 1 only ships the alloc / resize plumbing.
-#[allow(dead_code)]
 pub struct OffscreenTarget {
+    /// Kept alive for the view; bound via `color_view`.
+    #[allow(dead_code)]
     color: wgpu::Texture,
     color_view: wgpu::TextureView,
+    /// Kept alive for the view; bound via `depth_view`.
+    #[allow(dead_code)]
     depth: wgpu::Texture,
     depth_view: wgpu::TextureView,
     /// egui-side handle registered with `Renderer::register_native_texture`
@@ -187,16 +183,14 @@ pub struct OffscreenTarget {
 }
 
 impl OffscreenTarget {
-    /// Borrow the colour view (used by the offscreen render-pass
-    /// attachment in Phase 2).
-    #[allow(dead_code)] // Wired by Phase 2.
+    /// Borrow the colour view (consumed by the offscreen render-pass
+    /// attachment in [`TerrainCallback::prepare`]).
     pub fn color_view(&self) -> &wgpu::TextureView {
         &self.color_view
     }
 
-    /// Borrow the depth view (used by the offscreen render-pass
-    /// attachment in Phase 2).
-    #[allow(dead_code)] // Wired by Phase 2.
+    /// Borrow the depth view (consumed by the offscreen render-pass
+    /// attachment in [`TerrainCallback::prepare`]).
     pub fn depth_view(&self) -> &wgpu::TextureView {
         &self.depth_view
     }
@@ -205,7 +199,6 @@ impl OffscreenTarget {
 /// Allocate the colour + depth textures for an offscreen target at the
 /// given physical pixel size. Kept private; callers go through
 /// [`ensure_offscreen`].
-#[allow(dead_code)] // wired Phase 2 via ensure_offscreen
 fn allocate_offscreen_textures(
     device: &wgpu::Device,
     size: (u32, u32),
@@ -256,7 +249,6 @@ fn allocate_offscreen_textures(
 ///
 /// Pure / GPU-free — exercised by unit tests. The clamp policy lives in
 /// [`OFFSCREEN_CLAMP`] (PITFALLS §1: iGPU memory budget on 4K displays).
-#[allow(dead_code)] // wired Phase 2 via ensure_offscreen + central()
 pub fn resolve_offscreen_size(requested: (u32, u32)) -> Option<(u32, u32)> {
     let (w, h) = requested;
     if w < 2 || h < 2 {
@@ -296,7 +288,6 @@ pub struct RenderResources {
     /// Sprint-13 offscreen RT (ADR-037). `None` until the first
     /// successful [`ensure_offscreen`] call — `central()` allocates it
     /// on the first frame with a real central viewport rect.
-    #[allow(dead_code)] // wired Phase 2
     offscreen: Option<OffscreenTarget>,
 }
 
@@ -698,14 +689,27 @@ pub fn install(render_state: &egui_wgpu::RenderState) {
             cull_mode: Some(wgpu::Face::Back),
             ..Default::default()
         },
-        depth_stencil: None,
+        // ADR-037 — terrain WRITES depth so markers + lines (later
+        // passes in the same offscreen render pass) can test against
+        // it. Depth32Float matches the offscreen depth attachment.
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: OFFSCREEN_DEPTH_FORMAT,
+            depth_write_enabled: true,
+            depth_compare: wgpu::CompareFunction::Less,
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        }),
         multisample: wgpu::MultisampleState::default(),
         fragment: Some(wgpu::FragmentState {
             module: &shader,
             entry_point: Some("fs_main"),
             compilation_options: Default::default(),
+            // Pinned to the offscreen RT's colour format (NOT the
+            // swapchain's `render_state.target_format`) per pitfall #2.
+            // wgpu rejects a pipeline whose colour-target format
+            // disagrees with the actual RenderPassColorAttachment view.
             targets: &[Some(wgpu::ColorTargetState {
-                format: render_state.target_format,
+                format: OFFSCREEN_COLOR_FORMAT,
                 blend: Some(wgpu::BlendState::REPLACE),
                 write_mask: wgpu::ColorWrites::ALL,
             })],
@@ -831,7 +835,6 @@ pub fn upload_heightmap(render_state: &egui_wgpu::RenderState, heightmap: &Heigh
 /// is freed first to prevent renderer handle leaks (pitfall #5).
 ///
 /// ADR-037.
-#[allow(dead_code)] // wired Phase 2 by central()
 pub fn ensure_offscreen(
     render_state: &egui_wgpu::RenderState,
     requested: (u32, u32),
@@ -1281,53 +1284,108 @@ impl TerrainCallback {
     }
 }
 
+/// Clear colour for the offscreen colour attachment. Dark navy reads
+/// as a neutral 3D-viewport sky and produces enough contrast against
+/// both light and dark egui themes. Premultiplied — the alpha is 1.0
+/// so RGB = pre/post multiplied are identical for this opaque value.
+const OFFSCREEN_CLEAR_COLOR: wgpu::Color = wgpu::Color {
+    r: 0.04,
+    g: 0.05,
+    b: 0.07,
+    a: 1.0,
+};
+
 impl egui_wgpu::CallbackTrait for TerrainCallback {
     fn prepare(
         &self,
         _device: &wgpu::Device,
         queue: &wgpu::Queue,
         _screen: &egui_wgpu::ScreenDescriptor,
-        _encoder: &mut wgpu::CommandEncoder,
+        encoder: &mut wgpu::CommandEncoder,
         resources: &mut egui_wgpu::CallbackResources,
     ) -> Vec<wgpu::CommandBuffer> {
-        if let Some(res) = resources.get::<RenderResources>() {
-            res.write_uniforms(
-                queue,
-                &Uniforms {
-                    view_proj: self.view_proj,
-                    params: [
-                        self.max_height.max(1.0),
-                        ELMOS_PER_PIXEL,
-                        self.world_extent_x.max(1.0),
-                        self.world_extent_z.max(1.0),
-                    ],
-                },
-            );
-            res.write_splat_uniforms(queue, &self.splat);
+        let Some(res) = resources.get::<RenderResources>() else {
+            return Vec::new();
+        };
+
+        // Step 1 — uniforms (unchanged from Sprint 12).
+        res.write_uniforms(
+            queue,
+            &Uniforms {
+                view_proj: self.view_proj,
+                params: [
+                    self.max_height.max(1.0),
+                    ELMOS_PER_PIXEL,
+                    self.world_extent_x.max(1.0),
+                    self.world_extent_z.max(1.0),
+                ],
+            },
+        );
+        res.write_splat_uniforms(queue, &self.splat);
+
+        // Step 2 — encode the offscreen pass.
+        //
+        // We need an offscreen RT (allocated by `central()` via
+        // `ensure_offscreen`), a grid (built by `upload_heightmap`), and
+        // a real heightmap. Any missing → bail and let the previous
+        // frame's image stay on screen this frame (pitfall #12: no
+        // green flash on resize).
+        let Some(offscreen) = res.offscreen.as_ref() else {
+            return Vec::new();
+        };
+        let Some(grid) = res.grid.as_ref() else {
+            return Vec::new();
+        };
+        if res.heightmap.is_none() {
+            return Vec::new();
         }
+
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("offscreen.terrain"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: offscreen.color_view(),
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(OFFSCREEN_CLEAR_COLOR),
+                    store: wgpu::StoreOp::Store,
+                },
+                depth_slice: None,
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: offscreen.depth_view(),
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(1.0),
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+        pass.set_pipeline(&res.pipeline);
+        pass.set_bind_group(0, &res.bind_group, &[]);
+        pass.set_index_buffer(grid.index_buf.slice(..), wgpu::IndexFormat::Uint32);
+        pass.draw_indexed(0..grid.index_count, 0, 0..1);
+        // `pass` drops here — releases the encoder for egui's own pass
+        // and any other callbacks. We share `encoder` with egui per
+        // pitfall #1, so we DO NOT `encoder.finish()` ourselves.
+        drop(pass);
+
         Vec::new()
     }
 
     fn paint(
         &self,
         _info: egui::PaintCallbackInfo,
-        pass: &mut wgpu::RenderPass<'static>,
-        resources: &egui_wgpu::CallbackResources,
+        _pass: &mut wgpu::RenderPass<'static>,
+        _resources: &egui_wgpu::CallbackResources,
     ) {
-        let Some(res) = resources.get::<RenderResources>() else {
-            return;
-        };
-        let Some(grid) = res.grid.as_ref() else {
-            return;
-        };
-        // Skip draw if no real heightmap uploaded yet (dummy 1×1 + no grid).
-        if res.heightmap.is_none() {
-            return;
-        }
-        pass.set_pipeline(&res.pipeline);
-        pass.set_bind_group(0, &res.bind_group, &[]);
-        pass.set_index_buffer(grid.index_buf.slice(..), wgpu::IndexFormat::Uint32);
-        pass.draw_indexed(0..grid.index_count, 0, 0..1);
+        // ADR-037 / Sprint 13 Phase 2 — the terrain pass now renders to
+        // the offscreen RT inside `prepare()`. `central()` composites
+        // the result by drawing `OffscreenTarget::egui_texture_id` into
+        // the central viewport rect via `ui.painter().image(...)`. This
+        // `paint()` runs inside egui's own pass (which has no depth
+        // attachment) and intentionally does nothing.
     }
 }
 

@@ -6483,10 +6483,45 @@ impl App {
                 // until then the default suppresses every layer (mask = 0)
                 // so the fragment falls back to the biome gradient.
                 let splat_u = self.splat_uniforms_for_render();
+
+                // Sprint 13 / ADR-037 — ensure the offscreen RT matches
+                // the central viewport's physical pixel size BEFORE the
+                // Callback fires its `prepare()` (which encodes the
+                // offscreen render pass). Composite the colour view
+                // back into the viewport via `painter.image(...)`.
+                //
+                // The Callback's `paint()` is now a no-op; only its
+                // `prepare()` does real work. If `ensure_offscreen`
+                // returns `None` (degenerate rect or `install()` not
+                // run), we still add the Callback (it bails inside
+                // `prepare` on missing RT) and skip the composite —
+                // last frame's image stays on screen for ~16 ms.
+                let pixels_per_point = ctx.pixels_per_point();
+                let requested = (
+                    (rect.width() * pixels_per_point).round().max(0.0) as u32,
+                    (rect.height() * pixels_per_point).round().max(0.0) as u32,
+                );
+                let offscreen_id = self
+                    .render_state
+                    .as_ref()
+                    .and_then(|rs| render::ensure_offscreen(rs, requested));
+
                 let cb =
                     TerrainCallback::new(&self.camera, rect, self.height_scale, ex, ez, splat_u);
                 ui.painter()
                     .add(egui_wgpu::Callback::new_paint_callback(rect, cb));
+
+                if let Some(id) = offscreen_id {
+                    ui.painter().image(
+                        id,
+                        rect,
+                        egui::Rect::from_min_max(
+                            egui::pos2(0.0, 0.0),
+                            egui::pos2(1.0, 1.0),
+                        ),
+                        egui::Color32::WHITE,
+                    );
+                }
             } else {
                 ui.painter().text(
                     rect.center(),
