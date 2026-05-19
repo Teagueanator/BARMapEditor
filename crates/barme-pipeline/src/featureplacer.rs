@@ -63,7 +63,8 @@
 //! seam: the public `feature_entry_int` helper builds one Lua entry
 //! that C6 will reuse.
 
-use barme_core::{GeoVent, Project};
+use barme_core::{FeatureInstance, GeoVent, Project};
+use tracing::warn;
 
 use crate::lua_ast::{LuaKey, LuaValue, serialize};
 
@@ -148,16 +149,125 @@ pub(crate) fn feature_entry_int(name: &str, x: i32, z: i32, rot_heading: i16) ->
     ])
 }
 
-/// Walk `Project.geo_vents` and emit one feature entry per vent in
-/// `(z, x)`-sorted order. C6 will append generic features after
-/// the geo-vent block (sorted by `(name, z, x)`).
+/// Walk `Project.geo_vents` and `Project.features` (in that order) and
+/// emit one Lua entry per source.
+///
+/// **Sort order — deterministic two-section output:**
+/// 1. Geo vents first, sorted by `(z, x)`. Matches the C5 / Sprint 11
+///    convention; existing tests pin this.
+/// 2. User features next, sorted by `(name, z, x)` so a project with
+///    one cluster of pines + one cluster of rocks emits a stable
+///    grouped diff.
+///
+/// Putting geos first matches the rule the SRS STATUS UPDATE for
+/// Sprint 12 spells out — "emit `Project.geo_vents` first (sorted by
+/// xz), THEN `Project.features` (sorted by name then xz). One pass,
+/// two sections in source."
+///
+/// Rotation: geo vents always emit `rot = 0` (the engine samples the
+/// gadget at construction with no facing variation); user features
+/// emit `feature.rot_heading` cast `as i16` so the wrapping arithmetic
+/// preserves the unsigned bit pattern that
+/// `Spring.CreateFeature(..., fDef.rot)` consumes. PITFALL §23 — the
+/// gadget's rotation arg is numeric, NOT a quoted string (that's
+/// PyMapConv's `-k` text-file format, a separate codepath).
 fn object_entries(project: &Project) -> Vec<LuaValue> {
-    let mut sorted: Vec<GeoVent> = project.geo_vents.clone();
-    sorted.sort_by_key(|v| (v.z_elmo, v.x_elmo));
-    sorted
-        .into_iter()
-        .map(|v| feature_entry_int(GEOVENT_NAME, v.x_elmo, v.z_elmo, 0))
-        .collect()
+    let mut out: Vec<LuaValue> =
+        Vec::with_capacity(project.geo_vents.len() + project.features.len());
+
+    // Section 1 — geo vents (Sprint 11 / C5 invariant; sorted by `(z, x)`).
+    let mut vents: Vec<GeoVent> = project.geo_vents.clone();
+    vents.sort_by_key(|v| (v.z_elmo, v.x_elmo));
+    for v in vents {
+        out.push(feature_entry_int(GEOVENT_NAME, v.x_elmo, v.z_elmo, 0));
+    }
+
+    // Section 2 — user features (Sprint 12 / C6). Sorted by
+    // `(name, z, x)` for stable diffs across runs.
+    let mut features: Vec<FeatureInstance> = project.features.clone();
+    features.sort_by(|a, b| {
+        a.name
+            .cmp(&b.name)
+            .then(a.z_elmo.cmp(&b.z_elmo))
+            .then(a.x_elmo.cmp(&b.x_elmo))
+    });
+    for f in features {
+        // Unknown FeatureDef names don't gate the build — the engine
+        // logs `[GetFeatureDef] could not find FeatureDef` and skips
+        // spawn at load time. C8 (Sprint 14) surfaces this as a
+        // pre-emission lint. We still drop a `warn!` for the build
+        // log so a stalled smoke test has a clear breadcrumb.
+        if !is_known_stock_feature(&f.name) {
+            warn!(
+                feature_name = %f.name,
+                x = f.x_elmo,
+                z = f.z_elmo,
+                "featureplacer: feature name not in stock manifest — engine will skip spawn unless map bundles its own FeatureDef"
+            );
+        }
+        out.push(feature_entry_int(
+            &f.name,
+            f.x_elmo,
+            f.z_elmo,
+            f.rot_heading as i16,
+        ));
+    }
+
+    out
+}
+
+/// Stock-feature membership check. The full catalogue lives at
+/// `assets/mapfeatures_catalog.json` and feeds the C6 inspector picker;
+/// here we only need to recognise names so the build-time `warn!` is
+/// quiet for well-known features. Stage 2 will replace this with a
+/// load-once registry shared with the inspector.
+///
+/// Kept conservatively in-sync with `assets/mapfeatures_catalog.json`.
+/// A missing name surfaces as a `warn!` (not a hard failure); the C8
+/// lint pass (Sprint 14) is the authoritative gate.
+fn is_known_stock_feature(name: &str) -> bool {
+    const STOCK: &[&str] = &[
+        // trees
+        "pinetree",
+        "agorm_pine1",
+        "agorm_pine2",
+        "agorm_pine3",
+        "agorm_pine4",
+        "agorm_talltree1",
+        "agorm_talltree2",
+        "agorm_talltree3",
+        "agorm_talltree4",
+        "agorm_talltree5",
+        "agorm_talltree6",
+        "btree",
+        // rocks
+        "rock1",
+        "rock2",
+        "rock3",
+        "rock4",
+        "agorm_rock1",
+        "agorm_rock2",
+        "agorm_rock3",
+        // wreckage
+        "smallwreck",
+        "mediumwreck",
+        "largewreck",
+        "tankwreck",
+        "shipwreck",
+        "planewreck",
+        // props
+        "metalcrate",
+        "ruin1",
+        "ruin2",
+        "deadtree1",
+        "deadtree2",
+        "antenna",
+        "barrel",
+        "pillar",
+        // geo
+        GEOVENT_NAME,
+    ];
+    STOCK.contains(&name)
 }
 
 #[cfg(test)]
@@ -268,5 +378,137 @@ mod tests {
     #[test]
     fn geovent_name_constant_matches_bar_featuredef() {
         assert_eq!(GEOVENT_NAME, "geovent");
+    }
+
+    // ─────── C6 (Sprint 12): user features ───────
+
+    /// C6: `Project.features` populate the same `objectlist` as geo
+    /// vents do, with the user-supplied `name` and `rot_heading`.
+    #[test]
+    fn user_features_emit_into_objectlist() {
+        use barme_core::FeatureInstance;
+        let mut p = Project::new("trees", 8);
+        p.features
+            .push(FeatureInstance::new("pinetree", 1024, 2048, 0));
+        p.features
+            .push(FeatureInstance::new("agorm_talltree6", 3000, 4000, 32768));
+        let s = render_set(&p);
+        assert!(s.contains(r#"name = "pinetree""#), "got:\n{s}");
+        assert!(s.contains(r#"name = "agorm_talltree6""#), "got:\n{s}");
+    }
+
+    /// C6: rotation emits as an UNQUOTED integer (PITFALL §23 — the
+    /// gadget calls `Spring.CreateFeature(..., fDef.rot)` which
+    /// expects a number; PyMapConv's `-k` flat-text format that uses
+    /// quoted strings is a different codepath we don't ship). Pin
+    /// the wrap-through-i16 cast: rot_heading = 32768 (mid-circle
+    /// unsigned) → `rot = -32768,` (wrapping cast to signed 16-bit).
+    #[test]
+    fn renders_features_with_quoted_rot_emits_as_int_not_string() {
+        use barme_core::FeatureInstance;
+        let mut p = Project::new("rot", 4);
+        p.features
+            .push(FeatureInstance::new("pinetree", 100, 200, 0));
+        p.features
+            .push(FeatureInstance::new("rock1", 300, 400, 32768));
+        let s = render_set(&p);
+        // Unquoted integer form — PITFALL §23.
+        assert!(
+            s.contains("rot = 0,") || s.contains("rot = 0\n"),
+            "pinetree rot must be UNQUOTED int 0; got:\n{s}"
+        );
+        // rot_heading = 32768 unsigned → -32768 as i16 (bit pattern
+        // preserved through Lua → Spring.CreateFeature).
+        assert!(
+            s.contains("rot = -32768,") || s.contains("rot = -32768\n"),
+            "rock1 rot must wrap u16=32768 to i16=-32768; got:\n{s}"
+        );
+        // No string-form anywhere — guards against C2 / PyMapConv `-k`
+        // format leaking into the gadget path.
+        assert!(
+            !s.contains(r#"rot = ""#),
+            "rot must never be quoted in set.lua (PITFALL §23); got:\n{s}"
+        );
+    }
+
+    /// C6: geo vents AND user features coexist in `objectlist` —
+    /// geos first sorted by (z, x), then features sorted by
+    /// (name, z, x). Order is deterministic for NFR-Det.
+    #[test]
+    fn geo_and_user_features_coexist() {
+        use barme_core::FeatureInstance;
+        let mut p = Project::new("mixed", 8);
+        p.geo_vents.push(GeoVent::new(100, 200));
+        p.geo_vents.push(GeoVent::new(500, 100));
+        p.features
+            .push(FeatureInstance::new("pinetree", 100, 100, 0));
+        p.features.push(FeatureInstance::new("rock1", 200, 200, 0));
+        let s = render_set(&p);
+        // All four entries present.
+        assert_eq!(s.matches(r#"name = "geovent""#).count(), 2);
+        assert_eq!(s.matches(r#"name = "pinetree""#).count(), 1);
+        assert_eq!(s.matches(r#"name = "rock1""#).count(), 1);
+        // Section order: geovents block first, then user features.
+        let p_first_geo = s.find(r#"name = "geovent""#).unwrap();
+        let p_first_user = s
+            .find(r#"name = "pinetree""#)
+            .min(s.find(r#"name = "rock1""#).unwrap_or(usize::MAX).into())
+            .unwrap_or_else(|| s.find(r#"name = "pinetree""#).unwrap());
+        assert!(
+            p_first_geo < p_first_user,
+            "geo vents must emit before user features; got:\n{s}"
+        );
+        // Within user features, alphabetic order by name → pinetree
+        // (p) sorts before rock1 (r).
+        let p_pine = s.find(r#"name = "pinetree""#).unwrap();
+        let p_rock = s.find(r#"name = "rock1""#).unwrap();
+        assert!(
+            p_pine < p_rock,
+            "user features must be sorted by name; got:\n{s}"
+        );
+    }
+
+    /// C6: the stock manifest membership check finds the canonical
+    /// geovent name (so it doesn't trip the unknown-feature warn).
+    #[test]
+    fn stock_geovent_present_in_manifest_check() {
+        assert!(is_known_stock_feature(GEOVENT_NAME));
+        assert!(is_known_stock_feature("pinetree"));
+        assert!(is_known_stock_feature("agorm_talltree6"));
+        assert!(is_known_stock_feature("rock1"));
+        // A made-up name fails the check.
+        assert!(!is_known_stock_feature("not_a_real_feature"));
+        assert!(!is_known_stock_feature(""));
+    }
+
+    /// C6: empty geos + empty features still produces a well-formed
+    /// `objectlist = {}` (no spurious section markers).
+    #[test]
+    fn empty_geos_and_features_render_empty_objectlist() {
+        let p = Project::new("blank", 4);
+        let s = render_set(&p);
+        assert!(s.contains("objectlist = {}"), "got:\n{s}");
+    }
+
+    /// C6: features sort stably across renders — repeat render =
+    /// byte-identical (NFR-Determinism).
+    #[test]
+    fn features_render_deterministically_across_repeated_calls() {
+        use barme_core::FeatureInstance;
+        let mut p = Project::new("det", 4);
+        // Push in non-sorted insertion order.
+        p.features.push(FeatureInstance::new("rock1", 500, 100, 0));
+        p.features
+            .push(FeatureInstance::new("pinetree", 100, 500, 0));
+        p.features
+            .push(FeatureInstance::new("pinetree", 100, 100, 0));
+        let a = render_set(&p);
+        let b = render_set(&p);
+        assert_eq!(a, b, "non-deterministic emit");
+        // Within the same `name`, sorted by (z, x): the (100, 100)
+        // pine emits before the (100, 500) pine.
+        let pos_100_100 = a.find("z = 100,").unwrap();
+        let pos_100_500 = a.find("z = 500,").unwrap();
+        assert!(pos_100_100 < pos_100_500, "got:\n{a}");
     }
 }

@@ -7,10 +7,10 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use barme_core::{
-    ALLY_GROUP_PALETTE, AllyGroup, BIOMES, BrushRegistry, BrushStamp, DirtyRect, GeoVent,
-    Heightmap, History, HistoryEntry, MapSize, MetalSpot, PROJECT_EXTENSION, Project, ProjectDiff,
-    SplatBrushRegistry, SplatChannel, SplatConfig, SplatDistribution, SplatStamp, StartPosition,
-    SymmetryAxis, WizardSnapshot,
+    ALLY_GROUP_PALETTE, AllyGroup, BIOMES, BrushRegistry, BrushStamp, DirtyRect, FeatureInstance,
+    GeoVent, Heightmap, History, HistoryEntry, MapSize, MetalSpot, PROJECT_EXTENSION, Project,
+    ProjectDiff, SplatBrushRegistry, SplatChannel, SplatConfig, SplatDistribution, SplatStamp,
+    StartPosition, SymmetryAxis, WizardSnapshot,
     brushes::pixel_bbox,
     default_extractor_radius,
     procgen::{
@@ -320,6 +320,122 @@ struct App {
     /// Mirror of the above for the geo-vent tool.
     dragging_geo_vent: Option<usize>,
     dragging_geo_vent_from: Option<GeoVent>,
+    /// C6 (Sprint 12): F7 user-feature sources. Mirrors
+    /// `barme_core::Project::features`. Persists across save / open
+    /// through `snapshot_project` / `open_from`.
+    features: Vec<FeatureInstance>,
+    /// C6: session-only state for the feature picker / placed-list UI.
+    feature_state: FeatureState,
+    /// C6: while LMB is held in `Tool::Feature` on an existing feature
+    /// marker, holds the source's index in `features` so the drag
+    /// rotates that exact entry (rotation = drag dx → heading delta).
+    /// Cleared on release.
+    dragging_feature: Option<usize>,
+    /// C6: pre-drag feature record for the drag finalizer. On
+    /// drag-stop the original is paired with the now-current entry
+    /// and pushed as a `ProjectDiff::MoveFeature` undo entry.
+    dragging_feature_from: Option<FeatureInstance>,
+    /// C6: anchor (cursor x at drag-start) so the rotation gesture
+    /// produces a stable per-pixel heading delta. `Some(anchor_x)`
+    /// from `drag_started_by(LMB)` until `drag_stopped_by(LMB)`.
+    dragging_feature_anchor_x: Option<f32>,
+    /// C6: pre-drag heading captured at drag-start; combined with
+    /// `(cursor_x - anchor_x)` and `ROTATE_GAIN_PER_PX` to compute the
+    /// in-progress rotation. Cleared on release.
+    dragging_feature_start_rot: Option<u16>,
+}
+
+/// View-state for the F7 feature picker + placed-list inspector.
+/// Pure session state — the placements themselves live on
+/// `App::features` (mirrored to `Project.features` on save).
+#[derive(Debug, Clone)]
+struct FeatureState {
+    /// Stock manifest, parsed once at app start from
+    /// `assets/mapfeatures_catalog.json`. Empty when the file is
+    /// missing (first checkout before assets are committed).
+    manifest: FeatureCatalog,
+    /// User's current category selection in the inspector
+    /// (`"trees"` / `"rocks"` / `"wreckage"` / `"props"` / `"geo"`).
+    /// Drives the feature picker list below it.
+    active_category: String,
+    /// Currently-selected feature name (the picker's highlight).
+    /// LMB-clicks on the canvas place this name; `None` until the
+    /// user picks one.
+    selected_feature: Option<String>,
+    /// Free-text filter applied to the feature picker.
+    filter: String,
+    /// Index of the placed-features tree row the user clicked. Drives
+    /// hover-pulse + inspector scroll. Cleared on tool switch.
+    selected_placed: Option<usize>,
+}
+
+impl Default for FeatureState {
+    fn default() -> Self {
+        Self {
+            manifest: FeatureCatalog::default(),
+            active_category: "trees".to_string(),
+            selected_feature: None,
+            filter: String::new(),
+            selected_placed: None,
+        }
+    }
+}
+
+/// Parsed shape of `assets/mapfeatures_catalog.json` (C6 / Sprint 12).
+/// Loaded once at App start; `Default` is the empty catalog.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+struct FeatureCatalog {
+    #[serde(default)]
+    categories: std::collections::BTreeMap<String, Vec<CatalogEntry>>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct CatalogEntry {
+    name: String,
+    display: String,
+    #[serde(default)]
+    #[allow(dead_code)] // surfaced in inspector tooltip in a future polish pass
+    tags: Vec<String>,
+}
+
+impl FeatureCatalog {
+    /// Load the catalog from `assets/mapfeatures_catalog.json`. Falls
+    /// back to an empty catalog (with a `warn!` log) on any error so
+    /// a first checkout without the asset still launches.
+    fn load_default(repo_root: &Path) -> Self {
+        let path = repo_root.join("assets").join("mapfeatures_catalog.json");
+        match std::fs::read_to_string(&path) {
+            Ok(s) => match serde_json::from_str::<Self>(&s) {
+                Ok(c) => {
+                    info!(
+                        path = %path.display(),
+                        category_count = c.categories.len(),
+                        "feature catalog loaded"
+                    );
+                    c
+                }
+                Err(e) => {
+                    warn!(path = %path.display(), error = %e, "feature catalog parse failed; using empty catalog");
+                    Self::default()
+                }
+            },
+            Err(e) => {
+                warn!(path = %path.display(), error = %e, "feature catalog missing; using empty catalog");
+                Self::default()
+            }
+        }
+    }
+
+    fn category_names(&self) -> Vec<String> {
+        self.categories.keys().cloned().collect()
+    }
+
+    fn entries(&self, category: &str) -> &[CatalogEntry] {
+        self.categories
+            .get(category)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
+    }
 }
 
 /// D5: session-only splat brush controls. Persisted brush mode +
@@ -573,9 +689,18 @@ enum Tool {
     /// F5 metal-spot placement (ADR-035 scaffolding; schema work
     /// pending). LMB places spots, RMB deletes.
     MetalSpots,
-    /// F7 feature placement (ADR-035 scaffolding; schema work pending).
-    /// LMB places / scatters features.
+    /// F6 geo-vent placement (Sprint 11 / C5). LMB places vents
+    /// (which spawn as `geovent` features via the Springboard trio),
+    /// RMB deletes. Distinct from the general feature tool below —
+    /// vents are surfaced as their own affordance because they're
+    /// gameplay-critical (geo-only economy positions). Keyboard `V`
+    /// since Sprint 12 freed `F` for [`Tool::Feature`].
     GeoFeatures,
+    /// F7 general feature placement (Sprint 12 / C6). LMB places
+    /// from the inspector's picker (trees / rocks / wreckage / props
+    /// / geo); LMB-drag rotates an existing placement; RMB deletes.
+    /// Keyboard `F`.
+    Feature,
     /// Math-function terrain generator (F14 / ADR-020). No central-rect
     /// editing; the formula is committed via Apply in the Inspector.
     Procgen,
@@ -652,13 +777,14 @@ impl Tool {
     /// by the tool strip *and* the unit tests so adding a variant in
     /// one place doesn't drift from the other. The exhaustive `match`
     /// dispatches in the Inspector enforce the rest of the invariant.
-    const ALL: [Tool; 7] = [
+    const ALL: [Tool; 8] = [
         Tool::Select,
         Tool::Sculpt,
         Tool::StartPositions,
         Tool::SplatPaint,
         Tool::MetalSpots,
         Tool::GeoFeatures,
+        Tool::Feature,
         Tool::Procgen,
     ];
 
@@ -674,7 +800,8 @@ impl Tool {
             Tool::StartPositions => "⚑",
             Tool::SplatPaint => "▦",
             Tool::MetalSpots => "◆",
-            Tool::GeoFeatures => "🌲",
+            Tool::GeoFeatures => "♨",
+            Tool::Feature => "🌲",
             Tool::Procgen => "ƒ",
         }
     }
@@ -689,6 +816,7 @@ impl Tool {
             Tool::SplatPaint => Icon::Splat,
             Tool::MetalSpots => Icon::Metal,
             Tool::GeoFeatures => Icon::Geo,
+            Tool::Feature => Icon::Tree,
             Tool::Procgen => Icon::Procgen,
         }
     }
@@ -701,7 +829,10 @@ impl Tool {
             Tool::StartPositions => "S",
             Tool::SplatPaint => "T",
             Tool::MetalSpots => "M",
-            Tool::GeoFeatures => "F",
+            // V for "vent" — Sprint 12 freed `F` for the general
+            // feature tool below.
+            Tool::GeoFeatures => "V",
+            Tool::Feature => "F",
             Tool::Procgen => "G",
         }
     }
@@ -714,7 +845,8 @@ impl Tool {
             Tool::StartPositions => "Start positions",
             Tool::SplatPaint => "Splat paint",
             Tool::MetalSpots => "Metal spots",
-            Tool::GeoFeatures => "Geo features",
+            Tool::GeoFeatures => "Geo vents",
+            Tool::Feature => "Features",
             Tool::Procgen => "Procgen",
         }
     }
@@ -830,6 +962,15 @@ impl App {
             dragging_metal_spot_from: None,
             dragging_geo_vent: None,
             dragging_geo_vent_from: None,
+            features: Vec::new(),
+            feature_state: FeatureState {
+                manifest: FeatureCatalog::load_default(&repo_root()),
+                ..FeatureState::default()
+            },
+            dragging_feature: None,
+            dragging_feature_from: None,
+            dragging_feature_anchor_x: None,
+            dragging_feature_start_rot: None,
         }
     }
 
@@ -934,6 +1075,19 @@ impl App {
         self.dragging_metal_spot_from = None;
         self.dragging_geo_vent = None;
         self.dragging_geo_vent_from = None;
+        // C6 (Sprint 12): a fresh project starts with no user features
+        // and the inspector's picker reset to the "trees" category.
+        // The catalog itself is session-scoped (loaded at App start)
+        // and survives the project lifecycle.
+        self.features.clear();
+        self.feature_state.active_category = "trees".to_string();
+        self.feature_state.selected_feature = None;
+        self.feature_state.selected_placed = None;
+        self.feature_state.filter.clear();
+        self.dragging_feature = None;
+        self.dragging_feature_from = None;
+        self.dragging_feature_anchor_x = None;
+        self.dragging_feature_start_rot = None;
         self.dirty = false;
         self.end_stroke();
         self.history.barrier();
@@ -953,6 +1107,12 @@ impl App {
             splat_distribution: self.splat_distribution.clone(),
             metal_spots: self.metal_spots.clone(),
             geo_vents: self.geo_vents.clone(),
+            features: self.features.clone(),
+            // D6 (Sprint 12): user-authored specular override path. The
+            // inspector surface for setting this lands in F9 (Sprint 13);
+            // until then the field round-trips through `.barmeproj` so
+            // a future authored override survives save/open.
+            specular_tex_path: None,
             extractor_radius: self.extractor_radius,
         }
     }
@@ -2149,6 +2309,163 @@ impl App {
         best.map(|(i, _)| i)
     }
 
+    // ───────────────────────────────────────────────────────────────
+    // C6 (Sprint 12): F7 general feature helpers. Same shape as
+    // metal-spot / geo-vent above, with two extras:
+    //   - `name` and `rot_heading` carry through Place/Delete/Move diffs.
+    //   - drag is a ROTATION gesture (not translation) — see
+    //     [`Self::move_feature_to`] and the canvas dispatch.
+    // ───────────────────────────────────────────────────────────────
+
+    /// `2π` worth of Spring heading per pixel of horizontal drag. With
+    /// `ROTATE_GAIN_PER_PX = 182` (≈ 65536 / 360), one pixel of drag
+    /// corresponds to ~1° of rotation — feels responsive without being
+    /// twitchy. Matches the convention in BAR's `unit_sunfacing.lua`
+    /// (`mathAtan2 * (COBSCALE / ...)` scales similarly).
+    const ROTATE_GAIN_PER_PX: f32 = 182.0;
+
+    fn place_feature(&mut self, world_x: f32, world_z: f32) {
+        let Some(name) = self.feature_state.selected_feature.clone() else {
+            // No feature chosen — silently no-op rather than placing an
+            // invisible "" entry. The inspector reminds the user to pick
+            // one before clicking.
+            trace!("feature-tool click without selected feature; ignored");
+            return;
+        };
+        let extents = self.world_extents();
+        let (ex, ez) = extents;
+        if world_x < 0.0 || world_x > ex || world_z < 0.0 || world_z > ez {
+            trace!(world_x, world_z, "feature click off-map; ignored");
+            return;
+        }
+        self.dirty = true;
+        // Symmetry replication: source first, then mirrors. For
+        // rotational symmetry the per-copy `rot_heading` rotates by
+        // `65536 / fold` so visually-symmetric placements LOOK
+        // symmetric (a forward-facing tank wreck on the south side
+        // mirrors to north as the same forward-facing wreck on the
+        // mirror axis).
+        let centers = self.symmetry.replicate((world_x, world_z), extents);
+        let copies = centers.len().max(1) as u32;
+        for (i, (cx, cz)) in centers.into_iter().enumerate() {
+            if cx < 0.0 || cx > ex || cz < 0.0 || cz > ez {
+                continue;
+            }
+            let rot_offset = if matches!(self.symmetry, SymmetryAxis::Rotational { .. }) {
+                ((i as u32 * (u16::MAX as u32 + 1)) / copies) as u16
+            } else {
+                0
+            };
+            let f = FeatureInstance {
+                name: name.clone(),
+                x_elmo: cx.round().clamp(0.0, ex) as i32,
+                z_elmo: cz.round().clamp(0.0, ez) as i32,
+                rot_heading: rot_offset,
+            };
+            // Coords-only dedup — same as metal/geo. A future "rotate
+            // existing" feature edit doesn't collide because the user
+            // would drag-rotate, not re-place.
+            if self
+                .features
+                .iter()
+                .any(|q| q.name == f.name && q.x_elmo == f.x_elmo && q.z_elmo == f.z_elmo)
+            {
+                continue;
+            }
+            info!(
+                feature_name = %f.name,
+                x_elmo = f.x_elmo,
+                z_elmo = f.z_elmo,
+                rot_heading = f.rot_heading,
+                symmetry = self.symmetry.id(),
+                "feature placed"
+            );
+            self.features.push(f.clone());
+            self.history
+                .push_project_diff(ProjectDiff::PlaceFeature { feature: f });
+        }
+    }
+
+    fn move_feature_to(&mut self, index: usize, to: FeatureInstance) {
+        let (ex, ez) = self.world_extents();
+        if let Some(slot) = self.features.get_mut(index) {
+            // Coords clamp into the map; rot wraps freely (u16
+            // arithmetic is modular by definition — no clamp needed).
+            slot.x_elmo = (to.x_elmo as f32).clamp(0.0, ex).round() as i32;
+            slot.z_elmo = (to.z_elmo as f32).clamp(0.0, ez).round() as i32;
+            slot.rot_heading = to.rot_heading;
+            self.dirty = true;
+        }
+    }
+
+    fn finish_feature_drag(&mut self) {
+        let (Some(index), Some(from), _, _) = (
+            self.dragging_feature.take(),
+            self.dragging_feature_from.take(),
+            self.dragging_feature_anchor_x.take(),
+            self.dragging_feature_start_rot.take(),
+        ) else {
+            self.dragging_feature = None;
+            self.dragging_feature_from = None;
+            self.dragging_feature_anchor_x = None;
+            self.dragging_feature_start_rot = None;
+            return;
+        };
+        let Some(to) = self.features.get(index).cloned() else {
+            return;
+        };
+        if from == to {
+            return;
+        }
+        self.history
+            .push_project_diff(ProjectDiff::MoveFeature { from, to });
+    }
+
+    fn delete_feature(&mut self, index: usize) {
+        if index >= self.features.len() {
+            return;
+        }
+        self.dirty = true;
+        let feature = self.features.remove(index);
+        info!(
+            feature_name = %feature.name,
+            x_elmo = feature.x_elmo,
+            z_elmo = feature.z_elmo,
+            "feature deleted"
+        );
+        if let Some(sel) = self.feature_state.selected_placed {
+            if sel == index {
+                self.feature_state.selected_placed = None;
+            } else if sel > index {
+                self.feature_state.selected_placed = Some(sel - 1);
+            }
+        }
+        self.history
+            .push_project_diff(ProjectDiff::DeleteFeature { feature });
+    }
+
+    fn hit_test_feature(
+        &self,
+        cursor: egui::Pos2,
+        rect: egui::Rect,
+        radius_px: f32,
+    ) -> Option<usize> {
+        let rect_size = glam::Vec2::new(rect.width(), rect.height());
+        let cursor_in_rect = glam::Vec2::new(cursor.x - rect.min.x, cursor.y - rect.min.y);
+        let mut best: Option<(usize, f32)> = None;
+        for (i, f) in self.features.iter().enumerate() {
+            let world = glam::Vec3::new(f.x_elmo as f32, 0.0, f.z_elmo as f32);
+            let Some(screen) = render::world_to_screen(world, rect_size, &self.camera) else {
+                continue;
+            };
+            let d = (screen - cursor_in_rect).length();
+            if d <= radius_px && best.map(|(_, bd)| d < bd).unwrap_or(true) {
+                best = Some((i, d));
+            }
+        }
+        best.map(|(i, _)| i)
+    }
+
     /// Find the SOURCE start position whose on-screen marker is within
     /// `radius_px` of `cursor`. Returns `(ally_group_id, source_index)`.
     /// Symmetry-derived display markers are NOT hit-tested (they're
@@ -2416,6 +2733,48 @@ impl App {
                 trace!(?from, ?to, "undo: reverted geo-vent move");
                 ProjectDiff::MoveGeoVent { from: to, to: from }
             }
+
+            // C6 (Sprint 12): F7 feature undo dispatch. Identity is
+            // (name, x_elmo, z_elmo) — rot_heading is allowed to differ
+            // for the Move case (drag-rotate). Same per-mirror diff
+            // semantics as metal/geo: undo peels one mirror at a time.
+            ProjectDiff::PlaceFeature { feature } => {
+                if let Some(pos) = self.features.iter().position(|f| {
+                    f.name == feature.name
+                        && f.x_elmo == feature.x_elmo
+                        && f.z_elmo == feature.z_elmo
+                }) {
+                    self.features.remove(pos);
+                }
+                trace!(
+                    feature_name = %feature.name,
+                    x = feature.x_elmo,
+                    z = feature.z_elmo,
+                    "undo: removed placed feature"
+                );
+                ProjectDiff::DeleteFeature { feature }
+            }
+            ProjectDiff::DeleteFeature { feature } => {
+                self.features.push(feature.clone());
+                trace!(
+                    feature_name = %feature.name,
+                    x = feature.x_elmo,
+                    z = feature.z_elmo,
+                    "undo: restored deleted feature"
+                );
+                ProjectDiff::PlaceFeature { feature }
+            }
+            ProjectDiff::MoveFeature { from, to } => {
+                if let Some(slot) = self
+                    .features
+                    .iter_mut()
+                    .find(|f| f.name == to.name && f.x_elmo == to.x_elmo && f.z_elmo == to.z_elmo)
+                {
+                    *slot = from.clone();
+                }
+                trace!(?from, ?to, "undo: reverted feature move");
+                ProjectDiff::MoveFeature { from: to, to: from }
+            }
         }
     }
 
@@ -2590,6 +2949,20 @@ impl App {
                 self.dragging_metal_spot_from = None;
                 self.dragging_geo_vent = None;
                 self.dragging_geo_vent_from = None;
+
+                // C6 (Sprint 12): user-feature persistence. Like
+                // metal/geo, the Project owns the sources; the
+                // inspector's picker / selection / filter are
+                // session-scoped and reset on open.
+                self.features = p.features;
+                self.feature_state.active_category = "trees".to_string();
+                self.feature_state.selected_feature = None;
+                self.feature_state.selected_placed = None;
+                self.feature_state.filter.clear();
+                self.dragging_feature = None;
+                self.dragging_feature_from = None;
+                self.dragging_feature_anchor_x = None;
+                self.dragging_feature_start_rot = None;
 
                 if let Some(hm_path) = hm_resolved {
                     if hm_path.exists() {
@@ -3076,6 +3449,44 @@ fn expand_symmetry_into_ally_groups(project: &mut Project, symmetry: SymmetryAxi
             }
         }
     }
+
+    // C6 (Sprint 12): F7 features expand through symmetry too. Unlike
+    // metal/geo the mirrors carry a rotation offset — under rotational
+    // symmetry an N-fold copy spins by `65536 / fold` per copy so each
+    // mirror "looks the same" relative to its sector. Translation
+    // mirrors (Horizontal / Vertical / Quad) leave rotation alone —
+    // a tree facing east on the south stays facing east when mirrored
+    // to the north (the engine handles the visual flip via the mirror
+    // axis, not the heading).
+    let feature_sources: Vec<FeatureInstance> = project.features.clone();
+    for src in &feature_sources {
+        let mirrors = symmetry.replicate((src.x_elmo as f32, src.z_elmo as f32), extents);
+        let copies = mirrors.len().max(1) as u32;
+        for (i, (mx, mz)) in mirrors.into_iter().enumerate().skip(1) {
+            if mx < 0.0 || mx > extents.0 || mz < 0.0 || mz > extents.1 {
+                continue;
+            }
+            let rot_offset = if matches!(symmetry, SymmetryAxis::Rotational { .. }) {
+                src.rot_heading
+                    .wrapping_add(((i as u32 * (u16::MAX as u32 + 1)) / copies) as u16)
+            } else {
+                src.rot_heading
+            };
+            let f = FeatureInstance {
+                name: src.name.clone(),
+                x_elmo: mx.round() as i32,
+                z_elmo: mz.round() as i32,
+                rot_heading: rot_offset,
+            };
+            if !project
+                .features
+                .iter()
+                .any(|q| q.name == f.name && q.x_elmo == f.x_elmo && q.z_elmo == f.z_elmo)
+            {
+                project.features.push(f);
+            }
+        }
+    }
 }
 
 fn pick_save_path(suggested_name: &str) -> Option<PathBuf> {
@@ -3191,7 +3602,7 @@ impl App {
         if ctx.wants_keyboard_input() {
             return;
         }
-        let (q, b, s, t_key, m_key, f_key, g, help, esc) = ctx.input(|i| {
+        let (q, b, s, t_key, m_key, v_key, f_key, g, help, esc) = ctx.input(|i| {
             let shift = i.modifiers.shift;
             (
                 i.key_pressed(egui::Key::Q),
@@ -3199,6 +3610,7 @@ impl App {
                 i.key_pressed(egui::Key::S),
                 i.key_pressed(egui::Key::T),
                 i.key_pressed(egui::Key::M),
+                i.key_pressed(egui::Key::V),
                 i.key_pressed(egui::Key::F),
                 i.key_pressed(egui::Key::G),
                 // `?` is shift+/ on US layouts. Egui exposes the slash
@@ -3222,8 +3634,13 @@ impl App {
         if m_key {
             self.set_tool(Tool::MetalSpots);
         }
-        if f_key {
+        if v_key {
+            // Sprint 12 / C6: V = "vents" (the old F binding moved here
+            // to free F for Tool::Feature).
             self.set_tool(Tool::GeoFeatures);
+        }
+        if f_key {
+            self.set_tool(Tool::Feature);
         }
         if g {
             self.set_tool(Tool::Procgen);
@@ -3798,6 +4215,7 @@ impl App {
                             Tool::SplatPaint => self.inspector_splat(ui),
                             Tool::MetalSpots => self.inspector_metal(ui),
                             Tool::GeoFeatures => self.inspector_geo(ui),
+                            Tool::Feature => self.inspector_feature(ui),
                             Tool::Procgen => self.inspector_procgen(ctx, ui, action),
                         }
                     });
@@ -4714,6 +5132,257 @@ impl App {
         }
     }
 
+    /// F7 feature inspector (C6 / Sprint 12). Three sections:
+    ///   - CATEGORY: ComboBox to switch between trees / rocks /
+    ///     wreckage / props / geo.
+    ///   - PICKER: filtered list of features in the chosen category.
+    ///     Click a row to select; the canvas's next LMB-click places
+    ///     it at the cursor.
+    ///   - PLACED: list of already-placed sources with x/z/rotation
+    ///     fields + delete button. Rotation displays as 0..359 deg
+    ///     (`rot_heading * 360 / 65536` rounding to nearest int).
+    fn inspector_feature(&mut self, ui: &mut egui::Ui) {
+        let t = crate::ui::theme::Tokens::DARK;
+        let (ex, ez) = self.world_extents();
+
+        // CATEGORY section.
+        let categories: Vec<String> = self.feature_state.manifest.category_names();
+        let no_catalog = categories.is_empty();
+        crate::ui::widgets::section(
+            ui,
+            "Category",
+            true,
+            |_ui| {},
+            |ui| {
+                if no_catalog {
+                    ui.label(
+                        egui::RichText::new(
+                            "No mapfeatures_catalog.json found. Falling back to a single \"geovent\" entry.",
+                        )
+                        .color(t.dim)
+                        .size(11.0),
+                    );
+                    return;
+                }
+                ui.horizontal(|ui| {
+                    egui::ComboBox::from_id_salt("feature_category")
+                        .selected_text(self.feature_state.active_category.clone())
+                        .show_ui(ui, |ui| {
+                            for cat in &categories {
+                                if ui
+                                    .selectable_label(
+                                        cat == &self.feature_state.active_category,
+                                        cat,
+                                    )
+                                    .clicked()
+                                {
+                                    self.feature_state.active_category = cat.clone();
+                                    // Reset selection when switching
+                                    // categories so the next LMB doesn't
+                                    // place a stale name.
+                                    self.feature_state.selected_feature = None;
+                                }
+                            }
+                        });
+                });
+            },
+        );
+
+        // PICKER section.
+        let category = self.feature_state.active_category.clone();
+        let entries = self.feature_state.manifest.entries(&category).to_vec();
+        let filter_lc = self.feature_state.filter.to_lowercase();
+        let filtered: Vec<CatalogEntry> = if filter_lc.is_empty() {
+            entries.clone()
+        } else {
+            entries
+                .iter()
+                .filter(|e| {
+                    e.name.to_lowercase().contains(&filter_lc)
+                        || e.display.to_lowercase().contains(&filter_lc)
+                        || e.tags.iter().any(|t| t.to_lowercase().contains(&filter_lc))
+                })
+                .cloned()
+                .collect()
+        };
+        let picker_title = format!("{} · {}", category, filtered.len());
+        crate::ui::widgets::section(
+            ui,
+            &picker_title,
+            true,
+            |_ui| {},
+            |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Filter").color(t.muted).size(11.0));
+                    ui.text_edit_singleline(&mut self.feature_state.filter);
+                });
+                ui.add_space(4.0);
+                egui::ScrollArea::vertical()
+                    .max_height(180.0)
+                    .id_salt("feature_picker_scroll")
+                    .show(ui, |ui| {
+                        if filtered.is_empty() {
+                            ui.label(
+                                egui::RichText::new("No features match the current filter.")
+                                    .color(t.dim)
+                                    .size(11.0),
+                            );
+                        }
+                        for entry in &filtered {
+                            let is_sel = self.feature_state.selected_feature.as_deref()
+                                == Some(entry.name.as_str());
+                            let row = egui::Frame::new()
+                                .fill(if is_sel { t.hover } else { t.bg })
+                                .stroke(egui::Stroke::new(
+                                    1.0,
+                                    if is_sel { t.border_hi } else { t.border },
+                                ))
+                                .corner_radius(egui::CornerRadius::same(3))
+                                .inner_margin(egui::Margin::symmetric(8, 4))
+                                .show(ui, |ui| {
+                                    ui.vertical(|ui| {
+                                        ui.label(
+                                            egui::RichText::new(&entry.display)
+                                                .color(t.text)
+                                                .size(12.0),
+                                        );
+                                        ui.label(
+                                            egui::RichText::new(&entry.name)
+                                                .color(t.muted)
+                                                .monospace()
+                                                .size(10.0),
+                                        );
+                                    });
+                                })
+                                .response
+                                .interact(egui::Sense::click());
+                            if row.clicked() {
+                                self.feature_state.selected_feature = Some(entry.name.clone());
+                            }
+                        }
+                    });
+            },
+        );
+
+        // PLACED section.
+        let mut selected = self.feature_state.selected_placed;
+        let mut to_delete: Option<usize> = None;
+        let mut to_move: Option<(usize, FeatureInstance, FeatureInstance)> = None;
+        let features_snapshot: Vec<FeatureInstance> = self.features.clone();
+        let placed_title = format!("Placed · {}", features_snapshot.len());
+        crate::ui::widgets::section(
+            ui,
+            &placed_title,
+            true,
+            |_ui| {},
+            |ui| {
+                if features_snapshot.is_empty() {
+                    ui.label(
+                        egui::RichText::new(
+                            "No features yet. Pick one above, then LMB on the canvas to place. LMB-drag rotates; RMB deletes.",
+                        )
+                        .color(t.dim)
+                        .size(11.0),
+                    );
+                }
+                egui::ScrollArea::vertical()
+                    .max_height(360.0)
+                    .id_salt("features_placed_scroll")
+                    .show(ui, |ui| {
+                        for (i, original) in features_snapshot.iter().enumerate() {
+                            let mut edited = original.clone();
+                            let is_sel = selected == Some(i);
+                            let row = egui::Frame::new()
+                                .fill(if is_sel { t.hover } else { t.bg })
+                                .stroke(egui::Stroke::new(
+                                    1.0,
+                                    if is_sel { t.border_hi } else { t.border },
+                                ))
+                                .corner_radius(egui::CornerRadius::same(3))
+                                .inner_margin(egui::Margin::symmetric(8, 4))
+                                .show(ui, |ui| {
+                                    ui.vertical(|ui| {
+                                        ui.horizontal(|ui| {
+                                            ui.label(
+                                                egui::RichText::new(format!("F{:02}", i + 1))
+                                                    .color(t.muted)
+                                                    .monospace()
+                                                    .size(11.0),
+                                            );
+                                            ui.label(
+                                                egui::RichText::new(&original.name)
+                                                    .color(t.text)
+                                                    .monospace()
+                                                    .size(11.0),
+                                            );
+                                            if ui
+                                                .small_button("×")
+                                                .on_hover_text("Delete feature")
+                                                .clicked()
+                                            {
+                                                to_delete = Some(i);
+                                            }
+                                        });
+                                        ui.horizontal(|ui| {
+                                            ui.add(
+                                                egui::DragValue::new(&mut edited.x_elmo)
+                                                    .range(0..=(ex as i32))
+                                                    .speed(8.0)
+                                                    .prefix("x "),
+                                            );
+                                            ui.add(
+                                                egui::DragValue::new(&mut edited.z_elmo)
+                                                    .range(0..=(ez as i32))
+                                                    .speed(8.0)
+                                                    .prefix("z "),
+                                            );
+                                            // Display rotation as integer
+                                            // degrees 0..359; convert
+                                            // back through the heading
+                                            // rounding so a 90° edit
+                                            // produces exactly 16384.
+                                            let mut deg = ((edited.rot_heading as f32 * 360.0
+                                                / 65536.0)
+                                                .round()
+                                                as i32)
+                                                .rem_euclid(360);
+                                            let resp = ui.add(
+                                                egui::DragValue::new(&mut deg)
+                                                    .range(0..=359)
+                                                    .speed(1.0)
+                                                    .suffix("°"),
+                                            );
+                                            if resp.changed() {
+                                                let deg_u = deg.rem_euclid(360) as u32;
+                                                edited.rot_heading = ((deg_u * 65536) / 360) as u16;
+                                            }
+                                        });
+                                    });
+                                })
+                                .response
+                                .interact(egui::Sense::click());
+                            if row.clicked() {
+                                selected = Some(i);
+                            }
+                            if edited != *original {
+                                to_move = Some((i, original.clone(), edited));
+                            }
+                        }
+                    });
+            },
+        );
+        self.feature_state.selected_placed = selected;
+        if let Some(i) = to_delete {
+            self.delete_feature(i);
+        }
+        if let Some((i, from, to)) = to_move {
+            self.move_feature_to(i, to.clone());
+            self.history
+                .push_project_diff(ProjectDiff::MoveFeature { from, to });
+            self.mark_dirty();
+        }
+    }
+
     /// Sculpt inspector (ADR-035): 4-card brush picker (Off / Raise /
     /// Lower / Smooth) styled with a coloured swatch ring per mode,
     /// ramp sliders for radius and strength, and a behaviour chip row
@@ -5447,6 +6116,7 @@ impl App {
             let splat_active = matches!(self.tool, Tool::SplatPaint) && self.heightmap.is_some();
             let metal_active = matches!(self.tool, Tool::MetalSpots);
             let geo_active = matches!(self.tool, Tool::GeoFeatures);
+            let feature_active = matches!(self.tool, Tool::Feature);
             let central_interactive =
                 brush_active || start_pos_active || splat_active || metal_active || geo_active;
 
@@ -5708,6 +6378,69 @@ impl App {
                         render::screen_to_world_y0(cursor_in, rect_size, &self.camera)
                 {
                     self.place_geo_vent(world.x, world.z);
+                }
+            }
+
+            // C6 (Sprint 12): F7 feature pointer dispatch. Same hit
+            // pattern as metal/geo but the LMB-drag gesture ROTATES
+            // the hit feature rather than translating it. The drag
+            // anchor (cursor x at drag-start) + start_rot let us
+            // compute heading deltas without accumulating drift.
+            if feature_active
+                && !consumed_click
+                && !cursor_in_gizmo
+                && let Some(cursor) = ctx.pointer_interact_pos()
+            {
+                let cursor_in = glam::Vec2::new(cursor.x - rect.min.x, cursor.y - rect.min.y);
+                let rect_size = glam::Vec2::new(rect.width(), rect.height());
+                const FEATURE_HIT_RADIUS_PX: f32 = 12.0;
+                if response.clicked_by(egui::PointerButton::Secondary)
+                    && let Some(idx) = self.hit_test_feature(cursor, rect, FEATURE_HIT_RADIUS_PX)
+                {
+                    self.delete_feature(idx);
+                }
+                if response.drag_started_by(egui::PointerButton::Primary) {
+                    let idx = self.hit_test_feature(cursor, rect, FEATURE_HIT_RADIUS_PX);
+                    self.dragging_feature = idx;
+                    self.dragging_feature_from = idx.and_then(|i| self.features.get(i).cloned());
+                    self.dragging_feature_anchor_x = idx.map(|_| cursor.x);
+                    self.dragging_feature_start_rot =
+                        idx.and_then(|i| self.features.get(i).map(|f| f.rot_heading));
+                }
+                if response.dragged_by(egui::PointerButton::Primary)
+                    && let (Some(idx), Some(anchor_x), Some(start_rot)) = (
+                        self.dragging_feature,
+                        self.dragging_feature_anchor_x,
+                        self.dragging_feature_start_rot,
+                    )
+                    && let Some(existing) = self.features.get(idx).cloned()
+                {
+                    // Heading delta = (cursor_x - anchor_x) * gain.
+                    // Wrapping arithmetic preserves the u16 invariant
+                    // through full revolutions (a 720° drag wraps back
+                    // to 0). PITFALL §23 conventions stay intact.
+                    let dx = cursor.x - anchor_x;
+                    let delta = (dx * Self::ROTATE_GAIN_PER_PX) as i32;
+                    let new_rot = (start_rot as i32).wrapping_add(delta).rem_euclid(65536) as u16;
+                    let updated = FeatureInstance {
+                        name: existing.name.clone(),
+                        x_elmo: existing.x_elmo,
+                        z_elmo: existing.z_elmo,
+                        rot_heading: new_rot,
+                    };
+                    self.move_feature_to(idx, updated);
+                }
+                if response.drag_stopped_by(egui::PointerButton::Primary) {
+                    self.finish_feature_drag();
+                }
+                if response.clicked_by(egui::PointerButton::Primary)
+                    && self
+                        .hit_test_feature(cursor, rect, FEATURE_HIT_RADIUS_PX)
+                        .is_none()
+                    && let Some(world) =
+                        render::screen_to_world_y0(cursor_in, rect_size, &self.camera)
+                {
+                    self.place_feature(world.x, world.z);
                 }
             }
 
@@ -6301,6 +7034,12 @@ mod tests {
             dragging_metal_spot_from: None,
             dragging_geo_vent: None,
             dragging_geo_vent_from: None,
+            features: Vec::new(),
+            feature_state: FeatureState::default(),
+            dragging_feature: None,
+            dragging_feature_from: None,
+            dragging_feature_anchor_x: None,
+            dragging_feature_start_rot: None,
         }
     }
 
@@ -6313,12 +7052,12 @@ mod tests {
         for t in Tool::ALL {
             assert!(seen.insert(t), "Tool::ALL has a duplicate entry: {t:?}");
         }
-        // The current size is documented in ADR-030. A change here is
-        // intentional but should bump the ADR and the phase-3-plan
-        // entry for B1.
+        // C6 (Sprint 12) added Tool::Feature, bumping the count from 7
+        // to 8. A change here is intentional but should bump
+        // ADR-030 / ADR-035 + the phase-3-plan entry for B1.
         assert_eq!(
             Tool::ALL.len(),
-            7,
+            8,
             "Tool::ALL size changed — update ADR-030 / ADR-035 + plan"
         );
     }
@@ -6360,8 +7099,11 @@ mod tests {
     }
 
     /// ADR-030 nails Q / B / S / G to specific tools; ADR-035 adds
-    /// T / M / F. A drift here is a documented contract break — bump
-    /// the ADR if intentional.
+    /// T / M. Sprint 12 / C6 added `F` for the general feature tool
+    /// and rebound the geo-vent tool to `V` (it freed F by design —
+    /// general features are a more common operation; vents stay
+    /// reachable by one key). A drift here is a documented contract
+    /// break — bump the ADR if intentional.
     #[test]
     fn tool_accelerators_match_adr_030() {
         assert_eq!(Tool::Select.accel(), "Q");
@@ -6369,7 +7111,8 @@ mod tests {
         assert_eq!(Tool::StartPositions.accel(), "S");
         assert_eq!(Tool::SplatPaint.accel(), "T");
         assert_eq!(Tool::MetalSpots.accel(), "M");
-        assert_eq!(Tool::GeoFeatures.accel(), "F");
+        assert_eq!(Tool::GeoFeatures.accel(), "V");
+        assert_eq!(Tool::Feature.accel(), "F");
         assert_eq!(Tool::Procgen.accel(), "G");
     }
 

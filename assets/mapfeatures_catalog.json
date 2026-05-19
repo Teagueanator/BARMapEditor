@@ -1,0 +1,52 @@
+{
+  "version": 1,
+  "source": "github.com/beyond-all-reason/mapfeatures",
+  "curated_at": "2026-05-19",
+  "curation_note": "Hand-curated baseline for Sprint 12 / C6. Auto-generation from the upstream `mapfeatures` repo at fetch time is a polish task (see devlog/stage-1-f7-features/notes.md). The 30-50 entries below cover the common stock features BAR maps reuse: agorm pine + tall trees, pine generic trees, the rock pack, generic wrecks, the geo vent, plus a handful of misc props. FeatureDef names match the upstream repo's directory names byte-for-byte; the engine rejects unknown names with `[GetFeatureDef] could not find FeatureDef`, so any drift here surfaces as missing features in-game (caught by C8 lint at Sprint 14).",
+  "categories": {
+    "trees": [
+      { "name": "pinetree",        "display": "Pine tree",        "tags": ["tree", "conifer", "generic"] },
+      { "name": "agorm_pine1",     "display": "Agorm pine 1",     "tags": ["tree", "conifer", "agorm"] },
+      { "name": "agorm_pine2",     "display": "Agorm pine 2",     "tags": ["tree", "conifer", "agorm"] },
+      { "name": "agorm_pine3",     "display": "Agorm pine 3",     "tags": ["tree", "conifer", "agorm"] },
+      { "name": "agorm_pine4",     "display": "Agorm pine 4",     "tags": ["tree", "conifer", "agorm"] },
+      { "name": "agorm_talltree1", "display": "Agorm tall tree 1","tags": ["tree", "deciduous", "agorm"] },
+      { "name": "agorm_talltree2", "display": "Agorm tall tree 2","tags": ["tree", "deciduous", "agorm"] },
+      { "name": "agorm_talltree3", "display": "Agorm tall tree 3","tags": ["tree", "deciduous", "agorm"] },
+      { "name": "agorm_talltree4", "display": "Agorm tall tree 4","tags": ["tree", "deciduous", "agorm"] },
+      { "name": "agorm_talltree5", "display": "Agorm tall tree 5","tags": ["tree", "deciduous", "agorm"] },
+      { "name": "agorm_talltree6", "display": "Agorm tall tree 6","tags": ["tree", "deciduous", "agorm"] },
+      { "name": "btree",           "display": "Birch tree",       "tags": ["tree", "deciduous", "generic"] }
+    ],
+    "rocks": [
+      { "name": "rock1",           "display": "Rock — small",     "tags": ["rock", "stone", "small"] },
+      { "name": "rock2",           "display": "Rock — medium",    "tags": ["rock", "stone", "medium"] },
+      { "name": "rock3",           "display": "Rock — large",     "tags": ["rock", "stone", "large"] },
+      { "name": "rock4",           "display": "Rock — boulder",   "tags": ["rock", "stone", "boulder"] },
+      { "name": "agorm_rock1",     "display": "Agorm rock 1",     "tags": ["rock", "stone", "agorm"] },
+      { "name": "agorm_rock2",     "display": "Agorm rock 2",     "tags": ["rock", "stone", "agorm"] },
+      { "name": "agorm_rock3",     "display": "Agorm rock 3",     "tags": ["rock", "stone", "agorm"] }
+    ],
+    "wreckage": [
+      { "name": "smallwreck",      "display": "Small wreck",      "tags": ["wreck", "rusted", "small"] },
+      { "name": "mediumwreck",     "display": "Medium wreck",     "tags": ["wreck", "rusted", "medium"] },
+      { "name": "largewreck",      "display": "Large wreck",      "tags": ["wreck", "rusted", "large"] },
+      { "name": "tankwreck",       "display": "Tank wreck",       "tags": ["wreck", "vehicle"] },
+      { "name": "shipwreck",       "display": "Ship wreck",       "tags": ["wreck", "naval"] },
+      { "name": "planewreck",      "display": "Plane wreck",      "tags": ["wreck", "aircraft"] }
+    ],
+    "props": [
+      { "name": "metalcrate",      "display": "Metal crate",      "tags": ["prop", "crate"] },
+      { "name": "ruin1",           "display": "Ruined building 1","tags": ["prop", "ruin", "structure"] },
+      { "name": "ruin2",           "display": "Ruined building 2","tags": ["prop", "ruin", "structure"] },
+      { "name": "deadtree1",       "display": "Dead tree 1",      "tags": ["prop", "deadtree"] },
+      { "name": "deadtree2",       "display": "Dead tree 2",      "tags": ["prop", "deadtree"] },
+      { "name": "antenna",         "display": "Comms antenna",    "tags": ["prop", "structure"] },
+      { "name": "barrel",          "display": "Fuel barrel",      "tags": ["prop", "container"] },
+      { "name": "pillar",          "display": "Stone pillar",     "tags": ["prop", "ruin"] }
+    ],
+    "geo": [
+      { "name": "geovent",         "display": "Geo vent",         "tags": ["geo", "vent", "thermal"] }
+    ]
+  }
+}

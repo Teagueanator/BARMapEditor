@@ -1333,6 +1333,8 @@ mod tests {
             splat_distribution: None,
             metal_spots: vec![],
             geo_vents: vec![],
+            features: vec![],
+            specular_tex_path: None,
             extractor_radius: crate::project::default_extractor_radius(),
         };
         let info: MapInfo = (&p).into();

@@ -108,6 +108,27 @@ pub struct Project {
     /// §5 — there is no `geos = {}` table in BAR).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub geo_vents: Vec<GeoVent>,
+    /// C6 / Sprint 12: F7 user-placed feature sources (trees / rocks /
+    /// wreckage / props / geo vents authored through the picker UI).
+    /// Symmetry mirrors derive at emission time the same way as
+    /// `metal_spots` and `geo_vents`; only sources are stored.
+    ///
+    /// Emitted into `mapconfig/featureplacer/set.lua`'s `objectlist`
+    /// next to the geovents Sprint 11 ships. PITFALL §21 / §23 capture
+    /// the file shape — unquoted-integer `rot`, no `y`, gadget samples
+    /// `GroundHeight(x, z) + 5` at spawn so the feature rides the live
+    /// terrain.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub features: Vec<FeatureInstance>,
+    /// D6 / Sprint 12: optional override path for the project's
+    /// specular texture. When `None`, the build pipeline ships a stock
+    /// 1024² grey BC1 fallback at `maps/<projectname>_specular.dds`
+    /// so the engine's DNTS branch doesn't render flat (FINDINGS §7.2
+    /// — engine no longer gates DNTS on specularTex but the visual
+    /// result is noticeably muddier without one). The path is resolved
+    /// against the `.barmeproj` directory the same way `heightmap` is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub specular_tex_path: Option<PathBuf>,
     /// C4 / Sprint 11: BAR-convention extractor radius in elmos. Engine
     /// default is 500 but BAR overrides it to 80; setting it back to
     /// 500 silently breaks mex-snap (PITFALL §6). Surfaced to the F5
@@ -237,6 +258,55 @@ impl GeoVent {
     }
 }
 
+/// A single user-placed feature source (C6 / Sprint 12). `name` matches
+/// a stock `FeatureDef` from BAR's `mapfeatures` repo (pinned in
+/// `assets/mapfeatures_catalog.json`); unknown names emit a `warn!` at
+/// build time and trigger an in-engine
+/// `[GetFeatureDef] could not find FeatureDef` skip — caught by C8 lint
+/// (Sprint 14) rather than gated here.
+///
+/// Coordinates are elmos (engine world units). `rot_heading` is Spring's
+/// 16-bit heading: `0` = north, `16384` = east, `32768` = south,
+/// `49152` = west — full turn at 65536. Emission casts to a signed
+/// 16-bit integer (`as i16`) so wrap-around preserves the bit pattern
+/// that `Spring.CreateFeature(..., fDef.rot)` consumes. Per PITFALL §23
+/// the Lua value is an UNQUOTED integer (the gadget's numeric arg —
+/// distinct from PyMapConv's `-k` text-file format, which uses quoted
+/// strings).
+///
+/// **`y` is intentionally absent.** Same rationale as [`GeoVent`] — the
+/// FP_featureplacer gadget calls
+/// `Spring.CreateFeature(name, x, GroundHeight(x, z) + 5, z, rot)` at
+/// spawn, so the feature rides the live terrain and sculpting the
+/// heightmap after authoring does not detach it.
+///
+/// **Symmetry mirrors are NOT stored.** `Project.features` is the
+/// source set; the build pipeline expands sources through the active
+/// `SymmetryAxis` before emission, matching the F8 / metal-spot /
+/// geo-vent convention.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FeatureInstance {
+    /// `FeatureDef.name` from `mapfeatures` (e.g. `"pinetree"`,
+    /// `"agorm_talltree6"`, `"geovent"`).
+    pub name: String,
+    pub x_elmo: i32,
+    pub z_elmo: i32,
+    /// Spring heading 0..65535. UI surfaces as degrees via
+    /// `rot * 360.0 / 65536.0`.
+    pub rot_heading: u16,
+}
+
+impl FeatureInstance {
+    pub fn new(name: impl Into<String>, x_elmo: i32, z_elmo: i32, rot_heading: u16) -> Self {
+        Self {
+            name: name.into(),
+            x_elmo,
+            z_elmo,
+            rot_heading,
+        }
+    }
+}
+
 /// A single team start position in world coordinates (elmos).
 ///
 /// **ADR-032 (B6):** `team_id` was removed. Position identity is now
@@ -291,6 +361,10 @@ struct ProjectWire {
     metal_spots: Vec<MetalSpot>,
     #[serde(default)]
     geo_vents: Vec<GeoVent>,
+    #[serde(default)]
+    features: Vec<FeatureInstance>,
+    #[serde(default)]
+    specular_tex_path: Option<PathBuf>,
     #[serde(default = "default_extractor_radius")]
     extractor_radius: f32,
 }
@@ -310,6 +384,8 @@ impl From<ProjectWire> for Project {
             splat_distribution: None,
             metal_spots: w.metal_spots,
             geo_vents: w.geo_vents,
+            features: w.features,
+            specular_tex_path: w.specular_tex_path,
             extractor_radius: w.extractor_radius,
         };
         if !w.start_positions.is_empty() {
@@ -415,6 +491,8 @@ impl Project {
             splat_distribution: None,
             metal_spots: Vec::new(),
             geo_vents: Vec::new(),
+            features: Vec::new(),
+            specular_tex_path: None,
             extractor_radius: default_extractor_radius(),
         }
     }
@@ -819,6 +897,68 @@ smu_z = 4
         let p = Project::new("clean", 4);
         let s = toml::to_string(&p).unwrap();
         assert!(!s.contains("geo_vents"), "got:\n{s}");
+    }
+
+    /// C6 (Sprint 12): `features` round-trip through TOML. Same
+    /// omit-when-empty rule as the other source-vec fields.
+    #[test]
+    fn features_round_trip_through_toml() {
+        let mut p = Project::new("trees", 8);
+        p.features
+            .push(FeatureInstance::new("pinetree", 1024, 1024, 0));
+        p.features
+            .push(FeatureInstance::new("agorm_talltree6", 2048, 3072, 32768));
+        let s = toml::to_string(&p).unwrap();
+        assert!(s.contains("features"), "got:\n{s}");
+        let p2: Project = toml::from_str(&s).unwrap();
+        assert_eq!(p.features, p2.features);
+    }
+
+    #[test]
+    fn features_omitted_when_empty() {
+        let p = Project::new("clean", 4);
+        let s = toml::to_string(&p).unwrap();
+        assert!(!s.contains("\nfeatures = "), "got:\n{s}");
+        assert!(!s.contains("\n[[features]]"), "got:\n{s}");
+    }
+
+    /// C6: a pre-Sprint-12 project (no `features`, no `specular_tex_path`)
+    /// loads forward with empty defaults rather than failing.
+    #[test]
+    fn pre_c6_project_without_features_loads_with_defaults() {
+        let toml_str = r#"
+name = "pre_c6"
+min_height = 0.0
+max_height = 256.0
+
+[size]
+smu_x = 4
+smu_z = 4
+"#;
+        let p: Project = toml::from_str(toml_str).unwrap();
+        assert!(p.features.is_empty());
+        assert!(p.specular_tex_path.is_none());
+    }
+
+    /// C6: `FeatureInstance::new` is the convenience constructor.
+    #[test]
+    fn feature_instance_new_pins_fields() {
+        let f = FeatureInstance::new("pinetree", 100, 200, 16384);
+        assert_eq!(f.name, "pinetree");
+        assert_eq!(f.x_elmo, 100);
+        assert_eq!(f.z_elmo, 200);
+        assert_eq!(f.rot_heading, 16384);
+    }
+
+    /// D6 (Sprint 12): `specular_tex_path` round-trips when set.
+    #[test]
+    fn specular_tex_path_round_trips() {
+        let mut p = Project::new("spec", 4);
+        p.specular_tex_path = Some(PathBuf::from("custom_specular.dds"));
+        let s = toml::to_string(&p).unwrap();
+        assert!(s.contains("specular_tex_path"), "got:\n{s}");
+        let p2: Project = toml::from_str(&s).unwrap();
+        assert_eq!(p.specular_tex_path, p2.specular_tex_path);
     }
 
     /// PITFALL §6: setting `extractor_radius = 500` (the engine

@@ -27,7 +27,7 @@ pub use procgen::{
     BIOMES, BiomePreset, Domain, PRESETS, ProcGenError, ProcGenPreset, generate as procgen_generate,
 };
 pub use project::{
-    ALLY_GROUP_PALETTE, AllyGroup, GeoVent, MetalSpot, PROJECT_EXTENSION, Project,
+    ALLY_GROUP_PALETTE, AllyGroup, FeatureInstance, GeoVent, MetalSpot, PROJECT_EXTENSION, Project,
     ProjectLoadError, ProjectSaveError, StartPosition, default_extractor_radius, sanitize_name,
 };
 pub use splat::{

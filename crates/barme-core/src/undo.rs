@@ -44,7 +44,7 @@ use crate::MapSize;
 use crate::brushes::DirtyRect;
 use crate::heightmap::Heightmap;
 use crate::procgen::Domain;
-use crate::project::{AllyGroup, GeoVent, MetalSpot, StartPosition};
+use crate::project::{AllyGroup, FeatureInstance, GeoVent, MetalSpot, StartPosition};
 use crate::symmetry::SymmetryAxis;
 
 /// One committed undo entry. Either a heightmap stroke (the ADR-033
@@ -151,6 +151,21 @@ pub enum ProjectDiff {
     /// A geo-vent source's coordinates changed (drag-move / inspector
     /// edit).
     MoveGeoVent { from: GeoVent, to: GeoVent },
+    /// C6 (Sprint 12): a user-placed feature source was added. Identity
+    /// is the full `FeatureInstance` (name + coords + rotation). Per
+    /// the F7 dispatch the diff pushes one entry per symmetry mirror so
+    /// undo peels mirrors one at a time, matching the metal/geo
+    /// convention.
+    PlaceFeature { feature: FeatureInstance },
+    /// A feature source was deleted.
+    DeleteFeature { feature: FeatureInstance },
+    /// A feature source's coords and/or rotation changed (drag-move /
+    /// drag-rotate on canvas, or inspector edit). The drag finalizer
+    /// collapses the gesture into a single entry.
+    MoveFeature {
+        from: FeatureInstance,
+        to: FeatureInstance,
+    },
 }
 
 impl ProjectDiff {
@@ -168,6 +183,14 @@ impl ProjectDiff {
             | ProjectDiff::DeleteGeoVent { .. }
             | ProjectDiff::MoveGeoVent { .. } => inline,
             ProjectDiff::ApplyWizard(snap) => inline + snap.bytes(),
+            // Feature variants carry a String `name`; the heap cost of
+            // its capacity is in addition to the enum inline size.
+            ProjectDiff::PlaceFeature { feature } | ProjectDiff::DeleteFeature { feature } => {
+                inline + feature.name.capacity()
+            }
+            ProjectDiff::MoveFeature { from, to } => {
+                inline + from.name.capacity() + to.name.capacity()
+            }
         }
     }
 }
@@ -654,8 +677,11 @@ mod tests {
             | ProjectDiff::SetExtractorRadius { .. }
             | ProjectDiff::PlaceGeoVent { .. }
             | ProjectDiff::DeleteGeoVent { .. }
-            | ProjectDiff::MoveGeoVent { .. } => {
-                unreachable!("metal/geo diffs not exercised through AllyGroup test helper")
+            | ProjectDiff::MoveGeoVent { .. }
+            | ProjectDiff::PlaceFeature { .. }
+            | ProjectDiff::DeleteFeature { .. }
+            | ProjectDiff::MoveFeature { .. } => {
+                unreachable!("metal/geo/feature diffs not exercised through AllyGroup test helper")
             }
         }
     }
@@ -946,8 +972,20 @@ mod tests {
         // Push: small project diff (oldest), then a 'large' stroke.
         // Pre-B5 the oldest (the diff) would have been evicted; B5
         // evicts the largest (the stroke).
+        //
+        // `ProjectDiff::bytes()` reports the full enum inline size
+        // (constant across variants — std::mem::size_of::<Self>()),
+        // while `HeightmapEntry::bytes()` reports only the heap cost
+        // of `before`. So a "larger" stamp needs heap bytes >
+        // ProjectDiff inline. C4/C5/C6 widened the enum to ~88 bytes
+        // inline (`MoveFeature { from: FeatureInstance, to: FeatureInstance }`
+        // is the load-bearing variant). A 16×16 stamp = 256 pixels ×
+        // 2 = 512 bytes of heap — unambiguously larger; the test
+        // stays robust against future inline-size growth.
         let mut hm = mk_hm();
-        let mut h = History::new(40); // small cap to force eviction
+        let diff_inline = std::mem::size_of::<ProjectDiff>();
+        let cap = diff_inline * 4; // comfortably holds one diff; smaller than heap-cost of the stamp.
+        let mut h = History::new(cap);
 
         let pos = StartPosition {
             x_elmo: 1,
@@ -959,23 +997,24 @@ mod tests {
         });
         let small_bytes = h.bytes();
 
-        // Now push a heightmap entry larger than the project diff.
+        // Now push a heightmap entry whose heap cost (512 bytes)
+        // exceeds the ProjectDiff inline + cap.
         write_stamp(
             &mut h,
             &mut hm,
             DirtyRect {
                 x: 0,
                 y: 0,
-                w: 6,
-                h: 6,
+                w: 16,
+                h: 16,
             },
             0xF00D,
         );
         h.end_stroke(&hm);
 
-        // Eviction should kick out the largest (the heightmap entry,
-        // 72 bytes) — the small ProjectDiff survives.
-        assert!(h.bytes() <= 40);
+        // Eviction should kick out the largest (the heightmap entry) —
+        // the small ProjectDiff survives.
+        assert!(h.bytes() <= cap);
         assert_eq!(h.undo_depth(), 1);
         let surviving = h.undo.back().unwrap();
         match surviving {
@@ -1274,6 +1313,33 @@ mod tests {
         assert_eq!(place.bytes(), inline);
         assert_eq!(delete.bytes(), inline);
         assert_eq!(m.bytes(), inline);
+    }
+
+    /// C6 (Sprint 12): `FeatureInstance` carries a heap-allocated
+    /// `String name`, so the bytes accounting must include its
+    /// capacity in addition to the enum inline size. This keeps the
+    /// 100 MB cap honest under feature-heavy workloads (a placed
+    /// pinetree's name is 8 bytes of heap, an agorm_talltree6 is 15).
+    #[test]
+    fn feature_diff_bytes_includes_name_capacity() {
+        let inline = std::mem::size_of::<ProjectDiff>();
+        let f = FeatureInstance::new("agorm_talltree6", 1024, 2048, 0);
+        let cap = f.name.capacity();
+        assert!(cap >= "agorm_talltree6".len(), "string capacity sanity");
+        let place = ProjectDiff::PlaceFeature { feature: f.clone() };
+        let delete = ProjectDiff::DeleteFeature { feature: f.clone() };
+        let mv = ProjectDiff::MoveFeature {
+            from: f.clone(),
+            to: FeatureInstance::new("agorm_talltree6", 2048, 2048, 16384),
+        };
+        assert_eq!(place.bytes(), inline + cap);
+        assert_eq!(delete.bytes(), inline + cap);
+        // Move pays for both from + to names.
+        let to_cap = match &mv {
+            ProjectDiff::MoveFeature { to, .. } => to.name.capacity(),
+            _ => unreachable!(),
+        };
+        assert_eq!(mv.bytes(), inline + cap + to_cap);
     }
 
     /// Setting extractor_radius is also bytes-inline.
