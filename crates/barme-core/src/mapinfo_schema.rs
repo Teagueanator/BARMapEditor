@@ -62,6 +62,11 @@ use crate::project::Project;
 /// `glam::Vec3` but kept opaque since the schema crosses serde + Lua.
 pub type Rgb = [f32; 3];
 
+/// Engine default for `voidAlphaMin` (`MapInfo.cpp:107`).
+fn default_void_alpha_min() -> f32 {
+    0.9
+}
+
 /// Sun direction with a `w` component holding the engine's
 /// `sunStart` distance. Per the digest, the engine default is
 /// `{0, 1, 2, 1e9}`. The fourth element is **not** padding — it's a
@@ -121,6 +126,13 @@ pub struct MapInfo {
     /// Alpha-cuts ground using diffuse alpha channel.
     #[serde(default)]
     pub void_ground: bool,
+    /// Alpha threshold below which `voidGround` discards fragments
+    /// (engine default `0.9`, per `MapInfo.cpp:107`). The emitter
+    /// only writes the key when [`void_ground`] is `true` — the
+    /// engine default applies otherwise. Surfaced in F9 (Sprint 13)
+    /// only when `voidGround` is on.
+    #[serde(default = "default_void_alpha_min")]
+    pub void_alpha_min: f32,
     /// Auto F4 view on mex queue.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_show_metal: Option<bool>,
@@ -483,6 +495,7 @@ impl MapInfo {
             extractor_radius: Some(80.0),
             void_water: false,
             void_ground: false,
+            void_alpha_min: default_void_alpha_min(),
             auto_show_metal: Some(true),
             smf: SmfBlock {
                 min_height: None,
@@ -925,6 +938,35 @@ mod tests {
         assert!(!info.void_ground);
     }
 
+    /// PITFALL §20 / FINDINGS §1.1: `MapInfo::voidAlphaMin` defaults
+    /// to the engine value `0.9` (per `MapInfo.cpp:107`). The
+    /// emitter only writes the key when `void_ground` is true; the
+    /// field is always carried so F9 can surface it.
+    #[test]
+    fn bar_default_void_alpha_min_is_engine_default() {
+        assert_eq!(MapInfo::bar_default().void_alpha_min, 0.9);
+    }
+
+    /// PITFALL §20: a `.barmeproj` without the field still loads —
+    /// `#[serde(default = "default_void_alpha_min")]` produces 0.9.
+    #[test]
+    fn void_alpha_min_defaults_when_missing_from_toml() {
+        // Minimal TOML lacking void_alpha_min — should round-trip
+        // back to the engine default.
+        let mut info = MapInfo::bar_default();
+        info.void_alpha_min = 0.42; // serialise a non-default value
+        let s = toml::to_string(&info).expect("serialize");
+        // Strip the line containing void_alpha_min to simulate a
+        // legacy file lacking the key.
+        let stripped: String = s
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("void_alpha_min"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let back: MapInfo = toml::from_str(&stripped).expect("deserialize");
+        assert_eq!(back.void_alpha_min, 0.9);
+    }
+
     // ────── pitfall coverage — teams[] schema (digest §2) ──────
 
     /// **Pitfall:** `TeamBlock` MUST NOT have an `ally_team` field.
@@ -1054,6 +1096,7 @@ mod tests {
             extractor_radius,
             void_water,
             void_ground,
+            void_alpha_min,
             auto_show_metal,
             smf,
             lighting,
@@ -1088,6 +1131,7 @@ mod tests {
             extractor_radius,
             void_water,
             void_ground,
+            void_alpha_min,
             auto_show_metal,
             smf,
             lighting,
