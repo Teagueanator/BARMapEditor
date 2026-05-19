@@ -62,9 +62,38 @@ Implements SRS F1–F12. Ships a Windows `.exe` and a Linux AppImage.
       `SplatDistribution` + object-safe `SplatBrush` trait + registry
       with `paint` / `erase` / `smooth` brushes. `PaintChannel`
       enforces `R+G+B+A ≤ 255`; brushes return dirty rects for D4's
-      sub-upload pattern. F4 itself remains gated on D4 (fragment
-      shader blend, Sprint 9), D5 (splat tool inspector, Sprint 9),
-      D6 (mapinfo emission + `.sd7` bundling, Sprint 12).
+      sub-upload pattern.
+      **D4 shipped 2026-05-18** (ADR-036): `crates/barme-app::render`
+      extends the bind group to 7 entries (splat distribution
+      texture, 4-layer rgba8unorm slot diffuse array, SplatU uniform
+      block); `terrain.wgsl` fragment stage composites the four
+      diffuse layers via the engine's splatCofac math
+      (`SMFFragProg.glsl:174-198`) — diffuse-only this sprint, with
+      heightmap-derived normals + Lambert + ambient lighting and a
+      heightmap-driven biome-gradient fallback when no slot is
+      bound. `SMF_INTENSITY_MULT = 210/255` pre-applied CPU-side per
+      FINDINGS §7.1. Five engine-fidelity deferrals (DNTS-normal
+      blending, ADR-034 high-pass alpha, shadows, specular,
+      sky-reflect/water/fog) listed in ADR-036 with promotion
+      triggers.
+      **D5 shipped 2026-05-18** (no ADR — reuses ADR-035 widgets +
+      ADR-036 GPU): `barme_core::SplatConfig` persists per-channel
+      slot bindings + `tex_scales` / `tex_mults` /
+      `diffuse_in_alpha` on `Project`; in-memory
+      `SplatDistribution` field rides along for the session (D6
+      ships PNG sidecar persistence). Inspector rewrite drops the
+      Phase-7 scaffolding for a TEXTURE LAYERS picker (slot
+      thumbnails from `tools/textures/<NN-slot>/diffuse.png`,
+      inline slot-picker grid), BRUSH section driven by the D3
+      registry, PER-LAYER TUNING (`tex_scale` 0.0015..=0.05,
+      `tex_mult` 0..=4), and a GLOBAL `diffuse_in_alpha` pill.
+      Canvas LMB stamps via the D3 brush, fanned through
+      `App::symmetry`. Mini-map gains a translucent splat overlay.
+      Validation chip warns "DNTS: no specular" per FINDINGS §7.2.
+      Splat undo deferred (4 MB > 100 MB cap).
+      **F4 itself remains gated on D6** (mapinfo emission + `.sd7`
+      bundling, Sprint 12) — until then the painted distribution
+      shows in the editor preview only, not in BAR.
 - [ ] **F5** Metal-spot placement (point + radius → red-channel density)
 - [ ] **F6** Geo-vent placement
 - [ ] **F7** Feature placement (trees, rocks, wreckage) into a Lua gadget

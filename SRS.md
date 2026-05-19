@@ -154,6 +154,8 @@ A single-window, single-executable desktop app that produces a *playable* BAR ma
 | F2 | Real-time heightmap sculpting: raise/lower/flatten/smooth/erode/ramp | ✅ | | |
 | F3 | Symmetry enforcement (mirror H/V/diag/rot-N) on heightmap and overlays | ✅ | | |
 | F4 | Texture painting via DNTS splat channels (4 RGBA, ≤4 splat textures) | ✅ | | |
+| **STATUS UPDATE 2026-05-18 (Sprint 9 / D4 + D5):** ||||
+| F4 editor-preview half landed — D4 (ADR-036) wires the GPU bind group + WGSL composite (diffuse-only simplification of `SMFFragProg.glsl:174-198`, FINDINGS §7 corrections internalised). D5 ships the persisted `Project.splat_config` (per-channel slot bindings + `tex_scales` / `tex_mults` / `diffuse_in_alpha`) and the inspector that drives it. Painting works in the editor; the painted distribution does NOT yet flow into the `.sd7` — D6 (Sprint 12) wires `mapinfo.resources.splatDetailNormalTex` emission + the `splat_distribution.png` sidecar. The pitfall #6 line at §2.1 below is **updated by FINDINGS §7.2**: engine no longer gates DNTS on `specularTex`; the lint stays as a yellow warning. ||||
 | F5 | Metal-spot placement (point + radius → red-channel density on metal map) | ✅ | | |
 | F6 | Geo-vent placement | ✅ | | |
 | F7 | Feature placement (trees, rocks, wreckage) with rotation/scale, into a Lua feature gadget | ✅ | | |
