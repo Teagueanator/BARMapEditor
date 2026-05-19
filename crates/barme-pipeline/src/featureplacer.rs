@@ -24,15 +24,34 @@
 //!   what the parser expects; Gemini's report incorrectly typed this
 //!   as a float — adopt Claude's finding (PITFALL §6).
 //!
-//! ## C2 placeholder
+//! ## C5 (Sprint 11): geo vents land here
 //!
-//! Empty body until C6 lands `Project.features` + the feature-picker
-//! UI. The emitter walks a future `feature_instances` field; the
-//! `feature_instances` helper is the seam.
+//! `Project.geo_vents` emits as `name = "geovent"` features —
+//! PITFALL §14 / FINDINGS §5–§6: BAR's
+//! `api_resource_spot_finder.GetSpotsGeo()` scans
+//! `Spring.GetAllFeatures()` for `FeatureDef.geoThermal = true`
+//! (the stock `geovent` carries that flag), so the steam-plume
+//! visual + the GG["resource_spot_finder"].geoSpotsList registration
+//! both come from a single feature placement. The legacy `geos = {}`
+//! array in `map_metal_layout.lua` is Zero-K convention and does
+//! NOT apply to BAR — `metal_layout.rs` therefore emits only
+//! `spots`.
+//!
+//! C6 (Sprint 12) will land general feature placement on top of
+//! the same `feature_entry` helper; the order they end up in the
+//! emitted list is (geo vents) first, sorted by (z, x), then
+//! whatever C6 ships, sorted by (name, z, x) for determinism.
 
-use barme_core::Project;
+use barme_core::{GeoVent, Project};
 
 use crate::lua_ast::{LuaKey, LuaValue, serialize, sort_table_by_key};
+
+/// Canonical name of BAR's stock geothermal-vent FeatureDef. The
+/// `api_resource_spot_finder` upget looks for
+/// `FeatureDef.geoThermal = true`, which this name carries; verified
+/// against BAR's `sounds/atmos-geovents/` ambience binding + FINDINGS
+/// §5. Map-bundled custom geos are Stage 2 (own ADR).
+pub const GEOVENT_NAME: &str = "geovent";
 
 /// Render the canonical `return { … }` feature list. Empty array when
 /// no features are authored.
@@ -48,28 +67,44 @@ pub fn render(project: &Project) -> String {
 /// Build one feature entry as a Lua table. Kept public-in-module so
 /// C5 (geo vents) and C6 (general feature placement) can reuse it
 /// when they wire up their writes.
-#[allow(dead_code)]
 pub(crate) fn feature_entry(name: &str, x: i32, z: i32, rot_heading: u16) -> LuaValue {
     let mut t = vec![
         (LuaKey::str("name"), LuaValue::str(name)),
         (LuaKey::str("x"), LuaValue::Int(x as i64)),
         (LuaKey::str("z"), LuaValue::Int(z as i64)),
-        // rot is STRING-typed per BAR convention — Gemini's report
-        // typed it as float, which is wrong (PITFALL).
+        // rot is STRING-typed per BAR convention — Claude's source
+        // audit (FINDINGS §6) confirms the parser expects the quoted
+        // form. Test-pinned by `feature_entry_carries_*_rot_as_string`.
         (LuaKey::str("rot"), LuaValue::str(rot_heading.to_string())),
     ];
     sort_table_by_key(&mut t);
     LuaValue::Table(t)
 }
 
+/// Build one geovent feature entry from a [`GeoVent`]. Rotation is
+/// always `"0"` (Spring heading units) — the stock geovent FeatureDef
+/// is rotationally symmetric, so the heading doesn't matter visually
+/// and zero is the BAR-mapper convention.
+fn geovent_entry(v: &GeoVent) -> LuaValue {
+    feature_entry(GEOVENT_NAME, v.x_elmo, v.z_elmo, 0)
+}
+
 /// Walk the project's feature list and emit one [`LuaValue::Table`]
-/// per instance. C6 wires this to `project.features`; the C2 commit
-/// returns an empty list so the emitter shape is in place.
-fn feature_instances(_project: &Project) -> Vec<LuaValue> {
-    // C6 hook-point: read `project.features` and call
-    // `feature_entry(&f.name, f.x, f.z, f.rot)` for each, then sort
-    // by (name, x, z) for determinism.
-    Vec::new()
+/// per instance. C5 ships the geo-vent path; C6 will append general
+/// features after them.
+fn feature_instances(project: &Project) -> Vec<LuaValue> {
+    let mut out: Vec<LuaValue> = Vec::with_capacity(project.geo_vents.len());
+    // Sort sources by (z, x) for stable diffs. We must not sort the
+    // canonical `project.geo_vents` — App-side identity is index-
+    // based — so we clone into a local vec before sorting.
+    let mut sorted: Vec<GeoVent> = project.geo_vents.clone();
+    sorted.sort_by_key(|v| (v.z_elmo, v.x_elmo));
+    for v in &sorted {
+        out.push(geovent_entry(v));
+    }
+    // C6 hook-point: append `project.features` here, sorted by
+    // (name, z, x) for stable diffs.
+    out
 }
 
 #[cfg(test)]
@@ -110,5 +145,82 @@ mod tests {
         let a = render(&p);
         let b = render(&p);
         assert_eq!(a, b);
+    }
+
+    /// C5: a project with two geo vents emits two `name = "geovent"`
+    /// entries. Field shape verified against FINDINGS §5–§6 +
+    /// PITFALL §14 (no `geos` array — features only).
+    #[test]
+    fn geo_vents_emit_geovent_features() {
+        let mut p = Project::new("vents", 8);
+        p.geo_vents.push(GeoVent::new(2048, 4096));
+        p.geo_vents.push(GeoVent::new(2048, 8192));
+        let s = render(&p);
+        // Two entries.
+        let count = s.matches(r#"name = "geovent""#).count();
+        assert_eq!(count, 2, "expected 2 geovent entries; got:\n{s}");
+        // Both coords surface.
+        assert!(s.contains("z = 4096"), "got:\n{s}");
+        assert!(s.contains("z = 8192"), "got:\n{s}");
+        // X coordinate is shared across both.
+        assert!(s.contains("x = 2048"), "got:\n{s}");
+    }
+
+    /// PITFALL §6 / FINDINGS §6: `rot` must be a STRING-quoted
+    /// Spring heading integer. Default geo-vent rotation is `"0"`.
+    #[test]
+    fn geo_rotation_default_zero_string() {
+        let mut p = Project::new("rotstr", 8);
+        p.geo_vents.push(GeoVent::new(100, 200));
+        let s = render(&p);
+        assert!(
+            s.contains(r#"rot = "0""#),
+            "rot must be STRING-quoted; got:\n{s}"
+        );
+        // Defensive: make sure we didn't slip out the unquoted form
+        // (which would silently work in the engine but break BAR's
+        // mapper conventions + the C8 lint).
+        assert!(
+            !s.contains("rot = 0,") && !s.contains("rot = 0\n"),
+            "no unquoted `rot = 0` allowed; got:\n{s}"
+        );
+    }
+
+    /// Sources are sorted by (z, x) for stable diffs even when the
+    /// user authored them in another order.
+    #[test]
+    fn geo_vents_emit_sorted_by_z_then_x() {
+        let mut p = Project::new("sorted", 8);
+        // Insertion order intentionally not (z, x)-sorted.
+        p.geo_vents.push(GeoVent::new(500, 800));
+        p.geo_vents.push(GeoVent::new(100, 200));
+        p.geo_vents.push(GeoVent::new(900, 200));
+        let s = render(&p);
+        // (200, 100) → (200, 900) → (800, 500): rendered z entries
+        // must appear in that order.
+        let z200_a = s.find("z = 200").expect("z=200 present");
+        let z800 = s.find("z = 800").expect("z=800 present");
+        assert!(
+            z200_a < z800,
+            "smaller-z entries should sort before larger-z; got:\n{s}"
+        );
+    }
+
+    /// An empty `geo_vents` vec yields the existing C2-shape empty
+    /// table (no surprise regressions for projects without any
+    /// vents).
+    #[test]
+    fn empty_geo_vents_emit_empty_seq() {
+        let p = Project::new("blank-vents", 4);
+        let s = render(&p);
+        assert!(s.contains("return {}"), "got:\n{s}");
+    }
+
+    /// Verify the geovent name constant: typo here would render the
+    /// vents as non-existent features and BAR would silently skip
+    /// them with `[GetFeatureDef] could not find FeatureDef`.
+    #[test]
+    fn geovent_name_constant_matches_bar_featuredef() {
+        assert_eq!(GEOVENT_NAME, "geovent");
     }
 }
