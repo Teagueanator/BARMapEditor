@@ -452,6 +452,85 @@ overrides drop below `0.5` or rise above `5.0` — outliers are
 valid (e.g. `starwatcher_1.0` is balanced around 4.11) but should
 be a conscious choice.
 
+### 25. `LuaGaia/Gadgets/` needs a map-bundled `LuaGaia/main.lua` bootstrap
+
+Shipping a gadget at `LuaGaia/Gadgets/Foo.lua` does nothing on its own.
+The engine only scans that directory when the map carries a
+`LuaGaia/main.lua` that `VFS.Include`s the engine-provided
+`LuaGadgets/gadgets.lua` handler. `springcontent.sdz` (verified
+against recoil 2026.06.04) provides the handler but **not** a
+fallback bootstrap.
+
+Real BAR maps (`gecko_isle_remake_v1.2.1`, …) ship the canonical
+two-file pair:
+
+```
+LuaGaia/main.lua    -- synced bootstrap
+LuaGaia/draw.lua    -- unsynced-draw bootstrap
+```
+
+`main.lua`:
+
+```lua
+if AllowUnsafeChanges then AllowUnsafeChanges("USE AT YOUR OWN PERIL") end
+VFS.Include("LuaGadgets/gadgets.lua",nil, VFS.BASE)
+```
+
+`draw.lua`:
+
+```lua
+VFS.Include("LuaGadgets/gadgets.lua",nil, VFS.BASE)
+```
+
+**Rule:** `build_sd7` stages both files into every `.sd7`. They are
+vendored at `crates/barme-pipeline/assets/luagaia_{main,draw}.lua`
+and exposed as `featureplacer::LUAGAIA_{MAIN,DRAW}_SOURCE` (the
+gadget infrastructure lives in `featureplacer.rs` as the principal
+consumer). Pre-merge gate for any future "ship a gadget in
+`LuaGaia/Gadgets/`" change: extract a real BAR map and diff our SD7
+against it at the `LuaGaia/` level.
+
+### 26. Don't ship empty `map_startboxes.lua` — and the shape is unwrapped
+
+Two related findings from the 2026-05-19 smoke test:
+
+**Existence beats content.** `luarules/gadgets/include/startbox_
+utilities.lua::ParseBoxes:43` checks `VFS.FileExists("mapconfig/
+map_startboxes.lua")` and uses the file's return value as-is. There
+is no "is this table empty?" check. Shipping an empty file therefore
+**suppresses BAR's default-fallback codepath** at lines 79–137 of the
+same file (which would otherwise generate sensible N/S or E/W boxes
+from map dimensions). An absent file is strictly better than an
+empty one.
+
+**Shape is unwrapped, in elmos.** Pre-Sprint-11 research had
+`return { startboxes = { [0] = … } }`. That was wrong. Verified
+against `titanduel_v3.sd7`'s `map_startboxes.lua` on 2026-05-19:
+the file returns the per-ally-team table **directly**, with polygon
+vertices in **elmo coordinates** (not 0..1 fractions):
+
+```lua
+return {
+  [0] = {
+    nameLong = "North-West", nameShort = "NW",
+    boxes      = { { {0,0}, {614,0}, {614,614}, {0,614} } },
+    startpoints = { {307, 307} },
+  },
+  [1] = { … },
+}
+```
+
+The modoptions-string codepath at lines 56–59 *does* multiply
+fractions by `Game.mapSizeX/Z`, but the map-file codepath does not.
+Conflating those two formats yields silently-broken boxes.
+
+**Rule:** `startboxes::should_emit(project)` is `true` only when the
+project has ≥ 2 ally groups AND at least one has an authored
+`box_polygon`. `build_sd7` checks this and skips staging the file
+when `false`. When emitted, the file uses the unwrapped per-ally-
+team shape with elmo-space polygons. `startpoints` carries one
+entry at the polygon centroid in elmos.
+
 ### 23. Springboard featureplacer rotation is INTEGER, not string
 
 A subtle within-`set.lua` schema detail: even though the C2 emitter

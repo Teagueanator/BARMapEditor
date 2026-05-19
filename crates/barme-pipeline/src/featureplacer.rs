@@ -74,6 +74,22 @@ use crate::lua_ast::{LuaKey, LuaValue, serialize};
 /// map start.
 pub const FP_GADGET_SOURCE: &str = include_str!("../assets/FP_featureplacer.lua");
 
+/// LuaGaia bootstrap that triggers the engine-side gadget handler.
+/// Without this file at `LuaGaia/main.lua` in the SD7, Recoil never
+/// scans `LuaGaia/Gadgets/` and our `FP_featureplacer.lua` is dead
+/// code. Verified by extracting `springcontent.sdz` (recoil
+/// 2026.06.04) — the engine provides `LuaGadgets/gadgets.lua` but
+/// NOT a fallback `LuaGaia/main.lua`, so the map must ship its own.
+/// Real BAR maps (gecko_isle_remake_v1.2.1, jade_empress_1.3, …) all
+/// bundle this two-line bootstrap.
+pub const LUAGAIA_MAIN_SOURCE: &str = include_str!("../assets/luagaia_main.lua");
+
+/// LuaGaia draw-context bootstrap. The unsynced-draw context needs
+/// its own VFS.Include of the gadget handler so widgets that paint
+/// (e.g. mark-renderers) can attach. Bundled at `LuaGaia/draw.lua`.
+/// Same verification source as [`LUAGAIA_MAIN_SOURCE`].
+pub const LUAGAIA_DRAW_SOURCE: &str = include_str!("../assets/luagaia_draw.lua");
+
 /// Canonical name of BAR's stock geothermal-vent FeatureDef. The
 /// `api_resource_spot_finder` upget looks for
 /// `FeatureDef.geoThermal = true`, which this name carries; verified

@@ -112,8 +112,14 @@ pub fn build_sd7(
         "map_metal_layout.lua",
         &metal_layout::render(project),
     )?;
-    let startboxes_path =
-        write_lua_file(work_dir, "map_startboxes.lua", &startboxes::render(project))?;
+    // PITFALL §26: only ship `map_startboxes.lua` when the user
+    // authored startboxes. Shipping an empty file shadows BAR's
+    // default N/S or E/W fallback in
+    // `luarules/gadgets/include/startbox_utilities.lua:43`,
+    // producing a map with no playable spawn regions.
+    let startboxes_path = startboxes::render_optional(project)
+        .map(|body| write_lua_file(work_dir, "map_startboxes.lua", &body))
+        .transpose()?;
     // Springboard feature-placer trio (PITFALL §14 fix, Sprint 11):
     // 1. The gadget itself, bundled as `LuaGaia/Gadgets/FP_featureplacer.lua`
     //    so BAR auto-loads it on map start.
@@ -129,6 +135,19 @@ pub fn build_sd7(
     let fp_config_path =
         write_lua_file(work_dir, "fp_config.lua", &featureplacer::render_config())?;
     let fp_set_path = write_lua_file(work_dir, "fp_set.lua", &featureplacer::render_set(project))?;
+    // LuaGaia bootstrap pair — required for the engine to load
+    // anything in `LuaGaia/Gadgets/`. springcontent.sdz does NOT
+    // ship a fallback, so without these the FP gadget never runs.
+    let luagaia_main_path = write_lua_file(
+        work_dir,
+        "luagaia_main.lua",
+        featureplacer::LUAGAIA_MAIN_SOURCE,
+    )?;
+    let luagaia_draw_path = write_lua_file(
+        work_dir,
+        "luagaia_draw.lua",
+        featureplacer::LUAGAIA_DRAW_SOURCE,
+    )?;
 
     let staging = work_dir.join("staging");
     std::fs::create_dir_all(&staging).map_err(|source| BuildError::Io {
@@ -138,7 +157,7 @@ pub fn build_sd7(
 
     let smf_rel = format!("maps/{}.smf", project.name);
     let smt_rel = format!("maps/{}.smt", project.name);
-    let staged = [
+    let mut staged = vec![
         StagedFile {
             src: &outputs.smf,
             archive_rel: &smf_rel,
@@ -154,10 +173,6 @@ pub fn build_sd7(
         StagedFile {
             src: &metal_path,
             archive_rel: "mapconfig/map_metal_layout.lua",
-        },
-        StagedFile {
-            src: &startboxes_path,
-            archive_rel: "mapconfig/map_startboxes.lua",
         },
         // Springboard feature-placer trio. PITFALL §14: a bare
         // `mapconfig/featureplacer/features.lua` is NOT a BAR path —
@@ -177,7 +192,25 @@ pub fn build_sd7(
             src: &fp_set_path,
             archive_rel: "mapconfig/featureplacer/set.lua",
         },
+        // LuaGaia bootstrap pair. PITFALL §25: without these, the
+        // engine never scans `LuaGaia/Gadgets/` on map load and the
+        // FP gadget above is dead code.
+        StagedFile {
+            src: &luagaia_main_path,
+            archive_rel: "LuaGaia/main.lua",
+        },
+        StagedFile {
+            src: &luagaia_draw_path,
+            archive_rel: "LuaGaia/draw.lua",
+        },
     ];
+    // Conditional startboxes file — see PITFALL §26 above.
+    if let Some(ref path) = startboxes_path {
+        staged.push(StagedFile {
+            src: path,
+            archive_rel: "mapconfig/map_startboxes.lua",
+        });
+    }
 
     info!(?out_sd7, "build_sd7: packaging");
     let sd7_path = sd7::package(out_sd7, &staging, &staged)?;

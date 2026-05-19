@@ -1,83 +1,152 @@
 //! `mapconfig/map_startboxes.lua` emitter (ADR-029).
 //!
-//! Declares **ally-team start boxes** as `[0..1]`-fraction polygons of
-//! the map's extent (`{0, 0}` = top-left, `{1, 1}` = bottom-right).
-//! SPADS autohosts and the BAR Chobby lobby read this file to slot
-//! lobby players into geographically appropriate start regions; in its
-//! absence the lobby falls back to a whole-map box per ally which
-//! produces terrible 8v8 matchups (PITFALL: research §7 "ranked-play
-//! unfit silent failure").
+//! Declares **ally-team start boxes** as polygons in **elmo
+//! coordinates** (the map's world units, `[0, mapSizeX] × [0,
+//! mapSizeZ]`). SPADS autohosts and the BAR Chobby lobby read this
+//! file to slot lobby players into geographically appropriate start
+//! regions.
 //!
-//! ## Shape (per research §8 / claude-research-findings.md)
+//! ## Shape (verified against `titanduel_v3.sd7` and consumed by
+//! `luarules/gadgets/include/startbox_utilities.lua::ParseBoxes`)
 //!
 //! ```lua
 //! return {
-//!   startboxes = {
-//!     [0] = { boxes = { { { 0.0, 0.0 }, { 1.0, 0.12 } } }, startpoints = {} },
-//!     [1] = { boxes = { { { 0.0, 0.88 }, { 1.0, 1.0 } } },  startpoints = {} },
+//!   [0] = {
+//!     nameLong = "North-West",
+//!     nameShort = "NW",
+//!     boxes = { { {0,0}, {614,0}, {614,614}, {0,614} } },
+//!     startpoints = { {307, 307} },
 //!   },
+//!   [1] = { … },
 //! }
 //! ```
 //!
-//! Each `boxes` entry is a polygon — for an axis-aligned rectangle
-//! the polygon is a 2-vertex `{{x0,y0}, {x1,y1}}`; for triangles or
-//! arbitrary shapes (3-way FFA, etc.) it grows to N vertices.
+//! Notes:
+//! - The top-level table is **NOT wrapped in `startboxes = { … }`**.
+//!   `startbox_utilities.lua:44` does
+//!   `startBoxConfig = WrappedInclude (mapsideBoxes)` and uses the
+//!   returned table directly as the per-ally-team map. Earlier
+//!   research had the shape wrong; verified by extracting
+//!   `titanduel_v3.sd7`'s file on 2026-05-19.
+//! - Polygon vertices are in **elmos**, not 0..1 fractions. The
+//!   modoptions-string codepath in `startbox_utilities.lua:56-59`
+//!   multiplies fractions by `Game.mapSizeX/Z`; the map-file codepath
+//!   does not.
 //!
 //! ## Source data
 //!
-//! `Project.ally_groups[i].box_polygon: Option<Vec<(f32, f32)>>`
-//! (introduced by B6). Each ally group's polygon emits as one entry
-//! keyed by its `id`. Groups without a polygon are skipped — leaving
-//! the file empty if no group has a box (and the file overall is
-//! empty if `ally_groups.len() <= 1`, since startboxes only matter for
-//! ≥ 2 sides).
+//! `Project.ally_groups[i].box_polygon: Option<Vec<(f32, f32)>>` is
+//! authored in **0..1 fractions** (map-relative). The emitter
+//! multiplies by the project's elmo extents at render time so the
+//! stored polygons remain resolution-independent.
 //!
-//! ## C2 placeholder
+//! ## Skip-when-empty rule (PITFALL §26)
 //!
-//! Until B6 lands `ally_groups`, this module emits an empty body for
-//! every project. The helper `ally_group_boxes` is the seam — B6 will
-//! repoint it at `project.ally_groups` and the emitter starts
-//! producing real output.
+//! When no ally group has an authored polygon we **do not ship**
+//! `map_startboxes.lua` at all. `startbox_utilities.lua:43` checks
+//! `VFS.FileExists` first; if absent, BAR falls back to a sensible
+//! default (N/S split for portrait maps, E/W for landscape) at
+//! lines 79–137. Shipping an empty file shadows that fallback and
+//! produces a map with no playable spawn regions — exactly the bug
+//! the user hit in the 2026-05-19 smoke test.
 
 use barme_core::Project;
 
 use crate::lua_ast::{LuaKey, LuaValue, serialize, sort_table_by_key};
 
-/// Render the canonical `return { startboxes = { … } }` text. Emits
-/// an empty placeholder when the project has fewer than 2 ally groups
-/// — startboxes are only meaningful for multi-side maps. Groups with
-/// `box_polygon == None` are silently skipped.
+/// Render `map_startboxes.lua` for projects whose ally groups carry
+/// authored polygons. Returns `None` when the file should NOT be
+/// shipped — see [`should_emit`] for the policy.
+pub fn render_optional(project: &Project) -> Option<String> {
+    if !should_emit(project) {
+        return None;
+    }
+    Some(render_inner(project))
+}
+
+/// Legacy entry point retained so existing callers / tests keep
+/// compiling. Returns an empty `return {}` body when [`should_emit`]
+/// says no — callers that care about the skip-when-empty policy
+/// (notably `crate::build_sd7`) should use [`render_optional`].
 pub fn render(project: &Project) -> String {
-    let table = if project.ally_groups.len() <= 1 {
-        // < 2 distinct sides → no useful startbox file. Emit an empty
-        // `startboxes = {}` placeholder so callers that grep for the
-        // file shape don't choke.
-        LuaValue::Table(vec![(LuaKey::str("startboxes"), LuaValue::Table(vec![]))])
+    if should_emit(project) {
+        render_inner(project)
     } else {
-        let mut boxes: Vec<(LuaKey, LuaValue)> = ally_group_boxes(project)
-            .into_iter()
-            .map(|(id, poly)| (LuaKey::int(id as i64), startbox_entry(&poly)))
-            .collect();
-        sort_table_by_key(&mut boxes);
-        LuaValue::Table(vec![(LuaKey::str("startboxes"), LuaValue::Table(boxes))])
-    };
-    let body = serialize(&table);
+        "-- Auto-generated by barme-pipeline (ADR-029); do not hand-edit.\n\
+         return {}\n"
+            .to_string()
+    }
+}
+
+/// Skip-when-empty policy. Two `&&`-gated conditions:
+///
+/// 1. The project has ≥ 2 ally groups (a single side never needs a
+///    startbox file — only multi-side play does).
+/// 2. At least one ally group has `box_polygon = Some(…)`.
+///
+/// Either condition false → return `false` → caller should NOT ship
+/// the file. BAR's startbox_utilities.lua fallback then generates
+/// default N/S or E/W boxes.
+pub fn should_emit(project: &Project) -> bool {
+    if project.ally_groups.len() <= 1 {
+        return false;
+    }
+    project.ally_groups.iter().any(|g| g.box_polygon.is_some())
+}
+
+fn render_inner(project: &Project) -> String {
+    let (ex, ez) = project.size.elmo_extents();
+    let (extent_x, extent_z) = (ex as f32, ez as f32);
+    let mut entries: Vec<(LuaKey, LuaValue)> = ally_group_boxes(project)
+        .into_iter()
+        .map(|(id, poly)| {
+            (
+                LuaKey::int(id as i64),
+                startbox_entry(&poly, extent_x, extent_z),
+            )
+        })
+        .collect();
+    sort_table_by_key(&mut entries);
+    let body = serialize(&LuaValue::Table(entries));
     format!(
         "-- Auto-generated by barme-pipeline (ADR-029); do not hand-edit.\n\
          return {body}\n"
     )
 }
 
-/// Build one `[id] = { boxes = { { {x,y}, … } }, startpoints = {} }`
-/// entry from a polygon. Polygons are stored as 0..1 fractions of the
-/// map extent.
-fn startbox_entry(polygon: &[(f32, f32)]) -> LuaValue {
+/// Build one `[id] = { boxes = { { {x,z}, … } }, startpoints = {…} }`
+/// entry from a polygon. Input polygons are 0..1 fractions; we
+/// multiply by the map extent here so the emitted file carries
+/// **elmo coordinates** (matching the consumer in
+/// `startbox_utilities.lua`). The `startpoints` field gets one entry
+/// at the polygon's centroid so players have a sensible default
+/// spawn location inside the box.
+fn startbox_entry(polygon: &[(f32, f32)], extent_x: f32, extent_z: f32) -> LuaValue {
+    let to_elmos = |(x, y): (f32, f32)| (x * extent_x, y * extent_z);
     let vertices: Vec<LuaValue> = polygon
         .iter()
-        .map(|&(x, y)| LuaValue::Seq(vec![LuaValue::Float(x as f64), LuaValue::Float(y as f64)]))
+        .map(|&p| {
+            let (xe, ye) = to_elmos(p);
+            LuaValue::Seq(vec![
+                LuaValue::Int(xe.round() as i64),
+                LuaValue::Int(ye.round() as i64),
+            ])
+        })
         .collect();
     let boxes = LuaValue::Seq(vec![LuaValue::Seq(vertices)]);
-    let startpoints = LuaValue::Seq(Vec::new());
+    // Centroid of the (0..1) polygon, also remapped to elmos.
+    let (cx, cz) = if polygon.is_empty() {
+        (extent_x * 0.5, extent_z * 0.5)
+    } else {
+        let n = polygon.len() as f32;
+        let sx: f32 = polygon.iter().map(|p| p.0).sum::<f32>() / n;
+        let sz: f32 = polygon.iter().map(|p| p.1).sum::<f32>() / n;
+        (sx * extent_x, sz * extent_z)
+    };
+    let startpoints = LuaValue::Seq(vec![LuaValue::Seq(vec![
+        LuaValue::Int(cx.round() as i64),
+        LuaValue::Int(cz.round() as i64),
+    ])]);
     let mut t = vec![
         (LuaKey::str("boxes"), boxes),
         (LuaKey::str("startpoints"), startpoints),
@@ -103,54 +172,128 @@ fn ally_group_boxes(project: &Project) -> Vec<(u8, Vec<(f32, f32)>)> {
 mod tests {
     use super::*;
 
+    /// PITFALL §26: skip the file entirely when there's only one
+    /// ally group — startboxes are a multi-side concept.
     #[test]
-    fn empty_when_under_two_ally_groups() {
+    fn render_optional_returns_none_when_under_two_ally_groups() {
         let p = Project::new("solo", 4);
-        let s = render(&p);
-        assert!(s.contains("startboxes = {}"), "got:\n{s}");
+        assert!(render_optional(&p).is_none());
+        assert!(!should_emit(&p));
+    }
+
+    /// PITFALL §26: skip when no ally group authored a polygon.
+    /// BAR's startbox_utilities.lua falls back to a sensible
+    /// default (N/S or E/W) when the file is absent — shipping an
+    /// empty file would suppress that fallback.
+    #[test]
+    fn render_optional_returns_none_when_no_polygons_authored() {
+        use barme_core::AllyGroup;
+        let mut p = Project::new("no-boxes", 4);
+        p.ally_groups.push(AllyGroup::new(0));
+        p.ally_groups.push(AllyGroup::new(1));
+        assert!(render_optional(&p).is_none());
+        assert!(!should_emit(&p));
+    }
+
+    /// Emitted output starts with the auto-generated banner.
+    #[test]
+    fn render_optional_some_when_at_least_one_polygon_authored() {
+        use barme_core::AllyGroup;
+        let mut p = Project::new("boxes", 4);
+        let mut g0 = AllyGroup::new(0);
+        g0.box_polygon = Some(vec![(0.0, 0.0), (1.0, 0.5)]);
+        p.ally_groups.push(g0);
+        p.ally_groups.push(AllyGroup::new(1));
+        let s = render_optional(&p).expect("should emit");
         assert!(s.starts_with("-- Auto-generated"), "header missing");
-    }
-
-    #[test]
-    fn output_uses_return_table_shape() {
-        let p = Project::new("ret", 4);
-        let s = render(&p);
         assert!(s.contains("return {"), "got:\n{s}");
-        assert!(s.contains("startboxes ="), "got:\n{s}");
     }
 
+    /// Shape pin: the top-level returned table is **NOT** wrapped in
+    /// `startboxes = { … }`. Verified by comparing against
+    /// `titanduel_v3.sd7`'s `mapconfig/map_startboxes.lua` on
+    /// 2026-05-19 — that file returns the per-ally-team map
+    /// directly (`return { [0] = {…}, [1] = {…} }`).
     #[test]
-    fn startbox_entry_renders_polygon_as_two_or_more_vertex_pairs() {
-        let poly = vec![(0.0, 0.0), (1.0, 0.12)];
-        let v = startbox_entry(&poly);
-        let s = serialize(&v);
-        assert!(s.contains("boxes ="), "got:\n{s}");
-        assert!(s.contains("startpoints = {}"), "got:\n{s}");
-        assert!(s.contains("0.0,"), "got:\n{s}");
-        assert!(s.contains("0.12,"), "got:\n{s}");
+    fn output_returns_unwrapped_ally_table() {
+        use barme_core::AllyGroup;
+        let mut p = Project::new("shape", 4);
+        let mut g0 = AllyGroup::new(0);
+        g0.box_polygon = Some(vec![(0.0, 0.0), (1.0, 0.5)]);
+        p.ally_groups.push(g0);
+        p.ally_groups.push(AllyGroup::new(1));
+        let s = render_optional(&p).expect("should emit");
+        // Must NOT have the legacy wrapper.
+        assert!(
+            !s.contains("startboxes ="),
+            "must NOT wrap output in `startboxes`; got:\n{s}"
+        );
+        assert!(s.contains("[0] = {"), "got:\n{s}");
     }
 
+    /// Coordinates are in elmos (multiplied by map extent), not
+    /// 0..1 fractions. Verified by comparing against
+    /// `titanduel_v3.sd7` which uses absolute integers like `{614,
+    /// 0}` for a 10×10 SMU map (5120 elmos / side).
     #[test]
-    fn startbox_polygon_layout_matches_research_8v8_example() {
-        // Per research §8: ally 0 = top strip, ally 1 = bottom strip.
-        let north = vec![(0.0, 0.0), (1.0, 0.12)];
-        let south = vec![(0.0, 0.88), (1.0, 1.0)];
-        let v_north = startbox_entry(&north);
-        let v_south = startbox_entry(&south);
-        let s_n = serialize(&v_north);
-        let s_s = serialize(&v_south);
-        assert!(s_n.contains("0.12,"), "n:\n{s_n}");
-        assert!(s_s.contains("0.88,"), "s:\n{s_s}");
+    fn polygon_coords_are_in_elmos_not_fractions() {
+        use barme_core::AllyGroup;
+        // 4 SMU → 2048 elmos per side.
+        let mut p = Project::new("elmos", 4);
+        let mut g0 = AllyGroup::new(0);
+        g0.box_polygon = Some(vec![(0.0, 0.0), (1.0, 0.5)]);
+        p.ally_groups.push(g0);
+        p.ally_groups.push(AllyGroup::new(1));
+        let s = render_optional(&p).expect("should emit");
+        // (1.0, 0.5) on a 2048×2048 map → (2048, 1024). The 0..1
+        // fraction form would produce literal `0.5` or `1.0`.
+        assert!(s.contains("2048"), "elmo coord missing; got:\n{s}");
+        assert!(s.contains("1024"), "elmo coord missing; got:\n{s}");
+        assert!(
+            !s.contains("0.5,") && !s.contains("0.5\n"),
+            "fraction leaked into emitted output; got:\n{s}"
+        );
     }
 
+    /// `startpoints` get one entry at the polygon centroid in elmos
+    /// — gives lobby clients a sensible default spawn position even
+    /// for arbitrary polygons.
     #[test]
-    fn determinism_repeated_render_byte_identical() {
-        let p = Project::new("det", 4);
-        let a = render(&p);
-        let b = render(&p);
-        assert_eq!(a, b);
+    fn startpoints_get_centroid_in_elmos() {
+        use barme_core::AllyGroup;
+        let mut p = Project::new("centroid", 4); // 2048 elmos / side
+        let mut g0 = AllyGroup::new(0);
+        // Quadrilateral with centroid at (0.5, 0.5).
+        g0.box_polygon = Some(vec![(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)]);
+        p.ally_groups.push(g0);
+        p.ally_groups.push(AllyGroup::new(1));
+        let s = render_optional(&p).expect("should emit");
+        // Centroid (0.5, 0.5) → (1024, 1024).
+        assert!(
+            s.contains("startpoints"),
+            "startpoints key missing; got:\n{s}"
+        );
+        let startpoint_segment = &s[s.find("startpoints").unwrap()..];
+        assert!(
+            startpoint_segment.contains("1024"),
+            "centroid elmo coord missing; got:\n{s}"
+        );
     }
 
+    /// Determinism gate for the SD7 archive hash.
+    #[test]
+    fn render_optional_is_deterministic() {
+        use barme_core::AllyGroup;
+        let mut p = Project::new("det", 4);
+        let mut g0 = AllyGroup::new(0);
+        g0.box_polygon = Some(vec![(0.0, 0.0), (1.0, 0.5)]);
+        p.ally_groups.push(g0);
+        p.ally_groups.push(AllyGroup::new(1));
+        assert_eq!(render_optional(&p), render_optional(&p));
+    }
+
+    /// Multi-side populated case: both ally groups get a keyed
+    /// `[N] = { boxes = …, startpoints = … }` entry.
     #[test]
     fn populated_ally_groups_emit_per_id_polygon_entries() {
         use barme_core::AllyGroup;
@@ -161,32 +304,27 @@ mod tests {
         g1.box_polygon = Some(vec![(0.0, 0.88), (1.0, 1.0)]);
         p.ally_groups.push(g0);
         p.ally_groups.push(g1);
-        let s = render(&p);
-        // Both ally groups produce keyed entries.
+        let s = render_optional(&p).expect("should emit");
         assert!(s.contains("[0] = {"), "got:\n{s}");
         assert!(s.contains("[1] = {"), "got:\n{s}");
-        // Each entry includes both `boxes` and `startpoints`.
-        // Use a leading-whitespace match so "startboxes =" doesn't
-        // double-count `boxes =`.
-        assert_eq!(s.matches("      boxes =").count(), 2, "got:\n{s}");
-        assert_eq!(s.matches("startpoints = {}").count(), 2, "got:\n{s}");
-        // Polygon coords appear.
-        assert!(s.contains("0.12,"), "got:\n{s}");
-        assert!(s.contains("0.88,"), "got:\n{s}");
+        // Two entries, each with their own `boxes =` and
+        // `startpoints =` line.
+        assert_eq!(s.matches("boxes =").count(), 2, "got:\n{s}");
+        assert_eq!(s.matches("startpoints =").count(), 2, "got:\n{s}");
     }
 
+    /// Skip-policy: a group with `box_polygon == None` is dropped
+    /// from the output. Other groups still emit.
     #[test]
     fn groups_without_polygon_are_skipped() {
         use barme_core::AllyGroup;
-        // Two ally groups → guard allows emission. Only the group
-        // with `box_polygon == Some(…)` produces an `[N] = …` entry.
         let mut p = Project::new("partial", 4);
         let mut g0 = AllyGroup::new(0);
         g0.box_polygon = Some(vec![(0.0, 0.0), (1.0, 0.5)]);
         let g1 = AllyGroup::new(1); // no polygon
         p.ally_groups.push(g0);
         p.ally_groups.push(g1);
-        let s = render(&p);
+        let s = render_optional(&p).expect("should emit");
         assert!(s.contains("[0] = {"), "got:\n{s}");
         assert!(
             !s.contains("[1] = {"),
