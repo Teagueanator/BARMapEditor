@@ -1899,6 +1899,35 @@ impl App {
         }
     }
 
+    /// World-space Y of the terrain surface at `(x_elmo, z_elmo)`.
+    /// Returns 0.0 when no heightmap is loaded.
+    ///
+    /// Sprint 13 hotfix (2026-05-19): markers built in PHASE A of
+    /// `central()` were constructed at world Y = 0 and lifted by
+    /// `MARKER_Y_LIFT_ELMOS = 2`, leaving them buried under any
+    /// terrain with relief at their XZ. Lifting to `terrain_y_at +
+    /// MARKER_Y_LIFT_ELMOS` puts the marker on the surface, where the
+    /// depth test still occludes it behind hills BETWEEN camera and
+    /// marker — only the same-pixel z-fight is removed.
+    ///
+    /// Sampling is nearest-neighbour at `ELMOS_PER_PIXEL = 8`; XZ
+    /// outside the heightmap clamps to the edge sample rather than
+    /// panicking. Sub-pixel accuracy isn't load-bearing for marker
+    /// placement so bilinear is deliberately deferred.
+    fn terrain_y_at(&self, x_elmo: f32, z_elmo: f32) -> f32 {
+        let Some(hm) = self.heightmap.as_ref() else {
+            return 0.0;
+        };
+        let (w, h) = hm.data.dims();
+        if w == 0 || h == 0 {
+            return 0.0;
+        }
+        let px = ((x_elmo / render::ELMOS_PER_PIXEL).round() as i32).clamp(0, w as i32 - 1) as u32;
+        let pz = ((z_elmo / render::ELMOS_PER_PIXEL).round() as i32).clamp(0, h as i32 - 1) as u32;
+        let raw = hm.data.data()[(pz as usize) * (w as usize) + (px as usize)];
+        (raw as f32 / 65535.0) * self.height_scale
+    }
+
     /// Ensure an ally group with `active_ally_group_id` exists,
     /// creating it on first F8 placement when the project is empty.
     /// Returns the active group's vec index for further mutation.
@@ -6565,7 +6594,8 @@ impl App {
                                 self.pulsing_marker = None;
                             }
                         }
-                        let world = glam::Vec3::new(pos.x_elmo as f32, 0.0, pos.z_elmo as f32);
+                        let y = self.terrain_y_at(pos.x_elmo as f32, pos.z_elmo as f32);
+                        let world = glam::Vec3::new(pos.x_elmo as f32, y, pos.z_elmo as f32);
                         marker_batch.push(crate::ui::markers::Marker {
                             world_pos: world,
                             radius_px: r,
@@ -6580,8 +6610,9 @@ impl App {
                                 if mx < 0.0 || mx > extents.0 || mz < 0.0 || mz > extents.1 {
                                     continue;
                                 }
+                                let my = self.terrain_y_at(mx, mz);
                                 marker_batch.push(crate::ui::markers::Marker {
-                                    world_pos: glam::Vec3::new(mx, 0.0, mz),
+                                    world_pos: glam::Vec3::new(mx, my, mz),
                                     radius_px: 7.0,
                                     color: base_color,
                                     shape: crate::ui::markers::MarkerShape::OutlineRing,
@@ -6608,7 +6639,8 @@ impl App {
                 );
                 let radius_world = self.extractor_radius.max(8.0);
                 for (i, spot) in self.metal_spots.iter().enumerate() {
-                    let world = glam::Vec3::new(spot.x_elmo as f32, 0.0, spot.z_elmo as f32);
+                    let y = self.terrain_y_at(spot.x_elmo as f32, spot.z_elmo as f32);
+                    let world = glam::Vec3::new(spot.x_elmo as f32, y, spot.z_elmo as f32);
                     let dragging = self.dragging_metal_spot == Some(i);
                     let r = if dragging { 10.0_f32 } else { 7.0_f32 };
                     marker_batch.push(crate::ui::markers::Marker {
@@ -6618,11 +6650,9 @@ impl App {
                         shape: crate::ui::markers::MarkerShape::FilledWithStroke,
                     });
                     if !cross_tool_ghost {
-                        let east = glam::Vec3::new(
-                            spot.x_elmo as f32 + radius_world,
-                            0.0,
-                            spot.z_elmo as f32,
-                        );
+                        let east_x = spot.x_elmo as f32 + radius_world;
+                        let east_y = self.terrain_y_at(east_x, spot.z_elmo as f32);
+                        let east = glam::Vec3::new(east_x, east_y, spot.z_elmo as f32);
                         if let (Some(centre_screen), Some(east_screen)) = (
                             render::world_to_screen(world, rect_size, &self.camera),
                             render::world_to_screen(east, rect_size, &self.camera),
@@ -6646,8 +6676,9 @@ impl App {
                             if mx < 0.0 || mx > extents.0 || mz < 0.0 || mz > extents.1 {
                                 continue;
                             }
+                            let my = self.terrain_y_at(mx, mz);
                             marker_batch.push(crate::ui::markers::Marker {
-                                world_pos: glam::Vec3::new(mx, 0.0, mz),
+                                world_pos: glam::Vec3::new(mx, my, mz),
                                 radius_px: 6.0,
                                 color: red_fill,
                                 shape: crate::ui::markers::MarkerShape::OutlineRing,
@@ -6665,7 +6696,8 @@ impl App {
                 let alpha_mul: u8 = if cross_tool_ghost { 128 } else { 255 };
                 let orange = egui::Color32::from_rgba_unmultiplied(0xF5, 0x9E, 0x0B, alpha_mul);
                 for (i, vent) in self.geo_vents.iter().enumerate() {
-                    let world = glam::Vec3::new(vent.x_elmo as f32, 0.0, vent.z_elmo as f32);
+                    let y = self.terrain_y_at(vent.x_elmo as f32, vent.z_elmo as f32);
+                    let world = glam::Vec3::new(vent.x_elmo as f32, y, vent.z_elmo as f32);
                     let dragging = self.dragging_geo_vent == Some(i);
                     let size = if dragging { 12.0_f32 } else { 9.0_f32 };
                     marker_batch.push(crate::ui::markers::Marker {
@@ -6682,8 +6714,9 @@ impl App {
                             if mx < 0.0 || mx > extents.0 || mz < 0.0 || mz > extents.1 {
                                 continue;
                             }
+                            let my = self.terrain_y_at(mx, mz);
                             marker_batch.push(crate::ui::markers::Marker {
-                                world_pos: glam::Vec3::new(mx, 0.0, mz),
+                                world_pos: glam::Vec3::new(mx, my, mz),
                                 radius_px: 7.0,
                                 color: orange,
                                 shape: crate::ui::markers::MarkerShape::OutlineTriangle,
@@ -6715,9 +6748,15 @@ impl App {
                 let alpha_mul: u8 = if cross_tool_ghost { 128 } else { 255 };
                 let plume_color =
                     egui::Color32::from_rgba_unmultiplied(0xF5, 0x9E, 0x0B, alpha_mul / 3);
+                // Line vertices are NOT auto-lifted by
+                // `MarkerBatch::into_instances` (that path is markers-only),
+                // so the plume's base Y must be terrain_y + the marker
+                // Y-lift epsilon manually.
                 let lift = crate::ui::markers::MARKER_Y_LIFT_ELMOS;
                 for vent in &self.geo_vents {
-                    let base = glam::Vec3::new(vent.x_elmo as f32, lift, vent.z_elmo as f32);
+                    let base_y = self.terrain_y_at(vent.x_elmo as f32, vent.z_elmo as f32);
+                    let base =
+                        glam::Vec3::new(vent.x_elmo as f32, base_y + lift, vent.z_elmo as f32);
                     let top = base + glam::Vec3::new(0.0, PLUME_HEIGHT_ELMOS, 0.0);
                     line_vertices.push(crate::render::LineVertex::new(base, plume_color));
                     line_vertices.push(crate::render::LineVertex::new(top, plume_color));
@@ -8533,5 +8572,124 @@ mod tests {
             depth_after_place,
             "zero-distance drag must not push an undo entry"
         );
+    }
+
+    // ---------------- terrain_y_at (Sprint 13 hotfix) ----------------
+    //
+    // Bug 1: PHASE A marker construction in `central()` used a hard-
+    // coded world-Y = 0 which buried markers under any non-flat
+    // terrain. `terrain_y_at` samples the loaded heightmap to lift
+    // each marker to the surface; the existing `MARKER_Y_LIFT_ELMOS`
+    // continues to add the small epsilon on top.
+
+    /// Plant `data` (row-major, dims-matched) on `app` at `map_size`.
+    /// Skips PNG IO / dim validation — direct construction is fine
+    /// for these unit tests.
+    fn install_heightmap_with_data(app: &mut App, map_size: MapSize, data: Vec<u16>) {
+        let dims = map_size.heightmap_dims();
+        assert_eq!(
+            data.len(),
+            (dims.0 as usize) * (dims.1 as usize),
+            "test fixture data length must match map_size heightmap dims"
+        );
+        let hm = Heightmap::new(dims.0, dims.1, data).expect("build test heightmap");
+        app.map_size = map_size;
+        app.heightmap = Some(HeightmapState {
+            path: std::path::PathBuf::from("<fixture>"),
+            data: hm,
+            dims,
+            min: 0,
+            max: u16::MAX,
+            validated_against: Some(map_size),
+        });
+    }
+
+    #[test]
+    fn terrain_y_at_returns_zero_without_heightmap() {
+        // `App::heightmap` = None ⇒ no panic, returns 0.0 regardless
+        // of XZ (including out-of-map coordinates). This is the early-
+        // out path used during empty-state CTA rendering.
+        let app = make_test_app();
+        assert_eq!(app.terrain_y_at(0.0, 0.0), 0.0);
+        assert_eq!(app.terrain_y_at(123.0, 456.0), 0.0);
+        assert_eq!(app.terrain_y_at(-9999.0, 9999.0), 0.0);
+    }
+
+    #[test]
+    fn terrain_y_at_samples_known_value() {
+        // 2-SMU square map: heightmap dims = 64*2 + 1 = 129×129.
+        // Plant a single non-zero sample at the centre pixel and
+        // verify `terrain_y_at` decodes the same world-Y the terrain
+        // shader would (raw / 65535 * height_scale).
+        let mut app = make_test_app();
+        let map_size = MapSize::square(2);
+        let dims = map_size.heightmap_dims();
+        let (w, h) = (dims.0 as usize, dims.1 as usize);
+        let mut data = vec![0u16; w * h];
+        // Centre pixel (64, 64) — corresponds to XZ = (64*8, 64*8) =
+        // (512, 512) elmos.
+        data[64 * w + 64] = 32768;
+        install_heightmap_with_data(&mut app, map_size, data);
+        app.height_scale = 1000.0;
+
+        let y = app.terrain_y_at(512.0, 512.0);
+        let expected = (32768.0 / 65535.0) * 1000.0;
+        assert!((y - expected).abs() < 1e-3, "expected {expected}, got {y}",);
+    }
+
+    #[test]
+    fn terrain_y_at_clamps_out_of_bounds() {
+        // XZ way past the map extent must clamp to the edge sample,
+        // not panic and not wrap. Plant a known value at the very
+        // last pixel; sample at +∞ XZ; expect the edge value.
+        let mut app = make_test_app();
+        let map_size = MapSize::square(2);
+        let dims = map_size.heightmap_dims();
+        let (w, h) = (dims.0 as usize, dims.1 as usize);
+        let mut data = vec![0u16; w * h];
+        data[(h - 1) * w + (w - 1)] = u16::MAX;
+        install_heightmap_with_data(&mut app, map_size, data);
+        app.height_scale = 500.0;
+
+        // (1_000_000, 1_000_000) is well past the 1024-elmo extent;
+        // the clamp picks the (w-1, h-1) sample = u16::MAX.
+        let y_far = app.terrain_y_at(1_000_000.0, 1_000_000.0);
+        assert!(
+            (y_far - 500.0).abs() < 1e-3,
+            "expected 500.0 (clamped to edge), got {y_far}",
+        );
+
+        // Negative XZ clamps to (0, 0) which is the zero pixel.
+        let y_neg = app.terrain_y_at(-1_000_000.0, -1_000_000.0);
+        assert!((y_neg - 0.0).abs() < 1e-3, "expected 0.0, got {y_neg}");
+    }
+
+    #[test]
+    fn terrain_y_at_rounds_to_nearest_pixel() {
+        // ELMOS_PER_PIXEL = 8 → pixel 1 = elmos [4, 12). Place a
+        // value at pixel (1, 0). Sampling at 4.0 elmos rounds DOWN
+        // to pixel 0 (round-half-to-even via f32::round); 8.0 elmos
+        // is exactly pixel 1; 7.9 elmos rounds to pixel 1.
+        let mut app = make_test_app();
+        let map_size = MapSize::square(2);
+        let dims = map_size.heightmap_dims();
+        let (w, h) = (dims.0 as usize, dims.1 as usize);
+        let mut data = vec![0u16; w * h];
+        data[1] = u16::MAX; // pixel (1, 0)
+        install_heightmap_with_data(&mut app, map_size, data);
+        app.height_scale = 100.0;
+
+        // Pixel 0 → samples the zero pixel.
+        assert!((app.terrain_y_at(0.0, 0.0) - 0.0).abs() < 1e-3);
+        // Pixel 1 → samples the planted value.
+        assert!((app.terrain_y_at(8.0, 0.0) - 100.0).abs() < 1e-3);
+        // 7.9 elmos rounds to pixel 1.
+        assert!(
+            (app.terrain_y_at(7.9, 0.0) - 100.0).abs() < 1e-3,
+            "got {}",
+            app.terrain_y_at(7.9, 0.0),
+        );
+        // 3.9 elmos rounds DOWN to pixel 0 → zero.
+        assert!((app.terrain_y_at(3.9, 0.0) - 0.0).abs() < 1e-3);
     }
 }
