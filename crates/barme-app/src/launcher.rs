@@ -28,6 +28,26 @@ use barme_pipeline::{PyMapConvDriver, build_sd7};
 use image::{ImageBuffer, Rgb};
 use tracing::{info, warn};
 
+/// Biome gradient matching the editor's `terrain.wgsl::biome_ramp`
+/// fallback (the height-keyed colour you see in the central viewport
+/// when no splat is painted). Returned values are sRGB f32 in `[0,1]`.
+///
+/// Keep this **byte-equal** to the WGSL implementation so the baked
+/// texture matches the editor preview. The cutoff thresholds and the
+/// four colours are the canonical reference; changes here must be
+/// mirrored to `crates/barme-app/src/terrain.wgsl::biome_ramp`.
+fn biome_ramp(t: f32) -> [f32; 3] {
+    if t < 0.05 {
+        [0.227, 0.451, 0.604] // shoreline / water
+    } else if t < 0.50 {
+        [0.451, 0.616, 0.392] // grass
+    } else if t < 0.82 {
+        [0.502, 0.486, 0.439] // rock / dirt
+    } else {
+        [0.863, 0.878, 0.902] // snow / peak
+    }
+}
+
 /// Sub-path BAR's spring-launcher writes under each platform's resolved
 /// write root. The leaf `maps/` is where archive scanner expects custom
 /// `.sd7` files (per `RecoilEngine` `ArchiveScanner.cpp` and the
@@ -163,7 +183,12 @@ pub fn build_and_install(
     })?;
     let work = workdir.path();
 
-    // Stage 0 fallback: a flat grey BMP if the project has no texture yet.
+    // No caller-supplied texture? Bake one from the heightmap using
+    // the same biome ramp the editor preview uses (`biome_ramp` in
+    // `launcher.rs` + `terrain.wgsl`). Until D6 / Sprint 12 wires
+    // splat-distribution export, this is the "what you see is what
+    // you get" path — without it the texture would be flat grey and
+    // BAR would render the entire map in monochrome.
     let synth_path;
     let tex = match texture_bmp {
         Some(p) => {
@@ -171,7 +196,7 @@ pub fn build_and_install(
             p
         }
         None => {
-            synth_path = work.join("synth_grey.bmp");
+            synth_path = work.join("synth_biome.bmp");
             let (tw, th) = project.size.texture_dims();
             // 8 SMU = 4096² → ~48 MB RGB; 16 SMU = 8192² → ~192 MB. Warn-level
             // for ≥16 SMU so the user knows what the brief stall is.
@@ -181,19 +206,21 @@ pub fn build_and_install(
                     width = tw,
                     height = th,
                     bytes_estimate,
-                    "synthesizing fallback grey texture (large; replace with real \
-                     texture import once F4 lands)"
+                    "baking fallback biome texture (large; replace with painted \
+                     splat distribution once D6 / Sprint 12 wires the splat export)"
                 );
             } else {
                 info!(
                     width = tw,
                     height = th,
-                    "synthesizing fallback grey texture"
+                    "baking fallback biome texture from heightmap"
                 );
             }
-            synth_grey_bmp(&synth_path, tw, th).map_err(|source| LauncherError::TextureSynth {
-                path: synth_path.clone(),
-                source,
+            synth_biome_bmp(heightmap_png, &synth_path, tw, th).map_err(|source| {
+                LauncherError::TextureSynth {
+                    path: synth_path.clone(),
+                    source,
+                }
             })?;
             synth_path.as_path()
         }
@@ -208,8 +235,67 @@ pub fn build_and_install(
     Ok(installed)
 }
 
-fn synth_grey_bmp(path: &Path, w: u32, h: u32) -> Result<(), image::ImageError> {
-    let buf: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::from_pixel(w, h, Rgb([128, 128, 128]));
+/// Bake a colored BMP from the 16-bit heightmap PNG by sampling it
+/// per texture pixel (nearest-neighbour) and applying the biome ramp.
+///
+/// Why a real bake (not a CPU upload of the editor's GPU texture):
+/// the editor's terrain shader composites diffuse on the GPU from a
+/// `splat_distribution` + bound slot diffuses + a height-keyed fallback
+/// gradient. The `.sd7` needs a single baked diffuse BMP at the SMF
+/// texture resolution (`512 × smu_x` per side). Until D6 / Sprint 12
+/// ships the splat-distribution exporter, this height-keyed fallback
+/// is the closest the SD7 can get to the editor preview without a
+/// hard "your map is grey" jump.
+///
+/// Performance: 16 SMU = 8192² texture, 1025² heightmap, ~67M
+/// per-pixel samples. Runs in ~200–500 ms in release; the
+/// `>=100 MB` warn at the call site flags the cost.
+fn synth_biome_bmp(
+    heightmap_png: &Path,
+    path: &Path,
+    w: u32,
+    h: u32,
+) -> Result<(), image::ImageError> {
+    // Load the 16-bit grayscale heightmap. `image::open(...).into_luma16()`
+    // converts any input to 16-bit grayscale; a missing heightmap path
+    // surfaces as the `image::ImageError` we return.
+    let hm = image::open(heightmap_png)?.into_luma16();
+    let hm_w = hm.width();
+    let hm_h = hm.height();
+    if hm_w == 0 || hm_h == 0 {
+        return Err(image::ImageError::IoError(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "heightmap PNG has zero dimensions",
+        )));
+    }
+    info!(
+        hm_w,
+        hm_h, w, h, "baking biome texture (nearest-neighbour upsample)"
+    );
+
+    let mut buf: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::new(w, h);
+    // Pre-multiply the sample-step ratio once per row dimension so the
+    // inner loop stays a pair of integer multiplies.
+    let denom_x = (w - 1).max(1) as u64;
+    let denom_y = (h - 1).max(1) as u64;
+    let hm_last_x = (hm_w - 1) as u64;
+    let hm_last_y = (hm_h - 1) as u64;
+    for (tx, ty, p) in buf.enumerate_pixels_mut() {
+        let hx = (tx as u64 * hm_last_x / denom_x) as u32;
+        let hy = (ty as u64 * hm_last_y / denom_y) as u32;
+        let pixel = hm.get_pixel(hx, hy);
+        // t ∈ [0, 1] maps to the same domain as terrain.wgsl's
+        // `t = world_pos.y / max_height`. Since the heightmap pixel
+        // is the world height linearly scaled into 0..65535, dividing
+        // by 65535 yields the same normalised t.
+        let t = (pixel[0] as f32) / 65535.0;
+        let rgb = biome_ramp(t);
+        *p = Rgb([
+            (rgb[0].clamp(0.0, 1.0) * 255.0) as u8,
+            (rgb[1].clamp(0.0, 1.0) * 255.0) as u8,
+            (rgb[2].clamp(0.0, 1.0) * 255.0) as u8,
+        ]);
+    }
     buf.save(path)
 }
 
@@ -241,6 +327,54 @@ mod tests {
         assert_eq!(dst, dst_dir.join("fake.sd7"));
         assert!(dst.is_file());
         assert_eq!(std::fs::read(&dst).unwrap(), b"7z\xbc\xaf'\x1c");
+    }
+
+    /// Biome ramp matches `terrain.wgsl::biome_ramp` thresholds.
+    /// Locking the rules here keeps the baked SD7 texture aligned
+    /// with the editor preview.
+    #[test]
+    fn biome_ramp_thresholds_match_wgsl() {
+        // Water tier: t < 0.05.
+        assert_eq!(biome_ramp(0.0), [0.227, 0.451, 0.604]);
+        assert_eq!(biome_ramp(0.04), [0.227, 0.451, 0.604]);
+        // Grass tier: 0.05 <= t < 0.50.
+        assert_eq!(biome_ramp(0.05), [0.451, 0.616, 0.392]);
+        assert_eq!(biome_ramp(0.49), [0.451, 0.616, 0.392]);
+        // Rock tier: 0.50 <= t < 0.82.
+        assert_eq!(biome_ramp(0.50), [0.502, 0.486, 0.439]);
+        assert_eq!(biome_ramp(0.81), [0.502, 0.486, 0.439]);
+        // Snow tier: t >= 0.82.
+        assert_eq!(biome_ramp(0.82), [0.863, 0.878, 0.902]);
+        assert_eq!(biome_ramp(1.0), [0.863, 0.878, 0.902]);
+    }
+
+    /// Synthesizing a biome BMP from a tiny gradient heightmap
+    /// produces the expected tier colours at the sampled pixels.
+    #[test]
+    fn synth_biome_bmp_samples_heightmap_per_pixel() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Build a 5×1 16-bit grayscale gradient: 0, 16k, 32k, 48k, 64k.
+        // These land in water / grass / rock / rock / snow tiers.
+        let mut hm: ImageBuffer<image::Luma<u16>, Vec<u16>> = ImageBuffer::new(5, 1);
+        for (i, p) in hm.pixels_mut().enumerate() {
+            // Cast through u32 to avoid u16 overflow at i=4 (4*16384=65536).
+            let v = ((i as u32) * 16384).min(65535) as u16;
+            *p = image::Luma([v]);
+        }
+        let hm_path = tmp.path().join("hm.png");
+        hm.save(&hm_path).unwrap();
+
+        let out = tmp.path().join("bake.bmp");
+        synth_biome_bmp(&hm_path, &out, 5, 1).unwrap();
+
+        let baked = image::open(&out).unwrap().to_rgb8();
+        assert_eq!(baked.dimensions(), (5, 1));
+        // Pixel 0: t=0 → water tier.
+        assert_eq!(baked.get_pixel(0, 0)[0], (0.227 * 255.0) as u8);
+        // Pixel 1: t≈0.25 → grass tier.
+        assert_eq!(baked.get_pixel(1, 0)[1], (0.616 * 255.0) as u8);
+        // Pixel 4: t≈1.0 → snow tier.
+        assert_eq!(baked.get_pixel(4, 0)[0], (0.863 * 255.0) as u8);
     }
 
     #[test]

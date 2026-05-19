@@ -198,7 +198,24 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let n = normalize(in.world_normal);
     let l = normalize(sp.sun_dir.xyz);
     let n_dot_l = clamp(dot(n, l), 0.0, 1.0);
-    let lit = base_rgb * (sp.ground_ambient.rgb + sp.ground_diffuse.rgb * n_dot_l);
+    var lit = base_rgb * (sp.ground_ambient.rgb + sp.ground_diffuse.rgb * n_dot_l);
+
+    // Buildable-area overlay (Sprint 11 hotfix follow-up). When
+    // `flags.z == 1`, mix red into the composite where the surface is
+    // too steep for a factory. BAR's `armlab.lua` / `corlab.lua` set
+    // `maxslope = 15`; the engine divides by 1.5 in `movedefs.lua:551`
+    // so the effective cap is ~10°. `cos(10°) ≈ 0.9848`. The world
+    // normal here is vertex-derived (the wgpu pipeline writes per-vertex
+    // normals from the heightmap gradient) so the predicate matches
+    // the actual ground tangent the engine would compute.
+    let buildable_on = sp.flags.z;
+    if (buildable_on == 1u) {
+        let cos_max_slope = 0.9848;
+        if (n.y < cos_max_slope) {
+            let too_steep = vec3<f32>(0.95, 0.20, 0.20);
+            lit = mix(lit, too_steep, 0.55);
+        }
+    }
 
     return vec4<f32>(lit, 1.0);
 }

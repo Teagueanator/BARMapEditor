@@ -253,6 +253,14 @@ struct App {
     grid_overlay_on: bool,
     lighting_on: bool,
     wireframe_on: bool,
+    /// Sprint 11 hotfix follow-up: viewport overlay that shades
+    /// terrain too steep for a factory in red. Factory `maxslope`
+    /// is 15 (BAR `armlab.lua`/`corlab.lua`); the engine divides by
+    /// 1.5 → effective cap of ~10°. The fragment shader checks
+    /// `world_normal.y < cos(10°)` ≈ `0.9848` and mixes in red.
+    /// Mex spots use a more generous 20° cap (mex `maxslope = 30`)
+    /// — surfaced as a hover-tooltip nuance, not a separate mode.
+    buildable_overlay_on: bool,
     /// D5 / Sprint 9: persisted per-channel slot bindings, scales,
     /// mults, and the ADR-034 placeholder toggle. Round-trips through
     /// `Project.splat_config` on save / open. Replaces the Phase-7
@@ -805,6 +813,7 @@ impl App {
             grid_overlay_on: false,
             lighting_on: true,
             wireframe_on: false,
+            buildable_overlay_on: false,
             splat_config: SplatConfig::default(),
             splat_distribution: None,
             splat_brush_state: SplatBrushState::default(),
@@ -1475,7 +1484,7 @@ impl App {
             flags: [
                 self.splat_config.active_mask(),
                 u32::from(self.splat_config.diffuse_in_alpha),
-                0,
+                u32::from(self.buildable_overlay_on),
                 0,
             ],
             sun_dir: base.sun_dir,
@@ -6066,6 +6075,7 @@ impl App {
                 &mut self.grid_overlay_on,
                 &mut self.lighting_on,
                 &mut self.wireframe_on,
+                &mut self.buildable_overlay_on,
             );
 
             // Bottom-centre first-launch hint strip (ADR-035 replaces
@@ -6271,6 +6281,7 @@ mod tests {
             grid_overlay_on: false,
             lighting_on: true,
             wireframe_on: false,
+            buildable_overlay_on: false,
             splat_config: SplatConfig::default(),
             splat_distribution: None,
             splat_brush_state: SplatBrushState::default(),
@@ -6848,6 +6859,28 @@ mod tests {
         // R + B bound → mask = 0b101 = 5.
         assert_eq!(su.flags[0], 0b101);
         assert_eq!(su.flags[1], 1);
+        // buildable_overlay_on defaults to false.
+        assert_eq!(su.flags[2], 0);
+    }
+
+    /// Buildable-area toggle propagates to `splat_uniforms.flags.z`
+    /// (the bit the WGSL fragment shader checks for the red-mask
+    /// overlay).
+    #[test]
+    fn buildable_overlay_flag_propagates_to_uniforms() {
+        let mut app = make_test_app();
+        assert_eq!(app.splat_uniforms_for_render().flags[2], 0);
+        app.buildable_overlay_on = true;
+        assert_eq!(app.splat_uniforms_for_render().flags[2], 1);
+        app.buildable_overlay_on = false;
+        assert_eq!(app.splat_uniforms_for_render().flags[2], 0);
+    }
+
+    /// Fresh app default: buildable overlay starts off.
+    #[test]
+    fn fresh_app_buildable_overlay_default_off() {
+        let app = make_test_app();
+        assert!(!app.buildable_overlay_on);
     }
 
     #[test]

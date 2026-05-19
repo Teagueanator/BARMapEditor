@@ -63,12 +63,16 @@ struct Uniforms {
 pub struct SplatUniforms {
     pub tex_scales: [f32; 4],
     pub tex_mults: [f32; 4],
-    /// `[active_slot_mask, diffuse_in_alpha, _, _]`. The mask bit `i`
-    /// is set when channel `i` is bound to a slot (mirrors
-    /// `Project.splat_config.channels[i].is_some()` from D5).
-    /// `diffuse_in_alpha` plumbs ADR-034's high-pass workflow toggle
-    /// through the uniform buffer; the shader treats it as a no-op
-    /// this sprint.
+    /// `[active_slot_mask, diffuse_in_alpha, buildable_overlay_on, _]`.
+    /// - **`flags.x`** mask bit `i` is set when channel `i` is bound
+    ///   to a slot (mirrors `Project.splat_config.channels[i].is_some()`
+    ///   from D5).
+    /// - **`flags.y`** plumbs ADR-034's high-pass workflow toggle
+    ///   through the uniform buffer; the shader treats it as a no-op
+    ///   this sprint.
+    /// - **`flags.z`** = `1` when the viewport's buildable-area
+    ///   overlay is on. The fragment shader mixes red into the
+    ///   composite where `world_normal.y < cos(10°)` (factory cap).
     pub flags: [u32; 4],
     /// World-space to-sun direction. `.w` unused.
     pub sun_dir: [f32; 4],

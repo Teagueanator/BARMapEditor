@@ -63,6 +63,9 @@ pub enum Icon {
     Crystal,
     Spray,
     Compass,
+    /// Buildable-area toggle — a small grid with a check mark in one
+    /// cell, signifying "valid build footprints".
+    Build,
 
     // Symmetry glyphs (used in the top-bar mode dropdown)
     SymH,
@@ -115,6 +118,7 @@ pub const ALL: &[Icon] = &[
     Icon::Crystal,
     Icon::Spray,
     Icon::Compass,
+    Icon::Build,
     Icon::SymH,
     Icon::SymV,
     Icon::SymQ,
@@ -477,6 +481,14 @@ pub fn paint_icon(
             mapper.circle_filled(painter, color, (20, 9), 1);
             mapper.circle_filled(painter, color, (18, 10), 1);
         }
+        Icon::Build => {
+            // 2x2 grid of cells with a check in the lower-right cell
+            // (signifies "buildable footprints" semantically).
+            mapper.rect(painter, stroke, (4, 4), (20, 20));
+            mapper.line(painter, stroke, (12, 4), (12, 20));
+            mapper.line(painter, stroke, (4, 12), (20, 12));
+            mapper.poly_line(painter, stroke, &[(13, 16), (15, 18), (19, 14)], false);
+        }
         Icon::Compass => {
             mapper.circle(painter, stroke, (12, 12), 9);
             mapper.poly_line(
@@ -696,7 +708,7 @@ mod tests {
     fn all_catalogue_covers_every_variant() {
         // Every named variant should appear in ALL — otherwise the
         // cheat-sheet icon gallery skips icons silently.
-        let expected_variants = 42; // bump when adding icons
+        let expected_variants = 43; // bump when adding icons
         assert_eq!(
             ALL.len(),
             expected_variants,

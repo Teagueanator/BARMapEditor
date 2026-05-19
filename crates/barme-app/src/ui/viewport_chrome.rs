@@ -114,6 +114,7 @@ pub fn viewport_options_toolbar(
     grid: &mut bool,
     lighting: &mut bool,
     wireframe: &mut bool,
+    buildable: &mut bool,
 ) -> bool {
     let t = Tokens::DARK;
     let mut changed = false;
@@ -134,6 +135,20 @@ pub fn viewport_options_toolbar(
                 }
                 if vp_toggle_btn(ui, Icon::Wire, *wireframe, "Wireframe (W)") {
                     *wireframe = !*wireframe;
+                    changed = true;
+                }
+                // Buildable-area overlay (Sprint 11 hotfix follow-up).
+                // Red mask in the viewport over terrain that's too steep
+                // for a factory (slope > 10° per the BAR research:
+                // `armlab.lua` / `corlab.lua` set `maxslope = 15`, the
+                // engine divides by 1.5 → effective 10° cap).
+                if vp_toggle_btn(
+                    ui,
+                    Icon::Build,
+                    *buildable,
+                    "Buildable area for factories (red = too steep, >10° slope)",
+                ) {
+                    *buildable = !*buildable;
                     changed = true;
                 }
             });
