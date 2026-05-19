@@ -223,7 +223,19 @@ fn atmosphere_block(b: &barme_core::AtmosphereBlock) -> LuaValue {
     push_rgb(&mut t, "fogColor", b.fog_color);
     push_rgb(&mut t, "sunColor", b.sun_color);
     push_rgb(&mut t, "skyColor", b.sky_color);
-    push_rgb(&mut t, "skyDir", b.sky_dir);
+    // PITFALL §12 / FINDINGS §1.3 — `skyDir` is deprecated; engine
+    // logs `L_DEPRECATED` if it sees the key (MapInfo.cpp:144-146).
+    // `skyAxisAngle` is the float4 (axis xyz + radians angle) reader
+    // since the rewrite — see `MapInfo.cpp:149`.
+    t.push((
+        LuaKey::str("skyAxisAngle"),
+        LuaValue::Seq(
+            b.sky_axis_angle
+                .iter()
+                .map(|&f| LuaValue::Float(f as f64))
+                .collect(),
+        ),
+    ));
     if let Some(s) = &b.sky_box {
         t.push((LuaKey::str("skyBox"), LuaValue::str(s)));
     }
@@ -866,6 +878,48 @@ mod tests {
         assert!(
             s.contains("voidAlphaMin = 0.9"),
             "expected voidAlphaMin = 0.9 with void_ground on; got:\n{s}"
+        );
+    }
+
+    /// PITFALL §12 / FINDINGS §1.3: atmosphere emits `skyAxisAngle`
+    /// (the engine's current key) and never the deprecated `skyDir`.
+    /// Default value is the engine's `[0, 0, 1, 0]` per
+    /// `MapInfo.cpp:149` — +Z axis, 0 radians.
+    #[test]
+    fn atmosphere_emits_sky_axis_angle_not_legacy_sky_dir() {
+        let p = Project::new("sky", 4);
+        let s = render(&p);
+        assert!(
+            s.contains("skyAxisAngle = {"),
+            "expected skyAxisAngle table; got:\n{s}"
+        );
+        // The engine logs L_DEPRECATED if it sees `skyDir`. Catch
+        // any future regression here.
+        assert!(
+            !s.contains("skyDir = "),
+            "deprecated skyDir leaked into output; got:\n{s}"
+        );
+        // Default value matches engine `[0, 0, 1, 0]` exactly.
+        // Match against the canonical 4-float serialized form.
+        let needle = "skyAxisAngle = {\n      0.0,\n      0.0,\n      1.0,\n      0.0,\n    }";
+        assert!(
+            s.contains(needle),
+            "skyAxisAngle default block missing; want\n{needle}\ngot:\n{s}"
+        );
+    }
+
+    /// PITFALL §12: an authored `sky_axis_angle` value with a
+    /// non-zero rotation angle round-trips into the rendered text.
+    #[test]
+    fn atmosphere_emits_authored_sky_axis_angle() {
+        let p = Project::new("rotsky", 4);
+        let mut info: MapInfo = (&p).into();
+        info.atmosphere.sky_axis_angle = [0.0, 1.0, 0.0, 1.5];
+        let s = render_mapinfo(&info);
+        let needle = "skyAxisAngle = {\n      0.0,\n      1.0,\n      0.0,\n      1.5,\n    }";
+        assert!(
+            s.contains(needle),
+            "authored skyAxisAngle didn't survive emission; want\n{needle}\ngot:\n{s}"
         );
     }
 

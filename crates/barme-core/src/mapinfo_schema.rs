@@ -244,7 +244,18 @@ pub struct LightingBlock {
 }
 
 /// `atmosphere.*` sub-table — wind range, fog, sky tinting, skybox.
+///
+/// **Migration (PITFALL §12 / FINDINGS §1.3):** pre-Sprint-10
+/// `.barmeproj` / `MapInfo` fixtures carry a legacy
+/// `sky_dir: [f32; 3]` key. Deserialization routes through
+/// [`AtmosphereBlockWire`] which accepts either `sky_axis_angle`
+/// (the new key) or `sky_dir` (legacy) and emits the canonical
+/// shape: `sky_axis_angle = [x, y, z, 0.0]` when only legacy data
+/// is present (preserves the original direction; sets angle = 0
+/// radians, i.e. no skybox rotation). Engine default is
+/// `[0, 0, 1, 0]` per `MapInfo.cpp:149`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(from = "AtmosphereBlockWire")]
 pub struct AtmosphereBlock {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_wind: Option<f32>,
@@ -264,8 +275,12 @@ pub struct AtmosphereBlock {
     pub sun_color: Option<Rgb>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sky_color: Option<Rgb>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sky_dir: Option<Rgb>,
+    /// Skybox rotation as `{x, y, z, angle_radians}`. PITFALL §12 /
+    /// FINDINGS §1.3 — the predecessor `sky_dir` key is deprecated
+    /// (engine logs `L_DEPRECATED` if it ever sees it). Engine
+    /// default `[0, 0, 1, 0]` = +Z axis, 0 radians (no rotation).
+    #[serde(default = "default_sky_axis_angle")]
+    pub sky_axis_angle: [f32; 4],
     /// Skybox `.dds` cube filename (in `maps/` or `bitmaps/`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sky_box: Option<String>,
@@ -273,6 +288,71 @@ pub struct AtmosphereBlock {
     pub cloud_density: Option<f32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cloud_color: Option<Rgb>,
+}
+
+/// Engine default for `skyAxisAngle` (`MapInfo.cpp:149`). Axis +Z,
+/// angle 0 radians — no skybox rotation.
+fn default_sky_axis_angle() -> [f32; 4] {
+    [0.0, 0.0, 1.0, 0.0]
+}
+
+/// Deserialization-only projection of [`AtmosphereBlock`] that
+/// accepts both the new `sky_axis_angle` field and the legacy
+/// `sky_dir` field. Migration runs in `From<AtmosphereBlockWire>`.
+/// See PITFALL §12 / FINDINGS §1.3.
+#[derive(Debug, Deserialize)]
+struct AtmosphereBlockWire {
+    #[serde(default)]
+    min_wind: Option<f32>,
+    #[serde(default)]
+    max_wind: Option<f32>,
+    #[serde(default)]
+    fog_start: Option<f32>,
+    #[serde(default)]
+    fog_end: Option<f32>,
+    #[serde(default)]
+    fog_color: Option<Rgb>,
+    #[serde(default)]
+    sun_color: Option<Rgb>,
+    #[serde(default)]
+    sky_color: Option<Rgb>,
+    #[serde(default)]
+    sky_axis_angle: Option<[f32; 4]>,
+    /// Legacy key — pre-Sprint-10 schemas. Migrated by appending
+    /// `0.0` as the rotation angle, preserving the xyz direction.
+    /// Engine ignored this key once `skyAxisAngle` was added, so
+    /// the "no rotation" outcome matches what mappers were already
+    /// getting in practice.
+    #[serde(default)]
+    sky_dir: Option<[f32; 3]>,
+    #[serde(default)]
+    sky_box: Option<String>,
+    #[serde(default)]
+    cloud_density: Option<f32>,
+    #[serde(default)]
+    cloud_color: Option<Rgb>,
+}
+
+impl From<AtmosphereBlockWire> for AtmosphereBlock {
+    fn from(w: AtmosphereBlockWire) -> Self {
+        let sky_axis_angle = w
+            .sky_axis_angle
+            .or_else(|| w.sky_dir.map(|d| [d[0], d[1], d[2], 0.0]))
+            .unwrap_or_else(default_sky_axis_angle);
+        Self {
+            min_wind: w.min_wind,
+            max_wind: w.max_wind,
+            fog_start: w.fog_start,
+            fog_end: w.fog_end,
+            fog_color: w.fog_color,
+            sun_color: w.sun_color,
+            sky_color: w.sky_color,
+            sky_axis_angle,
+            sky_box: w.sky_box,
+            cloud_density: w.cloud_density,
+            cloud_color: w.cloud_color,
+        }
+    }
 }
 
 /// `water.*` sub-table — rendering parameters for the water plane.
@@ -536,7 +616,7 @@ impl MapInfo {
                 fog_color: Some([0.7, 0.7, 0.8]),
                 sun_color: Some([1.0, 1.0, 1.0]),
                 sky_color: Some([0.1, 0.15, 0.7]),
-                sky_dir: Some([0.0, 0.0, -1.0]),
+                sky_axis_angle: default_sky_axis_angle(),
                 sky_box: None,
                 cloud_density: Some(0.5),
                 cloud_color: Some([1.0, 1.0, 1.0]),
@@ -880,7 +960,11 @@ mod tests {
         assert_eq!(a.fog_color, Some([0.7, 0.7, 0.8]));
         assert_eq!(a.sun_color, Some([1.0, 1.0, 1.0]));
         assert_eq!(a.sky_color, Some([0.1, 0.15, 0.7]));
-        assert_eq!(a.sky_dir, Some([0.0, 0.0, -1.0]));
+        // PITFALL §12 / FINDINGS §1.3: legacy `sky_dir` was
+        // deprecated — engine reads `skyAxisAngle` (xyz axis +
+        // radians angle). Default is `[0, 0, 1, 0]` per
+        // `MapInfo.cpp:149`: +Z axis, no rotation.
+        assert_eq!(a.sky_axis_angle, [0.0, 0.0, 1.0, 0.0]);
         assert_eq!(a.cloud_density, Some(0.5));
         assert_eq!(a.cloud_color, Some([1.0, 1.0, 1.0]));
         // No skybox is set by default — projects opt in.
@@ -962,6 +1046,47 @@ mod tests {
     #[test]
     fn bar_default_void_alpha_min_is_engine_default() {
         assert_eq!(MapInfo::bar_default().void_alpha_min, 0.9);
+    }
+
+    /// PITFALL §12 / FINDINGS §1.3: legacy `sky_dir = [x, y, z]`
+    /// from a pre-Sprint-10 schema dump migrates into
+    /// `sky_axis_angle = [x, y, z, 0]`, preserving the direction
+    /// and setting the rotation angle to zero (no skybox spin —
+    /// which matches what the engine was doing in practice, since
+    /// `sky_dir` was deprecated once `skyAxisAngle` shipped).
+    #[test]
+    fn atmosphere_legacy_sky_dir_migrates_to_axis_angle() {
+        let toml_src = r#"
+            sky_dir = [0.5, -0.25, 0.8]
+        "#;
+        let block: AtmosphereBlock = toml::from_str(toml_src).expect("deserialize");
+        assert_eq!(
+            block.sky_axis_angle,
+            [0.5, -0.25, 0.8, 0.0],
+            "legacy sky_dir must migrate xyz unchanged with angle = 0"
+        );
+    }
+
+    /// PITFALL §12: an `.barmeproj` carrying the NEW `sky_axis_angle`
+    /// key takes precedence over legacy `sky_dir` if both somehow
+    /// coexist (defensive; the emitter never writes both).
+    #[test]
+    fn atmosphere_new_sky_axis_angle_wins_over_legacy_sky_dir() {
+        let toml_src = r#"
+            sky_dir = [1.0, 0.0, 0.0]
+            sky_axis_angle = [0.0, 0.0, 1.0, 0.5]
+        "#;
+        let block: AtmosphereBlock = toml::from_str(toml_src).expect("deserialize");
+        assert_eq!(block.sky_axis_angle, [0.0, 0.0, 1.0, 0.5]);
+    }
+
+    /// PITFALL §12: an empty atmosphere block (no sky key at all)
+    /// loads with the engine default `[0, 0, 1, 0]` via
+    /// `default_sky_axis_angle`.
+    #[test]
+    fn atmosphere_missing_sky_key_defaults_to_engine_value() {
+        let block: AtmosphereBlock = toml::from_str("").expect("deserialize");
+        assert_eq!(block.sky_axis_angle, [0.0, 0.0, 1.0, 0.0]);
     }
 
     /// PITFALL §20: a `.barmeproj` without the field still loads —
