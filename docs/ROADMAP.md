@@ -43,7 +43,7 @@ Implements SRS F1–F12. Ships a Windows `.exe` and a Linux AppImage.
 - [x] **F3** Symmetry enforcement — mirror H / V / Quad / both diagonals +
       rotational `fold ∈ 2..=12` (ADR-019). Arbitrary-axis line picker
       remains Stage 2.
-- [ ] **F4** Texture painting via DNTS splat channels (4 RGBA, ≤4 splat textures)
+- [x] **F4** Texture painting via DNTS splat channels (4 RGBA, ≤4 splat textures)
       — **D1 shipped 2026-05-18** (ADR-025 / ADR-027): 16-slot CC0
       ambientCG starter palette + `scripts/fetch-textures.sh` (sha256
       pinned, idempotent, `--check` HEAD-probe). Per-slot layout under
@@ -91,9 +91,20 @@ Implements SRS F1–F12. Ships a Windows `.exe` and a Linux AppImage.
       `App::symmetry`. Mini-map gains a translucent splat overlay.
       Validation chip warns "DNTS: no specular" per FINDINGS §7.2.
       Splat undo deferred (4 MB > 100 MB cap).
-      **F4 itself remains gated on D6** (mapinfo emission + `.sd7`
-      bundling, Sprint 12) — until then the painted distribution
-      shows in the editor preview only, not in BAR.
+      **D6 shipped 2026-05-19** (Sprint 12 / closes F4): a new
+      `barme-pipeline::splat_pipeline` module wires DNTS bake per
+      active channel + the splat distribution PNG + a grey BC1
+      specular fallback into the `.sd7`. `mapinfo.resources` emits
+      the SUBTABLE form of `splatDetailNormalTex` (PITFALL §15 /
+      FINDINGS §1.8) — `{ "a.dds", ..., alpha = false, }` — with
+      `splatDistrTex` / `specularTex` pointing at the staged paths.
+      A new `LuaValue::Mixed { values, keyed }` AST variant renders
+      the bare-positional + keyed shape real BAR maps ship; the
+      legacy `splatDetailNormalTex1..4` numbered keys stay in the
+      schema for hand-authored-import survival but D6 doesn't emit
+      them. `build_sd7` takes a new `SplatBakeInputs` parameter the
+      app resolves from its slot registry. Painted-in-editor splats
+      now load + render in BAR.
 - [x] **F5** Metal-spot placement — Sprint 11 / C4 lands `Project.metal_spots:
       Vec<MetalSpot>` + the BAR-convention `extractor_radius` (80 elmos
       default; PITFALL §6 surface). Inspector renders a per-spot table with
@@ -123,7 +134,25 @@ Implements SRS F1–F12. Ships a Windows `.exe` and a Linux AppImage.
       layout emitter explicitly suppresses it (regression-tested).
       `rot` is string-quoted per PITFALL §6 (FINDINGS §6 confirms the
       BAR-mapper convention).
-- [ ] **F7** Feature placement (trees, rocks, wreckage) into a Lua gadget
+- [x] **F7** Feature placement (trees, rocks, wreckage) into a Lua gadget —
+      Sprint 12 / C6 lands `Project.features: Vec<FeatureInstance
+      { name, x_elmo, z_elmo, rot_heading }>` + a new `Tool::Feature`
+      (keyboard `F`; the geo-vent tool moved to `V`). Inspector
+      surfaces a category combo + filtered picker driven by
+      `assets/mapfeatures_catalog.json` (a hand-curated 30-entry
+      baseline sourced from `github.com/beyond-all-reason/mapfeatures`,
+      auto-gen is a polish task). Canvas LMB places; LMB-drag rotates
+      (heading delta = dx × 182, ~1° per pixel); RMB deletes.
+      Symmetry replicates sources — rotational fold N spins each
+      mirror by `65536 / fold` so per-sector visuals stay symmetric.
+      `featureplacer::object_entries` emits geo vents first (sorted
+      by `(z, x)`) then user features (sorted by `(name, z, x)`) into
+      the Springboard `set.lua`'s `objectlist`. Rotation is an
+      UNQUOTED Lua integer (PITFALL §23 — the gadget's
+      `Spring.CreateFeature(..., fDef.rot)` expects a number;
+      PyMapConv's `-k` text-file format that uses quoted strings is
+      a separate codepath). Unknown FeatureDef names don't gate the
+      build (engine logs + skip; C8 will lint at Sprint 14).
 - [x] **F8** Start-position editor — Phase 2 ADR-023 shipped the flat
       `Vec<StartPosition>` model; Phase 3 ADR-032 (B6) supersedes the
       data shape with `Project.ally_groups: Vec<AllyGroup>` (id + name
