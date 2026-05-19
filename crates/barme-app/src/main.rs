@@ -6060,13 +6060,16 @@ impl App {
             );
 
             // Floating viewport-options toolbar. Allocate a Ui placed
-            // at the top-left, just inside the rulers.
+            // at the top-left, just inside the rulers. Width sized
+            // generously so future toolbar additions don't clip
+            // silently — current 4-button content is ~130 px, the
+            // allocation is 360 px to leave headroom.
             let chrome_origin = egui::pos2(rect.left() + 32.0, rect.top() + 14.0);
             let mut chrome_ui = ui.new_child(
                 egui::UiBuilder::new()
                     .max_rect(egui::Rect::from_min_size(
                         chrome_origin,
-                        egui::vec2(260.0, 32.0),
+                        egui::vec2(360.0, 32.0),
                     ))
                     .layout(egui::Layout::left_to_right(egui::Align::Center)),
             );
