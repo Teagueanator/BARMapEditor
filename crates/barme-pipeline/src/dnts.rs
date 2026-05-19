@@ -254,6 +254,7 @@ fn bake_dnts_in_env(
 
 /// Resolved environment for a bake invocation: where the
 /// Compressonator binary lives and where the cache is.
+#[derive(Debug)]
 struct BakeEnv {
     /// Path to the underlying ELF (`compressonatorcli-bin`). The
     /// `CompressonatorCLI` symlink at the same dir is the
@@ -761,5 +762,181 @@ mod tests {
             .filter(|n| n.to_string_lossy().ends_with(".dds"))
             .count();
         assert_eq!(dds_count3, 2, "diffuse_in_alpha toggle invalidates cache");
+    }
+
+    #[test]
+    fn bake_options_default_matches_adr_025_baseline() {
+        let opts = BakeOptions::default();
+        assert!(!opts.yflip_normal, "ambientCG _NormalGL is already OpenGL");
+        assert!(
+            !opts.diffuse_in_alpha,
+            "splatDetailNormalDiffuseAlpha = false is the safer ship default"
+        );
+        assert_eq!(opts.to_cache_bytes(), [0, 0]);
+    }
+
+    #[test]
+    fn cache_bytes_encode_each_flag_in_a_distinct_position() {
+        // Cache key sensitivity smoke: the two flags must be
+        // distinguishable in the encoded bytes so the sha256 picks up
+        // each independently.
+        let only_yflip = BakeOptions {
+            yflip_normal: true,
+            diffuse_in_alpha: false,
+        };
+        let only_alpha = BakeOptions {
+            yflip_normal: false,
+            diffuse_in_alpha: true,
+        };
+        let both = BakeOptions {
+            yflip_normal: true,
+            diffuse_in_alpha: true,
+        };
+        assert_eq!(only_yflip.to_cache_bytes(), [1, 0]);
+        assert_eq!(only_alpha.to_cache_bytes(), [0, 1]);
+        assert_eq!(both.to_cache_bytes(), [1, 1]);
+    }
+
+    #[test]
+    fn compose_dimension_mismatch_errors() {
+        let normal = synth_normal(4, 4, [0, 0, 255, 0]);
+        let diffuse = synth_normal(8, 4, [255, 255, 255, 255]);
+        let opts = BakeOptions {
+            yflip_normal: false,
+            diffuse_in_alpha: true,
+        };
+        let err = compose_dnts_rgba(&normal, Some(&diffuse), opts).unwrap_err();
+        assert!(
+            matches!(err, DntsBakeError::DimensionMismatch { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn diffuse_in_alpha_with_only_jpg_diffuse_errors() {
+        // bake_dnts_in_env with `diffuse_in_alpha: true` and a JPG
+        // diffuse-only present must surface DiffuseNotPngForAlpha.
+        let tmp = tempfile::tempdir().unwrap();
+        let slot = tmp.path().join("99-diffuse-jpg-slot");
+        fs::create_dir_all(&slot).unwrap();
+        synth_normal(4, 4, [128, 128, 255, 0xFF])
+            .save(slot.join("normal.png"))
+            .unwrap();
+        fs::write(slot.join("diffuse.jpg"), b"not-a-real-jpeg").unwrap();
+        let env = BakeEnv {
+            compressonator_bin: PathBuf::from("/nonexistent"),
+            compressonator_dir: PathBuf::from("/nonexistent"),
+            cache_dir: tmp.path().join("cache"),
+            slot_name: "99-diffuse-jpg-slot".into(),
+        };
+        let opts = BakeOptions {
+            yflip_normal: false,
+            diffuse_in_alpha: true,
+        };
+        let err = bake_dnts_in_env(&env, &slot, &tmp.path().join("out.dds"), opts).unwrap_err();
+        assert!(
+            matches!(err, DntsBakeError::DiffuseNotPngForAlpha(_)),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn slot_dir_missing_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = BakeEnv {
+            compressonator_bin: PathBuf::from("/nonexistent"),
+            compressonator_dir: PathBuf::from("/nonexistent"),
+            cache_dir: tmp.path().join("cache"),
+            slot_name: "<missing>".into(),
+        };
+        let err = bake_dnts_in_env(
+            &env,
+            &tmp.path().join("does-not-exist"),
+            &tmp.path().join("out.dds"),
+            BakeOptions::default(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, DntsBakeError::SlotDirMissing(_)),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn discover_errors_when_compressonator_missing() {
+        // `discover` walks two parents from slot_dir to find tools/;
+        // if tools/compressonator/CompressonatorCLI isn't there, error
+        // out before any bake work.
+        let tmp = tempfile::tempdir().unwrap();
+        let tools = tmp.path().join("tools");
+        let slot = tools.join("textures").join("00-test-slot");
+        fs::create_dir_all(&slot).unwrap();
+        let err = BakeEnv::discover(&slot).unwrap_err();
+        assert!(
+            matches!(err, DntsBakeError::CompressonatorMissing(_)),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn cache_hit_produces_identical_bytes() {
+        // Confirms the cache-copy path is byte-faithful — not just
+        // "any DDS appears" but "the same DDS as last time."
+        let Some((bin, dir)) = locate_compressonator() else {
+            eprintln!("skipping: compressonatorcli-bin not vendored");
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let slot = build_synth_slot(tmp.path(), "00-test-slot", [128, 128, 255, 0xFF]);
+        let env = BakeEnv {
+            compressonator_bin: bin,
+            compressonator_dir: dir,
+            cache_dir: tmp.path().join("textures-cache"),
+            slot_name: "00-test-slot".into(),
+        };
+        let out_a = tmp.path().join("a.dds");
+        let out_b = tmp.path().join("b.dds");
+        bake_dnts_in_env(&env, &slot, &out_a, BakeOptions::default()).unwrap();
+        bake_dnts_in_env(&env, &slot, &out_b, BakeOptions::default()).unwrap();
+        let bytes_a = fs::read(&out_a).unwrap();
+        let bytes_b = fs::read(&out_b).unwrap();
+        assert_eq!(bytes_a, bytes_b, "cache hit must produce identical bytes");
+        assert!(bytes_a.starts_with(b"DDS "), "DDS magic preserved");
+    }
+
+    #[test]
+    fn yflip_through_compose_inverts_g_only() {
+        // End-to-end check: compose_dnts_rgba → flip_green_channel
+        // mirrors the order the bake function uses (compose first,
+        // then flip the composed RGBA). Verifies the G of the
+        // *normal* gets flipped, not the alpha derived from diffuse.
+        let normal = synth_normal(2, 2, [10, 200, 50, 0]);
+        let diffuse = synth_normal(2, 2, [255, 255, 255, 0xFF]);
+        let opts = BakeOptions {
+            yflip_normal: true,
+            diffuse_in_alpha: true,
+        };
+        let mut composed = compose_dnts_rgba(&normal, Some(&diffuse), opts).unwrap();
+        flip_green_channel(&mut composed);
+        for px in composed.pixels() {
+            assert_eq!(px.0[0], 10, "R unchanged through compose+flip");
+            assert_eq!(px.0[1], 255 - 200, "G inverted by Y-flip step");
+            assert_eq!(px.0[2], 50, "B unchanged");
+            assert_eq!(px.0[3], 255, "A from luma(255,255,255) == 255");
+        }
+    }
+
+    #[test]
+    fn cache_key_sha256_is_deterministic_hex_64() {
+        // The cache filename derives from this; assert it's a stable
+        // 64-char lowercase hex string. Drift in the digest format
+        // would orphan every cache entry on the host.
+        let key = cache_key(&[], &[], BakeOptions::default());
+        assert_eq!(key.len(), 64);
+        assert!(
+            key.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()),
+            "lowercase hex only: {key}"
+        );
     }
 }

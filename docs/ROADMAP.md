@@ -48,10 +48,23 @@ Implements SRS F1–F12. Ships a Windows `.exe` and a Linux AppImage.
       ambientCG starter palette + `scripts/fetch-textures.sh` (sha256
       pinned, idempotent, `--check` HEAD-probe). Per-slot layout under
       `tools/textures/<NN-slot>/{diffuse.png, normal.png, meta.toml}`
-      is the contract D3's registry depends on. F4 itself remains
-      gated on D2 (DNTS bake, ADR-026), D3 (`barme-core::splat`),
-      D4 (fragment shader blend), D5 (splat tool inspector), D6
-      (mapinfo emission + `.sd7` bundling).
+      is the contract D3's registry depends on.
+      **D2 shipped 2026-05-18** (ADR-026): `crates/barme-pipeline::dnts
+      ::bake_dnts` produces BC3 / DXT5 DDS from a slot's `normal.png`
+      (+ optional diffuse) via the vendored Compressonator;
+      content-addressed cache under `tools/textures-cache/<sha>.dds`;
+      Y-flip is a runtime knob (default OFF — ambientCG `_NormalGL`
+      is already OpenGL convention per FINDINGS §7.4); the
+      `diffuse_in_alpha` high-pass path is plumbed but untested in
+      BAR until ADR-034.
+      **D3 shipped 2026-05-18** (no ADR — mirrors ADR-018):
+      `crates/barme-core::splat` lands the fixed-1024² RGBA
+      `SplatDistribution` + object-safe `SplatBrush` trait + registry
+      with `paint` / `erase` / `smooth` brushes. `PaintChannel`
+      enforces `R+G+B+A ≤ 255`; brushes return dirty rects for D4's
+      sub-upload pattern. F4 itself remains gated on D4 (fragment
+      shader blend, Sprint 9), D5 (splat tool inspector, Sprint 9),
+      D6 (mapinfo emission + `.sd7` bundling, Sprint 12).
 - [ ] **F5** Metal-spot placement (point + radius → red-channel density)
 - [ ] **F6** Geo-vent placement
 - [ ] **F7** Feature placement (trees, rocks, wreckage) into a Lua gadget

@@ -682,4 +682,131 @@ mod tests {
             assert!(brush.apply(&mut d, stamp).is_none(), "{}", brush.id());
         }
     }
+
+    #[test]
+    fn zero_radius_returns_none() {
+        let mut d = dist_16smu();
+        for brush in SplatBrushRegistry::default_set().iter() {
+            let stamp = SplatStamp {
+                world_x: 4096.0,
+                world_z: 4096.0,
+                radius: 0.0,
+                strength: 1.0,
+                channel: SplatChannel::R,
+            };
+            assert!(brush.apply(&mut d, stamp).is_none(), "{}", brush.id());
+        }
+    }
+
+    #[test]
+    fn get_returns_none_out_of_bounds() {
+        let d = dist_16smu();
+        assert!(d.get(0, 0).is_some());
+        assert!(d.get(1023, 1023).is_some());
+        assert!(d.get(1024, 0).is_none());
+        assert!(d.get(0, 1024).is_none());
+        assert!(d.get(u32::MAX, 0).is_none());
+    }
+
+    #[test]
+    fn registry_iter_ships_brushes_in_declared_order() {
+        let r = SplatBrushRegistry::default_set();
+        let ids: Vec<_> = r.iter().map(|b| b.id()).collect();
+        assert_eq!(ids, vec!["paint", "erase", "smooth"]);
+        let labels: Vec<_> = r.iter().map(|b| b.label()).collect();
+        assert_eq!(labels, vec!["Paint", "Erase", "Smooth"]);
+        assert!(!r.is_empty());
+    }
+
+    #[test]
+    fn paint_dirty_rect_contains_center_and_clips_to_texture() {
+        let mut d = dist_16smu();
+        let stamp = SplatStamp {
+            world_x: 0.0, // corner — should clip rect to (0..) only
+            world_z: 0.0,
+            radius: 100.0,
+            strength: 1.0,
+            channel: SplatChannel::R,
+        };
+        let bbox = PaintChannel.apply(&mut d, stamp).expect("touches pixels");
+        assert!(bbox.x + bbox.w <= d.width, "rect clipped to texture");
+        assert!(bbox.y + bbox.h <= d.height);
+        // Corner pixel (0,0) should be in the rect.
+        assert!(bbox.x == 0 && bbox.y == 0);
+        // Stamp at (0,0) world → centre pixel (0,0); paint must touch it.
+        let corner = d.get(0, 0).unwrap();
+        assert!(corner[0] > 0, "corner R painted: {corner:?}");
+    }
+
+    #[test]
+    fn erase_does_not_touch_other_channels() {
+        let mut d = dist_16smu();
+        // Pre-load a pixel with non-zero everywhere.
+        let cx = 512u32;
+        let cz = 512u32;
+        d.rgba[(cz * 1024 + cx) as usize] = [80, 80, 80, 15];
+        let stamp = SplatStamp {
+            world_x: 4096.0,
+            world_z: 4096.0,
+            radius: 80.0,
+            strength: 1.0,
+            channel: SplatChannel::R,
+        };
+        Erase.apply(&mut d, stamp).unwrap();
+        let px = d.get(cx, cz).unwrap();
+        // Only R should have moved toward 0; others unchanged.
+        assert!(px[0] < 80, "R erased: {px:?}");
+        assert_eq!(px[1], 80, "G untouched by erase(R)");
+        assert_eq!(px[2], 80, "B untouched by erase(R)");
+        assert_eq!(px[3], 15, "A untouched by erase(R)");
+    }
+
+    #[test]
+    fn smooth_preserves_channel_sum_invariant() {
+        // Smooth's output is a linear combination of inputs; if every
+        // input pixel obeys R+G+B+A ≤ 255 then so does the output.
+        // Stress: paint a region (PaintChannel maintains the
+        // invariant), then smooth over it, then confirm.
+        let mut d = dist_16smu();
+        for (i, ch) in [SplatChannel::R, SplatChannel::G, SplatChannel::B]
+            .iter()
+            .enumerate()
+        {
+            let stamp = SplatStamp {
+                world_x: 4096.0 + i as f32 * 50.0,
+                world_z: 4096.0,
+                radius: 80.0,
+                strength: 0.5,
+                channel: *ch,
+            };
+            PaintChannel.apply(&mut d, stamp).unwrap();
+        }
+        // Smooth pass over the painted area.
+        let smooth_stamp = SplatStamp {
+            world_x: 4096.0,
+            world_z: 4096.0,
+            radius: 200.0,
+            strength: 1.0,
+            channel: SplatChannel::R, // ignored by smooth
+        };
+        let bbox = Smooth.apply(&mut d, smooth_stamp).unwrap();
+        for iz in bbox.y..bbox.y + bbox.h {
+            for ix in bbox.x..bbox.x + bbox.w {
+                let px = d.get(ix, iz).unwrap();
+                let s = pixel_sum(px);
+                assert!(
+                    s <= 255,
+                    "smooth violated invariant at ({ix},{iz}): {px:?} sums to {s}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn splat_dim_constant_is_one_thousand_twenty_four() {
+        // The fixed 1024² dim is a public contract (D4 will allocate
+        // the GPU texture at this size); pin it as a test rather than
+        // a doc-only assertion so a typo can't silently break things.
+        assert_eq!(SPLAT_DIM, 1024);
+    }
 }

@@ -50,7 +50,12 @@ exists because of historical row-order confusion.
 
 ## 6. `mapinfo.lua` silent dependencies
 
-- `splatDetailNormalTex` requires `specularTex` (silently disables otherwise)
+- `splatDetailNormalTex` without `specularTex` produces visibly flat
+  output (FINDINGS §7.2 — earlier "silently disables" wording is wrong
+  at the C++ render-state level; engine gates DNTS on
+  `splatDistrTex && splatDetailNormalTex[].size() > 0`, not on spec.
+  Spec absence still makes the map look noticeably worse than
+  published BAR maps; the lint stays as a yellow warning, reworded.)
 - `voidWater` requires unsetting `water.planeColor`
 - Missing/renamed `smtFileName0` → the pink map
 - `fogStart == fogEnd` breaks the ground-grid renderer
@@ -172,3 +177,179 @@ Reference: a complete in-the-wild example is
 `scratch/bar-maps/extracted/titanduel/mapinfo.lua` (gitignored — copy
 from `~/.local/state/Beyond All Reason/maps/titanduel_v3.sd7` to
 inspect).
+
+## Source-audit additions (2026-05-18)
+
+Cross-referenced against locally-cloned `RecoilEngine`,
+`Beyond-All-Reason`, `BYAR-Chobby`, `maps-metadata`, and
+`springrts_smf_compiler` repos. Full write-up at
+`docs/research/source-audit-2026-05-18/FINDINGS.md`. Ten new rules,
+ordered by blast radius:
+
+### 11. `sundir` vs `sunDir` case mismatch
+
+- Engine (`rts/Map/MapInfo.cpp:207`) reads ONLY camelCase
+  `lighting.sunDir`.
+- BAR's active `luarules/gadgets/unit_sunfacing.lua` (March 2024,
+  line 43) reads ONLY lowercase `lighting.sundir`.
+- Lua tables are case-sensitive — these are two distinct keys.
+
+**Rule:** the emitter writes BOTH keys with the same value into the
+`lighting` subtable. Unit test in `barme-pipeline::mapinfo::tests`
+asserts both keys appear in the rendered output.
+
+### 12. `atmosphere.skyDir` is deprecated
+
+Engine reader at `MapInfo.cpp:144-146` logs `L_DEPRECATED` if `skyDir`
+is set; the field has been replaced by `skyAxisAngle` (float4: xyz
+axis + radians angle).
+
+**Rule:** emit `atmosphere.skyAxisAngle = {0, 0, 1, 0}` by default.
+Never emit `atmosphere.skyDir`. Lint warning if a user-edited
+override sets `skyDir`.
+
+### 13. SMF metalmap must be all-zero when emitting Lua metal spots
+
+`map_metal_spot_placer.lua` (BAR gadget) iterates the engine metalmap
+at startup; if ANY pixel is non-zero, the gadget bails and the
+Lua-defined spots are ignored.
+
+**Rule:** the build pipeline ships a 1×1 black metalmap PNG to
+PyMapConv whenever `Project.metal_spots` is non-empty. Integration
+test: after build, load the `.sd7`'s SMF, read the metalmap region,
+assert all bytes are zero.
+
+### 14. Geo vents are NOT a `geos = {…}` array
+
+The "second array in map_metal_layout.lua" pattern is Zero-K
+convention; BAR's `api_resource_spot_finder.GetSpotsGeo()` scans the
+map for engine features with `FeatureDef.geoThermal = true` (typically
+the stock `geovent` feature).
+
+**Rule:** `Project.geo_vents` emits ONLY into
+`mapconfig/featureplacer/features.lua` with `name = "geovent"`. Never
+write a `geos` array in `map_metal_layout.lua`.
+
+### 15. `splatDetailNormalTex` prefers the subtable form
+
+The engine reader (`MapInfo.cpp:383-399`) checks for the subtable
+form first and only falls back to the legacy numbered keys if
+absent. Mixing both will result in the subtable form winning.
+
+**Rule:** emit the subtable form only:
+```lua
+resources.splatDetailNormalTex = {
+  "tex1.dds", "tex2.dds", "tex3.dds", "tex4.dds",
+  alpha = (true|false),  -- == splatDetailNormalDiffuseAlpha
+}
+```
+
+### 16. SMT base normal encoding (R + A channels only)
+
+Map normal textures consumed by `SMFFragProg.glsl::GetFragmentNormal`
+encode `nx` in R and `nz` in A. Y is reconstructed at sample time.
+Generic RGB normal maps will render incorrectly.
+
+**Rule:** the normal-bake pipeline (D-stream) targets BC3 / DXT5 with
+R = nx, A = nz, G/B unused. Bench test: render a known sloped surface
+and assert sun-incidence matches Recoil's reference within ε.
+
+### 17. Specular exponent is `α × 16`, not a `mix`
+
+With a specular texture bound, the fragment shader computes
+`specularExp = specularCol.a * 16.0` (flat multiplication). The
+`lighting.specularExponent` Lua field is only consulted when NO
+specular texture is loaded.
+
+**Rule:** the editor's specular-texture baker treats the alpha
+channel as `desiredExponent / 16.0`, clamped to [0, 1]. Document in
+the F4 splat / specular emission pipeline.
+
+### 18. `lighting.sunDir.w = 1.0` default (NOT `1e9`)
+
+Engine default is `float4(0.0f, 1.0f, 2.0f, 1.0f)` — the W
+component is `1.0`, an intensity scalar. Earlier research's `1e9`
+default is a sunStartDistance leakage from a different code path
+and would over-saturate sunlight on map load if emitted.
+
+**Rule:** `MapInfo::bar_default()`'s `lighting.sun_dir` uses
+`[0.5, 0.7, 0.5, 1.0]` (or any normalized direction + W=1.0).
+Unit test pins W to exactly 1.0.
+
+### 19. `gui.minimapRotation` is unused
+
+Engine reader at `MapInfo.cpp:119-124` (ReadGui) reads only
+`autoShowMetal`. The `minimapRotation` field appears in older
+wiki docs but is not consumed by the current Recoil renderer.
+
+**Rule:** the C3 emitter omits `gui.minimapRotation` from its
+defaults. The F9 form editor may surface a "show in raw Lua only"
+toggle for legacy compatibility.
+
+### 20. `map.voidAlphaMin` exists (default 0.9)
+
+Top-level `voidAlphaMin` controls the alpha threshold below which
+voidGround discards fragments (`MapInfo.cpp:107`). Not currently in
+the schema. When users enable `voidGround`, they may want to tune
+this.
+
+**Rule:** add `voidAlphaMin: f32` (default 0.9) to the typed schema
+in `barme-core::mapinfo_schema::MapBlock`. F9 surfaces it only when
+`voidGround = true`.
+
+### 21. `modtype` is a six-value enum
+
+Values: 0=hidden, 1=primary, 2=unused, 3=map, 4=base, 5=menu.
+Editor emits 3 unconditionally; the linter can reject user attempts
+to set anything else.
+
+**Rule:** `MapInfo::bar_default().modtype` is a typed `Modtype::Map`
+enum, not a free `i32`. Serializes to `3`.
+
+## D2 DNTS bake additions (2026-05-18, ADR-026)
+
+### 22. JPG normal maps silently destroy X/Y vectors
+
+JPEG 4:2:0 chroma subsampling drops half of the chroma data — including
+the X (R) / Y (G) channels of a tangent-space normal map. The
+ambientCG `*_NormalGL.zip` packs ship JPEG-encoded normals, so
+"download whatever, the bake will figure it out" is silent-failure.
+
+**Rule:** the texture-pack fetch script (`scripts/fetch-textures.sh`)
+extracts `_1K-PNG.zip` only; the D2 bake (`bake_dnts`) probes
+`normal.png` first, errors with `DntsBakeError::NormalNotPng` if only
+`normal.jpg` is present. Per-slot dirname check enforced at
+registry-scan time (D3 layer / Sprint 9). Unit test
+`barme_pipeline::dnts::tests::rejects_jpg_normal` pins the guard.
+
+### 23. Y-flip silent-failure on DNTS normals
+
+The DNTS shader decodes per-fragment normals as `* 2 - 1` and builds
+the TBN with +Y up (`SMFFragProg.glsl:276-278` per FINDINGS §7.4).
+Sources authored under DirectX convention (Substance, Quixel,
+Beherith's `*_flipped.dds`) need the green channel inverted before
+shipping or every DNTS layer's lighting is upside-down on slopes —
+visually subtle but reproducible.
+
+**Rule:** `BakeOptions::yflip_normal` toggles the flip. Default OFF
+because the ADR-025 starter pack ships ambientCG `*_NormalGL.png`
+(already OpenGL). F23 (user-import, Phase 6) surfaces a per-import
+override; convention is to ask once at import time rather than guess
+from filename heuristics. Unit tests
+`flip_green_inverts_and_preserves_other_channels` and
+`flip_green_at_boundaries` pin the math; `passthrough_is_identity_
+when_flag_off` pins the off-branch.
+
+### 24. DNTS bake cache key MUST fold BakeOptions
+
+Content-addressed caching is great until you forget to fold the
+options into the cache key. Toggling `diffuse_in_alpha` or
+`yflip_normal` on the same source bytes is a different DDS; missing
+that in the key returns a stale cached entry that doesn't match
+the active options.
+
+**Rule:** `cache_key()` = `sha256(diffuse_bytes ‖ normal_bytes ‖
+BakeOptions::to_cache_bytes())`. Each new `BakeOptions` field appends
+to `to_cache_bytes` in a fixed position; the `cache_bytes_encode_
+each_flag_in_a_distinct_position` test pins the encoding. Cache
+files live at `tools/textures-cache/<sha>.dds` (gitignored).

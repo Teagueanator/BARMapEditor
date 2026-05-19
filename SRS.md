@@ -107,6 +107,23 @@ PA's in-game system designer is the cited gold standard. It does the following w
 9. **`.sd7` solidity.** 7-Zip solid archives are silently rejected by SpringFiles indexing. The packager must emit **non-solid** archives.
 10. **License of the output stack.** Recoil is GPL-2.0; legacy mapconv binaries are GPL-2.0; **PyMapConv has no SPDX-declared license**. Redistributing PyMapConv inside your installer requires explicit written permission from Beherith. This is a hard prerequisite. — **STATUS UPDATE 2026-05-17 (ADR-003):** upstream now carries an SPDX `CC0-1.0` LICENSE file. Redistribution is unrestricted; the "ask Beherith for written permission" workstream is removed (we still credit him in `CREDITS.md` out of courtesy).
 11. **3D preview ≠ in-game rendering.** Recoil's actual ground shader (DNTS + splats + PBR + atmospheric scatter + dynamic shadows) is non-trivial; the editor preview will be an approximation. Document this up front; do not pretend WYSIWYG.
+
+    > **STATUS UPDATE 2026-05-18 (renderer-parity arc, user direction):**
+    > policy reversed. The editor's renderer is being upgraded across
+    > Sprints 15–23 (the renderer-parity arc, sketched at
+    > `docs/research/renderer-bar-parity/ROADMAP.md`) to visually
+    > reproduce what BAR renders for terrain (DNTS + lighting + spec +
+    > normals), atmosphere (fog + sun + sky), water (surface +
+    > reflections + foam + caustics), shadows (directional + ground
+    > shadow density), features (S3O / 3DO models), grass, emission
+    > (lava glow), and skybox cubemap reflections. Sprint 15 ships the
+    > foundation (offscreen render target + depth attachment + GPU
+    > marker pipeline); subsequent sprints close the per-feature
+    > parity gap. Final target at Sprint 23 acceptance: mean ΔE < 5.0
+    > vs BAR's render on a three-map validation suite. This pitfall is
+    > kept on the SRS as a historical anchor — the new policy
+    > supersedes "do not pretend WYSIWYG" with "reproduce within a
+    > documented ΔE budget."
 12. **Decompilation fidelity.** Round-tripping an existing `.sd7` loses information: the recovered diffuse PNG has been through DXT1 (color precision loss); heightmap, metal, and type maps are exact; mapinfo.lua is exact; auxiliary splat textures survive untouched. Reuse PyMapConv's decompile path.
 13. **GPU brush latency.** Spring/Recoil maps can theoretically reach 96×96 SMUs. Sub-millisecond brush response at 32×32+ requires the heightmap to live on the GPU as a storage texture, edited by compute shaders. Read-back to CPU happens only at save.
 
@@ -386,6 +403,64 @@ A single-window, single-executable desktop app that produces a *playable* BAR ma
 > `mix`. See FINDINGS §7 for the full corrected math. The current
 > proposed WGSL in `splat-rendering/claude findings.md` will
 > render visibly wrong if implemented verbatim.
+
+> **STATUS UPDATE 2026-05-18 (F4 — D1, starter texture pack
+> shipped):** Sprint 7 / D1 lands the palette decision +
+> `scripts/fetch-textures.sh` (ADR-025 + ADR-027). 16 CC0 ambientCG
+> slots, 4 biome groups × 4 textures, pinned by sha256. F4 itself
+> stays unchecked — gated on D2 (DNTS bake / ADR-026), D3
+> (`barme-core::splat`), D4 (fragment shader blend), D5 (splat tool
+> UI), D6 (mapinfo emission + `.sd7` bundling).
+
+> **STATUS UPDATE 2026-05-18 (F4 — D2 + D3, pipeline + data model
+> shipped):** Sprint 8 / D2 lands `crates/barme-pipeline::dnts::
+> bake_dnts` (ADR-026): reads a slot's `normal.png` (+ optional
+> `diffuse.{png,jpg}`), Y-flips the green channel iff
+> `BakeOptions::yflip_normal` (default `false` for the D1 ambientCG
+> `*_NormalGL.png` sources — already OpenGL convention per FINDINGS
+> §7.4), composes RGBA8 (RGB = normal, A = `0xFF` baseline or Rec.709
+> luma when `diffuse_in_alpha`), BC3-compresses via the vendored
+> `compressonatorcli-bin` (ELF invoked directly with
+> `LD_LIBRARY_PATH` mirroring the wrapper script — avoids ENOEXEC
+> in `cargo test`'s subprocess path on the bash wrapper). Cache
+> keyed by `sha256(diffuse_bytes ‖ normal_bytes ‖ opts)` under
+> `tools/textures-cache/<sha>.dds` (gitignored). Cache hit ⇒ copy;
+> opts toggle ⇒ re-bake. The `diffuse_in_alpha = true` branch is
+> plumbed but untested in BAR — high-pass tuning + in-engine A/B
+> live behind **ADR-034**.
+>
+> Sprint 8 / D3 lands `crates/barme-core::splat`: fixed-1024² RGBA
+> `SplatDistribution` (independent of map size — the engine samples
+> `splatDistrTex` at `uv ∈ [0,1]^2` per `SMFFragProg.glsl:177`),
+> `SplatChannel { R, G, B, A }` aligned to the inspector row order,
+> object-safe `SplatBrush: Send + Sync + 'static` trait + registry,
+> three brushes (`paint`, `erase`, `smooth`) with kebab ids matching
+> the inspector's eventual D5 dispatch. `PaintChannel` enforces the
+> `R + G + B + A ≤ 255` invariant via floor-scaled others. Brushes
+> follow ADR-018's dirty-rect pattern so D4's GPU upload only
+> re-pushes the changed bbox. Splat-undo is deferred (4 MB
+> distribution × stroke would evict ~25 heightmap strokes from the
+> 100 MB cap); follow-up adapts A1's bitset copy-on-first-write.
+>
+> F4 remains unchecked — visible feature lands when D4 (fragment
+> shader blend) + D5 (splat tool UI) ship in Sprint 9, then D6
+> (mapinfo emission + `.sd7` bundling) in Sprint 12.
+>
+> **Source-of-truth note.** The verified palette, sha256-pinned,
+> lives in **ADR-025**; the on-disk registry layout lives in
+> **ADR-027**. Future texture-pack work reads from those + the
+> per-slot `tools/textures/<NN-slot>/meta.toml` files, NOT from
+> the Gemini research document. Four hallucinated ambientCG IDs
+> (`Grass012`, `Sand002`, `Metal042`, `Organic001`) plus one slot
+> collision after the Poly Haven → ambientCG substitution were
+> found during D1 verification; they have been corrected in place
+> in `docs/research/textures/Gemini BAR Editor Texture Pack
+> Scoping.md` so the research file no longer carries false data.
+> Gemini's biome structure and bundle-the-normal-map stance were
+> kept — only the per-slot asset IDs were unreliable. Same drift
+> class as the 2026-05-18 source-audit corrections above:
+> secondary research is a sketch; primary sources (ambientCG HEAD
+> checks, engine code) bind.
 
 > **STATUS UPDATE 2026-05-18 (F14 — procgen UX redesign, B7):**
 > Sprint 6 / B7 reorders the Procgen Inspector to preset-first per
