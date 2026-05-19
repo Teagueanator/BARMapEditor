@@ -108,6 +108,16 @@ struct App {
     render_state: Option<egui_wgpu::RenderState>,
     camera: OrbitCamera,
     height_scale: f32,
+    /// World-space Y for raw heightmap value 0 (in elmos). `< 0`
+    /// means the lowest sample carves below sea level — BAR's water
+    /// plane sits at Y = 0 (`Ground.h::GetWaterPlaneLevel` is
+    /// `consteval`), so this drives the C9 validation chip
+    /// (`water_mode` vs `min_height < 0` agreement).
+    ///
+    /// Mirrors `Project.min_height`. Sprint 14 / C9 introduces the
+    /// shadow — earlier `snapshot_project` hard-coded `0.0` which
+    /// silently dropped the wizard-set value on first save.
+    min_height: f32,
     current_project_path: Option<PathBuf>,
     last_install: Option<Result<PathBuf, String>>,
     brushes: BrushRegistry,
@@ -944,6 +954,7 @@ impl App {
             render_state,
             camera: OrbitCamera::framing(8192.0, 8192.0),
             height_scale: 256.0,
+            min_height: 0.0,
             current_project_path: None,
             last_install: None,
             brushes: BrushRegistry::default_set(),
@@ -1090,6 +1101,7 @@ impl App {
         self.heightmap = None;
         self.current_project_path = None;
         self.height_scale = 256.0;
+        self.min_height = 0.0;
         self.camera = OrbitCamera::framing(8192.0, 8192.0);
         self.last_error = None;
         self.last_install = None;
@@ -1162,7 +1174,7 @@ impl App {
         Project {
             name: self.project_name.clone(),
             size: self.map_size,
-            min_height: 0.0,
+            min_height: self.min_height,
             max_height: self.height_scale,
             heightmap: self.heightmap.as_ref().map(|h| h.path.clone()),
             ally_groups: self.ally_groups.clone(),
@@ -1296,14 +1308,44 @@ impl App {
         {
             return (ChipTone::Err, "Expression error".into());
         }
+        // C9 / Sprint 14 / PITFALL §8 — DNTS + water LOS TV-snow bug.
+        // Beherith forum t=35202: with DNTS slots bound AND water
+        // active (`min_height < 0` OR `water_mode != None`), any
+        // gameplay-side LOS widget can trigger animated-noise
+        // artefacts on the terrain. Warn but don't gate (the user
+        // might still ship and accept the risk). Sprint 19's lint
+        // panel will surface this same condition more loudly.
+        let has_dnts = self.splat_config.channels.iter().any(|c| c.is_some());
+        let has_water = self.water_mode != WaterMode::None || self.min_height < 0.0;
+        if has_dnts && has_water {
+            return (ChipTone::Warn, "DNTS + water: LOS bug".into());
+        }
         // D5 / FINDINGS §7.2: a DNTS slot is bound but no specular
         // texture is set. Engine no longer gates the DNTS branch on
         // specularTex (Recoil HEAD, SMFRenderState.cpp:114), but the
         // visual still looks flatter than published BAR maps. Surface
         // as a yellow warning. Editor doesn't author specular yet, so
         // any bound slot trips this.
-        if self.splat_config.channels.iter().any(|c| c.is_some()) {
+        if has_dnts {
             return (ChipTone::Warn, "DNTS: no specular".into());
+        }
+        // C9 / Sprint 14 — water mode vs min_height agreement.
+        // `min_height < 0` with no preset = engine renders its
+        // default blue ocean (silent surprise). Preset selected
+        // with `min_height >= 0` = no water visible without
+        // `forceRendering`. Sprint 19's lint promotes these into
+        // the lint panel with one-click fixes.
+        if self.water_mode == WaterMode::None && self.min_height < 0.0 {
+            return (
+                ChipTone::Warn,
+                "Terrain below Y=0 with no water preset".into(),
+            );
+        }
+        if self.water_mode != WaterMode::None && self.min_height >= 0.0 {
+            return (
+                ChipTone::Warn,
+                "Water preset set, no terrain below Y=0".into(),
+            );
         }
         // Soft warning: empty ally groups will fall back to the
         // engine's 25/75 diagonal default. That still ships a playable
@@ -1796,13 +1838,23 @@ impl App {
         // `PREMULTIPLIED_ALPHA_BLENDING`, so the shader output must
         // already be `(r·a, g·a, b·a, a)`.
         let surface_rgba = [r * a, g * a, b * a, a];
-        // Commit 2 ships `alpha_scale = 1.0`; commit 5 wires the
-        // cross-tool ghost (50%× when Tool::Water is inactive).
+        // Cross-tool ghosting (Sprint 14 / commit 5): the water plane
+        // is a project property regardless of active tool, but it
+        // shouldn't dominate the canvas while the user is sculpting
+        // or painting. At full opacity only when `Tool::Water` is
+        // active; otherwise 0.5× so the plane stays visible but
+        // doesn't take over. Pattern mirrors the marker / line
+        // cross-tool ghosts in `central()`.
+        let alpha_scale = if matches!(self.tool, Tool::Water) {
+            1.0
+        } else {
+            0.5
+        };
         Some(WaterDraw {
             surface_rgba,
             extent_x,
             extent_z,
-            alpha_scale: 1.0,
+            alpha_scale,
         })
     }
 
@@ -3232,6 +3284,7 @@ impl App {
                 self.project_name = p.name;
                 self.map_size = p.size;
                 self.height_scale = p.max_height.max(1.0);
+                self.min_height = p.min_height;
                 self.heightmap = None;
                 self.current_project_path = Some(path);
                 self.last_error = None;
@@ -6254,44 +6307,50 @@ impl App {
         }
     }
 
-    /// Read the loaded heightmap's observed min height (in elmos) so
-    /// the Inspector can display it. Returns `0.0` when no heightmap
-    /// is loaded (the user can still see the carve-depth control).
+    /// World Y (elmos) of the heightmap's lowest sample. Used by the
+    /// Inspector to display "this is the deepest point of your map"
+    /// alongside the carve-depth control.
+    ///
+    /// `u16 = 0` maps to `min_height`; `u16 = u16::MAX` maps to
+    /// `height_scale`. The lowest observed raw value sits at
+    /// `min_height + (raw_min / 65535) * (height_scale - min_height)`.
     fn heightmap_observed_min_height(&self) -> f32 {
         let Some(hm) = self.heightmap.as_ref() else {
-            return 0.0;
+            return self.min_height;
         };
-        // The heightmap stores u16 raw samples in [0, u16::MAX]
-        // mapped to world Y in [0, height_scale]. We're interested in
-        // the LOWEST sample because that's how deep the carved basin
-        // reaches — but for the C9 flood lint we want to know whether
-        // any sample is below the water plane (Y=0). The CPU side
-        // doesn't currently model below-zero heights distinctly from
-        // zero (the heightmap is normalised to a non-negative scale),
-        // so we approximate by reporting the project's min_height
-        // (which is signed) when it's negative.
-        // TODO Sprint 14: when min_height < 0 the heightmap u16 = 0
-        // corresponds to Y = min_height. Use Project.min_height
-        // directly. Until snapshot_project plumbs the live value
-        // through, return the project's max-depth approximation.
-        hm.min as f32 / u16::MAX as f32 * self.height_scale
+        let t = hm.min as f32 / u16::MAX as f32;
+        self.min_height + t * (self.height_scale - self.min_height)
     }
 
-    /// "Auto-set min_height from heightmap" — scan the loaded
-    /// heightmap and clamp `Project.min_height` (via the App-level
-    /// shadow) to `min(0, observed)`. No-op without a heightmap.
+    /// "Auto-set min_height from heightmap" — sets
+    /// `App.min_height` to `min(0, water_carve_depth)`, which makes
+    /// BAR's water plane sit inside any region the user carves down
+    /// to the heightmap's `u16 = 0` floor. The world-Y of a carved
+    /// pixel is then exactly `min_height` (i.e. `<= 0`), which is
+    /// what BAR's water render path expects for "this is water."
+    ///
+    /// **Simplification (Sprint 14 MVP):** the original prompt's
+    /// formula `min_height = min(0, observed_min)` requires sampling
+    /// the heightmap's normalised-then-projected world Y, which the
+    /// existing `Heightmap` representation doesn't expose directly.
+    /// The carve_depth shadow is the user's stated "how deep should
+    /// the pool go" anyway, so we use it as the target. Sprint 18's
+    /// F9 form will surface the underlying field for direct edit.
     fn auto_set_min_height_from_heightmap(&mut self) {
-        // TODO Sprint 14 follow-up: `App` doesn't currently carry a
-        // mutable `min_height` field — `snapshot_project` hard-codes
-        // it to 0.0 (line 1131 in main.rs). The auto-set logic
-        // belongs here once that field plumbs through. For now,
-        // log the user's intent and surface a toast via last_error
-        // so the click is observable.
-        info!(
-            observed_min = self.heightmap_observed_min_height(),
-            "auto_set_min_height_from_heightmap clicked — full plumbing \
-             arrives with the form editor (Sprint 18)"
-        );
+        if self.heightmap.is_none() {
+            return;
+        }
+        let target = self.water_carve_depth.min(0.0);
+        if (target - self.min_height).abs() > 1e-3 {
+            info!(
+                from = self.min_height,
+                to = target,
+                "auto_set_min_height_from_heightmap: setting min_height \
+                 = min(0, water_carve_depth)"
+            );
+            self.min_height = target;
+            self.mark_dirty();
+        }
     }
 
     /// Single 4-card BrushPicker tile. Pure renderer; returns the
@@ -7885,6 +7944,7 @@ mod tests {
             render_state: None,
             camera: OrbitCamera::framing(128.0, 128.0),
             height_scale: 256.0,
+            min_height: 0.0,
             current_project_path: None,
             last_install: None,
             brushes: BrushRegistry::default_set(),
@@ -8559,11 +8619,13 @@ mod tests {
 
     /// `WaterMode::Acid` → premultiplied RGBA matches the Acid preset's
     /// `(0.65, 0.8, 0.1, 0.4)` (surface + alpha). Pre-multiply yields
-    /// `(0.26, 0.32, 0.04, 0.4)`.
+    /// `(0.26, 0.32, 0.04, 0.4)`. Tool::Water active → alpha_scale = 1.
     #[test]
     fn water_draw_acid_produces_premultiplied_acidic_quarry_rgba() {
         let mut app = make_test_app();
         app.water_mode = WaterMode::Acid;
+        // Cross-tool ghost (commit 5) only fades when NOT Tool::Water.
+        app.tool = Tool::Water;
         let w = app.water_draw_for_frame(8192.0, 8192.0).unwrap();
         // Acid surface = (0.65, 0.8, 0.1), alpha = 0.4 → premul:
         // (0.26, 0.32, 0.04, 0.4).
@@ -8574,7 +8636,6 @@ mod tests {
         assert!((a - 0.4).abs() < 1e-5, "a = {a}");
         assert_eq!(w.extent_x, 8192.0);
         assert_eq!(w.extent_z, 8192.0);
-        // Commit 2 ships alpha_scale = 1.0; commit 5 wires the ghost.
         assert!((w.alpha_scale - 1.0).abs() < 1e-6);
     }
 
@@ -8608,6 +8669,91 @@ mod tests {
         let [_, _, _, a] = w.surface_rgba;
         // BAR_DEFAULT_SURFACE_ALPHA = 0.1
         assert!((a - 0.1).abs() < 1e-5);
+    }
+
+    /// Cross-tool ghosting (Sprint 14 / commit 5): when Tool::Water
+    /// is active the water plane renders at full alpha; otherwise it
+    /// drops to 0.5× so the user can still see the plane while
+    /// sculpting / painting but doesn't have it dominate.
+    #[test]
+    fn water_draw_alpha_scale_drops_when_tool_inactive() {
+        let mut app = make_test_app();
+        app.water_mode = WaterMode::Ocean;
+        // Default tool is Sculpt — not Water.
+        app.tool = Tool::Sculpt;
+        let ghost = app.water_draw_for_frame(8192.0, 8192.0).unwrap();
+        assert!(
+            (ghost.alpha_scale - 0.5).abs() < 1e-6,
+            "ghost should be 0.5×"
+        );
+        app.tool = Tool::Water;
+        let active = app.water_draw_for_frame(8192.0, 8192.0).unwrap();
+        assert!(
+            (active.alpha_scale - 1.0).abs() < 1e-6,
+            "active should be 1.0×"
+        );
+    }
+
+    /// C9 (Sprint 14 / commit 5) — validation chip:
+    /// `min_height < 0` with `WaterMode::None` warns the user that
+    /// BAR will render its default ocean rather than nothing.
+    #[test]
+    fn validation_warns_when_terrain_below_zero_without_water_preset() {
+        let mut app = make_test_app();
+        // Need a heightmap so the chip doesn't return "No heightmap" first.
+        app.heightmap = Some(test_heightmap_state(app.map_size));
+        app.water_mode = WaterMode::None;
+        app.min_height = -120.0;
+        let (tone, msg) = app.validation_summary();
+        assert!(matches!(tone, crate::ui::theme::ChipTone::Warn));
+        assert!(msg.contains("below Y=0"), "got: {msg}");
+    }
+
+    /// C9: `WaterMode != None` with `min_height >= 0` warns the
+    /// user that BAR won't render water without forceRendering or a
+    /// carved basin.
+    #[test]
+    fn validation_warns_when_water_preset_but_no_below_zero_terrain() {
+        let mut app = make_test_app();
+        app.heightmap = Some(test_heightmap_state(app.map_size));
+        app.water_mode = WaterMode::Ocean;
+        app.min_height = 0.0;
+        let (tone, msg) = app.validation_summary();
+        assert!(matches!(tone, crate::ui::theme::ChipTone::Warn));
+        assert!(msg.contains("no terrain below Y=0"), "got: {msg}");
+    }
+
+    /// C9 / PITFALL §8 — DNTS + water trips the TV-snow LOS bug
+    /// warning, in priority over the inverse "DNTS: no specular"
+    /// chip (this is the scarier condition because it ships a
+    /// broken in-engine map).
+    #[test]
+    fn validation_warns_on_dnts_with_water() {
+        let mut app = make_test_app();
+        app.heightmap = Some(test_heightmap_state(app.map_size));
+        // Bind a slot so DNTS is "on" per the chip's check.
+        app.splat_config.channels[0] = Some(0);
+        // Active water — either via preset or below-zero terrain.
+        app.water_mode = WaterMode::Ocean;
+        let (tone, msg) = app.validation_summary();
+        assert!(matches!(tone, crate::ui::theme::ChipTone::Warn));
+        assert!(msg.contains("DNTS + water"), "got: {msg}");
+    }
+
+    /// Helper: minimal `HeightmapState` so validation tests can
+    /// bypass the "no heightmap" early return.
+    fn test_heightmap_state(map_size: MapSize) -> HeightmapState {
+        let hm = Heightmap::synth_ramp(map_size);
+        let dims = hm.dims();
+        let (min, max) = hm.min_max();
+        HeightmapState {
+            path: PathBuf::from("<test>"),
+            data: hm,
+            dims,
+            min,
+            max,
+            validated_against: Some(map_size),
+        }
     }
 
     #[test]
