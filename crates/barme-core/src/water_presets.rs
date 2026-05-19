@@ -38,7 +38,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::mapinfo_schema::WaterBlock;
+use crate::mapinfo_schema::{AtmosphereBlock, WaterBlock};
 
 /// The active water preset for a project.
 ///
@@ -193,6 +193,36 @@ pub const BAR_DEFAULT_SURFACE_COLOR: [f32; 3] = [0.75, 0.80, 0.85];
 
 /// BAR-default `surface_alpha` for the same fallback.
 pub const BAR_DEFAULT_SURFACE_ALPHA: f32 = 0.1;
+
+/// C9 / Sprint 14 (ADR-042) — hard-coded atmosphere patch applied
+/// when `Project.lava_atmosphere == true`. Red-orange fog, dim warm
+/// sun, dusty clouds — the canonical "everything is hell" look that
+/// pairs with the Lava / Magma water presets.
+///
+/// Values come from the C9 prompt's spec:
+/// ```text
+/// fog_color     = [0.9, 0.3, 0.1]     // red-orange
+/// sun_color     = [1.0, 0.5, 0.3]     // dim warm
+/// fog_start     = 0.1
+/// fog_end       = 1.5
+/// cloud_color   = [0.4, 0.2, 0.15]
+/// cloud_density = 0.7
+/// ```
+///
+/// The emission path in `mapinfo_schema::From<&Project>` per-field
+/// overrides `bar_default()`'s atmosphere with these values when the
+/// flag is on. `sky_axis_angle` / `min_wind` / `max_wind` /
+/// `sky_color` / `sky_box` are NOT in the patch — they keep their
+/// BAR defaults so the user can independently set a skybox / wind
+/// behaviour without colliding with the lava look.
+pub fn apply_lava_atmosphere_patch(atmos: &mut AtmosphereBlock) {
+    atmos.fog_color = Some([0.9, 0.3, 0.1]);
+    atmos.sun_color = Some([1.0, 0.5, 0.3]);
+    atmos.fog_start = Some(0.1);
+    atmos.fog_end = Some(1.5);
+    atmos.cloud_color = Some([0.4, 0.2, 0.15]);
+    atmos.cloud_density = Some(0.7);
+}
 
 /// Count the populated fields in a [`WaterBlock`]. Sprint 14's
 /// Inspector uses this to render "Custom (N overrides)" on the

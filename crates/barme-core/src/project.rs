@@ -173,6 +173,19 @@ pub struct Project {
     /// inspector surfaces it under the Water section purely for UX.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tidal_strength: Option<f32>,
+    /// C9 / Sprint 14 (ADR-042): one-click lava-atmosphere offer.
+    /// `true` overrides `info.atmosphere` with the hard-coded
+    /// `LAVA_ATMOSPHERE_PATCH` values (red-orange fog, dim warm
+    /// sun) on top of the BAR default — common pairing for
+    /// `WaterMode::Lava` / `Magma` maps. Independent of `water_mode`
+    /// so the user can mix freely. The inspector surfaces the offer
+    /// in the Preset section when Lava / Magma is active.
+    ///
+    /// Coarser than full per-field atmosphere overrides; Sprint 18's
+    /// F9 form ships the granular surface. See ADR-042 / phase-3-plan
+    /// C9's "lava-atmosphere link" slice.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub lava_atmosphere: bool,
     /// C9 / Sprint 14: monotonic project-file schema version. Bumped
     /// every time a load-time migration runs, so subsequent loads of
     /// the same project skip the migration. Sprint 14 introduced
@@ -431,6 +444,8 @@ struct ProjectWire {
     #[serde(default)]
     tidal_strength: Option<f32>,
     #[serde(default)]
+    lava_atmosphere: bool,
+    #[serde(default)]
     schema_v: u32,
 }
 
@@ -456,6 +471,7 @@ impl From<ProjectWire> for Project {
             water_overrides: w.water_overrides,
             void_water: w.void_water,
             tidal_strength: w.tidal_strength,
+            lava_atmosphere: w.lava_atmosphere,
             schema_v: w.schema_v,
         };
         Project::run_migrations(&mut p);
@@ -579,6 +595,7 @@ impl Project {
             water_overrides: WaterBlock::default(),
             void_water: false,
             tidal_strength: None,
+            lava_atmosphere: false,
             schema_v: Self::SCHEMA_V,
         }
     }
@@ -1260,6 +1277,20 @@ smu_z = 4
         assert!(s.contains("void_water = true"));
         let p2: Project = toml::from_str(&s).unwrap();
         assert!(p2.void_water);
+    }
+
+    /// `lava_atmosphere` round-trips and omits the false default.
+    #[test]
+    fn lava_atmosphere_round_trips_and_omits_when_default() {
+        let mut p = Project::new("hellscape", 4);
+        assert!(!p.lava_atmosphere);
+        let s = toml::to_string(&p).unwrap();
+        assert!(!s.contains("lava_atmosphere"));
+        p.lava_atmosphere = true;
+        let s = toml::to_string(&p).unwrap();
+        assert!(s.contains("lava_atmosphere = true"));
+        let p2: Project = toml::from_str(&s).unwrap();
+        assert!(p2.lava_atmosphere);
     }
 
     #[test]

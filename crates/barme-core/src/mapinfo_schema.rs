@@ -799,7 +799,9 @@ fn bar_default_terrain_types() -> Vec<TerrainTypeBlock> {
 ///    the user.
 impl From<&Project> for MapInfo {
     fn from(p: &Project) -> Self {
-        use crate::water_presets::{WaterMode, merge_overrides, preset_water_block};
+        use crate::water_presets::{
+            WaterMode, apply_lava_atmosphere_patch, merge_overrides, preset_water_block,
+        };
         let mut info = MapInfo::bar_default();
         info.name = p.name.clone();
         info.shortname = Some(p.name.clone());
@@ -809,6 +811,11 @@ impl From<&Project> for MapInfo {
         info.smf.max_height = Some(p.max_height);
         info.void_water = p.void_water;
         info.tidal_strength = p.tidal_strength;
+        // C9 / Sprint 14: lava-atmosphere offer. The patch overrides
+        // bar_default's atmosphere fog / sun / cloud per the C9 spec.
+        if p.lava_atmosphere {
+            apply_lava_atmosphere_patch(&mut info.atmosphere);
+        }
         // Teams: flat ordered pool, ally-group id order + within-group
         // order. Emission walks groups sorted by `id` for determinism
         // (NFR-Det); within each group positions emit in the order the
@@ -1494,5 +1501,57 @@ mod tests {
         assert_eq!(w.damage, Some(1000.0));
         assert!(w.damage.unwrap() >= 1e3);
         assert!(w.damage.unwrap() < 1e4);
+    }
+
+    /// C9 (Sprint 14 / ADR-042 — Slice 4): `lava_atmosphere = true`
+    /// overrides BAR-default atmosphere with red-orange fog, dim
+    /// warm sun, and dusty clouds. Other atmosphere fields (sky
+    /// colour, sky axis, wind) stay at the BAR baseline.
+    #[test]
+    fn lava_atmosphere_patches_fog_sun_and_clouds() {
+        let mut p = Project::new("lava", 4);
+        p.lava_atmosphere = true;
+        let info: MapInfo = (&p).into();
+        assert_eq!(info.atmosphere.fog_color, Some([0.9, 0.3, 0.1]));
+        assert_eq!(info.atmosphere.sun_color, Some([1.0, 0.5, 0.3]));
+        assert_eq!(info.atmosphere.fog_start, Some(0.1));
+        assert_eq!(info.atmosphere.fog_end, Some(1.5));
+        assert_eq!(info.atmosphere.cloud_color, Some([0.4, 0.2, 0.15]));
+        assert_eq!(info.atmosphere.cloud_density, Some(0.7));
+        // Sky colour stays untouched (BAR default).
+        let baseline = MapInfo::bar_default();
+        assert_eq!(info.atmosphere.sky_color, baseline.atmosphere.sky_color);
+        assert_eq!(info.atmosphere.min_wind, baseline.atmosphere.min_wind);
+        assert_eq!(info.atmosphere.max_wind, baseline.atmosphere.max_wind);
+    }
+
+    /// Default (`lava_atmosphere = false`) leaves atmosphere at BAR
+    /// default. Verifies the offer is opt-in.
+    #[test]
+    fn no_lava_atmosphere_leaves_atmosphere_at_bar_default() {
+        let p = Project::new("dry", 4);
+        let info: MapInfo = (&p).into();
+        let baseline = MapInfo::bar_default();
+        assert_eq!(info.atmosphere.fog_color, baseline.atmosphere.fog_color);
+        assert_eq!(info.atmosphere.sun_color, baseline.atmosphere.sun_color);
+        assert_eq!(
+            info.atmosphere.cloud_density,
+            baseline.atmosphere.cloud_density
+        );
+    }
+
+    /// Lava-atmosphere is independent of water_mode — the user can
+    /// apply it freely even on a non-Lava preset (e.g. for stylistic
+    /// effect).
+    #[test]
+    fn lava_atmosphere_independent_of_water_mode() {
+        let mut p = Project::new("mixed", 4);
+        p.water_mode = crate::water_presets::WaterMode::Ocean;
+        p.lava_atmosphere = true;
+        let info: MapInfo = (&p).into();
+        // Water is Ocean.
+        assert_eq!(info.water.unwrap().surface_color, Some([0.67, 0.8, 1.0]));
+        // Atmosphere is lava-patched.
+        assert_eq!(info.atmosphere.fog_color, Some([0.9, 0.3, 0.1]));
     }
 }

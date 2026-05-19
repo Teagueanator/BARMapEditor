@@ -40,6 +40,6 @@ pub use undo::{
     HeightmapEntry, History, HistoryEntry, ProjectDiff, WaterField, WaterValue, WizardSnapshot,
 };
 pub use water_presets::{
-    BAR_DEFAULT_SURFACE_ALPHA, BAR_DEFAULT_SURFACE_COLOR, WaterMode, merge_overrides,
-    preset_water_block, water_override_count,
+    BAR_DEFAULT_SURFACE_ALPHA, BAR_DEFAULT_SURFACE_COLOR, WaterMode, apply_lava_atmosphere_patch,
+    merge_overrides, preset_water_block, water_override_count,
 };

@@ -362,6 +362,12 @@ struct App {
     /// `Project.tidal_strength`. Lives at MapInfo top level, NOT
     /// inside `water = {}` — the inspector co-locates for UX.
     tidal_strength: Option<f32>,
+    /// C9 (Sprint 14): lava-atmosphere offer. Mirrors
+    /// `Project.lava_atmosphere`. When `true`, the emission path
+    /// applies a hardcoded fog/sun/cloud patch (red-orange fog, dim
+    /// warm sun) on top of `bar_default()`. Independent of
+    /// `water_mode` so the user can apply it freely.
+    lava_atmosphere: bool,
     /// C9 (Sprint 14): ephemeral target depth for `Tool::Water`'s
     /// flood-carve gesture (elmos, negative = lower terrain). NOT
     /// persisted — same status as `brush_radius` / `brush_strength`
@@ -1016,6 +1022,7 @@ impl App {
             water_overrides: WaterBlock::default(),
             void_water: false,
             tidal_strength: None,
+            lava_atmosphere: false,
             // Default carve depth — matches the prompt's spec and a
             // generic flooded basin. Lives on App not Project (per-
             // session tool preference, same status as brush_radius).
@@ -1145,6 +1152,7 @@ impl App {
         self.water_overrides = WaterBlock::default();
         self.void_water = false;
         self.tidal_strength = None;
+        self.lava_atmosphere = false;
         self.dirty = false;
         self.end_stroke();
         self.history.barrier();
@@ -1175,6 +1183,7 @@ impl App {
             water_overrides: self.water_overrides.clone(),
             void_water: self.void_water,
             tidal_strength: self.tidal_strength,
+            lava_atmosphere: self.lava_atmosphere,
             // Re-saved projects always carry the current schema version
             // so subsequent loads skip migrations.
             schema_v: Project::SCHEMA_V,
@@ -2968,6 +2977,11 @@ impl App {
                     to: from,
                 }
             }
+            ProjectDiff::SetLavaAtmosphere { from, to } => {
+                self.lava_atmosphere = from;
+                trace!(from, to, "undo: reverted lava-atmosphere toggle");
+                ProjectDiff::SetLavaAtmosphere { from: to, to: from }
+            }
         }
     }
 
@@ -3264,6 +3278,7 @@ impl App {
                 self.water_overrides = p.water_overrides;
                 self.void_water = p.void_water;
                 self.tidal_strength = p.tidal_strength;
+                self.lava_atmosphere = p.lava_atmosphere;
                 self.metal_state = MetalState::default();
                 self.geo_state = GeoState::default();
                 self.dragging_metal_spot = None;
@@ -5898,6 +5913,13 @@ impl App {
             tracing::info!(from = ?active_mode, to = ?self.water_mode, "water mode changed");
         }
 
+        // ── LAVA ATMOSPHERE OFFER ─────────────────────────
+        // C9 / Sprint 14 Slice 4. When Lava / Magma is active and the
+        // user hasn't applied the lava-atmosphere patch yet, offer
+        // the one-click affordance. When the patch IS on, surface
+        // a "Revert" button so the user can undo from the same card.
+        self.inspector_water_atmosphere_offer(ui);
+
         // ── BEHAVIOUR ────────────────────────────────────
         // Damage / void_water / tidal_strength. Tidal lives at
         // MapInfo top level but co-locates here for UX (PITFALL §5
@@ -6030,6 +6052,73 @@ impl App {
                 .size(10.0),
             );
         });
+    }
+
+    /// C9 (Sprint 14 / ADR-042 — Slice 4): render the lava-atmosphere
+    /// offer / status card. Shows only when the active water preset
+    /// is Lava or Magma. Toggle pushes `SetLavaAtmosphere` for undo.
+    fn inspector_water_atmosphere_offer(&mut self, ui: &mut egui::Ui) {
+        let lava_family = matches!(self.water_mode, WaterMode::Lava | WaterMode::Magma);
+        if !lava_family {
+            return;
+        }
+        let t = crate::ui::theme::Tokens::DARK;
+        let applied = self.lava_atmosphere;
+        crate::ui::widgets::section(
+            ui,
+            "Lava atmosphere",
+            false,
+            |ui| {
+                let tone = if applied {
+                    crate::ui::theme::ChipTone::Ok
+                } else {
+                    crate::ui::theme::ChipTone::Warn
+                };
+                let label = if applied { "Applied" } else { "Not applied" };
+                crate::ui::widgets::chip(ui, tone, label);
+            },
+            |ui| {
+                ui.label(
+                    egui::RichText::new(
+                        "Lava maps usually pair their water with red-orange fog \
+                         and a dim warm sun. The patch sets fogColor, sunColor, \
+                         fogStart/End, and cloud density on top of the BAR \
+                         atmosphere default.",
+                    )
+                    .color(t.dim)
+                    .size(11.0),
+                );
+                ui.add_space(6.0);
+                let mut clicked_toggle = false;
+                if applied {
+                    let resp = ui.add(egui::Button::new("Revert atmosphere"));
+                    if resp.clicked() {
+                        clicked_toggle = true;
+                    }
+                } else {
+                    let resp = ui
+                        .add(egui::Button::new("Apply lava-style atmosphere").fill(t.accent))
+                        .on_hover_text(
+                            "Hardcoded patch: fog (0.9, 0.3, 0.1), \
+                             sun (1.0, 0.5, 0.3), cloud (0.4, 0.2, 0.15) @ 0.7.",
+                        );
+                    if resp.clicked() {
+                        clicked_toggle = true;
+                    }
+                }
+                if clicked_toggle {
+                    let new_val = !applied;
+                    self.history
+                        .push_project_diff(ProjectDiff::SetLavaAtmosphere {
+                            from: applied,
+                            to: new_val,
+                        });
+                    self.lava_atmosphere = new_val;
+                    self.mark_dirty();
+                    tracing::info!(applied = new_val, "lava atmosphere toggle");
+                }
+            },
+        );
     }
 
     /// Float-slider edit on `Project.water_overrides`'s `field`,
@@ -7865,6 +7954,7 @@ mod tests {
             water_overrides: WaterBlock::default(),
             void_water: false,
             tidal_strength: None,
+            lava_atmosphere: false,
             water_carve_depth: -80.0,
         }
     }

@@ -189,6 +189,13 @@ pub enum ProjectDiff {
         from: WaterValue,
         to: WaterValue,
     },
+    /// C9 (Sprint 14 / ADR-042): the lava-atmosphere offer was
+    /// flipped. Coarser than per-field atmosphere editing — the
+    /// `Project.lava_atmosphere: bool` gates a hardcoded
+    /// fog/sun/cloud patch the emission path applies on top of
+    /// `bar_default()`. Sprint 18's F9 form will eventually offer
+    /// per-field atmosphere overrides.
+    SetLavaAtmosphere { from: bool, to: bool },
 }
 
 /// C9 / Sprint 14: which water-related field an [`ProjectDiff::EditWaterField`]
@@ -265,7 +272,8 @@ impl ProjectDiff {
             | ProjectDiff::DeleteGeoVent { .. }
             | ProjectDiff::MoveGeoVent { .. }
             | ProjectDiff::SetWaterMode { .. }
-            | ProjectDiff::EditWaterField { .. } => inline,
+            | ProjectDiff::EditWaterField { .. }
+            | ProjectDiff::SetLavaAtmosphere { .. } => inline,
             ProjectDiff::ApplyWizard(snap) => inline + snap.bytes(),
             // Feature variants carry a String `name`; the heap cost of
             // its capacity is in addition to the enum inline size.
@@ -766,7 +774,8 @@ mod tests {
             | ProjectDiff::DeleteFeature { .. }
             | ProjectDiff::MoveFeature { .. }
             | ProjectDiff::SetWaterMode { .. }
-            | ProjectDiff::EditWaterField { .. } => {
+            | ProjectDiff::EditWaterField { .. }
+            | ProjectDiff::SetLavaAtmosphere { .. } => {
                 unreachable!(
                     "metal/geo/feature/water diffs not exercised through AllyGroup test helper"
                 )
@@ -1480,6 +1489,29 @@ mod tests {
             to: WaterValue::Float(Some(0.4)),
         });
         assert!(!h.can_redo());
+    }
+
+    /// C9 / Sprint 14 (Slice 4): SetLavaAtmosphere is inline and
+    /// pushes through history like other water diffs.
+    #[test]
+    fn set_lava_atmosphere_diff_is_inline_and_round_trips_through_history() {
+        let inline = std::mem::size_of::<ProjectDiff>();
+        let d = ProjectDiff::SetLavaAtmosphere {
+            from: false,
+            to: true,
+        };
+        assert_eq!(d.bytes(), inline);
+
+        let mut h = History::default();
+        h.push_project_diff(d);
+        let popped = h.pop_undo().unwrap();
+        match popped {
+            HistoryEntry::Project(ProjectDiff::SetLavaAtmosphere { from, to }) => {
+                assert!(!from);
+                assert!(to);
+            }
+            other => panic!("expected SetLavaAtmosphere, got {other:?}"),
+        }
     }
 
     /// C4/C5 diff variants push through history just like the F8
