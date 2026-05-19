@@ -29,8 +29,10 @@
 //!
 //! ## Pitfalls modelled at the type level
 //!
-//! - `lighting.sun_dir` is `[f32; 4]` — vec3 + `w` sunStart distance.
-//!   Not `[f32; 3]`. Encoded in [`SunDir`].
+//! - `lighting.sun_dir` is `[f32; 4]` — vec3 + `w` intensity scalar
+//!   (engine default `1.0`, per `MapInfo.cpp:213`, FINDINGS NEW-6).
+//!   Not `[f32; 3]`, and not the `1e9` sunStartDistance the
+//!   pre-audit research mis-attributed. Encoded in [`SunDir`].
 //! - [`TeamBlock`] carries ONLY `start_pos`. NO `ally_team` field —
 //!   that belongs to `mapconfig/map_startboxes.lua`, a separate file
 //!   that C2 emits from `Project.ally_groups` (when B6 lands).
@@ -68,9 +70,11 @@ fn default_void_alpha_min() -> f32 {
 }
 
 /// Sun direction with a `w` component holding the engine's
-/// `sunStart` distance. Per the digest, the engine default is
-/// `{0, 1, 2, 1e9}`. The fourth element is **not** padding — it's a
-/// real piece of state the lighting renderer reads.
+/// intensity scalar (NOT the `sunStartDistance` pre-audit research
+/// mis-attributed). Engine default is `{0, 1, 2, 1.0}` per
+/// `MapInfo.cpp:213` (FINDINGS §1.4 / NEW-6). The fourth element
+/// is **not** padding — emitting `1e9` over-saturates sunlight on
+/// map load and would surface as a blown-out preview.
 pub type SunDir = [f32; 4];
 
 /// Top-level `mapinfo.lua` table. Mirrors `MapInfo.cpp::ReadGlobal`
@@ -211,10 +215,12 @@ pub struct SmfBlock {
 /// colours.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LightingBlock {
-    /// Sun direction `{x, y, z, sunStart}`. **`[f32; 4]`** — the
-    /// fourth element is the start distance, not padding. Engine
-    /// default is `{0, 1, 2, 1e9}`. Many BAR widgets crash if the
-    /// `lighting` subtable is missing entirely; emit a real value.
+    /// Sun direction `{x, y, z, w}`. **`[f32; 4]`** — `w` is the
+    /// engine's intensity scalar (default `1.0` per
+    /// `MapInfo.cpp:213`, FINDINGS NEW-6), NOT the
+    /// `sunStartDistance` value (`1e9`) older notes claim. Many BAR
+    /// widgets crash if the `lighting` subtable is missing
+    /// entirely; emit a real value.
     pub sun_dir: SunDir,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ground_ambient_color: Option<Rgb>,
@@ -475,7 +481,7 @@ impl MapInfo {
     /// - `atmosphere.fog_start == Some(0.1)`, `fog_end == Some(1.0)` —
     ///   not equal (would break build-ETA renderer).
     /// - `splats.tex_scales == [0.02; 4]`, `tex_mults == [1.0; 4]`.
-    /// - `lighting.sun_dir.len() == 4` (vec3 + sunStart).
+    /// - `lighting.sun_dir.len() == 4` (vec3 + intensity).
     pub fn bar_default() -> Self {
         Self {
             name: String::new(),
@@ -505,8 +511,12 @@ impl MapInfo {
                 smt_file_name_extras: Vec::new(),
             },
             lighting: LightingBlock {
-                // Mild SE sun with the engine-default sunStart distance.
-                sun_dir: [0.3, 1.0, -0.2, 1.0e9],
+                // Mild SE sun direction (xyz). `w` is the engine's
+                // intensity scalar — default 1.0 per `MapInfo.cpp:213`
+                // (FINDINGS NEW-6); the older `1e9` value was a
+                // sunStartDistance leakage from a different code
+                // path that over-saturates sunlight on load.
+                sun_dir: [0.3, 1.0, -0.2, 1.0],
                 ground_ambient_color: Some([0.5, 0.5, 0.5]),
                 ground_diffuse_color: Some([0.5, 0.5, 0.5]),
                 ground_specular_color: Some([0.1, 0.1, 0.1]),
@@ -748,11 +758,18 @@ mod tests {
     #[test]
     fn bar_default_lighting_sun_dir_is_four_floats() {
         // Pitfall: easy to model as [f32; 3]. The fourth element is
-        // the engine's sunStart distance, not padding.
+        // the engine's intensity scalar (NOT a sunStartDistance —
+        // see PITFALL §18 / FINDINGS §1.4 / NEW-6). Engine default
+        // is exactly 1.0 per `MapInfo.cpp:213`; the older `1e9`
+        // value over-saturates sunlight on load.
         let info = MapInfo::bar_default();
         let sd: SunDir = info.lighting.sun_dir;
         assert_eq!(sd.len(), 4, "sun_dir must be a 4-element array");
-        assert!(sd[3] > 1.0e3, "sun_dir.w (sunStart) should be ≫ 1.0");
+        assert_eq!(
+            sd[3], 1.0,
+            "sun_dir.w (intensity scalar) must equal 1.0; got {}",
+            sd[3]
+        );
     }
 
     #[test]
