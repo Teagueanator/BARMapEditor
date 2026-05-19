@@ -179,9 +179,13 @@ pub struct MapInfo {
     /// authored in BAR maps; defaults to `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sound: Option<SoundBlock>,
-    /// `gui.*` sub-table — minimap rotation hint. Almost never set.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub gui: Option<GuiBlock>,
+    // NOTE: a `gui` subtable was dropped in Sprint 10 (PITFALL §19 /
+    // FINDINGS §1.11). Engine reader at `MapInfo.cpp:119-124` only
+    // consumes `autoShowMetal`, which already lives at the
+    // top-level [`MapInfo::auto_show_metal`]. `minimapRotation` —
+    // the only field a `GuiBlock` would have carried — is unused by
+    // current Recoil. If F9 (Sprint 13) ever exposes another `gui.*`
+    // override, re-add the struct then.
     /// `custom.*` — free-form per-gadget config (dual-fog,
     /// precipitation, volumetric clouds, etc.). Surfaced as
     /// `Spring.GetMapOptions()` to gadgets at runtime.
@@ -540,14 +544,6 @@ pub struct SoundBlock {
     pub preset: Option<String>,
 }
 
-/// `gui.*` sub-table — minimap rotation hint. Almost never set.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
-pub struct GuiBlock {
-    /// Minimap rotation in degrees.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub minimap_rotation: Option<i32>,
-}
-
 impl MapInfo {
     /// Return a fresh [`MapInfo`] populated with the BAR convention
     /// values from the research digest. Empty `teams[]` and empty
@@ -631,7 +627,6 @@ impl MapInfo {
             grass: None,
             teams: Vec::new(),
             sound: None,
-            gui: None,
             custom: HashMap::new(),
         }
     }
@@ -1250,7 +1245,6 @@ mod tests {
             grass,
             teams,
             sound,
-            gui,
             custom,
         } = info;
         // Silence the unused-variable lints; we exist for the pattern
@@ -1285,7 +1279,6 @@ mod tests {
             grass,
             teams,
             sound,
-            gui,
             custom,
         );
     }

@@ -20,9 +20,8 @@ pub use brushes::{Brush, BrushRegistry, BrushStamp, DirtyRect};
 pub use heightmap::{DimMismatch, Heightmap};
 pub use map_size::MapSize;
 pub use mapinfo_schema::{
-    AtmosphereBlock, GrassBlock, GuiBlock, LightingBlock, MapInfo, ResourcesBlock, Rgb, SmfBlock,
-    SoundBlock, SplatsBlock, SunDir, TeamBlock, TeamStartPos, TerrainMoveSpeeds, TerrainTypeBlock,
-    WaterBlock,
+    AtmosphereBlock, GrassBlock, LightingBlock, MapInfo, ResourcesBlock, Rgb, SmfBlock, SoundBlock,
+    SplatsBlock, SunDir, TeamBlock, TeamStartPos, TerrainMoveSpeeds, TerrainTypeBlock, WaterBlock,
 };
 pub use procgen::{
     BIOMES, BiomePreset, Domain, PRESETS, ProcGenError, ProcGenPreset, generate as procgen_generate,

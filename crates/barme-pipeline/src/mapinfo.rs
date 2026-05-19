@@ -150,9 +150,13 @@ fn build_mapinfo(info: &MapInfo) -> LuaValue {
     if let Some(s) = &info.sound {
         t.push((LuaKey::str("sound"), sound_block(s)));
     }
-    if let Some(g) = &info.gui {
-        t.push((LuaKey::str("gui"), gui_block(g)));
-    }
+    // PITFALL §19 / FINDINGS §1.11 — `gui.minimapRotation` was the
+    // only key a `gui` subtable would have carried, and the engine
+    // reader at `MapInfo.cpp:119-124` doesn't consume it. The other
+    // `gui` field the reader DOES consume — `autoShowMetal` — lives
+    // at the top-level [`MapInfo::auto_show_metal`]. So no `gui = {}`
+    // table emits. F9 (Sprint 13) can re-introduce one if a new
+    // `gui.*` field appears in the engine reader.
     // custom is a free-form bag; emit a placeholder empty table so
     // gadgets reading `mapinfo.custom.fog` etc. get nil rather than a
     // crash on `index a nil value`. (The schema's custom HashMap is
@@ -406,15 +410,6 @@ fn sound_block(b: &barme_core::SoundBlock) -> LuaValue {
     let mut t: Vec<(LuaKey, LuaValue)> = Vec::new();
     if let Some(s) = &b.preset {
         t.push((LuaKey::str("preset"), LuaValue::str(s)));
-    }
-    sort_table_by_key(&mut t);
-    LuaValue::Table(t)
-}
-
-fn gui_block(b: &barme_core::GuiBlock) -> LuaValue {
-    let mut t: Vec<(LuaKey, LuaValue)> = Vec::new();
-    if let Some(n) = b.minimap_rotation {
-        t.push((LuaKey::str("minimapRotation"), LuaValue::Int(n as i64)));
     }
     sort_table_by_key(&mut t);
     LuaValue::Table(t)
@@ -905,6 +900,28 @@ mod tests {
         assert!(
             s.contains(needle),
             "skyAxisAngle default block missing; want\n{needle}\ngot:\n{s}"
+        );
+    }
+
+    /// PITFALL §19 / FINDINGS §1.11: engine reader at
+    /// `MapInfo.cpp:119-124` (`ReadGui`) only consumes
+    /// `autoShowMetal`; `minimapRotation` is dead Lua. The emitter
+    /// must not write it — and since `autoShowMetal` lives at
+    /// top-level, no `gui = {}` subtable emits either.
+    #[test]
+    fn minimap_rotation_and_gui_subtable_are_absent() {
+        let p = Project::new("nogui", 4);
+        let s = render(&p);
+        assert!(
+            !s.contains("minimapRotation"),
+            "minimapRotation leaked into output; got:\n{s}"
+        );
+        // The `gui` subtable should also be absent — there's nothing
+        // for it to carry. `autoShowMetal` is a top-level key, not
+        // `gui.autoShowMetal`.
+        assert!(
+            !s.contains("gui = {"),
+            "empty `gui` subtable leaked into output; got:\n{s}"
         );
     }
 
