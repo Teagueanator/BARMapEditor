@@ -619,7 +619,12 @@ impl Default for PaintBrushState {
     fn default() -> Self {
         Self {
             brush_id: "mask-reveal".to_string(),
-            radius: 64.0,
+            // 192 elmos = ~2.3% of a 16-SMU map's width — visible at
+            // a glance during the first paint test without being so
+            // large it dominates the canvas. Mirrors the Sprint-9
+            // splat default that aims for "obviously a stroke,
+            // obviously not the whole map."
+            radius: 192.0,
             strength: 0.5,
             spacing: 0.5,
             mask_only_preview: false,
@@ -1106,7 +1111,7 @@ impl App {
         let editor_config = config::EditorConfig::load();
         let show_intro = !editor_config.intro_seen_for_current_version();
 
-        let app = Self {
+        let mut app = Self {
             project_name: "untitled".to_string(),
             map_size: MapSize::square(16),
             heightmap: None,
@@ -1216,6 +1221,11 @@ impl App {
         // diffuse to the composite slot array so the first central()
         // frame has real data to composite from (mask uploads land
         // on the same frame via `sync_composite_mask_tiles`).
+        // Demo seed: add a second accent layer (slot 1 if it exists)
+        // at mask = 0 so painting reveal in `Tool::PaintLayer`
+        // produces immediately-visible results without forcing the
+        // user to "+ Add" a layer first.
+        app.seed_demo_accent_layer();
         app.reupload_layer_stack_diffuses();
         app
     }
@@ -1305,9 +1315,11 @@ impl App {
         self.splat_distribution = None;
         self.splat_picker_open_for = None;
         // D8 / Sprint 15 (ADR-038): a fresh "New project" gets a
-        // single-layer biome-base stack. Sprint 17 will offer the
-        // user a Layers panel to grow / delete / reorder from here.
+        // single-layer biome-base stack. D9 / Sprint 16 seeds a
+        // second accent layer at mask=0 so paint reveal/hide
+        // immediately produce visible results.
         self.layer_stack = LayerStack::from_biome("", self.map_size);
+        self.seed_demo_accent_layer();
         // D9 / Sprint 16 (ADR-039): clear the per-layer GPU upload
         // cursor so the new stack's masks land on the first central()
         // frame. The slot diffuse re-upload pushes the default
@@ -2282,6 +2294,188 @@ impl App {
         self.splat_config.channels[channel] = None;
         self.mark_dirty();
         info!(channel, "splat slot unbound");
+    }
+
+    /// D9 / Sprint 16 — seed a freshly-built `LayerStack::from_biome`
+    /// with a second "accent" layer (slot 1 if it exists, mask = 0)
+    /// so the user can immediately paint reveal/hide and see the
+    /// result in the central viewport without first having to add a
+    /// layer via the Layers panel. Idempotent — bails when the stack
+    /// already has > 1 layer (migration from older projects) or when
+    /// the registry doesn't carry a second slot.
+    fn seed_demo_accent_layer(&mut self) {
+        if self.layer_stack.layers.len() != 1 {
+            return;
+        }
+        let used_first = match &self.layer_stack.layers[0].source {
+            barme_core::LayerSource::Slot { id } => Some(*id),
+            barme_core::LayerSource::Imported { .. } => None,
+        };
+        let next = self
+            .slot_registry
+            .iter()
+            .find(|s| Some(s.id) != used_first)
+            .map(|s| s.id);
+        let Some(slot_id) = next else {
+            return;
+        };
+        let accent = TextureLayer::new(
+            barme_core::LayerSource::Slot { id: slot_id },
+            self.map_size,
+            0,
+        );
+        self.layer_stack.layers.push(accent);
+        // Don't `mark_dirty` — this is part of the initial fresh-
+        // project shape, not a user edit.
+        info!(
+            slot_id,
+            "Sprint 16 Layers: seeded demo accent layer on top of base biome"
+        );
+    }
+
+    /// D9 / Sprint 16 (ADR-040, brought-forward Layers panel) — add a
+    /// new layer at the TOP of the stack (Photoshop convention: the
+    /// new layer sits over what was there). Picks the next available
+    /// slot id from the registry that isn't already used in the
+    /// stack; falls back to slot 0 when every registry slot is
+    /// already bound. Mask starts at 0 (fully transparent) so the new
+    /// layer is a clean canvas to paint into.
+    ///
+    /// Returns the new layer's id. Re-uploads all slot diffuses to
+    /// the composite slot array so indices stay aligned, and clears
+    /// the per-layer mask version cache so the new layer's mask
+    /// uploads on the next frame.
+    fn add_layer_at_top(&mut self) -> String {
+        let used: std::collections::HashSet<u8> = self
+            .layer_stack
+            .layers
+            .iter()
+            .filter_map(|l| match &l.source {
+                barme_core::LayerSource::Slot { id } => Some(*id),
+                barme_core::LayerSource::Imported { .. } => None,
+            })
+            .collect();
+        let pick = self
+            .slot_registry
+            .iter()
+            .find(|s| !used.contains(&s.id))
+            .map(|s| s.id)
+            .unwrap_or(0);
+        let layer = TextureLayer::new(barme_core::LayerSource::Slot { id: pick }, self.map_size, 0);
+        let id = layer.id.clone();
+        self.layer_stack.layers.push(layer);
+        self.mark_dirty();
+        self.composite_layer_last_version.clear();
+        self.reupload_layer_stack_diffuses();
+        info!(
+            slot_id = pick,
+            layer_id = %id,
+            "Sprint 16 Layers: added layer at top of stack"
+        );
+        id
+    }
+
+    /// D9 / Sprint 16 — delete the layer with `layer_id`. If it was
+    /// the active layer, drop the active selection (the central
+    /// helper picks a fresh top-of-stack default on next frame).
+    /// Re-uploads slot diffuses so the remaining layers' indices
+    /// realign with the composite slot array.
+    fn delete_layer(&mut self, layer_id: &str) {
+        let Some(idx) = self
+            .layer_stack
+            .layers
+            .iter()
+            .position(|l| l.id == layer_id)
+        else {
+            return;
+        };
+        self.layer_stack.layers.remove(idx);
+        if self.paint_active_layer_id.as_deref() == Some(layer_id) {
+            self.paint_active_layer_id = None;
+        }
+        self.mark_dirty();
+        self.composite_layer_last_version.clear();
+        self.reupload_layer_stack_diffuses();
+        info!(layer_id, "Sprint 16 Layers: deleted layer");
+    }
+
+    /// D9 / Sprint 16 — move the layer at `from` to `to`, shifting the
+    /// rest. Indices are bottom-first vec indices, so a UI "move up"
+    /// (Photoshop convention = move toward the top of the visible
+    /// stack) is `from + 1` → `from`. Idempotent when `from == to`.
+    fn reorder_layer(&mut self, from: usize, to: usize) {
+        let n = self.layer_stack.layers.len();
+        if from >= n || to >= n || from == to {
+            return;
+        }
+        let layer = self.layer_stack.layers.remove(from);
+        self.layer_stack.layers.insert(to, layer);
+        self.mark_dirty();
+        self.composite_layer_last_version.clear();
+        self.reupload_layer_stack_diffuses();
+        info!(from, to, "Sprint 16 Layers: reordered layer");
+    }
+
+    /// D9 / Sprint 16 — import a PNG / JPG from disk into the layer
+    /// identified by `layer_id`. The image is resized to
+    /// `SLOT_COMPOSITE_DIM` (1024²) and uploaded to the composite
+    /// slot array at the layer's vec index; the layer's source flips
+    /// to `LayerSource::Imported { path }`. The default name "Slot
+    /// XX" updates to the file stem if the user hasn't renamed it.
+    fn import_layer_texture(&mut self, layer_id: &str, path: PathBuf) {
+        use barme_core::LayerSource;
+        let Some(idx) = self
+            .layer_stack
+            .layers
+            .iter()
+            .position(|l| l.id == layer_id)
+        else {
+            return;
+        };
+        let img = match image::open(&path) {
+            Ok(i) => i,
+            Err(e) => {
+                warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "Sprint 16 Layers: import failed; layer unchanged"
+                );
+                self.last_error = Some(format!("Texture import failed: {e:#}"));
+                return;
+            }
+        };
+        let mut rgba = img.to_rgba8();
+        if rgba.width() != crate::render::SLOT_COMPOSITE_DIM
+            || rgba.height() != crate::render::SLOT_COMPOSITE_DIM
+        {
+            rgba = image::imageops::resize(
+                &rgba,
+                crate::render::SLOT_COMPOSITE_DIM,
+                crate::render::SLOT_COMPOSITE_DIM,
+                image::imageops::FilterType::Lanczos3,
+            );
+        }
+        let layer = &mut self.layer_stack.layers[idx];
+        // Update the name when it still looks like the auto-default
+        // ("Slot XX" / "Imported"); a user-renamed name survives.
+        let auto_name = layer.source.default_label();
+        if layer.name == auto_name {
+            layer.name = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "Imported".to_string());
+        }
+        layer.source = LayerSource::Imported { path: path.clone() };
+        self.mark_dirty();
+        if let Some(rs) = self.render_state.as_ref() {
+            crate::render::upload_composite_slot_diffuse(rs, idx as u32, rgba.as_raw());
+        }
+        info!(
+            layer_id,
+            path = %path.display(),
+            "Sprint 16 Layers: imported texture"
+        );
     }
 
     /// D9 / Sprint 16 (ADR-040) — apply the active mask brush at the
@@ -6515,63 +6709,230 @@ impl App {
     /// Lower / Smooth) styled with a coloured swatch ring per mode,
     /// ramp sliders for radius and strength, and a behaviour chip row
     /// (Continuous active; Pressure and Lock-Z placeholder-disabled).
-    /// D9 / Sprint 16 (ADR-040) — minimal paint-layer inspector. A
-    /// vertical strip of layer chips (top-of-stack first, Photoshop
-    /// convention) above a BRUSH section that mirrors the Sprint-9
-    /// splat inspector's controls. Sprint 17 replaces the strip with
-    /// the full Layers panel; the brush controls survive as-is.
+    /// D9 / Sprint 16 (ADR-040) — paint-layer inspector. Originally
+    /// scoped as a minimal active-layer strip; expanded mid-Sprint
+    /// per user request into a proper Layers panel covering
+    /// add / rename / delete / reorder / opacity / per-layer
+    /// visibility / texture-import. Sprint 17's spec (ADR-041) had
+    /// owned these affordances; bringing them forward keeps the
+    /// painting workflow self-sufficient without waiting on the
+    /// full Photoshop-style panel.
     fn inspector_paint_layer(&mut self, ui: &mut egui::Ui) {
         let t = crate::ui::theme::Tokens::DARK;
 
-        // ---- ACTIVE LAYER strip ----
+        // Deferred actions — collected during the iteration so we
+        // don't mutate the stack mid-walk (Rust borrow rules + the
+        // potential for index drift after delete / reorder).
+        enum LayerAction {
+            SetActive(String),
+            ToggleVisible(String),
+            Rename(String, String),
+            Delete(String),
+            MoveUp(usize),
+            MoveDown(usize),
+            SetOpacity(String, f32),
+            ImportTexture(String),
+            AddLayer,
+        }
+        // RefCell so the two `section` closures (header + body) can
+        // both push without fighting over the borrow.
+        let actions: std::cell::RefCell<Vec<LayerAction>> = std::cell::RefCell::new(Vec::new());
+
         crate::ui::widgets::section(
             ui,
-            "Active layer",
+            "Layers",
             false,
-            |_ui| {},
+            |ui| {
+                if ui.small_button("+ Add").clicked() {
+                    actions.borrow_mut().push(LayerAction::AddLayer);
+                }
+            },
             |ui| {
                 if self.layer_stack.layers.is_empty() {
                     ui.label(
-                        egui::RichText::new("No layers in the stack. Sprint 17 adds the Layers panel.")
+                        egui::RichText::new("Empty stack — click '+ Add' to start.")
                             .small()
                             .weak(),
                     );
                     return;
                 }
-                // Render top-of-stack first to match Photoshop UX
-                // even though the data is bottom-first.
+                let n = self.layer_stack.layers.len();
                 let active = self.paint_active_layer_id.clone();
-                let mut new_active: Option<String> = None;
-                for layer in self.layer_stack.layers.iter().rev() {
+                // Iterate top-of-stack first (Photoshop convention)
+                // even though the vec is bottom-first.
+                for vec_idx_from_top in 0..n {
+                    let vec_idx = n - 1 - vec_idx_from_top;
+                    let layer = &self.layer_stack.layers[vec_idx];
                     let is_active = active.as_ref() == Some(&layer.id);
-                    let bg = if is_active { t.accent } else { t.panel };
-                    let fg = if is_active { t.bg } else { t.text };
-                    let label = if layer.visible {
-                        layer.name.clone()
-                    } else {
-                        format!("(hidden) {}", layer.name)
+                    let id = layer.id.clone();
+                    let name = layer.name.clone();
+                    let visible = layer.visible;
+                    let opacity = layer.opacity;
+                    let source_label = match &layer.source {
+                        barme_core::LayerSource::Slot { id } => format!("Slot {id:02}"),
+                        barme_core::LayerSource::Imported { path } => path
+                            .file_name()
+                            .and_then(|s| s.to_str())
+                            .map(|s| format!("imp: {s}"))
+                            .unwrap_or_else(|| "imp: ?".to_string()),
                     };
-                    let (chip_rect, chip_resp) =
-                        ui.allocate_exact_size(egui::vec2(ui.available_width(), 28.0), egui::Sense::click());
-                    let painter = ui.painter_at(chip_rect);
-                    painter.rect_filled(chip_rect, 4.0, bg);
-                    painter.text(
-                        chip_rect.left_center() + egui::vec2(10.0, 0.0),
-                        egui::Align2::LEFT_CENTER,
-                        &label,
-                        egui::FontId::proportional(12.0),
-                        fg,
-                    );
-                    if chip_resp.clicked() {
-                        new_active = Some(layer.id.clone());
-                    }
-                    ui.add_space(2.0);
-                }
-                if let Some(id) = new_active {
-                    self.paint_active_layer_id = Some(id);
+                    let bg = if is_active { t.accent_dim } else { t.panel2 };
+
+                    egui::Frame::group(ui.style())
+                        .fill(bg)
+                        .corner_radius(4.0)
+                        .inner_margin(egui::Margin::symmetric(6, 4))
+                        .show(ui, |ui| {
+                            // Top row: select-by-name + visibility +
+                            // up/down arrows + delete.
+                            ui.horizontal(|ui| {
+                                let eye = if visible { "👁" } else { "—" };
+                                if ui
+                                    .add(egui::Button::new(eye).small())
+                                    .on_hover_text("Toggle visibility")
+                                    .clicked()
+                                {
+                                    actions.borrow_mut().push(LayerAction::ToggleVisible(id.clone()));
+                                }
+                                // Rename via TextEdit. Submit on
+                                // focus-loss / Enter.
+                                let mut name_mut = name.clone();
+                                let name_resp = ui.add(
+                                    egui::TextEdit::singleline(&mut name_mut)
+                                        .desired_width(ui.available_width() - 100.0)
+                                        .frame(false),
+                                );
+                                if name_resp.lost_focus() && name_mut != name {
+                                    actions.borrow_mut().push(LayerAction::Rename(id.clone(), name_mut));
+                                }
+                                if name_resp.clicked() {
+                                    actions.borrow_mut().push(LayerAction::SetActive(id.clone()));
+                                }
+                                // Up = move toward top of stack (= +1
+                                // in the bottom-first vec).
+                                let can_up = vec_idx + 1 < n;
+                                if ui
+                                    .add_enabled(can_up, egui::Button::new("↑").small())
+                                    .on_hover_text("Move up (toward top of stack)")
+                                    .clicked()
+                                {
+                                    actions.borrow_mut().push(LayerAction::MoveUp(vec_idx));
+                                }
+                                let can_down = vec_idx > 0;
+                                if ui
+                                    .add_enabled(can_down, egui::Button::new("↓").small())
+                                    .on_hover_text("Move down")
+                                    .clicked()
+                                {
+                                    actions.borrow_mut().push(LayerAction::MoveDown(vec_idx));
+                                }
+                                if ui
+                                    .add(egui::Button::new("×").small())
+                                    .on_hover_text("Delete layer")
+                                    .clicked()
+                                {
+                                    actions.borrow_mut().push(LayerAction::Delete(id.clone()));
+                                }
+                            });
+                            // Second row: source label + opacity slider.
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    egui::RichText::new(&source_label)
+                                        .color(t.muted)
+                                        .size(10.0)
+                                        .monospace(),
+                                );
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if ui
+                                            .add(egui::Button::new("Import…").small())
+                                            .on_hover_text(
+                                                "Replace this layer's source with a PNG/JPG from disk",
+                                            )
+                                            .clicked()
+                                        {
+                                            actions.borrow_mut().push(LayerAction::ImportTexture(id.clone()));
+                                        }
+                                        let mut op = opacity;
+                                        if ui
+                                            .add(
+                                                egui::Slider::new(&mut op, 0.0..=1.0)
+                                                    .show_value(false),
+                                            )
+                                            .on_hover_text(format!("Opacity: {:.0}%", op * 100.0))
+                                            .changed()
+                                        {
+                                            actions.borrow_mut().push(LayerAction::SetOpacity(id.clone(), op));
+                                        }
+                                    },
+                                );
+                            });
+                            // Click anywhere on the card to make it
+                            // active (matches Photoshop's row-click
+                            // behaviour; the rename TextEdit above
+                            // owns focus when the user clicks the name
+                            // specifically).
+                            let resp = ui.interact(
+                                ui.min_rect(),
+                                ui.id().with(("layer_card", &id)),
+                                egui::Sense::click(),
+                            );
+                            if resp.clicked() {
+                                actions.borrow_mut().push(LayerAction::SetActive(id.clone()));
+                            }
+                        });
+                    ui.add_space(3.0);
                 }
             },
         );
+
+        // ---- Apply collected actions ----
+        for action in actions.into_inner() {
+            match action {
+                LayerAction::SetActive(id) => self.paint_active_layer_id = Some(id),
+                LayerAction::ToggleVisible(id) => {
+                    if let Some(l) = self.layer_stack.active_layer_mut(&id) {
+                        l.visible = !l.visible;
+                        self.mark_dirty();
+                    }
+                }
+                LayerAction::Rename(id, new_name) => {
+                    if let Some(l) = self.layer_stack.active_layer_mut(&id) {
+                        l.name = new_name;
+                        self.mark_dirty();
+                    }
+                }
+                LayerAction::Delete(id) => self.delete_layer(&id),
+                LayerAction::MoveUp(from) => self.reorder_layer(
+                    from,
+                    (from + 1).min(self.layer_stack.layers.len().saturating_sub(1)),
+                ),
+                LayerAction::MoveDown(from) => {
+                    if from > 0 {
+                        self.reorder_layer(from, from - 1);
+                    }
+                }
+                LayerAction::SetOpacity(id, v) => {
+                    if let Some(l) = self.layer_stack.active_layer_mut(&id) {
+                        l.opacity = v;
+                        self.mark_dirty();
+                    }
+                }
+                LayerAction::ImportTexture(id) => {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("Texture image", &["png", "jpg", "jpeg"])
+                        .pick_file()
+                    {
+                        self.import_layer_texture(&id, path);
+                    }
+                }
+                LayerAction::AddLayer => {
+                    let new_id = self.add_layer_at_top();
+                    self.paint_active_layer_id = Some(new_id);
+                }
+            }
+        }
 
         // ---- BRUSH section ----
         crate::ui::widgets::section(

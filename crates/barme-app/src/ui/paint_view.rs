@@ -81,7 +81,11 @@ pub struct PaintViewOutput {
 /// Zoom: scroll wheel (pivot on cursor); range 0.25× – 16× of
 /// auto-fit.
 /// Double-click: reset to auto-fit + zero pan.
-pub fn paint_view(ui: &mut egui::Ui, rect: egui::Rect, input: PaintViewInput<'_>) -> PaintViewOutput {
+pub fn paint_view(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    input: PaintViewInput<'_>,
+) -> PaintViewOutput {
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 0.0, input.background);
 
@@ -95,7 +99,10 @@ pub fn paint_view(ui: &mut egui::Ui, rect: egui::Rect, input: PaintViewInput<'_>
     let (extent_x, extent_z) = input.world_extent_elmos;
     let auto_fit = auto_fit_factor(rect.size(), extent_x, extent_z);
     let zoom = if input.view_state.zoom > 0.0 {
-        input.view_state.zoom.clamp(auto_fit * 0.25, auto_fit * 16.0)
+        input
+            .view_state
+            .zoom
+            .clamp(auto_fit * 0.25, auto_fit * 16.0)
     } else {
         auto_fit
     };
@@ -184,10 +191,8 @@ pub fn paint_view(ui: &mut egui::Ui, rect: egui::Rect, input: PaintViewInput<'_>
     // `view_state` mut here).
     let cursor_elmos = input.cursor_elmos;
     if let Some(elmos) = cursor_elmos {
-        let cursor_screen = egui::pos2(
-            map_origin.x + elmos.x * zoom,
-            map_origin.y + elmos.y * zoom,
-        );
+        let cursor_screen =
+            egui::pos2(map_origin.x + elmos.x * zoom, map_origin.y + elmos.y * zoom);
         let radius_px = input.brush_radius_elmos * zoom;
         let accent = ui.visuals().selection.bg_fill;
         painter.circle_stroke(cursor_screen, radius_px, egui::Stroke::new(1.5, accent));
@@ -206,8 +211,11 @@ pub fn paint_view(ui: &mut egui::Ui, rect: egui::Rect, input: PaintViewInput<'_>
             egui::pos2(rect.right() - 162.0, rect.top() + 8.0),
             egui::vec2(154.0, 22.0),
         );
-        let chip_response =
-            ui.interact(chip_rect, ui.id().with("paint_mask_only"), egui::Sense::click());
+        let chip_response = ui.interact(
+            chip_rect,
+            ui.id().with("paint_mask_only"),
+            egui::Sense::click(),
+        );
         let bg = if input.mask_only_preview {
             ui.visuals().selection.bg_fill
         } else {
