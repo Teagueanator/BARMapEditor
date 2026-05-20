@@ -3220,6 +3220,287 @@ within the renderer-parity arc's ΔE < 5.0 target.
   perf will be measured in Sprint 16's first commit cycle once
   the paint viewport can produce realistic stacks.
 
+## ADR-039 — GPU layered composite pipeline + tiled-COW mask storage (Sprint 16 / D9)
+
+**Status:** Accepted (2026-05-19). Lands the GPU live preview half
+of the layered painter trio. The CPU bake (ADR-038) stays
+authoritative for the `.sd7` export; this ADR adds the GPU
+preview the paint viewport (ADR-040) and the terrain shader sample
+on every frame. The data path that drives the GPU side — the
+tiled-COW mask storage — ships under this same ADR because the
+GPU upload contract (`dirty_tiles_since` + per-tile sub-uploads)
+is defined relative to the storage shape.
+
+**Context.** Sprint 15 / ADR-038 shipped [`LayerMask`] backed by a
+flat `Vec<u8>`. That carries 64 MB per layer on a 16-SMU map
+regardless of paint coverage — a 16-layer cap multiplied at 1 GB
+before the user touched a brush, breaking the SRS NFR-Memory ≤ 4
+GB resident budget at 16 SMU. The GPU side was also unwired —
+the bake produced a BMP for export but the editor preview kept
+sampling the Sprint-9 biome gradient + splat composite, so painting
+into a layer didn't show up live.
+
+**Decision.**
+
+- **Tiled COW masks (`barme_core::layers::mask`).** Storage is a
+  grid of 256² `Tile` cells, each either `Tile::Uniform(byte)` (16
+  bytes resident) or `Tile::Pixels(Box<[u8; 65536]>)` (64 KB
+  resident, allocated lazily on the first write that touches a
+  uniform tile). `LayerMask::filled` returns an all-`Uniform` grid
+  at ~16 KB regardless of map size; a typical brush stroke touches
+  ~5–20 tiles for ~320 KB – 1.3 MB allocation. Memory scales with
+  paint coverage, not map size — pinned by
+  `tests::filled_layer_costs_under_one_kb_per_smu_axis`.
+
+  The Sprint-15 wire format (`{ width, height, bytes: <base64> }`)
+  loads cleanly via a custom `Deserialize` impl that scans each
+  256² tile for runs of identical bytes and collapses to `Uniform`
+  on import (`legacy_flat_bytes_round_trip_compresses_uniform_
+  tiles`). Sprint-16+ serialises with the tile-discriminated wire
+  shape (`tiles: Vec<String>` with `"u:<byte>"` / `"p:<b64>"`
+  encoding); ~5 bytes per uniform tile, ~88 KB per concrete tile
+  (base64 overhead included).
+
+  `LayerMask::dirty_tiles_since(version)` + `version()` form the
+  GPU upload cursor: callers capture the latest version after each
+  upload pass, and the next call returns the tile coords with
+  more-recent writes. A single brush stamp typically marks 1–4
+  tiles dirty.
+
+- **GPU composite pipeline (`crates/barme-app/src/composite.wgsl`).**
+  Bind group: `CompositeU` uniform + 16-layer slot diffuse array
+  + slot sampler (`Repeat` for wallpaper-tile) + 16-layer mask
+  array (`r8unorm`, dims = composite RT) + mask sampler
+  (`ClampToEdge` so mask edges don't tile). Fragment stage walks
+  layers bottom-to-front, alpha-overing into an `acc_rgb`/`acc_a`
+  pair, flattening against the same `0.18` mid-grey the CPU bake
+  uses so the preview tone matches the export.
+
+  16-layer cap: above 16, only the bottom 16 contribute to the
+  preview; the CPU bake handles the full stack for `.sd7` export.
+  The `dims` uniform packs `[rt_w, rt_h, world_extent_x_elmos,
+  world_extent_z_elmos]` so layer offsets (in elmos) stay
+  correct even when the RT clamps below `texture_dims` for >8-SMU
+  maps.
+
+- **Composite RT (`render::CompositeResources`).** `Rgba8Unorm`
+  (NOT sRGB — matches the slot diffuse format so blending stays
+  byte-true to the CPU path). Clamped at `COMPOSITE_RT_CLAMP =
+  4096²`; maps >8 SMU clamp here and the terrain shader's bilinear
+  sampler upscales when binding the RT as its diffuse base. The
+  CPU bake stays full `texture_dims` for `.sd7` export.
+
+- **Slot diffuse array.** 16-layer `texture_2d_array<rgba8unorm>`
+  at 1024² per layer (`SLOT_COMPOSITE_DIM`). Pre-loaded once on
+  app start via `App::reupload_layer_stack_diffuses`; per-layer
+  rebind targets a single array layer via
+  `render::upload_composite_slot_diffuse`. Layer N of the array
+  matches layer N of `LayerStack::layers` — reorder / add /
+  delete re-upload the affected layers to keep indices aligned.
+
+- **Mask array.** 16-layer `texture_2d_array<r8unorm>` sized to the
+  composite RT. Per-tile sub-uploads via
+  `render::write_composite_layer_mask_tiles(layer_idx, &mask,
+  &[TileCoord])` — reads each tile via `LayerMask::read_tile` into
+  a stack buffer, calls `queue.write_texture` with
+  `origin = (tx * TILE_DIM, ty * TILE_DIM, layer_idx)`. A
+  `debug_assert!` pins the tile-grid-bounds invariant. **Full mask
+  writes are explicitly avoided** — 4096² × 16 layers = 256 MB per
+  frame and would blow the 8 ms NFR-Performance budget.
+
+- **Terrain shader patch.** New `params2.y` flag plus binding 7 /
+  8 (composite RT view + sampler). When the project has a non-empty
+  layer stack, `params2.y = 1.0` switches the terrain shader's
+  diffuse base from the Sprint-9 biome ramp + splat composite to a
+  direct sample of the composite RT. The Sprint-9 DNTS detail-
+  normal overlay stays unchanged — Sprint 17 / ADR-041 will move
+  DNTS emission onto the layer model.
+
+- **Per-frame dispatch.** `App::central` calls
+  `render::ensure_composite_rt` + `App::sync_composite_mask_tiles`
+  before building the `TerrainCallback`; the callback's
+  `prepare()` encodes the composite pass into the RT before the
+  terrain pass so the terrain shader's sample lands on this
+  frame's bake. The pass is unconditional when a layer stack
+  exists — Sprint 16 doesn't scissor-mask to dirty rects because
+  the full-screen pass at 4096² is < 1 ms on iGPU and the
+  simpler shape is easier to debug.
+
+**Alternatives considered.**
+
+- *Per-stroke full-mask upload.* 256 MB per frame at 4096² × 16
+  layers. Blows the 8 ms NFR. Rejected.
+- *GPU composite into the heightmap's existing offscreen RT.*
+  Reuses the egui texture binding but couples the layered diffuse
+  to the terrain's depth attachment, which doesn't apply to a 2D
+  preview. Rejected.
+- *Run the composite as a separate `egui_wgpu::Callback`.* Cleaner
+  separation but doubles the encoder churn. Folding into
+  `TerrainCallback::prepare` keeps both passes in one encoder.
+- *Pack mirror+rotate into a 2×3 affine matrix.* The 4-scalar
+  packing (`[mirror_x_sign, mirror_y_sign, cos, sin]`) is smaller
+  (4 floats vs 6) and the WGSL math is one fewer multiplication
+  per pixel.
+
+**Consequence.**
+
+- `barme-core` gains a `layers::mask` module with `TileGrid`,
+  `Tile::Uniform`/`Pixels`, `TileCoord`, `MaskStamp`, and the
+  `flood_fill` helper for `mask-fill`. `LayerStack::apply_brush`
+  dispatches one stamp into the named layer's mask.
+- `barme-core::layers::brushes` ships the four mask brushes
+  (`mask-reveal` / `mask-hide` / `mask-smooth` / `mask-fill`)
+  under the new `MaskBrush` trait — object-safe `Send + Sync +
+  'static`, mirrors the `SplatBrush` shape from ADR-018 / Sprint
+  9.
+- `crates/barme-app/src/composite.wgsl` — the new pipeline.
+- `crates/barme-app/src/render.rs` gains `CompositeResources`,
+  `CompositeLayerU`, `CompositeU`, `ensure_composite_rt`,
+  `write_composite_layer_mask_tiles`,
+  `upload_composite_slot_diffuse`, `update_composite_uniforms`.
+  The terrain bind-group layout grows entries 7 + 8 for the
+  composite RT view + sampler; `make_bind_group` takes the
+  composite view + sampler as new args.
+- `barme-app::main` plumbs the per-frame composite-mask sync from
+  `central()` and re-uploads slot diffuses on project open / new /
+  wizard / structural layer edits.
+- Caveat: mask-pixel undo is NOT in scope. The COW machinery is
+  the foundation a future sprint (Sprint 19+) can hang per-stroke
+  undo off, mirroring ADR-033's heightmap path.
+- Caveat: the composite RT preview is approximate on >8-SMU maps
+  (4096² clamp; bilinear upscale to the terrain shader's per-
+  fragment sample). The CPU bake remains authoritative for `.sd7`
+  export.
+
+## ADR-040 — Top-down 2D paint viewport + brought-forward Layers panel (Sprint 16 / D9)
+
+**Status:** Accepted (2026-05-19). Lands the user-facing
+painter for the layered diffuse: the 2D paint viewport that
+samples the composite RT (ADR-039) + the Layers panel UI that
+manages the stack. Scoped originally as a "minimal active-layer
+strip" pending Sprint 17 / ADR-041; expanded mid-sprint per user
+direction to ship a full add / rename / delete / reorder / opacity
+/ import experience so the painting workflow is self-sufficient
+without Sprint 17's hybrid emission.
+
+**Context.** Sprint 16's prompt scoped the inspector to a vertical
+"active layer" chip strip on the right, with Sprint 17 / ADR-041
+owning the Photoshop-style Layers panel. Mid-Sprint review
+established that without the ability to add / reorder / rename /
+delete / set per-layer opacity / import a texture, the painting
+workflow couldn't actually be tested — every stroke would target
+the same single default biome layer at mask=255, where reveal is
+a no-op and hide only uncovers the mid-grey background. The user
+explicitly requested the full panel before signing off on Sprint
+16. ADR-041 still owns custom-texture sidecar storage (`<project>/
+textures/<uuid>.png`) + DNTS hybrid emission + retirement of
+`inspector_splat`; this ADR ships the UX side only.
+
+**Decision.**
+
+- **`Tool::PaintLayer` variant** — keyboard `L`, `Icon::Brush`,
+  label "Paint layer". Slots between `Water` and `Procgen` in
+  `Tool::ALL`. When active, the central viewport swaps the 3D
+  `TerrainCallback` for the 2D `ui::paint_view::paint_view` call.
+
+- **Top-down 2D paint viewport** (`crates/barme-app/src/ui/paint_
+  view.rs`). Ortho projection of the composite RT into the central
+  rect at 1:1 aspect, **letterboxed bands** when the viewport's
+  aspect differs from the map's (PITFALL §8 — explicit no-stretch).
+  Pan: middle-mouse-button drag in world-elmo space. Zoom: scroll
+  wheel pivoted on the cursor, range 0.25× – 16× of the auto-fit
+  factor. Double-click resets pan + zoom to auto-fit. Brush ring
+  overlay at the cursor (accent-coloured stroke + inner pip);
+  mask-only preview toggle chip (top-right, Sprint 17 finishes
+  the actual grayscale render); status strip (bottom) with layer
+  name + cursor elmo coord + mask byte at the cursor.
+
+- **Pointer dispatch** — `central_paint_layer` resolves the cursor
+  → world elmos via the paint_view's pan/zoom math, calls
+  `apply_mask_brush_at_elmos` on `drag_started_by(LMB)` and
+  `apply_mask_brush_along_drag` on each subsequent `dragged_by`.
+  Drag interpolation: when delta > `spacing × radius`, intermediate
+  stamps are emitted so fast 500-px drags don't leave gaps (PITFALL
+  §3). Off-map cursor clips silently.
+
+- **Layers panel** (`App::inspector_paint_layer`). Top-down list
+  (Photoshop convention; vec is bottom-first). Per layer:
+  visibility toggle (👁/—), inline-edit name (TextEdit; commits
+  on focus loss / Enter), source label (`Slot 02` or `imp: foo.png`),
+  up / down move arrows, delete `×` button. Below the name row:
+  opacity slider (0..=1) + Import button. Clicking the card sets
+  the layer active.
+
+  Pre-iteration `RefCell<Vec<LayerAction>>` collects intents
+  during the layer walk so structural mutations (delete /
+  reorder / import) don't fight egui's per-frame mut-borrows or
+  shift the index mid-loop.
+
+- **Demo seed.** `App::seed_demo_accent_layer` runs in `App::new`
+  + `new_project` + (transitively via `apply_wizard`); adds a
+  second layer at slot 1 (mask=0) on top of the default biome's
+  base so paint reveal/hide immediately produce visible results
+  on the first stroke. Idempotent — bails when the stack already
+  has > 1 layer or when the registry doesn't carry a second slot.
+
+- **`paint_active_layer_id` persistence.** Lives on App; survives
+  tool switches (re-entering `Tool::PaintLayer` resumes on the
+  same layer). Cleared on `new_project` / `open_from` (a loaded
+  project may have a different stack).
+
+- **Brush dispatch through `LayerStack::apply_brush`** which
+  honours the per-layer `locked` flag (Sprint 17 will surface a
+  lock toggle in the panel; the data field is in place since
+  Sprint 15 / ADR-038).
+
+**Scope boundary with ADR-041 (Sprint 17).**
+
+- This ADR ships: add / rename / delete / reorder / opacity /
+  visibility / texture import via picked-path. The texture import
+  uses the picked path directly — the file isn't copied into a
+  project-local sidecar; ADR-041 still owns that migration.
+- ADR-041 will further add: drag-to-reorder (vs the up/down
+  arrows here), per-layer thumbnail, lock toggle, DNTS-channel
+  binding chip, blend-mode selector, per-layer transform editor.
+- ADR-041 also owns retirement of `inspector_splat` /
+  `Tool::SplatPaint` and the DNTS hybrid emission (bottom ≤ 4
+  DNTS-bound layers populate the splat distribution + DDS bake).
+- Mask-only preview chip toggles state but the per-frame mask
+  grayscale render is Sprint 17. Sprint 17's path: register the
+  composite mask array's per-layer view as an egui native
+  texture and overlay it via `painter.image`.
+- Mask-only preview chip toggles state but doesn't render the
+  grayscale overlay yet — Sprint 17.
+
+**Alternatives considered.**
+
+- *Strict spec — ship only the minimal chip strip and defer the
+  panel to Sprint 17.* User overruled. The minimal strip can't
+  demonstrate the painting workflow on a default project.
+- *Drag-to-reorder via `egui::dnd_*`.* Cleaner UX but the egui
+  drag-and-drop API has subtle quirks around hit-testing during
+  drag-over. The up/down arrow pair ships now; Sprint 17 upgrades.
+- *Project-local texture sidecar.* ADR-041 spec — would mean
+  copying the picked file into `<project>/textures/<uuid>.png` and
+  updating the LayerSource to point there. Sprint 16 uses the
+  picked path directly so unsaved projects can import too.
+
+**Consequence.**
+
+- `crates/barme-app/src/ui/paint_view.rs` (new) — ortho viewport.
+- `App::central_paint_layer` + `apply_mask_brush_at_elmos` +
+  `apply_mask_brush_along_drag` — pointer dispatch + drag
+  interpolation.
+- `App::inspector_paint_layer` — Layers panel.
+- `App::add_layer_at_top` / `delete_layer` / `reorder_layer` /
+  `import_layer_texture` / `seed_demo_accent_layer` — layer CRUD.
+- `Tool::PaintLayer` variant + keyboard `L` + `Icon::Brush`.
+- `Tool::ALL` widens to 10 variants; the pinning test bumps to 10.
+- App state: `paint_active_layer_id`, `paint_view_state`,
+  `paint_brush_state`, `mask_brushes`, `paint_last_drag_pos`.
+- Default brush radius bumped 64 → 192 elmos for visibility on
+  the first stamp.
+
 ## ADR template
 
 ```

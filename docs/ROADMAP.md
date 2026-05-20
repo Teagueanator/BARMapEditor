@@ -382,6 +382,49 @@ Implements SRS F1–F12. Ships a Windows `.exe` and a Linux AppImage.
       Photoshop-style Layers panel + custom texture import +
       DNTS hybrid emission (retires `inspector_splat` and
       `Tool::SplatPaint`).
+- [x] **STATUS UPDATE 2026-05-19 (Sprint 16 / D9 — ADR-039 +
+      ADR-040).** Layered painter UI + GPU live preview shipped.
+      The user paints into per-layer masks via a new top-down 2D
+      paint viewport (`Tool::PaintLayer`, keyboard `L`); strokes
+      show up live in both the 2D viewport AND the 3D viewport
+      (composite RT bound to the terrain shader's diffuse base).
+      Tiled COW mask storage (`barme_core::layers::mask::TileGrid`)
+      replaces Sprint 15's flat `Vec<u8>` — 256² tiles in either
+      `Tile::Uniform(byte)` (~16 B resident) or `Tile::Pixels`
+      (64 KB, allocated lazily). Fresh layers cost ~16 KB
+      regardless of map size; brush strokes scale with paint
+      coverage. Four mask brushes (`mask-reveal` / `mask-hide` /
+      `mask-smooth` / `mask-fill`) under a new `MaskBrush` trait.
+      GPU composite pipeline (`composite.wgsl`) alpha-overs up
+      to 16 layers into an `Rgba8Unorm` RT clamped at 4096²
+      (PITFALL §5 — bilinear upsample at terrain bind time for
+      >8 SMU maps; CPU bake stays authoritative for `.sd7`). Per-
+      layer dirty-tile sub-uploads (`dirty_tiles_since(version)`
+      → `write_composite_layer_mask_tiles`) honour the 8 ms NFR
+      — a 200×200 stamp uploads ~64 KB, not the 256 MB a full
+      mask push would cost. Paint viewport (`ui::paint_view`)
+      renders the composite RT into the central rect at 1:1
+      aspect with letterboxed bands (PITFALL §8); pan = middle-
+      drag, zoom = scroll wheel, double-click reset. Brush ring
+      overlay + status strip + mask-only preview toggle. Fast-
+      drag stamp interpolation (PITFALL §3) prevents gaps. Per
+      user direction, Sprint 17's Layers panel was brought
+      forward: add / rename / delete / reorder / opacity /
+      visibility / texture import (picked-path; project-local
+      sidecar still Sprint 17). Demo seed adds a second slot-1
+      accent layer on fresh projects so painting reveal/hide
+      immediately produces visible results. Tests: barme-core
+      221 → 253 (+32 mask + brush invariants); barme-app 234 →
+      247 (+13 composite uniform layout + RT clamp + paint-view
+      auto-fit). 5 commits on `main`: tiled COW + brushes; GPU
+      composite + offscreen RT; paint viewport + minimal strip;
+      full Layers panel + demo seed; this rollup. Sprint 17 (D10
+      / ADR-041) remains scoped to DNTS hybrid emission +
+      `inspector_splat` retirement + project-local texture
+      sidecar + drag-to-reorder + per-layer thumbnail + lock
+      toggle + blend-mode selector + per-layer transform UI +
+      mask-only preview's grayscale render + mask symmetry +
+      per-stroke mask undo.
 - [ ] Beherith (or active mapper) reviews `.sd7` byte-for-byte against PyMapConv
       reference output on three test maps
 - [ ] Listed on `beyondallreason.info/guide/mapmaking-resources` as beta
