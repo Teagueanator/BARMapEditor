@@ -75,6 +75,11 @@ pub enum Icon {
     SymV,
     SymQ,
     SymRot,
+
+    /// C7 / Sprint 18 (F9) — mapinfo form button. A stylised "i" inside
+    /// a square (like a document with an info badge) so it reads as
+    /// "edit map metadata" at top-bar scale.
+    MapInfo,
 }
 
 /// All variants in declaration order. Used by tests + the icon-debug
@@ -127,6 +132,7 @@ pub const ALL: &[Icon] = &[
     Icon::SymV,
     Icon::SymQ,
     Icon::SymRot,
+    Icon::MapInfo,
 ];
 
 /// Paint `icon` into `rect` at the given colour. `stroke_width` is in
@@ -534,6 +540,18 @@ pub fn paint_icon(
             mapper.circle(painter, stroke, (12, 12), 7);
             mapper.poly_line(painter, stroke, &[(12, 5), (12, 12), (17, 14)], false);
         }
+        Icon::MapInfo => {
+            // Document outline + lowercase "i" inside.
+            mapper.poly_line(
+                painter,
+                stroke,
+                &[(5, 3), (16, 3), (19, 6), (19, 21), (5, 21)],
+                true,
+            );
+            // Dot + stem of the "i".
+            mapper.circle_filled(painter, color, (12, 9), 1);
+            mapper.line(painter, stroke, (12, 12), (12, 17));
+        }
     }
 
     // Provide an accessible string id for tooltips / a11y; egui doesn't
@@ -725,7 +743,7 @@ mod tests {
     fn all_catalogue_covers_every_variant() {
         // Every named variant should appear in ALL — otherwise the
         // cheat-sheet icon gallery skips icons silently.
-        let expected_variants = 44; // bump when adding icons
+        let expected_variants = 45; // bump when adding icons
         assert_eq!(
             ALL.len(),
             expected_variants,

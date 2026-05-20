@@ -260,6 +260,12 @@ struct App {
     /// lands the field round-trips silently so the path survives
     /// save/open.
     minimap_override: Option<PathBuf>,
+    /// C7 / Sprint 18 (F9): is the mapinfo form `egui::Window` open?
+    /// Driven by the top-bar `Icon::MapInfo` button.
+    mapinfo_form_open: bool,
+    /// C7 / Sprint 18 (F9): which tab the mapinfo form is showing.
+    /// Persisted across re-opens of the form within a session.
+    mapinfo_form_tab: crate::ui::inspector_mapinfo::MapInfoTab,
     /// D10 / Sprint 17 (ADR-041): mirrors
     /// `Project.migration_toast_dismissed`. Persists across save /
     /// open so the "your splat layers were migrated" toast stays
@@ -1287,6 +1293,8 @@ impl App {
             show_next_steps: false,
             next_steps_dismissed: false,
             minimap_override: None,
+            mapinfo_form_open: false,
+            mapinfo_form_tab: crate::ui::inspector_mapinfo::MapInfoTab::default(),
             migration_toast_dismissed: false,
             pending_migration_toast: false,
             dirty: false,
@@ -4364,6 +4372,15 @@ impl App {
                     to: from,
                 }
             }
+            // C7 / Sprint 18 (F9): F9 form mutation. The `from` patch
+            // holds the pre-edit value; on undo we apply `from` and
+            // return the inverse (with `from` / `to` swapped) so redo
+            // restores the post-edit value.
+            ProjectDiff::EditMapInfo { from, to } => {
+                self.apply_mapinfo_patch(from.clone());
+                trace!(field = %to.label(), "undo: reverted mapinfo edit");
+                ProjectDiff::EditMapInfo { from: to, to: from }
+            }
         }
     }
 
@@ -4475,6 +4492,245 @@ impl App {
                 ),
             },
             WaterField::TidalStrength => float!(self.tidal_strength),
+        }
+    }
+
+    /// C7 / Sprint 18 (F9): dispatch a [`MapInfoPatch`] against the
+    /// App-side fields it targets. Most variants update either
+    /// `self.mapinfo_overrides` (the free-form bag the emitter
+    /// consults) or a dedicated App shadow (`min_height`, `height_scale`,
+    /// `minimap_override`, `lava_atmosphere`, …).
+    ///
+    /// Pragmatic Sprint 18 dispatch: schema fields with first-class
+    /// App shadows route to those shadows; everything else routes
+    /// through `Project.mapinfo_overrides` keyed by the dotted Lua
+    /// path. Sprint 19's tooltip / lint pass + Sprint 27's inspector
+    /// consistency refactor will introduce typed shadow fields on
+    /// `App` for the most-edited atmosphere / lighting subset; until
+    /// then this routes safely through the bag.
+    fn apply_mapinfo_patch(&mut self, patch: barme_core::MapInfoPatch) {
+        use barme_core::MapInfoPatch as P;
+        let label = patch.label();
+        match patch {
+            // ─── First-class App shadows ───
+            P::SmfMinHeight(Some(v)) => self.min_height = v,
+            P::SmfMinHeight(None) => self.min_height = 0.0,
+            P::SmfMaxHeight(Some(v)) => self.height_scale = v.max(1.0),
+            P::SmfMaxHeight(None) => {} // engine default
+            P::ExtractorRadius(Some(v)) => self.extractor_radius = v,
+            P::ExtractorRadius(None) => {
+                self.extractor_radius = barme_core::default_extractor_radius();
+            }
+            P::VoidWater(b) => self.void_water = b,
+            P::TidalStrength(v) => self.tidal_strength = v,
+            P::LavaAtmosphere(b) => self.lava_atmosphere = b,
+            P::MinimapOverride(p) => self.minimap_override = p,
+            // ─── Free-form bag (Sprint 19 / 27 will type these) ───
+            ref other => {
+                let toml_value: Option<toml::Value> = match other {
+                    P::Name(s) | P::Version(s) => Some(toml::Value::String(s.clone())),
+                    P::Shortname(s)
+                    | P::Description(s)
+                    | P::Author(s)
+                    | P::SmfMinimapTex(s)
+                    | P::AtmosphereSkyBox(s)
+                    | P::ResourcesDetailTex(s)
+                    | P::ResourcesSpecularTex(s)
+                    | P::ResourcesDetailNormalTex(s)
+                    | P::ResourcesLightEmissionTex(s)
+                    | P::ResourcesSkyReflectModTex(s)
+                    | P::ResourcesParallaxHeightTex(s) => s.clone().map(toml::Value::String),
+                    P::Maphardness(v)
+                    | P::Gravity(v)
+                    | P::MaxMetal(v)
+                    | P::LightingGroundShadowDensity(v)
+                    | P::LightingUnitShadowDensity(v)
+                    | P::LightingSpecularExponent(v)
+                    | P::AtmosphereMinWind(v)
+                    | P::AtmosphereMaxWind(v)
+                    | P::AtmosphereFogStart(v)
+                    | P::AtmosphereFogEnd(v)
+                    | P::AtmosphereCloudDensity(v) => v.map(|f| toml::Value::Float(f as f64)),
+                    P::VoidAlphaMin(v) => Some(toml::Value::Float(*v as f64)),
+                    P::NotDeformable(b) | P::AutoShowMetal(b) => b.map(toml::Value::Boolean),
+                    P::LightingSunDir(arr) | P::AtmosphereSkyAxisAngle(arr) => {
+                        Some(toml::Value::Array(
+                            arr.iter().map(|f| toml::Value::Float(*f as f64)).collect(),
+                        ))
+                    }
+                    P::LightingGroundAmbientColor(c)
+                    | P::LightingGroundDiffuseColor(c)
+                    | P::LightingGroundSpecularColor(c)
+                    | P::LightingUnitAmbientColor(c)
+                    | P::LightingUnitDiffuseColor(c)
+                    | P::LightingUnitSpecularColor(c)
+                    | P::AtmosphereFogColor(c)
+                    | P::AtmosphereSunColor(c)
+                    | P::AtmosphereSkyColor(c)
+                    | P::AtmosphereCloudColor(c) => c.map(|rgb| {
+                        toml::Value::Array(
+                            rgb.iter().map(|f| toml::Value::Float(*f as f64)).collect(),
+                        )
+                    }),
+                    P::TerrainTypes(types) => {
+                        // Round-trip the vec via TOML so the override bag
+                        // keeps the data. Per-row editing inside the
+                        // override bag is awkward but Sprint 27 will
+                        // promote terrain_types to a first-class App
+                        // shadow.
+                        toml::Value::try_from(types).ok()
+                    }
+                    P::CustomField { key: k, value: v } => {
+                        // Custom-field path bypasses the dotted-path
+                        // bag and writes directly to the user's
+                        // mapinfo_overrides under the user's chosen key.
+                        match v {
+                            Some(val) => {
+                                self.mapinfo_overrides.insert(k.clone(), val.clone());
+                            }
+                            None => {
+                                self.mapinfo_overrides.remove(k);
+                            }
+                        }
+                        self.dirty = true;
+                        trace!(field = %label, "F9 form: applied (custom key)");
+                        return;
+                    }
+                    // Variants we already handled above.
+                    P::SmfMinHeight(_)
+                    | P::SmfMaxHeight(_)
+                    | P::ExtractorRadius(_)
+                    | P::VoidWater(_)
+                    | P::TidalStrength(_)
+                    | P::LavaAtmosphere(_)
+                    | P::MinimapOverride(_)
+                    | P::VoidGround(_) => None,
+                };
+                let dotted = format!("mapinfo.{}", label);
+                match toml_value {
+                    Some(v) => {
+                        self.mapinfo_overrides.insert(dotted, v);
+                    }
+                    None => {
+                        self.mapinfo_overrides.remove(&format!("mapinfo.{}", label));
+                    }
+                }
+                // VoidGround is a non-Option bool with no first-class
+                // shadow; route as a Boolean entry to mapinfo_overrides
+                // so the emitter (post-Sprint-19) can consult it.
+                if let P::VoidGround(b) = patch {
+                    self.mapinfo_overrides
+                        .insert(format!("mapinfo.{}", label), toml::Value::Boolean(b));
+                }
+            }
+        }
+        self.dirty = true;
+        trace!(field = %label, "F9 form: applied");
+    }
+
+    /// C7 / Sprint 18 (F9): produce the inverse [`MapInfoPatch`] for
+    /// the given prospective edit by sampling the App's current state
+    /// for the same field. Used by the undo plumbing — the "from"
+    /// side of a `ProjectDiff::EditMapInfo` is what the field was
+    /// before the user committed the new value.
+    ///
+    /// For App-shadow fields (gravity / void_water / minimap_override
+    /// / …) we read the shadow directly. For free-form-bag fields the
+    /// snapshot reads from `mapinfo_overrides` via the schema view —
+    /// `MapInfo::from(&Project)` materialises the canonical value the
+    /// emitter would write today.
+    fn snapshot_mapinfo_patch_inverse(
+        &self,
+        new: &barme_core::MapInfoPatch,
+    ) -> barme_core::MapInfoPatch {
+        use barme_core::MapInfoPatch as P;
+        let project = self.snapshot_project();
+        let info: barme_core::MapInfo = (&project).into();
+        match new {
+            P::Name(_) => P::Name(info.name.clone()),
+            P::Shortname(_) => P::Shortname(info.shortname.clone()),
+            P::Description(_) => P::Description(info.description.clone()),
+            P::Author(_) => P::Author(info.author.clone()),
+            P::Version(_) => P::Version(info.version.clone()),
+            P::Maphardness(_) => P::Maphardness(info.maphardness),
+            P::NotDeformable(_) => P::NotDeformable(info.not_deformable),
+            P::Gravity(_) => P::Gravity(info.gravity),
+            P::TidalStrength(_) => P::TidalStrength(self.tidal_strength),
+            P::MaxMetal(_) => P::MaxMetal(info.max_metal),
+            P::ExtractorRadius(_) => P::ExtractorRadius(Some(self.extractor_radius)),
+            P::VoidWater(_) => P::VoidWater(self.void_water),
+            P::VoidGround(_) => P::VoidGround(info.void_ground),
+            P::VoidAlphaMin(_) => P::VoidAlphaMin(info.void_alpha_min),
+            P::AutoShowMetal(_) => P::AutoShowMetal(info.auto_show_metal),
+            P::LavaAtmosphere(_) => P::LavaAtmosphere(self.lava_atmosphere),
+            P::SmfMinHeight(_) => P::SmfMinHeight(Some(self.min_height)),
+            P::SmfMaxHeight(_) => P::SmfMaxHeight(Some(self.height_scale)),
+            P::SmfMinimapTex(_) => P::SmfMinimapTex(info.smf.minimap_tex.clone()),
+            P::LightingSunDir(_) => P::LightingSunDir(info.lighting.sun_dir),
+            P::LightingGroundAmbientColor(_) => {
+                P::LightingGroundAmbientColor(info.lighting.ground_ambient_color)
+            }
+            P::LightingGroundDiffuseColor(_) => {
+                P::LightingGroundDiffuseColor(info.lighting.ground_diffuse_color)
+            }
+            P::LightingGroundSpecularColor(_) => {
+                P::LightingGroundSpecularColor(info.lighting.ground_specular_color)
+            }
+            P::LightingGroundShadowDensity(_) => {
+                P::LightingGroundShadowDensity(info.lighting.ground_shadow_density)
+            }
+            P::LightingUnitAmbientColor(_) => {
+                P::LightingUnitAmbientColor(info.lighting.unit_ambient_color)
+            }
+            P::LightingUnitDiffuseColor(_) => {
+                P::LightingUnitDiffuseColor(info.lighting.unit_diffuse_color)
+            }
+            P::LightingUnitSpecularColor(_) => {
+                P::LightingUnitSpecularColor(info.lighting.unit_specular_color)
+            }
+            P::LightingUnitShadowDensity(_) => {
+                P::LightingUnitShadowDensity(info.lighting.unit_shadow_density)
+            }
+            P::LightingSpecularExponent(_) => {
+                P::LightingSpecularExponent(info.lighting.specular_exponent)
+            }
+            P::AtmosphereMinWind(_) => P::AtmosphereMinWind(info.atmosphere.min_wind),
+            P::AtmosphereMaxWind(_) => P::AtmosphereMaxWind(info.atmosphere.max_wind),
+            P::AtmosphereFogStart(_) => P::AtmosphereFogStart(info.atmosphere.fog_start),
+            P::AtmosphereFogEnd(_) => P::AtmosphereFogEnd(info.atmosphere.fog_end),
+            P::AtmosphereFogColor(_) => P::AtmosphereFogColor(info.atmosphere.fog_color),
+            P::AtmosphereSunColor(_) => P::AtmosphereSunColor(info.atmosphere.sun_color),
+            P::AtmosphereSkyColor(_) => P::AtmosphereSkyColor(info.atmosphere.sky_color),
+            P::AtmosphereSkyAxisAngle(_) => {
+                P::AtmosphereSkyAxisAngle(info.atmosphere.sky_axis_angle)
+            }
+            P::AtmosphereSkyBox(_) => P::AtmosphereSkyBox(info.atmosphere.sky_box.clone()),
+            P::AtmosphereCloudDensity(_) => {
+                P::AtmosphereCloudDensity(info.atmosphere.cloud_density)
+            }
+            P::AtmosphereCloudColor(_) => P::AtmosphereCloudColor(info.atmosphere.cloud_color),
+            P::ResourcesDetailTex(_) => P::ResourcesDetailTex(info.resources.detail_tex.clone()),
+            P::ResourcesSpecularTex(_) => {
+                P::ResourcesSpecularTex(info.resources.specular_tex.clone())
+            }
+            P::ResourcesDetailNormalTex(_) => {
+                P::ResourcesDetailNormalTex(info.resources.detail_normal_tex.clone())
+            }
+            P::ResourcesLightEmissionTex(_) => {
+                P::ResourcesLightEmissionTex(info.resources.light_emission_tex.clone())
+            }
+            P::ResourcesSkyReflectModTex(_) => {
+                P::ResourcesSkyReflectModTex(info.resources.sky_reflect_mod_tex.clone())
+            }
+            P::ResourcesParallaxHeightTex(_) => {
+                P::ResourcesParallaxHeightTex(info.resources.parallax_height_tex.clone())
+            }
+            P::TerrainTypes(_) => P::TerrainTypes(info.terrain_types.clone()),
+            P::CustomField { key, .. } => P::CustomField {
+                key: key.clone(),
+                value: self.mapinfo_overrides.get(key).cloned(),
+            },
+            P::MinimapOverride(_) => P::MinimapOverride(self.minimap_override.clone()),
         }
     }
 
@@ -6012,6 +6268,16 @@ impl App {
             .clicked()
         {
             *action = Some(FileAction::Save);
+        }
+        ui.add_space(4.0);
+
+        // C7 / Sprint 18 (F9): mapinfo form button. Opens an
+        // egui::Window with the 12-tab editor. Non-modal so a user
+        // can tweak gravity while painting splats.
+        if crate::ui::widgets::icon_button(ui, Icon::MapInfo, 30.0, "Edit mapinfo.lua (F9)")
+            .clicked()
+        {
+            self.mapinfo_form_open = !self.mapinfo_form_open;
         }
         ui.add_space(4.0);
 
@@ -9451,6 +9717,68 @@ impl eframe::App for App {
             self.dismiss_intro();
         }
 
+        // C7 / Sprint 18 (F9): mapinfo form. Non-modal — runs every
+        // frame the user keeps it open. The form returns a batch of
+        // `MapInfoPatch` edits made this frame; each one becomes one
+        // `ProjectDiff::EditMapInfo` undo entry.
+        if self.mapinfo_form_open {
+            let project = self.snapshot_project();
+            let info: barme_core::MapInfo = (&project).into();
+            let raw_lua = barme_pipeline::mapinfo::render_mapinfo(&info);
+            let dnts_summary = self
+                .layer_stack
+                .dnts_layers()
+                .iter()
+                .enumerate()
+                .filter_map(|(ch, l)| {
+                    l.map(|layer| {
+                        let ch_letter = ['R', 'G', 'B', 'A'][ch];
+                        let idx = self
+                            .layer_stack
+                            .layers
+                            .iter()
+                            .position(|l| l.id == layer.id)
+                            .unwrap_or(usize::MAX);
+                        (
+                            idx,
+                            layer.name.clone(),
+                            ch_letter,
+                            layer.dnts_tex_scale,
+                            layer.dnts_tex_mult,
+                        )
+                    })
+                })
+                .collect();
+            let mut tab = self.mapinfo_form_tab;
+            let mut open = self.mapinfo_form_open;
+            let form_ctx = crate::ui::inspector_mapinfo::FormCtx {
+                project: &project,
+                info: &info,
+                dnts_summary,
+                layer_count: self.layer_stack.layers.len(),
+                raw_lua: &raw_lua,
+                // Sprint 18 / D7: minimap preview texture lands in
+                // Sprint 19 (the preview rebake on a 1-Hz debounce is
+                // not load-bearing for this commit). Pass None so the
+                // tab shows the "(preview pending)" placeholder.
+                minimap_preview: None,
+                // Sprint 21 / C8 lint output — stubbed at zero. The
+                // rendering is live so per-tab dots show up the moment
+                // Sprint 21 populates this.
+                lint_per_tab: [0; 12],
+            };
+            let patches =
+                crate::ui::inspector_mapinfo::show_window(ctx, &mut open, &mut tab, &form_ctx);
+            self.mapinfo_form_tab = tab;
+            self.mapinfo_form_open = open;
+            for patch in patches {
+                let from = self.snapshot_mapinfo_patch_inverse(&patch);
+                self.apply_mapinfo_patch(patch.clone());
+                self.history
+                    .push_project_diff(ProjectDiff::EditMapInfo { from, to: patch });
+            }
+        }
+
         // D10 / Sprint 17 (ADR-041) — one-time migration toast for
         // pre-Sprint-14 projects whose layer stack got seeded from
         // the legacy `splat_config`. Persists across reopens via
@@ -9568,6 +9896,8 @@ mod tests {
             show_next_steps: false,
             next_steps_dismissed: false,
             minimap_override: None,
+            mapinfo_form_open: false,
+            mapinfo_form_tab: crate::ui::inspector_mapinfo::MapInfoTab::default(),
             migration_toast_dismissed: false,
             pending_migration_toast: false,
             dirty: false,

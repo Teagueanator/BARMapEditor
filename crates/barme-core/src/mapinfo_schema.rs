@@ -860,6 +860,174 @@ impl From<&Project> for MapInfo {
     }
 }
 
+// ─────── C7 / Sprint 18 — F9 form-edit patch enum ───────
+
+/// C7 / Sprint 18 (F9): typed-union value carried by
+/// [`crate::ProjectDiff::EditMapInfo`]. Each variant identifies which
+/// leaf field on the [`MapInfo`] schema (or its App-side shadows like
+/// `Project.minimap_override`, `Project.lava_atmosphere`,
+/// `Project.water_overrides`) the form is mutating.
+///
+/// **Invariant:** every `pub` field on the schema that the form
+/// surfaces gets a variant here. The
+/// `inspector_mapinfo::tests::all_schema_fields_have_a_form_row`
+/// pin enforces this — adding a field to [`MapInfo`] without
+/// adding both a `MapInfoPatch` variant and a form row will fail
+/// the test.
+///
+/// **Why a flat enum, not a sub-enum per block?** The block-level
+/// schema structs (`LightingBlock`, `AtmosphereBlock`, …) make
+/// sense for the data shape but produce noisy undo dispatch — a
+/// nested `LightingPatch::SunDir([…])` adds three layers of
+/// pattern matching before the leaf assignment. Flat variants
+/// scope-prefixed by block name (`LightingSunDir`,
+/// `AtmosphereSkyAxisAngle`, …) reads cleaner at the dispatch
+/// site and matches the rest of `ProjectDiff`'s flat shape.
+///
+/// **Edits commit on widget release**, not on every `changed()`
+/// callback. A DragValue scrub through 200 values produces ONE
+/// `MapInfoPatch` (the final value), not 200. The form code uses
+/// egui's `response.drag_stopped() || response.lost_focus()`
+/// pattern to decide when to commit.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MapInfoPatch {
+    // ─── General ───
+    Name(String),
+    Shortname(Option<String>),
+    Description(Option<String>),
+    Author(Option<String>),
+    Version(String),
+
+    // ─── Map (top level) ───
+    Maphardness(Option<f32>),
+    NotDeformable(Option<bool>),
+    Gravity(Option<f32>),
+    TidalStrength(Option<f32>),
+    MaxMetal(Option<f32>),
+    ExtractorRadius(Option<f32>),
+    VoidWater(bool),
+    VoidGround(bool),
+    VoidAlphaMin(f32),
+    AutoShowMetal(Option<bool>),
+    LavaAtmosphere(bool),
+
+    // ─── SMF ───
+    SmfMinHeight(Option<f32>),
+    SmfMaxHeight(Option<f32>),
+    SmfMinimapTex(Option<String>),
+
+    // ─── Lighting ───
+    LightingSunDir(SunDir),
+    LightingGroundAmbientColor(Option<Rgb>),
+    LightingGroundDiffuseColor(Option<Rgb>),
+    LightingGroundSpecularColor(Option<Rgb>),
+    LightingGroundShadowDensity(Option<f32>),
+    LightingUnitAmbientColor(Option<Rgb>),
+    LightingUnitDiffuseColor(Option<Rgb>),
+    LightingUnitSpecularColor(Option<Rgb>),
+    LightingUnitShadowDensity(Option<f32>),
+    LightingSpecularExponent(Option<f32>),
+
+    // ─── Atmosphere ───
+    AtmosphereMinWind(Option<f32>),
+    AtmosphereMaxWind(Option<f32>),
+    AtmosphereFogStart(Option<f32>),
+    AtmosphereFogEnd(Option<f32>),
+    AtmosphereFogColor(Option<Rgb>),
+    AtmosphereSunColor(Option<Rgb>),
+    AtmosphereSkyColor(Option<Rgb>),
+    AtmosphereSkyAxisAngle([f32; 4]),
+    AtmosphereSkyBox(Option<String>),
+    AtmosphereCloudDensity(Option<f32>),
+    AtmosphereCloudColor(Option<Rgb>),
+
+    // ─── Resources (text-input subset; file pickers deferred) ───
+    ResourcesDetailTex(Option<String>),
+    ResourcesSpecularTex(Option<String>),
+    ResourcesDetailNormalTex(Option<String>),
+    ResourcesLightEmissionTex(Option<String>),
+    ResourcesSkyReflectModTex(Option<String>),
+    ResourcesParallaxHeightTex(Option<String>),
+
+    // ─── Terrain types — table-level replace (whole vec) ───
+    /// Terrain-types are usually edited as a whole table (add /
+    /// remove rows, re-order); per-cell undo isn't worth the
+    /// per-cell variant explosion. The form snapshots the whole
+    /// vec on commit.
+    TerrainTypes(Vec<TerrainTypeBlock>),
+
+    // ─── Custom (mapinfo_overrides) ───
+    /// Set, update, or remove a key in `Project.mapinfo_overrides`.
+    /// `to == None` deletes the key. Round-trips through TOML for
+    /// undo because `toml::Value` is `Clone`.
+    CustomField {
+        key: String,
+        value: Option<toml::Value>,
+    },
+
+    // ─── Project-level shadows surfaced in the form ───
+    MinimapOverride(Option<std::path::PathBuf>),
+}
+
+impl MapInfoPatch {
+    /// Short human-readable name for logs / undo descriptions.
+    /// Used by the validation chip's tooltip and by `tracing::info!`
+    /// at the dispatch site.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Name(_) => "name",
+            Self::Shortname(_) => "shortname",
+            Self::Description(_) => "description",
+            Self::Author(_) => "author",
+            Self::Version(_) => "version",
+            Self::Maphardness(_) => "maphardness",
+            Self::NotDeformable(_) => "notDeformable",
+            Self::Gravity(_) => "gravity",
+            Self::TidalStrength(_) => "tidalStrength",
+            Self::MaxMetal(_) => "maxMetal",
+            Self::ExtractorRadius(_) => "extractorRadius",
+            Self::VoidWater(_) => "voidWater",
+            Self::VoidGround(_) => "voidGround",
+            Self::VoidAlphaMin(_) => "voidAlphaMin",
+            Self::AutoShowMetal(_) => "autoShowMetal",
+            Self::LavaAtmosphere(_) => "lavaAtmosphere",
+            Self::SmfMinHeight(_) => "smf.minHeight",
+            Self::SmfMaxHeight(_) => "smf.maxHeight",
+            Self::SmfMinimapTex(_) => "smf.minimapTex",
+            Self::LightingSunDir(_) => "lighting.sunDir",
+            Self::LightingGroundAmbientColor(_) => "lighting.groundAmbientColor",
+            Self::LightingGroundDiffuseColor(_) => "lighting.groundDiffuseColor",
+            Self::LightingGroundSpecularColor(_) => "lighting.groundSpecularColor",
+            Self::LightingGroundShadowDensity(_) => "lighting.groundShadowDensity",
+            Self::LightingUnitAmbientColor(_) => "lighting.unitAmbientColor",
+            Self::LightingUnitDiffuseColor(_) => "lighting.unitDiffuseColor",
+            Self::LightingUnitSpecularColor(_) => "lighting.unitSpecularColor",
+            Self::LightingUnitShadowDensity(_) => "lighting.unitShadowDensity",
+            Self::LightingSpecularExponent(_) => "lighting.specularExponent",
+            Self::AtmosphereMinWind(_) => "atmosphere.minWind",
+            Self::AtmosphereMaxWind(_) => "atmosphere.maxWind",
+            Self::AtmosphereFogStart(_) => "atmosphere.fogStart",
+            Self::AtmosphereFogEnd(_) => "atmosphere.fogEnd",
+            Self::AtmosphereFogColor(_) => "atmosphere.fogColor",
+            Self::AtmosphereSunColor(_) => "atmosphere.sunColor",
+            Self::AtmosphereSkyColor(_) => "atmosphere.skyColor",
+            Self::AtmosphereSkyAxisAngle(_) => "atmosphere.skyAxisAngle",
+            Self::AtmosphereSkyBox(_) => "atmosphere.skyBox",
+            Self::AtmosphereCloudDensity(_) => "atmosphere.cloudDensity",
+            Self::AtmosphereCloudColor(_) => "atmosphere.cloudColor",
+            Self::ResourcesDetailTex(_) => "resources.detailTex",
+            Self::ResourcesSpecularTex(_) => "resources.specularTex",
+            Self::ResourcesDetailNormalTex(_) => "resources.detailNormalTex",
+            Self::ResourcesLightEmissionTex(_) => "resources.lightEmissionTex",
+            Self::ResourcesSkyReflectModTex(_) => "resources.skyReflectModTex",
+            Self::ResourcesParallaxHeightTex(_) => "resources.parallaxHeightTex",
+            Self::TerrainTypes(_) => "terrainTypes",
+            Self::CustomField { .. } => "custom.*",
+            Self::MinimapOverride(_) => "minimap_override",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

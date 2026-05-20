@@ -48,6 +48,7 @@ use crate::heightmap::Heightmap;
 use crate::layers::{
     BlendMode, LayerColor, LayerMask, LayerSource, LayerTransform, TextureLayer, Tile, TileCoord,
 };
+use crate::mapinfo_schema::MapInfoPatch;
 use crate::procgen::Domain;
 use crate::project::{AllyGroup, FeatureInstance, GeoVent, MetalSpot, StartPosition};
 use crate::splat::SplatChannel;
@@ -268,6 +269,28 @@ pub enum ProjectDiff {
         from: LayerPropertyValue,
         to: LayerPropertyValue,
     },
+    /// C7 / Sprint 18 (F9): one leaf field on the typed
+    /// [`crate::MapInfo`] schema (or its App-side shadow on `Project`,
+    /// like `Project.minimap_override` /
+    /// `Project.lava_atmosphere`) was edited via the F9 form. `from`
+    /// holds the pre-edit value; `to` the post-edit. The discriminant
+    /// is identical between `from` and `to` (the dispatcher debug-asserts
+    /// this) so the form's variant pick determines the target field
+    /// uniquely.
+    ///
+    /// Why a separate variant from [`Self::EditWaterField`]: the
+    /// water-block editor (Sprint 14 / C9) was scoped to the dedicated
+    /// `Tool::Water` Inspector with a sparse-Option overlay and
+    /// per-preset reset semantics that don't fit MapInfo's flat-leaf
+    /// shape. F9's "Water" tab is a power-user backstop that drives
+    /// the SAME `Project.water_overrides` — its DragValue commits
+    /// still emit `EditWaterField`, not `EditMapInfo`. Keeps the two
+    /// undo streams aligned: any water-block edit, no matter where the
+    /// user made it, undoes the same way.
+    EditMapInfo {
+        from: MapInfoPatch,
+        to: MapInfoPatch,
+    },
 }
 
 /// D8 / Sprint 15 (ADR-038): typed-union value carried by
@@ -396,7 +419,52 @@ impl ProjectDiff {
             } => {
                 inline + layer_id.capacity() + layer_property_bytes(from) + layer_property_bytes(to)
             }
+            // C7 / Sprint 18 (F9): every MapInfoPatch variant the F9
+            // form emits carries small leaves (scalars, RGB triples,
+            // string overrides) — total weight is dominated by any
+            // heap-allocated `String` / `PathBuf` / `Vec<TerrainTypeBlock>`
+            // inside the variant. We approximate via the inline enum
+            // size + the heap capacity of the worst-case-known
+            // variants. The undo cap can absorb hundreds of
+            // f32-leaf edits without re-budgeting.
+            ProjectDiff::EditMapInfo { from, to } => {
+                inline + mapinfo_patch_bytes(from) + mapinfo_patch_bytes(to)
+            }
         }
+    }
+}
+
+/// Heap-byte estimate for one [`MapInfoPatch`]. Scalars cost zero
+/// (already inline in the enum); strings + path buffers + the
+/// terrain-types vec cost their heap footprint.
+fn mapinfo_patch_bytes(p: &MapInfoPatch) -> usize {
+    match p {
+        MapInfoPatch::Name(s) | MapInfoPatch::Version(s) => s.capacity(),
+        MapInfoPatch::Shortname(s)
+        | MapInfoPatch::Description(s)
+        | MapInfoPatch::Author(s)
+        | MapInfoPatch::SmfMinimapTex(s)
+        | MapInfoPatch::AtmosphereSkyBox(s)
+        | MapInfoPatch::ResourcesDetailTex(s)
+        | MapInfoPatch::ResourcesSpecularTex(s)
+        | MapInfoPatch::ResourcesDetailNormalTex(s)
+        | MapInfoPatch::ResourcesLightEmissionTex(s)
+        | MapInfoPatch::ResourcesSkyReflectModTex(s)
+        | MapInfoPatch::ResourcesParallaxHeightTex(s) => {
+            s.as_ref().map(String::capacity).unwrap_or(0)
+        }
+        MapInfoPatch::TerrainTypes(v) => {
+            // Per-row name + per-row TerrainMoveSpeeds inline. Names
+            // are ≤ ~16 chars in practice; bound at 32 B / row plus
+            // the vec capacity.
+            v.iter()
+                .map(|t| t.name.as_ref().map(String::capacity).unwrap_or(0))
+                .sum::<usize>()
+                + v.capacity() * std::mem::size_of::<crate::TerrainTypeBlock>()
+        }
+        MapInfoPatch::CustomField { key, .. } => key.capacity(),
+        MapInfoPatch::MinimapOverride(p) => p.as_ref().map(|p| p.as_os_str().len()).unwrap_or(0),
+        _ => 0,
     }
 }
 
@@ -1136,9 +1204,10 @@ mod tests {
             | ProjectDiff::AddLayer { .. }
             | ProjectDiff::RemoveLayer { .. }
             | ProjectDiff::ReorderLayer { .. }
-            | ProjectDiff::SetLayerProperty { .. } => {
+            | ProjectDiff::SetLayerProperty { .. }
+            | ProjectDiff::EditMapInfo { .. } => {
                 unreachable!(
-                    "metal/geo/feature/water/layer diffs not exercised through AllyGroup test helper"
+                    "metal/geo/feature/water/layer/mapinfo diffs not exercised through AllyGroup test helper"
                 )
             }
         }
