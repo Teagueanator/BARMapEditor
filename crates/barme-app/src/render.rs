@@ -18,12 +18,14 @@
 //! the per-frame [`TerrainCallback`] only carries camera matrix +
 //! lighting tunables.
 
-use barme_core::{DirtyRect, Heightmap, SPLAT_DIM, SplatDistribution};
+use barme_core::{
+    DirtyRect, Heightmap, LayerMask, SPLAT_DIM, SplatDistribution, TILE_DIM, TILE_PIXELS, TileCoord,
+};
 use bytemuck::{Pod, Zeroable};
 use eframe::egui_wgpu;
 use eframe::wgpu;
 use glam::{Mat4, Vec3};
-use tracing::{info, trace, warn};
+use tracing::{debug, info, trace, warn};
 use wgpu::util::DeviceExt;
 
 /// 8 elmos per heightmap pixel — `MapSize::ELMOS_PER_SMU / HEIGHTMAP_PER_SMU`.
@@ -81,6 +83,39 @@ pub const SLOT_DIFFUSE_DIM: u32 = 1024;
 /// `SplatU::flags.x` (the active-slot mask).
 pub const SLOT_LAYER_COUNT: u32 = 4;
 
+// ─── Composite pipeline constants (Sprint 16 / D9 / ADR-039) ────────
+
+/// Cap on the layered composite pipeline (D9 / ADR-039). The CPU bake
+/// in `barme_core::layers::bake_diffuse` accepts any layer count; the
+/// GPU preview clamps at 16 to keep the per-pixel work in the
+/// fragment loop bounded and the slot-diffuse / mask texture arrays
+/// at fixed sizes. Maps with >16 layers fall back to the CPU bake for
+/// `.sd7` export and show a "preview is approximate" chip.
+pub const COMPOSITE_MAX_LAYERS: u32 = 16;
+
+/// Side of one layer of the composite-side slot diffuse texture array.
+/// Matches `SLOT_DIFFUSE_DIM` so the same source PNGs feed both the
+/// legacy Sprint-9 4-layer DNTS path and the Sprint-16 composite.
+pub const SLOT_COMPOSITE_DIM: u32 = 1024;
+
+/// Max per-axis edge length of the composite render target. Maps >
+/// 8 SMU produce a `texture_dims` > 4096²; we cap the RT at 4096²
+/// and let the terrain shader's bilinear sampler upscale at view
+/// time. The CPU bake (D8 / ADR-038) runs at full `texture_dims`
+/// for the .sd7 export. ADR-039 / PITFALLS §5.
+pub const COMPOSITE_RT_CLAMP: u32 = 4096;
+
+/// Composite RT colour format. `Rgba8Unorm` (NOT sRGB) so the
+/// blending math matches the CPU bake byte-for-byte (the bake works
+/// in sRGB-space-but-not-decoded; the slot diffuses are also
+/// `Rgba8Unorm`).
+pub const COMPOSITE_RT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+
+/// Per-layer mask texture format. R8Unorm matches `LayerMask`'s u8
+/// byte payload exactly; the shader reads `.r` and treats it as a
+/// 0..=1 alpha.
+pub const COMPOSITE_MASK_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R8Unorm;
+
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
 struct Uniforms {
@@ -137,6 +172,105 @@ impl LineVertex {
                 b as f32 * inv,
                 a as f32 * inv,
             ],
+        }
+    }
+}
+
+/// One layer's slice of the composite shader's per-frame uniform.
+/// Mirror of `composite.wgsl::LayerU`. ADR-039.
+///
+/// Inactive slots set `params[3] = 0.0`; the shader skips them in
+/// the per-pixel loop.
+///
+/// The forward CPU bake (`LayerStack::bake_diffuse`) order is
+/// `mirror → rotate → translate-by-(-offset) → scale → re-centre`
+/// (pinned by `bake_mirror_then_rotate_matches_reference`). The
+/// shader replays the same chain with `cos(theta)` / `sin(theta)`
+/// pre-computed CPU-side to keep the per-pixel loop divide-free.
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable, Debug)]
+pub struct CompositeLayerU {
+    /// `[mirror_x_sign, mirror_y_sign, cos_theta, sin_theta]`.
+    /// `mirror_*_sign` ∈ {-1.0, +1.0}.
+    pub rot_mirror: [f32; 4],
+    /// `[offset_x_elmos, offset_y_elmos, _pad, _pad]`.
+    pub offset: [f32; 4],
+    /// `[1.0 / scale, opacity, brightness_add, active_flag]`. The
+    /// CPU pre-inverts scale so the shader does one multiply instead
+    /// of a divide per pixel.
+    pub params: [f32; 4],
+    /// `[r, g, b, _reserved]` tint multiplier.
+    pub tint: [f32; 4],
+}
+
+impl Default for CompositeLayerU {
+    fn default() -> Self {
+        // Identity layer: no mirror, no rotation, scale = 1, opacity
+        // = 0, inactive. cos(0) = 1, sin(0) = 0.
+        Self {
+            rot_mirror: [1.0, 1.0, 1.0, 0.0],
+            offset: [0.0; 4],
+            params: [1.0, 0.0, 0.0, 0.0],
+            tint: [1.0, 1.0, 1.0, 0.0],
+        }
+    }
+}
+
+impl CompositeLayerU {
+    /// Build a layer uniform from a [`barme_core::TextureLayer`]'s
+    /// transform / colour / blend / opacity state. The caller is
+    /// responsible for setting `active` to `1.0` on the layers it
+    /// wants the shader to render (typically every layer with
+    /// `visible && opacity > 0`).
+    pub fn from_layer(
+        transform: &barme_core::LayerTransform,
+        color: &barme_core::LayerColor,
+        opacity: f32,
+        active: bool,
+    ) -> Self {
+        let mx = if transform.mirror_x { -1.0_f32 } else { 1.0 };
+        let my = if transform.mirror_y { -1.0_f32 } else { 1.0 };
+        let (s, c) = transform.rotation_rad.sin_cos();
+        let inv_scale = 1.0 / transform.scale.max(1e-4);
+        Self {
+            rot_mirror: [mx, my, c, s],
+            offset: [
+                transform.offset_elmos[0],
+                transform.offset_elmos[1],
+                0.0,
+                0.0,
+            ],
+            params: [
+                inv_scale,
+                opacity.clamp(0.0, 1.0),
+                color.brightness,
+                if active { 1.0 } else { 0.0 },
+            ],
+            tint: [color.tint_rgb[0], color.tint_rgb[1], color.tint_rgb[2], 0.0],
+        }
+    }
+}
+
+/// CPU mirror of `composite.wgsl::CompositeU`. The `dims` vec carries
+/// the RT dims in `.x` / `.y`; layer-loop bound is encoded per-layer
+/// via the `active_flag` field (so widening `COMPOSITE_MAX_LAYERS`
+/// past 16 in the future needs only a pipeline rebuild, not a uniform-
+/// shape change).
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable, Debug)]
+pub struct CompositeU {
+    /// `[width_px, height_px, layer_count, _]`. Width / height are
+    /// the RT's physical dimensions; layer_count is informational
+    /// (the shader walks every slot and gates via `active_flag`).
+    pub dims: [f32; 4],
+    pub layers: [CompositeLayerU; COMPOSITE_MAX_LAYERS as usize],
+}
+
+impl Default for CompositeU {
+    fn default() -> Self {
+        Self {
+            dims: [0.0, 0.0, 0.0, 0.0],
+            layers: [CompositeLayerU::default(); COMPOSITE_MAX_LAYERS as usize],
         }
     }
 }
@@ -396,6 +530,58 @@ struct SplatResources {
     uniform_buf: wgpu::Buffer,
 }
 
+/// GPU state for the Sprint-16 layered composite pipeline (D9 /
+/// ADR-039). The `rt` is the offscreen colour target the
+/// `composite.wgsl` pipeline writes into; the terrain shader
+/// samples it as the diffuse base when the project carries a
+/// non-empty layer stack.
+///
+/// Lifetimes: the `_tex` fields keep the textures alive while the
+/// `_view`s are bound to pipelines. The slot diffuse array is
+/// pre-sized at install time (the registry is fixed at app start);
+/// the RT + mask array are re-sized on demand via
+/// [`ensure_composite_rt`] when the central viewport changes.
+struct CompositeResources {
+    pipeline: wgpu::RenderPipeline,
+    bind_group_layout: wgpu::BindGroupLayout,
+    bind_group: wgpu::BindGroup,
+    uniform_buf: wgpu::Buffer,
+
+    /// Composite RT (`rgba8unorm`, max 4096²). `None` until the first
+    /// successful [`ensure_composite_rt`] call. Re-allocated when the
+    /// requested size changes; the terrain bind group + the egui
+    /// texture id are refreshed alongside.
+    rt: Option<CompositeRt>,
+
+    /// 16-layer slot diffuse array (1024²). Pre-loaded once at app
+    /// start; each per-slot rebind goes through
+    /// [`upload_composite_slot_diffuse`].
+    #[allow(dead_code)]
+    slot_array_tex: wgpu::Texture,
+    slot_array_view: wgpu::TextureView,
+    slot_array_samp: wgpu::Sampler,
+
+    /// 16-layer mask array (`r8unorm`, sized to RT). Allocated on the
+    /// first [`ensure_composite_rt`] call; re-allocated alongside
+    /// the RT when the central viewport changes.
+    mask_tex: Option<wgpu::Texture>,
+    mask_view: Option<wgpu::TextureView>,
+    mask_samp: wgpu::Sampler,
+}
+
+/// Composite render target + the egui handle for the paint viewport.
+/// Re-allocated when `ensure_composite_rt` is called with a different
+/// size; the old egui id is freed before the new one is registered to
+/// avoid renderer handle leaks (PITFALLS §5 — same pattern as
+/// `OffscreenTarget`).
+struct CompositeRt {
+    #[allow(dead_code)]
+    tex: wgpu::Texture,
+    view: wgpu::TextureView,
+    egui_texture_id: egui::TextureId,
+    size: (u32, u32),
+}
+
 pub struct RenderResources {
     pipeline: wgpu::RenderPipeline,
     bind_group_layout: wgpu::BindGroupLayout,
@@ -405,9 +591,17 @@ pub struct RenderResources {
     /// Keeps the bind group always valid so the pipeline can be created
     /// once at startup.
     _dummy_tex: wgpu::Texture,
+    /// Default 1×1 dummy composite RT view bound until
+    /// [`ensure_composite_rt`] allocates a real one. Keeps the terrain
+    /// bind group valid pre-allocation so the pipeline doesn't need to
+    /// be rebuilt on first composite use.
+    _dummy_composite_tex: wgpu::Texture,
     grid: Option<Grid>,
     heightmap: Option<HeightmapTex>,
     splat: SplatResources,
+    /// Sprint-16 composite pipeline (D9 / ADR-039). The pipeline lives
+    /// here; the RT view drops in when [`ensure_composite_rt`] runs.
+    composite: CompositeResources,
     /// Sprint-13 offscreen RT (ADR-037). `None` until the first
     /// successful [`ensure_offscreen`] call — `central()` allocates it
     /// on the first frame with a real central viewport rect.
@@ -433,6 +627,22 @@ impl RenderResources {
         queue.write_buffer(&self.splat.uniform_buf, 0, bytemuck::bytes_of(su));
     }
 
+    fn write_composite_uniforms(&self, queue: &wgpu::Queue, cu: &CompositeU) {
+        queue.write_buffer(&self.composite.uniform_buf, 0, bytemuck::bytes_of(cu));
+    }
+
+    /// View bound at the terrain bind group's composite slot. Falls
+    /// back to the 1×1 dummy when no composite RT is allocated yet so
+    /// the bind group stays valid even on a fresh app start.
+    fn composite_terrain_view(&self) -> wgpu::TextureView {
+        match &self.composite.rt {
+            Some(rt) => rt.tex.create_view(&wgpu::TextureViewDescriptor::default()),
+            None => self
+                ._dummy_composite_tex
+                .create_view(&wgpu::TextureViewDescriptor::default()),
+        }
+    }
+
     fn rebind(&mut self, device: &wgpu::Device) {
         let view = self.heightmap.as_ref().map(|h| &h.view).unwrap_or_else(|| {
             // The dummy tex's view lives only as long as we hold it; the
@@ -440,12 +650,15 @@ impl RenderResources {
             // long-lived dummy view too. See `install()` for setup.
             unreachable!("rebind called with no heightmap and no dummy view")
         });
+        let composite_view = self.composite_terrain_view();
         self.bind_group = make_bind_group(
             device,
             &self.bind_group_layout,
             &self.uniform_buf,
             view,
             &self.splat,
+            &composite_view,
+            &self.composite.mask_samp,
         );
     }
 }
@@ -552,6 +765,28 @@ fn bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
                 ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                 count: None,
             },
+            // 7: composite RT (Sprint 16 / D9 / ADR-039). Diffuse-base
+            // input when `params2.y > 0.5`; ignored otherwise. The
+            // view rebinds on composite RT resize via `rebind()`.
+            wgpu::BindGroupLayoutEntry {
+                binding: 7,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            // 8: composite RT sampler. ClampToEdge — the composite RT
+            // covers the full map; sampling past its edge is a
+            // programmer error, not a wallpaper-tile case.
+            wgpu::BindGroupLayoutEntry {
+                binding: 8,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
         ],
     })
 }
@@ -562,6 +797,8 @@ fn make_bind_group(
     uniform_buf: &wgpu::Buffer,
     heightmap_view: &wgpu::TextureView,
     splat: &SplatResources,
+    composite_view: &wgpu::TextureView,
+    composite_samp: &wgpu::Sampler,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("terrain.bg"),
@@ -594,6 +831,14 @@ fn make_bind_group(
             wgpu::BindGroupEntry {
                 binding: 6,
                 resource: wgpu::BindingResource::Sampler(&splat.slot_array_samp),
+            },
+            wgpu::BindGroupEntry {
+                binding: 7,
+                resource: wgpu::BindingResource::TextureView(composite_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 8,
+                resource: wgpu::BindingResource::Sampler(composite_samp),
             },
         ],
     })
@@ -1075,6 +1320,290 @@ fn install_water_resources(device: &wgpu::Device) -> WaterResources {
     }
 }
 
+/// Build the composite pipeline + bind-group layout + slot-array
+/// texture + mask sampler. Called once at install time; the per-frame
+/// RT + mask array allocate later via [`ensure_composite_rt`] once
+/// the central viewport size is known.
+///
+/// Sprint 16 / D9 / ADR-039.
+fn install_composite_resources(device: &wgpu::Device, queue: &wgpu::Queue) -> CompositeResources {
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("composite.wgsl"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("composite.wgsl").into()),
+    });
+
+    // 16-layer slot diffuse array at 1024². Initialised to a magenta
+    // diagnostic so an unbound layer doesn't render garbage if the
+    // user's slot registry has gaps. Per-slot `upload_composite_slot_
+    // diffuse` overwrites this with the real diffuse when a slot
+    // binds.
+    let slot_array_tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("composite.slot_array"),
+        size: wgpu::Extent3d {
+            width: SLOT_COMPOSITE_DIM,
+            height: SLOT_COMPOSITE_DIM,
+            depth_or_array_layers: COMPOSITE_MAX_LAYERS,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: SLOT_DIFFUSE_FORMAT,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let slot_array_view = slot_array_tex.create_view(&wgpu::TextureViewDescriptor {
+        label: Some("composite.slot_array.view"),
+        dimension: Some(wgpu::TextureViewDimension::D2Array),
+        ..Default::default()
+    });
+    // Magenta = (255, 0, 255, 255). Loud unbound-layer diagnostic.
+    let magenta_layer: Vec<u8> = vec![0xFF, 0x00, 0xFF, 0xFF]
+        .into_iter()
+        .cycle()
+        .take((SLOT_COMPOSITE_DIM as usize) * (SLOT_COMPOSITE_DIM as usize) * 4)
+        .collect();
+    for layer in 0..COMPOSITE_MAX_LAYERS {
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &slot_array_tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: 0,
+                    y: 0,
+                    z: layer,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            &magenta_layer,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(SLOT_COMPOSITE_DIM * 4),
+                rows_per_image: Some(SLOT_COMPOSITE_DIM),
+            },
+            wgpu::Extent3d {
+                width: SLOT_COMPOSITE_DIM,
+                height: SLOT_COMPOSITE_DIM,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+
+    let slot_array_samp = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("composite.slot_array.sampler"),
+        // CRITICAL — wallpaper-tile. ClampToEdge would stretch scaled-
+        // down textures into a smeared seam (PITFALLS §2 in the
+        // Sprint-16 prompt).
+        address_mode_u: wgpu::AddressMode::Repeat,
+        address_mode_v: wgpu::AddressMode::Repeat,
+        address_mode_w: wgpu::AddressMode::Repeat,
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        mipmap_filter: wgpu::FilterMode::Nearest,
+        ..Default::default()
+    });
+
+    let mask_samp = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("composite.mask.sampler"),
+        // ClampToEdge — masks must NOT tile (else a stroke near one
+        // edge would bleed into the opposite edge of the wallpaper
+        // composite).
+        address_mode_u: wgpu::AddressMode::ClampToEdge,
+        address_mode_v: wgpu::AddressMode::ClampToEdge,
+        address_mode_w: wgpu::AddressMode::ClampToEdge,
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        mipmap_filter: wgpu::FilterMode::Nearest,
+        ..Default::default()
+    });
+
+    let uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("composite.uniforms"),
+        size: std::mem::size_of::<CompositeU>() as u64,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    queue.write_buffer(&uniform_buf, 0, bytemuck::bytes_of(&CompositeU::default()));
+
+    // 1×16 dummy mask layer — keeps the bind group valid before the
+    // first real `ensure_composite_rt` lands a properly-sized mask
+    // array. Initialised to all zero so the shader-side composite
+    // produces the mid-grey background.
+    let dummy_mask_tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("composite.mask.dummy"),
+        size: wgpu::Extent3d {
+            width: 1,
+            height: 1,
+            depth_or_array_layers: COMPOSITE_MAX_LAYERS,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: COMPOSITE_MASK_FORMAT,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    // Zero-initialise each layer so the dummy reads predictably.
+    for layer in 0..COMPOSITE_MAX_LAYERS {
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &dummy_mask_tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: 0,
+                    y: 0,
+                    z: layer,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            &[0u8],
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(1),
+                rows_per_image: Some(1),
+            },
+            wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+    let dummy_mask_view = dummy_mask_tex.create_view(&wgpu::TextureViewDescriptor {
+        label: Some("composite.mask.dummy.view"),
+        dimension: Some(wgpu::TextureViewDimension::D2Array),
+        ..Default::default()
+    });
+
+    let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("composite.bgl"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2Array,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 3,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2Array,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 4,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+        ],
+    });
+
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("composite.bg"),
+        layout: &bgl,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: uniform_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(&slot_array_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::Sampler(&slot_array_samp),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::TextureView(&dummy_mask_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: wgpu::BindingResource::Sampler(&mask_samp),
+            },
+        ],
+    });
+
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("composite.pl"),
+        bind_group_layouts: &[&bgl],
+        push_constant_ranges: &[],
+    });
+
+    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("composite.pipeline"),
+        layout: Some(&pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_main"),
+            compilation_options: Default::default(),
+            buffers: &[],
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            cull_mode: None,
+            ..Default::default()
+        },
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_main"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: COMPOSITE_RT_FORMAT,
+                blend: Some(wgpu::BlendState::REPLACE),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        multiview: None,
+        cache: None,
+    });
+
+    // Keep the dummy mask alive while the bind group references it.
+    // The CompositeResources owns it via `mask_tex` until the real
+    // mask array allocates; the first `ensure_composite_rt` swaps
+    // both `mask_tex` / `mask_view` AND rebuilds the bind group.
+    CompositeResources {
+        pipeline,
+        bind_group_layout: bgl,
+        bind_group,
+        uniform_buf,
+        rt: None,
+        slot_array_tex,
+        slot_array_view,
+        slot_array_samp,
+        mask_tex: Some(dummy_mask_tex),
+        mask_view: Some(dummy_mask_view),
+        mask_samp,
+    }
+}
+
 /// Install the pipeline, uniform buffer, splat resources, and a 1×1
 /// dummy heightmap. Called once from `App::new`.
 pub fn install(render_state: &egui_wgpu::RenderState) {
@@ -1132,8 +1661,61 @@ pub fn install(render_state: &egui_wgpu::RenderState) {
     );
     let dummy_view = dummy_tex.create_view(&wgpu::TextureViewDescriptor::default());
 
+    // Sprint 16 / D9 — 1×1 dummy composite RT view bound until
+    // `ensure_composite_rt` allocates a real one. Same shape as the
+    // heightmap dummy; keeps the terrain bind group always valid so
+    // a fresh app start doesn't need an early "create real composite
+    // RT" branch.
+    let dummy_composite_tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("terrain.composite.dummy"),
+        size: wgpu::Extent3d {
+            width: 1,
+            height: 1,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: COMPOSITE_RT_FORMAT,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    // Zero-fill the dummy so the shader sees a deterministic (0, 0,
+    // 0, 0) sample if it ever reaches here. The terrain shader's
+    // `use_composite_rt` gate guards against that in practice.
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &dummy_composite_tex,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        &[0u8, 0, 0, 0],
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(4),
+            rows_per_image: Some(1),
+        },
+        wgpu::Extent3d {
+            width: 1,
+            height: 1,
+            depth_or_array_layers: 1,
+        },
+    );
+    let dummy_composite_view =
+        dummy_composite_tex.create_view(&wgpu::TextureViewDescriptor::default());
+
     let splat = install_splat_resources(device, queue);
-    let bind_group = make_bind_group(device, &bgl, &uniform_buf, &dummy_view, &splat);
+    let composite = install_composite_resources(device, queue);
+    let bind_group = make_bind_group(
+        device,
+        &bgl,
+        &uniform_buf,
+        &dummy_view,
+        &splat,
+        &dummy_composite_view,
+        &composite.mask_samp,
+    );
 
     let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("terrain.pl"),
@@ -1201,9 +1783,11 @@ pub fn install(render_state: &egui_wgpu::RenderState) {
             bind_group,
             uniform_buf,
             _dummy_tex: dummy_tex,
+            _dummy_composite_tex: dummy_composite_tex,
             grid: None,
             heightmap: None,
             splat,
+            composite,
             offscreen: None,
             marker,
             line,
@@ -1748,6 +2332,374 @@ pub fn upload_diffuse_layer(render_state: &egui_wgpu::RenderState, layer: u32, r
     info!(layer, "upload_diffuse_layer: slot diffuse written");
 }
 
+// ─── Composite pipeline API (Sprint 16 / D9 / ADR-039) ──────────────
+
+/// Clamp + validate a requested composite RT size. Returns `None` for
+/// degenerate inputs (`< 2 px` on either axis). The CPU bake stays
+/// authoritative at full `texture_dims` regardless of this clamp —
+/// the GPU preview merely loses sub-pixel detail past 4096².
+///
+/// Pure / GPU-free — exercised by unit tests.
+pub fn resolve_composite_rt_size(requested: (u32, u32)) -> Option<(u32, u32)> {
+    let (w, h) = requested;
+    if w < 2 || h < 2 {
+        return None;
+    }
+    Some((w.min(COMPOSITE_RT_CLAMP), h.min(COMPOSITE_RT_CLAMP)))
+}
+
+/// Allocate / refresh the composite render target + mask array at
+/// the given physical pixel size. Resizes the mask array alongside
+/// so per-tile sub-uploads land at the right dims. Re-registers the
+/// egui texture id on resize and frees the old one to avoid renderer
+/// handle leaks.
+///
+/// Returns the `egui::TextureId` the paint viewport (Sprint 16 /
+/// Commit 3) should hand to `ui.painter().image(...)` to render the
+/// composite into the 2D viewport. `None` on degenerate inputs or
+/// when [`install`] hasn't run.
+///
+/// Idempotency: if the composite RT is already at the requested
+/// (clamped) size, this is a no-op apart from returning the cached id.
+pub fn ensure_composite_rt(
+    render_state: &egui_wgpu::RenderState,
+    requested: (u32, u32),
+) -> Option<egui::TextureId> {
+    let size = resolve_composite_rt_size(requested)?;
+    let device = render_state.device.clone();
+    let queue = render_state.queue.clone();
+    let mut renderer = render_state.renderer.write();
+
+    let (needs_realloc, old_id) = {
+        let Some(res) = renderer.callback_resources.get_mut::<RenderResources>() else {
+            warn!("ensure_composite_rt: no RenderResources (install() not run)");
+            return None;
+        };
+        let same_size = matches!(&res.composite.rt, Some(rt) if rt.size == size);
+        if same_size {
+            return Some(
+                res.composite
+                    .rt
+                    .as_ref()
+                    .expect("matched on Some above")
+                    .egui_texture_id,
+            );
+        }
+        let old = res.composite.rt.take().map(|rt| rt.egui_texture_id);
+        (true, old)
+    };
+
+    if let Some(id) = old_id {
+        renderer.free_texture(&id);
+    }
+    let _ = needs_realloc;
+
+    // Allocate the new RT.
+    let tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("composite.rt"),
+        size: wgpu::Extent3d {
+            width: size.0,
+            height: size.1,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: COMPOSITE_RT_FORMAT,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::RENDER_ATTACHMENT
+            | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let view = tex.create_view(&wgpu::TextureViewDescriptor {
+        label: Some("composite.rt.view"),
+        ..Default::default()
+    });
+    let egui_texture_id =
+        renderer.register_native_texture(&device, &view, wgpu::FilterMode::Linear);
+    info!(
+        width = size.0,
+        height = size.1,
+        format = ?COMPOSITE_RT_FORMAT,
+        "composite RT (re)allocated"
+    );
+
+    // Allocate the new 16-layer mask array at the matching dims. Init
+    // every layer to zero so the shader produces the mid-grey
+    // background until the paint dispatcher uploads real mask bytes.
+    let mask_tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("composite.mask_array"),
+        size: wgpu::Extent3d {
+            width: size.0,
+            height: size.1,
+            depth_or_array_layers: COMPOSITE_MAX_LAYERS,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: COMPOSITE_MASK_FORMAT,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let mask_view = mask_tex.create_view(&wgpu::TextureViewDescriptor {
+        label: Some("composite.mask_array.view"),
+        dimension: Some(wgpu::TextureViewDimension::D2Array),
+        ..Default::default()
+    });
+    // Zero-fill row by row to avoid a huge upfront allocation.
+    let zero_row = vec![0u8; size.0 as usize];
+    for layer in 0..COMPOSITE_MAX_LAYERS {
+        for y in 0..size.1 {
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &mask_tex,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d { x: 0, y, z: layer },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &zero_row,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(size.0),
+                    rows_per_image: Some(1),
+                },
+                wgpu::Extent3d {
+                    width: size.0,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+    }
+
+    // Drop the borrow chain so we can take `&mut res` again to swap
+    // the new resources in.
+    let Some(res) = renderer.callback_resources.get_mut::<RenderResources>() else {
+        renderer.free_texture(&egui_texture_id);
+        return None;
+    };
+    res.composite.rt = Some(CompositeRt {
+        tex,
+        view,
+        egui_texture_id,
+        size,
+    });
+    res.composite.mask_tex = Some(mask_tex);
+    res.composite.mask_view = Some(mask_view);
+
+    // Rebuild the composite bind group with the new mask array view.
+    let mask_view = res.composite.mask_view.as_ref().expect("just set above");
+    res.composite.bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("composite.bg"),
+        layout: &res.composite.bind_group_layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: res.composite.uniform_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(&res.composite.slot_array_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::Sampler(&res.composite.slot_array_samp),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::TextureView(mask_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: wgpu::BindingResource::Sampler(&res.composite.mask_samp),
+            },
+        ],
+    });
+
+    // Rebuild the terrain bind group so its composite RT view points
+    // at the new RT (was the 1×1 dummy until now).
+    res.rebind(&device);
+
+    Some(egui_texture_id)
+}
+
+/// Upload one slot's 1024² diffuse into the composite slot array at
+/// the given `layer_idx`. Mirrors [`upload_diffuse_layer`] for the
+/// Sprint-9 / legacy 4-layer path but targets the 16-layer composite
+/// side. Source `rgba` MUST be exactly `SLOT_COMPOSITE_DIM² × 4`
+/// bytes; the caller resizes on import.
+pub fn upload_composite_slot_diffuse(
+    render_state: &egui_wgpu::RenderState,
+    layer_idx: u32,
+    rgba: &[u8],
+) {
+    if layer_idx >= COMPOSITE_MAX_LAYERS {
+        warn!(
+            layer = layer_idx,
+            "upload_composite_slot_diffuse: layer out of range"
+        );
+        return;
+    }
+    let expected = (SLOT_COMPOSITE_DIM as usize) * (SLOT_COMPOSITE_DIM as usize) * 4;
+    if rgba.len() != expected {
+        warn!(
+            got = rgba.len(),
+            expected, "upload_composite_slot_diffuse: byte length mismatch; resize before calling"
+        );
+        return;
+    }
+    let renderer = render_state.renderer.read();
+    let Some(res) = renderer.callback_resources.get::<RenderResources>() else {
+        warn!("upload_composite_slot_diffuse: no RenderResources");
+        return;
+    };
+    let queue = &render_state.queue;
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &res.composite.slot_array_tex,
+            mip_level: 0,
+            origin: wgpu::Origin3d {
+                x: 0,
+                y: 0,
+                z: layer_idx,
+            },
+            aspect: wgpu::TextureAspect::All,
+        },
+        rgba,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(SLOT_COMPOSITE_DIM * 4),
+            rows_per_image: Some(SLOT_COMPOSITE_DIM),
+        },
+        wgpu::Extent3d {
+            width: SLOT_COMPOSITE_DIM,
+            height: SLOT_COMPOSITE_DIM,
+            depth_or_array_layers: 1,
+        },
+    );
+    info!(layer = layer_idx, "composite slot diffuse uploaded");
+}
+
+/// Sub-upload one or more tiles of a layer's mask to the composite
+/// mask array. Reads each tile via [`LayerMask::read_tile`] so the
+/// fast path for `Uniform` tiles is a single byte-fill instead of a
+/// heap allocation.
+///
+/// `layer_idx` must be `< COMPOSITE_MAX_LAYERS`. `tiles` may be the
+/// output of [`LayerMask::dirty_tiles_since`]. Empty `tiles` is a
+/// no-op. Out-of-array `(tx, ty)` clip silently.
+///
+/// **Pitfall (Sprint-16 prompt #6):** ALWAYS prefer this path over
+/// uploading the entire mask. A full mask write at 4096² × 16 layers
+/// is 256 MB per frame.
+pub fn write_composite_layer_mask_tiles(
+    render_state: &egui_wgpu::RenderState,
+    layer_idx: u32,
+    mask: &LayerMask,
+    tiles: &[TileCoord],
+) {
+    if tiles.is_empty() {
+        return;
+    }
+    if layer_idx >= COMPOSITE_MAX_LAYERS {
+        warn!(
+            layer = layer_idx,
+            "write_composite_layer_mask_tiles: layer out of range"
+        );
+        return;
+    }
+    let renderer = render_state.renderer.read();
+    let Some(res) = renderer.callback_resources.get::<RenderResources>() else {
+        warn!("write_composite_layer_mask_tiles: no RenderResources");
+        return;
+    };
+    let Some(rt) = res.composite.rt.as_ref() else {
+        // No composite RT yet — nothing to upload to. The paint
+        // viewport allocates the RT on its first frame; until then,
+        // upload requests are a no-op.
+        debug!(
+            "write_composite_layer_mask_tiles: no composite RT — skipping {} tiles",
+            tiles.len()
+        );
+        return;
+    };
+    let Some(mask_tex) = res.composite.mask_tex.as_ref() else {
+        debug!("write_composite_layer_mask_tiles: no mask array — skipping");
+        return;
+    };
+    let queue = &render_state.queue;
+    let (rt_w, rt_h) = rt.size;
+    let (mtx, mty) = mask.tile_grid_dims();
+
+    let mut tile_buf = [0u8; TILE_PIXELS];
+    for coord in tiles {
+        debug_assert!(
+            coord.tile_x < mtx && coord.tile_y < mty,
+            "tile coord ({}, {}) outside mask tile grid ({mtx}, {mty})",
+            coord.tile_x,
+            coord.tile_y,
+        );
+        let tile_x_px = coord.tile_x * TILE_DIM;
+        let tile_y_px = coord.tile_y * TILE_DIM;
+        if tile_x_px >= rt_w || tile_y_px >= rt_h {
+            // Composite RT may be smaller than the mask dims (the
+            // 4096² clamp kicks in for >8 SMU maps). Skip tiles that
+            // land entirely past the RT — the preview will be
+            // approximate there.
+            continue;
+        }
+        let copy_w = TILE_DIM.min(rt_w - tile_x_px);
+        let copy_h = TILE_DIM.min(rt_h - tile_y_px);
+        mask.read_tile(coord.tile_x, coord.tile_y, &mut tile_buf);
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: mask_tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: tile_x_px,
+                    y: tile_y_px,
+                    z: layer_idx,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            &tile_buf[..],
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(TILE_DIM),
+                rows_per_image: Some(TILE_DIM),
+            },
+            wgpu::Extent3d {
+                width: copy_w,
+                height: copy_h,
+                depth_or_array_layers: 1,
+            },
+        );
+        trace!(
+            layer = layer_idx,
+            tile_x = coord.tile_x,
+            tile_y = coord.tile_y,
+            "composite mask tile uploaded"
+        );
+    }
+}
+
+/// Push the latest composite uniforms (per-layer transform / tint /
+/// opacity / active flag + RT dims) to the GPU. The
+/// `TerrainCallback::prepare` path writes these per-frame when the
+/// layered preview is active; this helper exists for the Sprint-17
+/// Layers panel's outside-the-callback dispatch (e.g. an inspector
+/// edit that needs immediate GPU sync without waiting on the next
+/// paint).
+#[allow(dead_code)] // Sprint 17 (Layers panel) wires this in.
+pub fn update_composite_uniforms(render_state: &egui_wgpu::RenderState, cu: &CompositeU) {
+    let renderer = render_state.renderer.read();
+    let Some(res) = renderer.callback_resources.get::<RenderResources>() else {
+        warn!("update_composite_uniforms: no RenderResources");
+        return;
+    };
+    res.write_composite_uniforms(&render_state.queue, cu);
+}
+
 /// Push the latest splat uniforms (active mask, scales, mults,
 /// diffuse-in-alpha flag) to the GPU. The TerrainCallback also
 /// writes these every frame via `prepare`, so this helper is only
@@ -1789,6 +2741,12 @@ pub struct TerrainCallback {
     pub world_extent_x: f32,
     pub world_extent_z: f32,
     pub splat: SplatUniforms,
+    /// Sprint 16 / D9 / ADR-039 — when `Some`, `prepare()` encodes the
+    /// layered composite pipeline pass into the composite RT BEFORE
+    /// the terrain pass, and the terrain shader samples the composite
+    /// RT as its diffuse base via the `params2.y = 1.0` flag. `None`
+    /// keeps the pre-Sprint-16 splat-based diffuse path active.
+    pub composite: Option<CompositeU>,
     /// Sprint-13 (ADR-037) — pre-sorted, GPU-encoded marker instances.
     /// `central()` builds these by walking the start-positions / metal-
     /// spots / geo-vents / brush rings and pushing one `Marker` per
@@ -1822,6 +2780,7 @@ impl TerrainCallback {
         viewport_size: [f32; 2],
         line_vertices: Vec<LineVertex>,
         water: Option<WaterDraw>,
+        composite: Option<CompositeU>,
     ) -> Self {
         let aspect = (rect.width() / rect.height()).max(0.0001);
         Self {
@@ -1835,6 +2794,7 @@ impl TerrainCallback {
             viewport_size,
             line_vertices,
             water,
+            composite,
         }
     }
 }
@@ -1864,9 +2824,10 @@ impl egui_wgpu::CallbackTrait for TerrainCallback {
         };
 
         // Step 1 — terrain uniforms. `params2.x` carries
-        // `min_height` (Sprint 14 follow-up) so the WGSL `sample_y`
-        // can map raw heightmap u16 values into `[min_h, max_h]`,
-        // letting the terrain dip below BAR's water plane at Y = 0.
+        // `min_height` (Sprint 14); `params2.y` carries the Sprint-16
+        // composite-RT diffuse-source flag — `1.0` when the project
+        // has a non-empty layer stack AND the composite RT is allocated.
+        let use_composite_rt = self.composite.is_some() && res.composite.rt.is_some();
         res.write_uniforms(
             queue,
             &Uniforms {
@@ -1877,10 +2838,61 @@ impl egui_wgpu::CallbackTrait for TerrainCallback {
                     self.world_extent_x.max(1.0),
                     self.world_extent_z.max(1.0),
                 ],
-                params2: [self.min_height, 0.0, 0.0, 0.0],
+                params2: [
+                    self.min_height,
+                    if use_composite_rt { 1.0 } else { 0.0 },
+                    0.0,
+                    0.0,
+                ],
             },
         );
         res.write_splat_uniforms(queue, &self.splat);
+
+        // Step 1d — Sprint 16 / D9 / ADR-039 — encode the layered
+        // composite pass into the composite RT. The terrain pass that
+        // follows samples from the same RT (via binding 7) so the
+        // composite must land first. Skipped when the project has no
+        // layer stack OR the composite RT hasn't been allocated yet.
+        if let (Some(cu), Some(_rt)) = (self.composite.as_ref(), res.composite.rt.as_ref()) {
+            res.write_composite_uniforms(queue, cu);
+            let composite_view = res
+                .composite
+                .rt
+                .as_ref()
+                .map(|rt| &rt.view)
+                .expect("matched on Some above");
+            let mut cpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("composite.pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: composite_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        // Clear to fully-opaque mid-grey so a no-layer
+                        // pass produces the same background tone the
+                        // CPU bake's `bg = 0.18` flattens against.
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0.18,
+                            g: 0.18,
+                            b: 0.18,
+                            a: 1.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            cpass.set_pipeline(&res.composite.pipeline);
+            cpass.set_bind_group(0, &res.composite.bind_group, &[]);
+            cpass.draw(0..3, 0..1);
+            drop(cpass);
+            trace!(
+                rt_size = ?res.composite.rt.as_ref().map(|r| r.size),
+                "composite RT recomposited"
+            );
+        }
 
         // Step 1b — marker uniforms + instance upload (Sprint 13 /
         // ADR-037). Cap instance count to the pre-allocated capacity
@@ -2333,6 +3345,114 @@ mod tests {
             96,
             "WaterU layout drift — water.wgsl expects 96 bytes"
         );
+    }
+
+    // ─── Sprint 16 / D9 — composite uniform + RT sizing ────────
+
+    /// `CompositeU` byte size MUST match the WGSL `composite.wgsl::
+    /// CompositeU` layout exactly — `dims` (16 B) + `[LayerU; 16]` ×
+    /// 64 B = 1040 B. A drift here uploads garbage to the GPU.
+    #[test]
+    fn composite_uniform_size_matches_wgsl_layout() {
+        // LayerU = 4 × vec4<f32> = 64 B.
+        assert_eq!(std::mem::size_of::<CompositeLayerU>(), 64);
+        // CompositeU = vec4<f32> + array<LayerU, 16> = 16 + 1024 = 1040 B.
+        assert_eq!(std::mem::size_of::<CompositeU>(), 1040);
+    }
+
+    #[test]
+    fn composite_layer_u_default_is_inactive_identity() {
+        let l = CompositeLayerU::default();
+        assert_eq!(l.rot_mirror, [1.0, 1.0, 1.0, 0.0]);
+        assert_eq!(l.offset, [0.0; 4]);
+        assert_eq!(l.params[3], 0.0, "default active flag is OFF");
+        assert_eq!(l.tint[0..3], [1.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn composite_layer_u_from_identity_transform() {
+        let t = barme_core::LayerTransform::default();
+        let c = barme_core::LayerColor::default();
+        let lu = CompositeLayerU::from_layer(&t, &c, 1.0, true);
+        // Identity: mirror = (+1, +1), rotation = 0 → cos=1, sin=0.
+        assert_eq!(lu.rot_mirror, [1.0, 1.0, 1.0, 0.0]);
+        // inv_scale = 1, opacity = 1, brightness = 0, active = 1.
+        assert_eq!(lu.params, [1.0, 1.0, 0.0, 1.0]);
+        assert_eq!(lu.offset, [0.0; 4]);
+    }
+
+    #[test]
+    fn composite_layer_u_from_mirror_and_rotation_packs_correctly() {
+        let t = barme_core::LayerTransform {
+            mirror_x: true,
+            mirror_y: false,
+            rotation_rad: std::f32::consts::FRAC_PI_2, // 90°
+            offset_elmos: [100.0, -200.0],
+            scale: 2.0,
+        };
+        let c = barme_core::LayerColor::default();
+        let lu = CompositeLayerU::from_layer(&t, &c, 0.5, true);
+        // mirror_x = -1, mirror_y = +1, cos(π/2) ≈ 0, sin(π/2) ≈ 1.
+        assert_eq!(lu.rot_mirror[0], -1.0);
+        assert_eq!(lu.rot_mirror[1], 1.0);
+        assert!((lu.rot_mirror[2] - 0.0).abs() < 1e-5);
+        assert!((lu.rot_mirror[3] - 1.0).abs() < 1e-5);
+        // offset elmos hoisted into .xy.
+        assert_eq!(lu.offset[0], 100.0);
+        assert_eq!(lu.offset[1], -200.0);
+        // inv_scale = 1 / 2 = 0.5.
+        assert!((lu.params[0] - 0.5).abs() < 1e-6);
+        assert_eq!(lu.params[1], 0.5);
+        assert_eq!(lu.params[3], 1.0);
+    }
+
+    #[test]
+    fn composite_layer_u_inactive_when_visible_false_passed() {
+        let t = barme_core::LayerTransform::default();
+        let c = barme_core::LayerColor::default();
+        let lu = CompositeLayerU::from_layer(&t, &c, 1.0, false);
+        assert_eq!(lu.params[3], 0.0, "inactive layer skipped by shader");
+    }
+
+    #[test]
+    fn composite_rt_size_passes_through_in_range() {
+        // Typical 8-SMU = 4096² — fits exactly at the clamp.
+        assert_eq!(resolve_composite_rt_size((4096, 4096)), Some((4096, 4096)));
+        assert_eq!(resolve_composite_rt_size((2048, 1024)), Some((2048, 1024)));
+    }
+
+    #[test]
+    fn composite_rt_size_clamps_each_axis_to_4096() {
+        // 16-SMU = 8192² — clamp engages on both axes.
+        assert_eq!(resolve_composite_rt_size((8192, 8192)), Some((4096, 4096)));
+        // Asymmetric: only the over-cap axis is clamped.
+        assert_eq!(resolve_composite_rt_size((6000, 2048)), Some((4096, 2048)));
+        assert_eq!(resolve_composite_rt_size((1024, 5000)), Some((1024, 4096)));
+    }
+
+    #[test]
+    fn composite_rt_size_skips_degenerate_inputs() {
+        assert_eq!(resolve_composite_rt_size((0, 4096)), None);
+        assert_eq!(resolve_composite_rt_size((4096, 0)), None);
+        assert_eq!(resolve_composite_rt_size((1, 4096)), None);
+        assert_eq!(resolve_composite_rt_size((4096, 1)), None);
+        assert_eq!(resolve_composite_rt_size((2, 2)), Some((2, 2)));
+    }
+
+    #[test]
+    fn composite_rt_clamp_constant_is_4096() {
+        // Pinned by ADR-039 — 4096² is the cap where every reasonable
+        // wgpu backend agrees a 2D RT works. Bumping this requires a
+        // memory-budget review.
+        assert_eq!(COMPOSITE_RT_CLAMP, 4096);
+    }
+
+    #[test]
+    fn composite_max_layers_is_sixteen() {
+        // The 16-layer cap is hard-coded into composite.wgsl's
+        // `MAX_LAYERS` and the `array<LayerU, 16>` size. Changing this
+        // is a coordinated WGSL + uniform-layout edit.
+        assert_eq!(COMPOSITE_MAX_LAYERS, 16);
     }
 
     /// `WaterU` is `bytemuck::Pod`; constructing one and round-tripping

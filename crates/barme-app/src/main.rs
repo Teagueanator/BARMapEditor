@@ -27,7 +27,9 @@ use eframe::egui;
 use eframe::egui_wgpu;
 use tracing::{error, info, trace, warn};
 
-use crate::render::{OrbitCamera, SplatUniforms, TerrainCallback, WaterDraw};
+use crate::render::{
+    CompositeLayerU, CompositeU, OrbitCamera, SplatUniforms, TerrainCallback, WaterDraw,
+};
 
 /// wgpu/vulkan/naga emit a lot of INFO-level chatter at startup (adapter
 /// enumeration, layer loading) that drowns out our own logs. Keep them at
@@ -277,10 +279,16 @@ struct App {
     /// D8 / Sprint 15 (ADR-038): the project's texture layer stack —
     /// the Photoshop-style stack of [`TextureLayer`]s the `.sd7` bake
     /// composites into the diffuse BMP. Mirrors `Project.layers`;
-    /// persists through `snapshot_project` / `open_from`. Sprint 15 is
-    /// data-only — no inspector surface yet (Sprint 17 lands the
-    /// Layers panel).
+    /// persists through `snapshot_project` / `open_from`. Sprint 15
+    /// shipped data + bake; Sprint 16 wires the GPU live preview.
     layer_stack: LayerStack,
+    /// D9 / Sprint 16 (ADR-039): per-layer mask versions last uploaded
+    /// to the composite mask array. Keyed by `(layer_id,
+    /// composite_slot_idx)`. `version() > last_uploaded` drives the
+    /// per-frame [`render::write_composite_layer_mask_tiles`] dispatch
+    /// so a single brush stroke only triggers a tile-scoped GPU upload
+    /// next frame, not a full mask re-push.
+    composite_layer_last_version: std::collections::HashMap<(String, usize), u64>,
     /// D5 / Sprint 9: persisted per-channel slot bindings, scales,
     /// mults, and the ADR-034 placeholder toggle. Round-trips through
     /// `Project.splat_config` on save / open. Replaces the Phase-7
@@ -995,7 +1003,7 @@ impl App {
         let editor_config = config::EditorConfig::load();
         let show_intro = !editor_config.intro_seen_for_current_version();
 
-        Self {
+        let app = Self {
             project_name: "untitled".to_string(),
             map_size: MapSize::square(16),
             heightmap: None,
@@ -1060,6 +1068,7 @@ impl App {
             // session lifetime and re-syncs from `Project` on every
             // open.
             layer_stack: LayerStack::from_biome("", MapSize::square(16)),
+            composite_layer_last_version: std::collections::HashMap::new(),
             splat_config: SplatConfig::default(),
             splat_distribution: None,
             splat_brush_state: SplatBrushState::default(),
@@ -1094,7 +1103,13 @@ impl App {
             // generic flooded basin. Lives on App not Project (per-
             // session tool preference, same status as brush_radius).
             water_carve_depth: -80.0,
-        }
+        };
+        // D9 / Sprint 16 — push the default biome stack's source
+        // diffuse to the composite slot array so the first central()
+        // frame has real data to composite from (mask uploads land
+        // on the same frame via `sync_composite_mask_tiles`).
+        app.reupload_layer_stack_diffuses();
+        app
     }
 
     fn load_heightmap(&mut self, path: PathBuf) {
@@ -1185,6 +1200,12 @@ impl App {
         // single-layer biome-base stack. Sprint 17 will offer the
         // user a Layers panel to grow / delete / reorder from here.
         self.layer_stack = LayerStack::from_biome("", self.map_size);
+        // D9 / Sprint 16 (ADR-039): clear the per-layer GPU upload
+        // cursor so the new stack's masks land on the first central()
+        // frame. The slot diffuse re-upload pushes the default
+        // biome's source to the composite slot array next.
+        self.composite_layer_last_version.clear();
+        self.reupload_layer_stack_diffuses();
         // GPU side resets via the next-frame TerrainCallback (uniforms
         // re-write to defaults; distribution texture is left holding
         // the prior session's pixels — irrelevant since active_mask = 0
@@ -1917,6 +1938,132 @@ impl App {
             extent_z,
             alpha_scale,
         })
+    }
+
+    /// D9 / Sprint 16 (ADR-039) — build the per-frame composite
+    /// uniforms from the live layer stack. Returns `None` when the
+    /// stack is empty (the terrain shader's `params2.y` stays at 0
+    /// and the Sprint-9 splat/biome fallback renders instead).
+    ///
+    /// Layers beyond `COMPOSITE_MAX_LAYERS = 16` are clipped — the
+    /// Sprint-17 Layers panel will surface a chip warning when this
+    /// hits; for now, only the bottom 16 contribute to the preview.
+    fn composite_uniforms_for_render(&self) -> Option<CompositeU> {
+        if self.layer_stack.layers.is_empty() {
+            return None;
+        }
+        let (rt_w, rt_h) = self.composite_rt_dims();
+        let (ex, ez) = self.map_size.elmo_extents();
+        let mut cu = CompositeU {
+            // .xy = RT dims (mask UV normalisation), .zw = elmo
+            // extent (layer-transform math). The two diverge on >8
+            // SMU maps where the RT clamp engages.
+            dims: [rt_w as f32, rt_h as f32, ex as f32, ez as f32],
+            ..CompositeU::default()
+        };
+        for (i, layer) in self.layer_stack.layers.iter().enumerate().take(16) {
+            let active = layer.visible && layer.opacity > 0.0;
+            cu.layers[i] =
+                CompositeLayerU::from_layer(&layer.transform, &layer.color, layer.opacity, active);
+        }
+        Some(cu)
+    }
+
+    /// D9 / Sprint 16 — composite RT dims = `min(texture_dims, 4096²)`
+    /// per ADR-039. The CPU bake stays authoritative at full
+    /// texture_dims for the .sd7 export; the GPU preview is
+    /// approximate for >8-SMU maps.
+    fn composite_rt_dims(&self) -> (u32, u32) {
+        let (tw, th) = self.map_size.texture_dims();
+        let cap = crate::render::COMPOSITE_RT_CLAMP;
+        (tw.min(cap), th.min(cap))
+    }
+
+    /// D9 / Sprint 16 — re-upload every layer's source diffuse to the
+    /// composite slot array. Stock slots resolve through the registry;
+    /// imported layers fall back to the magenta diagnostic the slot
+    /// array initialises with at install time (Sprint 17 fixes this).
+    ///
+    /// Called on project open / new project / wizard apply / migration
+    /// — anywhere the layer stack changes wholesale. Per-layer slot
+    /// rebinds (Sprint 17's Layers panel) target individual array
+    /// layers via a focused call.
+    fn reupload_layer_stack_diffuses(&self) {
+        let Some(rs) = self.render_state.as_ref() else {
+            return;
+        };
+        for (i, layer) in self.layer_stack.layers.iter().enumerate().take(16) {
+            match &layer.source {
+                barme_core::LayerSource::Slot { id } => {
+                    let Some(slot) = self.slot_registry.iter().find(|s| s.id == *id) else {
+                        warn!(
+                            slot_id = id,
+                            layer_idx = i,
+                            "composite slot diffuse missing in registry — layer renders magenta"
+                        );
+                        continue;
+                    };
+                    let Some(rgba) = load_slot_full_rgba(slot) else {
+                        continue;
+                    };
+                    crate::render::upload_composite_slot_diffuse(rs, i as u32, rgba.as_raw());
+                }
+                barme_core::LayerSource::Imported { .. } => {
+                    // Sprint 16 deliberately leaves imported layers
+                    // as the magenta diagnostic the slot array
+                    // initialised with — Sprint 17 lands the import
+                    // workflow that populates this for real.
+                    trace!(
+                        layer_idx = i,
+                        layer_id = %layer.id,
+                        "composite: imported layer renders magenta until Sprint 17"
+                    );
+                }
+            }
+        }
+    }
+
+    /// D9 / Sprint 16 — push any layer mask tiles that have changed
+    /// since the last upload to the composite mask array. Called from
+    /// `central()` once per frame when a composite RT is allocated.
+    ///
+    /// On the first call after `reupload_layer_stack_diffuses` (or on
+    /// a project open), every layer has `version() > last_uploaded =
+    /// 0`, so the full mask grid uploads. Subsequent frames only push
+    /// tiles touched by brush strokes (Sprint 16 Commit 3).
+    fn sync_composite_mask_tiles(&mut self) {
+        let Some(rs) = self.render_state.as_ref() else {
+            return;
+        };
+        if self.layer_stack.layers.is_empty() {
+            return;
+        }
+        for (i, layer) in self.layer_stack.layers.iter().enumerate().take(16) {
+            let key = (layer.id.clone(), i);
+            let last = self
+                .composite_layer_last_version
+                .get(&key)
+                .copied()
+                .unwrap_or(0);
+            let cur = layer.mask.version();
+            if cur <= last {
+                continue;
+            }
+            let dirty = layer.mask.dirty_tiles_since(last);
+            if dirty.is_empty() {
+                continue;
+            }
+            crate::render::write_composite_layer_mask_tiles(rs, i as u32, &layer.mask, &dirty);
+            self.composite_layer_last_version.insert(key, cur);
+            trace!(
+                layer_idx = i,
+                layer_id = %layer.id,
+                dirty_tiles = dirty.len(),
+                from_version = last,
+                to_version = cur,
+                "composite mask sync"
+            );
+        }
     }
 
     /// Walk `splat_config.channels` and re-upload every bound slot's
@@ -3479,6 +3626,12 @@ impl App {
                     shadow.after_load_migrate(&resolver);
                     shadow.layers
                 };
+                // D9 / Sprint 16 (ADR-039): loaded project may have
+                // painted layer masks from a prior session; force a
+                // full mask resync next frame + push every layer's
+                // slot diffuse to the composite slot array.
+                self.composite_layer_last_version.clear();
+                self.reupload_layer_stack_diffuses();
 
                 // C4/C5 (Sprint 11): metal-spot + geo-vent persistence.
                 // The Project model owns the sources; the inspector
@@ -7960,6 +8113,20 @@ impl App {
                     .and_then(|rs| render::ensure_offscreen(rs, requested_phys));
 
                 let water = self.water_draw_for_frame(ex, ez);
+
+                // D9 / Sprint 16 (ADR-039) — composite RT + per-frame
+                // mask-tile sync. The RT allocation is idempotent;
+                // sync_composite_mask_tiles is a no-op when no layer
+                // has accumulated dirty tiles since the last push.
+                let composite_uniforms = self.composite_uniforms_for_render();
+                if composite_uniforms.is_some()
+                    && let Some(rs) = self.render_state.as_ref()
+                {
+                    let (cw, ch) = self.composite_rt_dims();
+                    crate::render::ensure_composite_rt(rs, (cw, ch));
+                    self.sync_composite_mask_tiles();
+                }
+
                 let cb = TerrainCallback::new(
                     &self.camera,
                     rect,
@@ -7972,6 +8139,7 @@ impl App {
                     viewport_size,
                     line_vertices,
                     water,
+                    composite_uniforms,
                 );
                 ui.painter()
                     .add(egui_wgpu::Callback::new_paint_callback(rect, cb));
@@ -8333,6 +8501,7 @@ mod tests {
             // implicit biome seed, so smoke tests can opt-in to a
             // specific stack shape.
             layer_stack: LayerStack::default(),
+            composite_layer_last_version: std::collections::HashMap::new(),
             splat_config: SplatConfig::default(),
             splat_distribution: None,
             splat_brush_state: SplatBrushState::default(),

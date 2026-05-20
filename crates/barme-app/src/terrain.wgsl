@@ -37,7 +37,10 @@ struct Uniforms {
     //   (`Ground.h::GetWaterPlaneLevel` is `consteval 0.0`). Together
     //   with `params.x` (= max_height), gives the linear mapping
     //   `y = min_h + (raw / 65535) * (max_h - min_h)`.
-    // .y / .z / .w reserved for future scalars (lighting tuning,
+    // .y = use_composite_rt flag (0.0 = sample the Sprint-9 splat
+    //   composite + biome ramp; > 0.5 = sample the Sprint-16
+    //   composite RT instead). Sprint 16 / D9 / ADR-039.
+    // .z / .w reserved for future scalars (lighting tuning,
     //   tide animation, etc.).
     params2: vec4<f32>,
 };
@@ -77,6 +80,12 @@ struct SplatU {
 @group(0) @binding(4) var splat_distr_samp: sampler;
 @group(0) @binding(5) var slot_diffuse: texture_2d_array<f32>;
 @group(0) @binding(6) var slot_diffuse_samp: sampler;
+// Sprint 16 / D9 / ADR-039 — layered composite RT bound as the
+// diffuse base when `u.params2.y > 0.5`. Cap dims 4096²; the shader
+// bilinearly upsamples to the terrain's per-fragment sample
+// coordinate. CPU bake stays authoritative for the .sd7 export.
+@group(0) @binding(7) var composite_rt: texture_2d<f32>;
+@group(0) @binding(8) var composite_samp: sampler;
 
 struct VsOut {
     @builtin(position) clip_pos: vec4<f32>,
@@ -211,7 +220,20 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let range = max(max_h - min_h, 1.0);
     let t = clamp((in.world_pos.y - min_h) / range, 0.0, 1.0);
     let fallback = biome_ramp(t);
-    let base_rgb = mix(fallback, splat_rgb, detail_strength);
+    let splat_base = mix(fallback, splat_rgb, detail_strength);
+
+    // Sprint 16 / D9 / ADR-039 — diffuse-source switch. When the
+    // project carries a non-empty layer stack the App sets
+    // `params2.y = 1.0`; the terrain shader samples the composite
+    // RT instead of the biome ramp + splat blend. The Sprint-9 DNTS
+    // detail (splat_cofac) is intentionally NOT layered on top here
+    // — Sprint 17 lands the DNTS hybrid emission; until then, the
+    // composite RT IS the entire diffuse for layered projects.
+    var base_rgb = splat_base;
+    if (u.params2.y > 0.5) {
+        let uv = in.uv_norm;
+        base_rgb = textureSample(composite_rt, composite_samp, uv).rgb;
+    }
 
     // Lambert + ambient lighting (FINDINGS §7 simplified path — no
     // shadows, no specular). The ambient was pre-multiplied by
