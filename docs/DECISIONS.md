@@ -2972,6 +2972,53 @@ affordances are missing in Stage 1 today.
 Sprint prompt: `docs/prompts/sprint-14-water-and-lava.md`. Devlogs:
 `devlog/stage-1-water-{data-and-emission,preview-plane,tool-and-inspector}/`.
 
+**STATUS UPDATE 2026-05-19 (post-C9 smoke).** First user run of
+Tool::Water surfaced three issues; all fixed before this STATUS
+line lands. The data path + emission flow described above was
+correct, but the renderer + camera UX wasn't quite usable as
+shipped.
+
+1. **`Project.min_height` was inert in the terrain shader.**
+   `sample_y` mapped raw `u16` to `[0, max_height]` regardless of
+   `min_height`. Even after the C9 inspector's "Auto-set" button
+   wrote `min_height = -100`, the heightmap rendered as if it
+   still started at `Y = 0` — so BAR's water plane (also at
+   `Y = 0`) sat flush with the floor and was invisible. Fixed by
+   extending the terrain `Uniforms` with `params2: vec4<f32>`
+   (`.x = min_height`, `.yzw` reserved) and updating `sample_y` to
+   compute `y = min_h + t * (max_h - min_h)`. The fragment
+   biome-ramp also rescaled so submerged terrain gets a distinct
+   gradient colour instead of clamping at the lowest band. New
+   PITFALL §28 captures this.
+
+2. **Inspector Flood section rewritten for clarity.** Pre-fix the
+   section had a `carve_depth` DragValue + a placeholder "Auto-set
+   min_height" button — no direct way to set the sea-floor depth,
+   no explanation of why a user would. Post-fix the section opens
+   with the explainer "BAR's water plane is fixed at Y = 0. To
+   make water visible, set min_height below zero…", then exposes
+   a directly-editable **Sea-floor depth** DragValue
+   (range `-2048..=0`). The carve-depth control + the "Set sea
+   floor to carve depth" shortcut button stay.
+
+3. **Arrow-key camera pan + recenter button.** Adjacent UX gap the
+   smoke exposed: navigating an off-the-map view required either
+   re-running the wizard or manually orbiting. Added arrow-key
+   pan (delta-time-scaled velocity, Shift = 3× faster) and a
+   Compass-icon recenter button in `top_bar_right_block` that
+   calls `App::recenter_camera`. Rulers rewritten to be zoom-
+   aware (`viewport_chrome::paint_rulers` now takes the camera
+   and projects screen positions back to world XZ via
+   `screen_to_world_y0`, then labels at 1-2-5 step sizes from
+   the visible world range). The first arrow-key implementation
+   had left/right inverted; PITFALL §27 documents the glam
+   `look_at_lh` sign-flip convention that caused it.
+
+Test counts after smoke follow-ups: barme-core 196 / barme-app
+232 / barme-pipeline 114 (+1 net new since the rollup, for the
+`pick_nice_step` and `interp_screen_pos` ruler-math pins). cargo
+fmt / clippy / test all green.
+
 ```
 ## ADR-NNN — One-line decision
 

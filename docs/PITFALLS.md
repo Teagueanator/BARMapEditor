@@ -553,3 +553,62 @@ rotation type differs.
 **Rule:** `set.lua` rotation is an unquoted integer. PyMapConv's
 text-file path (currently unused) uses the quoted string form per
 the `-k` `--help` text. Don't conflate them.
+
+## Sprint 14 follow-up additions (post-C9 smoke, 2026-05-19)
+
+### 27. glam's `look_at_lh` flips the X axis sign vs RH conventions
+
+A camera at `eye = (0, 0, +d)` looking at `(0, 0, 0)` along `-Z`,
+with `up = +Y`, naively has its "right" axis pointing to world `+X`
+(the user's right hand). glam's `Mat4::look_at_lh` builds the side
+basis as `s = up.cross(forward)`. At the example above
+`forward = (0, 0, -1)`, so `s = (0,1,0) × (0,0,-1) = (-1, 0, 0)`
+— world `-X`. The resulting view matrix mirrors X relative to what
+a RH-trained intuition expects: world `+X` (east) lands on the
+LEFT side of the screen.
+
+This bit the Sprint 14 arrow-key pan: the first pass derived the
+screen-right axis from the RH formula `right_xz = (cos(yaw), 0,
+-sin(yaw))`, which made ArrowLeft pan the user right and vice
+versa. The empirically-correct axis for camera-relative panning
+under glam's LH look-at is:
+
+```
+screen-right (world) = (-cos(yaw), 0,  sin(yaw))
+screen-up    (world) = (-sin(yaw), 0, -cos(yaw))
+```
+
+**Rule:** when wiring keyboard or gamepad input to camera-relative
+world motion under `glam::Mat4::look_at_lh`, flip the sign on the
+"right" component of whatever cross-product formula you derived
+from RH conventions. Verify empirically with a simple "press right,
+camera should slide right under the user's view" test — math
+alone is too easy to get wrong with mixed-handedness conventions.
+
+### 28. BAR's water plane is `consteval`; users CANNOT move it
+
+`RecoilEngine/rts/Map/Ground.h:23-38` makes
+`GetWaterPlaneLevel()` a `consteval` returning `0.0f`. Water is
+always at world `Y = 0`. The user can't raise or lower it.
+
+Implication for the editor: a "water depth" or "water level"
+slider would be a lie. The right affordance is a
+`Project.min_height` control (negative = the lowest heightmap
+sample sits below sea level → flooding is visible).
+
+The first Tool::Water smoke (2026-05-19) caught a related defect:
+the terrain shader's `sample_y` mapped raw `u16` linearly into
+`[0, max_height]`, ignoring `Project.min_height` entirely. Even
+with `min_height = -100` the heightmap rendered as if it started
+at `Y = 0`, so the water plane sat flush with the floor and was
+invisible. Fixed by extending the terrain Uniforms with
+`params2.x = min_height` and updating `sample_y` to compute
+`y = min_h + t * (max_h - min_h)`.
+
+**Rule:** the terrain shader MUST consult `Project.min_height`
+when projecting raw heightmap values to world Y, otherwise the
+"flood a basin" workflow is broken even with the right data on
+the project side. Pinned by the C9 inspector emission tests in
+`barme-core::mapinfo_schema::tests` (which would catch a regression
+on the data side) plus the shader uniform pin in `render.rs::tests`
+(which catches a layout drift).

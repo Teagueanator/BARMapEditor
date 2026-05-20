@@ -325,6 +325,29 @@ Implements SRS F1–F12. Ships a Windows `.exe` and a Linux AppImage.
       water (foam / fresnel / caustics / lava
       emission / perlin wave motion) deferred to the renderer-parity
       arc as agreed in the C9 prompt's "Out of scope" section.
+- [x] **STATUS UPDATE 2026-05-19 (post-C9 smoke).** First Tool::Water
+      run surfaced three follow-ups; all fixed before this line
+      lands. (1) The terrain shader ignored `Project.min_height` —
+      water at `Y = 0` sat invisibly at the heightmap floor. Fixed
+      by extending the terrain `Uniforms` with
+      `params2: vec4<f32>` (`.x = min_height`) and rewriting
+      `sample_y` to compute `y = min_h + t * (max_h - min_h)`. The
+      fragment biome-ramp rescales so submerged terrain gets a
+      distinct gradient band. (2) Inspector Flood section rewritten
+      with an explainer card and a directly-editable
+      **Sea-floor depth** DragValue replacing the previous
+      Auto-set-only affordance. (3) Adjacent camera-UX gap:
+      arrow-key pan (delta-time-scaled, Shift = 3× faster) +
+      Compass-icon recenter button in the top bar + zoom-aware
+      rulers (`viewport_chrome::paint_rulers` now camera-projects
+      ticks back to world XZ via `screen_to_world_y0`, labels in
+      `1-2-5 × 10^k` step sizes that adapt to visible range). The
+      first arrow-key build had left/right inverted; new PITFALL §27
+      documents the `glam::Mat4::look_at_lh` sign-flip that caused
+      it, and PITFALL §28 captures the
+      `Ground.h::GetWaterPlaneLevel` `consteval` constraint + the
+      `min_height` shader-plumbing requirement. ADR-042 carries the
+      same details in its post-C9 STATUS UPDATE block.
 - [ ] Beherith (or active mapper) reviews `.sd7` byte-for-byte against PyMapConv
       reference output on three test maps
 - [ ] Listed on `beyondallreason.info/guide/mapmaking-resources` as beta
