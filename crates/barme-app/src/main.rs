@@ -2920,6 +2920,11 @@ impl App {
     /// both halves of the map. The compositor picks up the per-tile
     /// version bumps via [`Self::sync_composite_mask_tiles`] next
     /// frame; no per-stamp dirty-rect plumbing is needed.
+    ///
+    /// D10 / Sprint 17 (ADR-041): also pre-walks the brush bbox's
+    /// tile coords + snapshots each tile via `History::snapshot_mask_tile`
+    /// BEFORE the brush writes, so the drag's `end_mask_stroke` can
+    /// commit a `HistoryEntry::Mask` covering all touched tiles.
     fn apply_mask_brush_at_elmos(&mut self, world_x: f32, world_z: f32) {
         let Some(layer_id) = self.paint_active_layer_id.clone() else {
             return;
@@ -2937,6 +2942,37 @@ impl App {
         let radius = self.paint_brush_state.radius;
         let strength = self.paint_brush_state.strength;
         let target_visible = self.paint_brush_state.fill_target_visible;
+        // Pre-walk + snapshot every tile each per-symmetry stamp will
+        // touch, capturing the pre-stroke state. Deduplicate via a
+        // HashSet — overlapping stamps + the per-tile `or_insert` on
+        // the history side already guard against double-snapshot, but
+        // the local set saves the work of N tile clones.
+        let mut tiles_to_snapshot: std::collections::HashSet<barme_core::TileCoord> =
+            std::collections::HashSet::new();
+        if let Some(layer) = self.layer_stack.layer_by_id(&layer_id) {
+            for (cx, cz) in &centers {
+                let stamp = barme_core::MaskStamp {
+                    world_x: *cx,
+                    world_z: *cz,
+                    radius,
+                    strength,
+                    target_visible,
+                };
+                if let Some(bbox) = layer.mask.brush_bbox(stamp) {
+                    for coord in layer.mask.tile_coords_overlapping_rect(bbox) {
+                        tiles_to_snapshot.insert(coord);
+                    }
+                }
+            }
+        }
+        if !tiles_to_snapshot.is_empty()
+            && let Some(layer) = self.layer_stack.layer_by_id(&layer_id)
+        {
+            for coord in &tiles_to_snapshot {
+                let current = layer.mask.clone_tile(*coord);
+                self.history.snapshot_mask_tile(&layer_id, *coord, current);
+            }
+        }
         let mut touched_any = false;
         for (cx, cz) in centers {
             let stamp = barme_core::MaskStamp {
@@ -3121,6 +3157,22 @@ impl App {
         }
         if out.response.drag_stopped_by(egui::PointerButton::Primary) {
             self.paint_last_drag_pos = None;
+            // D10 / Sprint 17 (ADR-041) — commit any in-flight mask
+            // stroke into the undo history. The stroke records every
+            // tile the brush touched (with before / after snapshots);
+            // a no-op stroke (net change == 0) discards itself in
+            // `History::end_mask_stroke`.
+            if let Some(layer_id) = self.paint_active_layer_id.as_ref().cloned()
+                && let Some(layer) = self.layer_stack.layer_by_id(&layer_id)
+            {
+                let pushed = self.history.end_mask_stroke(&layer.mask);
+                if pushed {
+                    tracing::debug!(
+                        layer_id = %layer_id,
+                        "mask stroke committed to undo history",
+                    );
+                }
+            }
         }
     }
 
@@ -3988,8 +4040,49 @@ impl App {
                 }
                 HistoryEntry::Heightmap(e)
             }
+            HistoryEntry::Mask(e) => HistoryEntry::Mask(self.apply_mask_entry(e)),
             HistoryEntry::Project(diff) => HistoryEntry::Project(self.apply_project_diff(diff)),
         }
+    }
+
+    /// D10 / Sprint 17 (ADR-041) — walk a [`MaskEntry`]'s tiles and
+    /// swap each `(before, after)` pair on the named layer's mask.
+    /// Returns the symmetric entry (before / after swapped) for the
+    /// opposite-stack push.
+    ///
+    /// Clears `composite_layer_last_version` for the affected layer
+    /// so the GPU compositor re-uploads the changed tiles on the
+    /// next frame.
+    fn apply_mask_entry(
+        &mut self,
+        mut e: barme_core::undo::MaskEntry,
+    ) -> barme_core::undo::MaskEntry {
+        let Some(layer) = self.layer_stack.active_layer_mut(&e.layer_id) else {
+            warn!(
+                layer_id = %e.layer_id,
+                "undo: mask entry references unknown layer; pushing unchanged to opposite stack"
+            );
+            return e;
+        };
+        for (coord, before, after) in e.tiles.iter_mut() {
+            // Restore `before` (the pre-stroke state) onto the mask;
+            // capture the current state into `after` for the redo
+            // direction. Since we swap below, the post-swap `before`
+            // is what the redo restores.
+            let live = layer.mask.clone_tile(*coord);
+            layer.mask.restore_tile(*coord, before.clone());
+            *after = live;
+        }
+        // Swap before/after so the entry on the opposite stack
+        // restores the post-undo state correctly on redo.
+        for (_, before, after) in e.tiles.iter_mut() {
+            std::mem::swap(before, after);
+        }
+        // Invalidate the composite cache for this layer so the GPU
+        // picks up the change next frame.
+        self.composite_layer_last_version
+            .retain(|(id, _), _| id != &e.layer_id);
+        e
     }
 
     /// Dispatch a `ProjectDiff` against this `App`'s F8 + wizard state,

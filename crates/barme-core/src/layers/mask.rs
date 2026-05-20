@@ -59,8 +59,13 @@ pub const TILE_DIM: u32 = 256;
 pub const TILE_PIXELS: usize = (TILE_DIM as usize) * (TILE_DIM as usize);
 
 /// One cell in the [`TileGrid`].
+///
+/// **Sprint 17 (ADR-041):** promoted from module-private to `pub` so
+/// per-stroke mask undo (see [`crate::undo::MaskEntry`]) can hold
+/// before/after snapshots without re-exporting the enum behind a
+/// newtype.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Tile {
+pub enum Tile {
     /// All `TILE_PIXELS` pixels are this byte. Allocates 0 bytes on
     /// the heap.
     Uniform(u8),
@@ -68,6 +73,17 @@ enum Tile {
     /// (8 B pointer + 1 B discriminant; padded to 16 B per Tile) so
     /// the surrounding `Vec<Tile>` stays compact for sparse grids.
     Pixels(Box<[u8; TILE_PIXELS]>),
+}
+
+impl Tile {
+    /// Resident-byte cost of one tile snapshot. Used by
+    /// [`crate::undo::MaskEntry::bytes`] to keep the 100 MB cap honest.
+    pub fn resident_bytes(&self) -> usize {
+        match self {
+            Tile::Uniform(_) => std::mem::size_of::<Tile>(),
+            Tile::Pixels(_) => TILE_PIXELS + std::mem::size_of::<Tile>(),
+        }
+    }
 }
 
 impl Tile {
@@ -491,6 +507,81 @@ impl LayerMask {
             .filter(|t| matches!(t, Tile::Pixels(_)))
             .count()
     }
+
+    /// D10 / Sprint 17 (ADR-041) — return a clone of the tile at
+    /// `coord`. Used by [`crate::undo::OpenMaskStroke`] to capture
+    /// the pre-stroke state of every tile a brush stamp will touch.
+    /// `Uniform` tiles clone cheaply (one byte); `Pixels` tiles
+    /// allocate a fresh `Box<[u8; TILE_PIXELS]>` — the 64 KB cost is
+    /// the per-tile undo cost noted in ADR-041.
+    ///
+    /// Returns `Tile::Uniform(0)` for out-of-range coords (defensive;
+    /// the caller is expected to pass valid coords from
+    /// [`Self::tile_coords_overlapping_rect`]).
+    pub fn clone_tile(&self, coord: TileCoord) -> Tile {
+        if coord.tile_x >= self.grid.tiles_x || coord.tile_y >= self.grid.tiles_y {
+            return Tile::Uniform(0);
+        }
+        let idx = self.grid.tile_index(coord.tile_x, coord.tile_y);
+        self.grid.tiles[idx].clone()
+    }
+
+    /// D10 / Sprint 17 (ADR-041) — restore a single tile at `coord`
+    /// from a snapshot. Bumps the global write version + the per-tile
+    /// version so the GPU compositor picks up the change. Used by the
+    /// undo dispatcher to reverse a brush stroke.
+    ///
+    /// Out-of-range coords silently no-op.
+    pub fn restore_tile(&mut self, coord: TileCoord, tile: Tile) {
+        if coord.tile_x >= self.grid.tiles_x || coord.tile_y >= self.grid.tiles_y {
+            return;
+        }
+        self.grid.current_version += 1;
+        let idx = self.grid.tile_index(coord.tile_x, coord.tile_y);
+        self.grid.tiles[idx] = tile;
+        self.grid.tile_versions[idx] = self.grid.current_version;
+    }
+
+    /// D10 / Sprint 17 (ADR-041) — tile coordinates whose tile rect
+    /// intersects `rect` (a pixel-space rectangle). Used by the undo
+    /// dispatcher's pre-stamp snapshot path: the brush bbox maps to
+    /// a small set of tiles, each of which gets cloned into the open
+    /// stroke before the brush writes.
+    ///
+    /// Returns empty when `rect` is degenerate or lies entirely
+    /// outside the mask.
+    pub fn tile_coords_overlapping_rect(&self, rect: DirtyRect) -> Vec<TileCoord> {
+        if rect.w == 0 || rect.h == 0 || rect.x >= self.width || rect.y >= self.height {
+            return Vec::new();
+        }
+        let cw = rect.w.min(self.width - rect.x);
+        let ch = rect.h.min(self.height - rect.y);
+        if cw == 0 || ch == 0 {
+            return Vec::new();
+        }
+        let tx0 = rect.x / TILE_DIM;
+        let ty0 = rect.y / TILE_DIM;
+        let tx1 = (rect.x + cw - 1) / TILE_DIM;
+        let ty1 = (rect.y + ch - 1) / TILE_DIM;
+        let mut out = Vec::with_capacity(((tx1 - tx0 + 1) * (ty1 - ty0 + 1)) as usize);
+        for ty in ty0..=ty1 {
+            for tx in tx0..=tx1 {
+                out.push(TileCoord {
+                    tile_x: tx,
+                    tile_y: ty,
+                });
+            }
+        }
+        out
+    }
+
+    /// D10 / Sprint 17 (ADR-041) — pixel-space bbox of the stamp
+    /// clipped to the mask. Promoted from `pub(super)` so the app's
+    /// pre-stamp snapshot loop can compute the tile set to capture
+    /// without re-implementing the math.
+    pub fn brush_bbox(&self, stamp: MaskStamp) -> Option<DirtyRect> {
+        mask_pixel_bbox(self, stamp)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -795,6 +886,80 @@ mod tests {
 
     fn two_smu() -> MapSize {
         MapSize::square(2)
+    }
+
+    /// D10 / Sprint 17 (ADR-041): clone_tile + restore_tile round-trip.
+    /// Paint a known pattern into one tile, snapshot it, mutate, then
+    /// restore — the mask should match the original byte-for-byte.
+    #[test]
+    fn clone_and_restore_tile_round_trip() {
+        let mut m = LayerMask::filled(two_smu(), 0);
+        // Promote (0, 0) tile to Pixels by writing a single pixel.
+        m.set_pixel(10, 10, 240);
+        let coord = TileCoord {
+            tile_x: 0,
+            tile_y: 0,
+        };
+        let snap = m.clone_tile(coord);
+        assert!(matches!(snap, Tile::Pixels(_)));
+        // Overwrite — paint a giant rect that covers the tile.
+        m.write_rect_with(0, 0, 256, 256, |_, _| 5);
+        assert_eq!(m.sample(10, 10), 5);
+        // Restore.
+        m.restore_tile(coord, snap);
+        assert_eq!(m.sample(10, 10), 240);
+        assert_eq!(m.sample(11, 11), 0);
+    }
+
+    #[test]
+    fn clone_uniform_tile_is_cheap_and_correct() {
+        let m = LayerMask::filled(two_smu(), 200);
+        let coord = TileCoord {
+            tile_x: 1,
+            tile_y: 2,
+        };
+        let snap = m.clone_tile(coord);
+        assert!(matches!(snap, Tile::Uniform(200)));
+        assert_eq!(snap.resident_bytes(), std::mem::size_of::<Tile>());
+    }
+
+    #[test]
+    fn tile_coords_overlapping_rect_returns_full_tile_set() {
+        let m = LayerMask::filled(two_smu(), 0);
+        // 2-SMU = 1024² → 4×4 tiles. A rect spanning (200, 200) ×
+        // (400, 400) pixels touches tiles (0,0), (1,0), (0,1), (1,1).
+        let coords = m.tile_coords_overlapping_rect(DirtyRect {
+            x: 200,
+            y: 200,
+            w: 200,
+            h: 200,
+        });
+        assert_eq!(coords.len(), 4);
+        assert!(coords.contains(&TileCoord {
+            tile_x: 0,
+            tile_y: 0
+        }));
+        assert!(coords.contains(&TileCoord {
+            tile_x: 1,
+            tile_y: 1
+        }));
+    }
+
+    #[test]
+    fn restore_tile_bumps_version_for_gpu_dirty_pickup() {
+        let mut m = LayerMask::filled(two_smu(), 0);
+        let v0 = m.version();
+        let coord = TileCoord {
+            tile_x: 0,
+            tile_y: 0,
+        };
+        m.restore_tile(coord, Tile::Uniform(128));
+        assert!(
+            m.version() > v0,
+            "restore_tile must bump current_version so the GPU compositor re-uploads",
+        );
+        let dirty = m.dirty_tiles_since(v0);
+        assert!(dirty.contains(&coord));
     }
 
     #[test]

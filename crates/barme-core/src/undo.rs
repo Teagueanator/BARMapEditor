@@ -40,10 +40,14 @@ use std::collections::VecDeque;
 
 use tracing::{trace, warn};
 
+use std::collections::HashMap;
+
 use crate::MapSize;
 use crate::brushes::DirtyRect;
 use crate::heightmap::Heightmap;
-use crate::layers::{BlendMode, LayerColor, LayerSource, LayerTransform, TextureLayer};
+use crate::layers::{
+    BlendMode, LayerColor, LayerMask, LayerSource, LayerTransform, TextureLayer, Tile, TileCoord,
+};
 use crate::procgen::Domain;
 use crate::project::{AllyGroup, FeatureInstance, GeoVent, MetalSpot, StartPosition};
 use crate::splat::SplatChannel;
@@ -51,10 +55,15 @@ use crate::symmetry::SymmetryAxis;
 use crate::water_presets::WaterMode;
 
 /// One committed undo entry. Either a heightmap stroke (the ADR-033
-/// shape) or a project-level diff.
+/// shape), a layer-mask stroke (the Sprint 17 / ADR-041 adaptation
+/// of ADR-033 onto tiled-COW masks), or a project-level diff.
 #[derive(Debug, Clone, PartialEq)]
 pub enum HistoryEntry {
     Heightmap(HeightmapEntry),
+    /// D10 / Sprint 17 (ADR-041) — one brush stroke against a layer
+    /// mask. Stored as a sparse map of (tile coord, before, after)
+    /// snapshots. Undo restores `before`; redo replays `after`.
+    Mask(MaskEntry),
     Project(ProjectDiff),
 }
 
@@ -65,8 +74,37 @@ impl HistoryEntry {
     pub fn bytes(&self) -> usize {
         match self {
             HistoryEntry::Heightmap(h) => h.bytes(),
+            HistoryEntry::Mask(m) => m.bytes(),
             HistoryEntry::Project(p) => p.bytes(),
         }
+    }
+}
+
+/// D10 / Sprint 17 (ADR-041) — one layer-mask stroke. The Sprint 16
+/// tiled-COW mask makes a flat byte snapshot wasteful (you'd pay
+/// 64 MB even for a 16-px stamp); the entry instead stores per-tile
+/// before/after snapshots scoped to the tiles the brush touched.
+///
+/// `tiles` only contains entries where `before != after` — a no-op
+/// stroke gets filtered out at commit time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MaskEntry {
+    /// Layer the stroke targeted. Stored as the layer id (stable
+    /// across reorders) rather than a vec index.
+    pub layer_id: String,
+    /// Per-tile before/after pairs. Order is committed-into-vec order
+    /// (insertion order of the open stroke).
+    pub tiles: Vec<(TileCoord, Tile, Tile)>,
+}
+
+impl MaskEntry {
+    pub fn bytes(&self) -> usize {
+        let per_tile: usize = self
+            .tiles
+            .iter()
+            .map(|(_, b, a)| b.resident_bytes() + a.resident_bytes())
+            .sum();
+        self.layer_id.capacity() + per_tile
     }
 }
 
@@ -548,6 +586,27 @@ impl OpenStroke {
     }
 }
 
+/// D10 / Sprint 17 (ADR-041) — in-flight layer-mask stroke. Mirrors
+/// the heightmap-side [`OpenStroke`] but at tile granularity: each
+/// distinct `TileCoord` the brush touches gets a single pre-stroke
+/// snapshot, regardless of how many stamps land in it.
+struct OpenMaskStroke {
+    layer_id: String,
+    /// Pre-stroke tile state captured on the first stamp that
+    /// touches each tile. Subsequent stamps re-find the entry and
+    /// leave it untouched — the snapshot stays pre-stroke.
+    pre: HashMap<TileCoord, Tile>,
+}
+
+impl OpenMaskStroke {
+    fn new(layer_id: String) -> Self {
+        Self {
+            layer_id,
+            pre: HashMap::new(),
+        }
+    }
+}
+
 /// Bounded undo/redo stack. The cap is enforced on every push by evicting
 /// the *largest* committed entry until total bytes ≤ `cap_bytes`. Default
 /// cap is [`History::DEFAULT_CAP_BYTES`].
@@ -557,6 +616,9 @@ pub struct History {
     bytes: usize,
     cap_bytes: usize,
     open: Option<OpenStroke>,
+    /// D10 / Sprint 17 (ADR-041) — open mask stroke (parallel to
+    /// `open`, scoped to layer-mask edits).
+    mask_open: Option<OpenMaskStroke>,
 }
 
 impl History {
@@ -571,6 +633,7 @@ impl History {
             bytes: 0,
             cap_bytes,
             open: None,
+            mask_open: None,
         }
     }
 
@@ -607,7 +670,7 @@ impl History {
     /// Drop the entire history AND any in-flight stroke. Called when the
     /// project state is replaced wholesale (procgen, load, new project).
     pub fn barrier(&mut self) {
-        let had_open = self.open.is_some();
+        let had_open = self.open.is_some() || self.mask_open.is_some();
         if !self.undo.is_empty() || !self.redo.is_empty() || had_open {
             trace!(
                 undo = self.undo.len(),
@@ -621,6 +684,97 @@ impl History {
         self.redo.clear();
         self.bytes = 0;
         self.open = None;
+        self.mask_open = None;
+    }
+
+    /// D10 / Sprint 17 (ADR-041) — capture the pre-stroke state of
+    /// one tile. The first call per `(layer_id, coord)` stores
+    /// `current_tile`; subsequent calls are no-ops. If `layer_id`
+    /// switches mid-stroke (defensive — the UI doesn't allow it), the
+    /// prior open stroke gets dropped with a `warn!` and a new one
+    /// opens for the new layer.
+    ///
+    /// Callers (the app's `apply_mask_brush_at_elmos`) walk the
+    /// brush bbox's tile coords via
+    /// [`LayerMask::tile_coords_overlapping_rect`] and call this
+    /// before invoking the brush.
+    pub fn snapshot_mask_tile(&mut self, layer_id: &str, coord: TileCoord, current_tile: Tile) {
+        match self.mask_open.as_mut() {
+            Some(s) if s.layer_id == layer_id => {
+                s.pre.entry(coord).or_insert(current_tile);
+            }
+            _ => {
+                if self.mask_open.is_some() {
+                    warn!(
+                        layer_id,
+                        "undo: mask stroke switched layers mid-stroke; dropping prior snapshot"
+                    );
+                }
+                let mut stroke = OpenMaskStroke::new(layer_id.to_string());
+                stroke.pre.insert(coord, current_tile);
+                self.mask_open = Some(stroke);
+            }
+        }
+    }
+
+    /// D10 / Sprint 17 (ADR-041) — commit the in-flight mask stroke
+    /// against `mask` (which is the live post-stroke layer mask).
+    /// Builds a [`MaskEntry`] from the open snapshot's pre tiles +
+    /// the current tile states, filters out tiles where before == after,
+    /// pushes onto the undo stack. Returns `true` if anything was
+    /// pushed (i.e. the stroke produced net change).
+    pub fn end_mask_stroke(&mut self, mask: &LayerMask) -> bool {
+        let Some(stroke) = self.mask_open.take() else {
+            return false;
+        };
+        if stroke.pre.is_empty() {
+            return false;
+        }
+        let tiles: Vec<(TileCoord, Tile, Tile)> = stroke
+            .pre
+            .into_iter()
+            .filter_map(|(coord, before)| {
+                let after = mask.clone_tile(coord);
+                if before == after {
+                    None
+                } else {
+                    Some((coord, before, after))
+                }
+            })
+            .collect();
+        if tiles.is_empty() {
+            trace!(
+                layer_id = %stroke.layer_id,
+                "mask stroke committed no net change; discarding entry"
+            );
+            return false;
+        }
+        let entry = HistoryEntry::Mask(MaskEntry {
+            layer_id: stroke.layer_id,
+            tiles,
+        });
+        let added = entry.bytes();
+        trace!(
+            tiles = match &entry {
+                HistoryEntry::Mask(m) => m.tiles.len(),
+                _ => 0,
+            },
+            bytes = added,
+            "mask stroke committed to undo history"
+        );
+        self.redo.clear();
+        self.bytes += added;
+        self.undo.push_back(entry);
+        self.evict_until_under_cap();
+        true
+    }
+
+    /// `true` while a mask stroke is in flight. Used by the app to
+    /// decide whether `end_mask_stroke` would do anything on
+    /// drag-stopped (it's safe to call unconditionally; this
+    /// accessor exists for tests + telemetry).
+    pub fn mask_stroke_open(&self) -> bool {
+        self.mask_open.is_some()
     }
 
     // ───────── heightmap-stroke capture (unchanged from ADR-033) ─────────
@@ -792,6 +946,89 @@ mod tests {
         Heightmap::synth_ramp(MapSize::square(2)) // 129×129
     }
 
+    // D10 / Sprint 17 (ADR-041) — mask undo tests.
+
+    /// Helper: build a fresh 2-SMU LayerMask wrapped in a layer so the
+    /// stroke tests can target it by id.
+    fn make_test_mask() -> LayerMask {
+        LayerMask::filled(MapSize::square(2), 0)
+    }
+
+    #[test]
+    fn mask_undo_round_trip_restores_pre_stroke_state() {
+        let mut mask = make_test_mask();
+        let mut history = History::new(History::DEFAULT_CAP_BYTES);
+
+        // Open a stroke: snapshot the tile that contains pixel (10, 10)
+        // before mutating.
+        let coord = TileCoord {
+            tile_x: 0,
+            tile_y: 0,
+        };
+        history.snapshot_mask_tile("layer-A", coord, mask.clone_tile(coord));
+        assert!(history.mask_stroke_open());
+
+        // Mutate.
+        mask.set_pixel(10, 10, 200);
+        assert_eq!(mask.sample(10, 10), 200);
+
+        // Commit. Should push exactly one entry.
+        let pushed = history.end_mask_stroke(&mask);
+        assert!(pushed, "non-trivial stroke must commit an entry");
+        assert_eq!(history.undo_depth(), 1);
+        assert!(!history.mask_stroke_open());
+
+        // Pop + apply inverse (the dispatcher path; we mirror it
+        // inline for the test).
+        let entry = history.pop_undo().unwrap();
+        let HistoryEntry::Mask(mut mask_entry) = entry else {
+            panic!("expected Mask entry");
+        };
+        for (c, before, after) in mask_entry.tiles.iter_mut() {
+            let live = mask.clone_tile(*c);
+            mask.restore_tile(*c, before.clone());
+            *after = live;
+        }
+        assert_eq!(mask.sample(10, 10), 0, "undo must restore pre-stroke");
+    }
+
+    #[test]
+    fn mask_undo_filters_no_op_strokes() {
+        let mask = make_test_mask();
+        let mut history = History::new(History::DEFAULT_CAP_BYTES);
+        let coord = TileCoord {
+            tile_x: 0,
+            tile_y: 0,
+        };
+        // Snapshot the tile but never actually write to the mask.
+        history.snapshot_mask_tile("layer-A", coord, mask.clone_tile(coord));
+        let pushed = history.end_mask_stroke(&mask);
+        assert!(!pushed, "stroke with no net change must NOT commit");
+        assert_eq!(history.undo_depth(), 0);
+    }
+
+    #[test]
+    fn mask_undo_bytes_accounting_includes_each_tile_snapshot() {
+        let mut mask = make_test_mask();
+        let mut history = History::new(History::DEFAULT_CAP_BYTES);
+        let coord = TileCoord {
+            tile_x: 0,
+            tile_y: 0,
+        };
+        history.snapshot_mask_tile("layer-A", coord, mask.clone_tile(coord));
+        mask.write_rect_with(0, 0, 256, 256, |_, _| 5);
+        let pushed = history.end_mask_stroke(&mask);
+        assert!(pushed);
+        // The promoted Pixels tile is 64 KB; the snapshot stored a
+        // Uniform(0) (24 B) before the write. Total bytes_account
+        // should be >= TILE_PIXELS + small overhead.
+        assert!(
+            history.bytes() >= crate::TILE_PIXELS,
+            "history.bytes() should reflect the 64 KB Pixels snapshot; got {}",
+            history.bytes(),
+        );
+    }
+
     /// Helper: snapshot `rect`, then write `value` into the heightmap at
     /// every pixel of `rect`. Mirrors what `apply_brush_at` does in
     /// `main.rs`.
@@ -820,6 +1057,13 @@ mod tests {
                 HistoryEntry::Project(diff) => {
                     let inverse = apply_project_diff_for_test(diff, group);
                     history.push_to_redo(HistoryEntry::Project(inverse));
+                }
+                HistoryEntry::Mask(_) => {
+                    // This test harness operates on heightmap + start
+                    // positions only; mask entries aren't exercised
+                    // here. The app-side dispatcher walks them via
+                    // `LayerMask::restore_tile` (covered by the
+                    // mask-undo unit tests below).
                 }
             }
         }

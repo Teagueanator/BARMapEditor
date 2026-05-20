@@ -50,7 +50,7 @@ use crate::brushes::DirtyRect;
 use crate::splat::{SplatChannel, SplatConfig};
 
 pub use brushes::{MaskBrush, MaskBrushRegistry, MaskFill, MaskHide, MaskReveal, MaskSmooth};
-pub use mask::{LayerMask, MaskStamp, TILE_DIM, TILE_PIXELS, TileCoord};
+pub use mask::{LayerMask, MaskStamp, TILE_DIM, TILE_PIXELS, Tile, TileCoord};
 
 // ---------------------------------------------------------------------------
 // Source / transform / colour / blend
