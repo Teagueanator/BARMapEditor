@@ -2505,6 +2505,34 @@ tools/textures/
   Out-of-pack slots get index ≥ 16 and skip the dirname-prefix
   drift check.
 
+**Sprint 17 update (ADR-041, D10, 2026-05-20):** ADR-027 covers
+the stock-slot layout under `tools/textures/`. Sprint 17 adds a
+second source location for `LayerSource::Imported` entries:
+`<project>/textures/<uuid>.png` + a sibling `<uuid>.meta.toml`
+with `name`, `source_filename`, `original_dims`, `imported_at_unix`.
+
+The two locations are disjoint:
+- **Stock slots** live under the shared `tools/textures/<NN-slug>/`
+  tree, discovered once at app start, share thumbnails across all
+  projects.
+- **Imported textures** live under each `.barmeproj`'s parent
+  directory + a `textures/` subdirectory. Paths are stored
+  project-relative on `LayerSource::Imported { path }` so a
+  moved project carries its textures with it.
+
+`SlotResolver::imported_root` (default-method addition in Sprint 17)
+returns the directory relative-imported paths resolve against;
+`AppSlotResolver::with_project_root` threads the `.barmeproj`
+parent through to the bake. Sprint 17's `App::migrate_imported_
+layer_paths` re-homes any pre-Sprint-17 absolute / non-`textures/`
+paths into the canonical sidecar at load time.
+
+UUIDs come from `barme_core::alloc_layer_id` (the same UUID-shaped
+hex `TextureLayer.id` allocator). PITFALL §17.4 — imports refuse to
+run when the project isn't saved (no target dir to copy into).
+PITFALL §17.5 — importing marks the project dirty so a
+user-quit-without-save doesn't dangle the imported file.
+
 ## Template for new entries
 
 ## ADR-036 — Terrain fragment shader: splat-blended diffuse composite (Sprint 9 / D4)
@@ -3500,6 +3528,188 @@ textures/<uuid>.png`) + DNTS hybrid emission + retirement of
   `paint_brush_state`, `mask_brushes`, `paint_last_drag_pos`.
 - Default brush radius bumped 64 → 192 elmos for visibility on
   the first stamp.
+
+## ADR-041 — Layers panel UI + DNTS hybrid emission + legacy splat retirement (Sprint 17 / D10)
+
+**Status:** Accepted.
+
+Closes the F4 row of the SRS feature matrix end-to-end. Extends
+(does not supersede) ADR-038 (data model + CPU bake) / ADR-039
+(GPU composite + tiled-COW masks) / ADR-040 (paint viewport +
+brought-forward Layers panel skeleton). Retires `Tool::SplatPaint`
++ `inspector_splat` + the per-channel `splat_config` /
+`splat_distribution` model at the project boundary.
+
+**Context.** Sprint 16 (ADR-039 + ADR-040) shipped the
+layered-painter foundation + a minimal panel inline in
+`App::inspector_paint_layer`. The user feedback at end-of-Sprint-16
+was clear: the painter is testable but the UX gaps make stock
+textures hard to use ("Add layer" picks whatever next-unused slot)
+and the legacy 4-channel splat inspector still ships alongside the
+new panel — two ways to do everything is a worse onboarding story
+than one. Sprint 17 finishes the feature.
+
+**Decisions:**
+
+- **Lift the Layers panel out of `main.rs`.** New module
+  `crates/barme-app/src/ui/layers_panel.rs`. `main.rs` was already
+  > 11 000 LoC; the panel's complexity (drag-to-reorder + thumbnail
+  cache + DNTS chip + transform/color/blend properties + footer
+  chips + slot picker popups) doubled the inline code. The module
+  exposes `pub fn render(app: &mut App, ui: &mut egui::Ui)`; the
+  `Tool::PaintLayer` Inspector dispatch reduces to a 3-line
+  forwarder + the session-only BRUSH section underneath.
+
+- **Per-layer DNTS scale + mult fields, not a per-channel global.**
+  `TextureLayer.dnts_tex_scale: f32` + `dnts_tex_mult: f32` (default
+  `0.02` / `1.0`, per FINDINGS §1.6). The retired
+  `SplatConfig.tex_scales` / `tex_mults` migrate into the per-layer
+  fields at `LayerStack::migrate_from_splat_config` time
+  (PITFALL §17.8). The runtime DNTS shader reads via
+  `LayerStack::dnts_layers()` instead of `SplatConfig.channels`.
+
+- **`dnts_diffuse_in_alpha` becomes a per-project setting**, not
+  per-channel. The Layers-panel footer toggle drives
+  `Project.dnts_diffuse_in_alpha: bool`. Migration carries the
+  legacy `SplatConfig.diffuse_in_alpha` flag forward once.
+
+- **Stock-texture picker is the primary Add-layer path.** Sprint 16's
+  "Add layer = next unused slot" was a fallback; Sprint 17's primary
+  click on "Add layer" opens a popup with a 3-column thumbnail grid
+  of every stock slot. "Import texture from disk…" is the secondary
+  affordance in the same popup. The active-layer Source section's
+  "Change slot…" button opens the same picker. Extracted as
+  `widgets::slot_picker_grid` so the Add flow + the Change flow
+  share one widget. (User-driven addition mid-sprint.)
+
+- **DNTS hybrid emission drives runtime detail from layer masks.**
+  Bottom ≤4 DNTS-bound layers materialise into the splat
+  distribution PNG via a box-filter downsample (PITFALL §17.2:
+  NOT nearest-neighbour) to 1024². Each bound layer's slot bakes a
+  per-channel DDS via the existing `bake_dnts`. Imported-source
+  DNTS layers emit a `LintWarning::ImportedLayerDnts` and skip the
+  DDS bake (no stock normal map). New entry point
+  `barme_pipeline::stage_splat_assets_from_layers` parallel to
+  Sprint 12's `stage_splat_assets`; `build_sd7` dispatches on
+  `project.layers.layers.is_empty()`.
+
+  The `R + G + B + A ≤ 255` invariant holds by construction (one
+  channel per layer; channels independent in the materialisation).
+  Pinned by `mask_to_splat_distr_invariant_rgba_under_255`.
+
+- **Per-stroke mask undo adapts ADR-033 to tiled-COW masks.**
+  Sprint 16 left mask edits non-undoable; Sprint 17 lands a
+  tile-granular snapshot/diff. `LayerMask::clone_tile(coord)` +
+  `restore_tile(coord, tile)` + `tile_coords_overlapping_rect(rect)`
+  expose the storage API. `History::snapshot_mask_tile` (called
+  per-tile BEFORE the brush writes) + `end_mask_stroke` (commits a
+  `HistoryEntry::Mask` from before / after pairs, filtering no-op
+  tiles). Bytes accounting sums `Tile::resident_bytes` per pair.
+
+- **Project-local texture sidecar.** Imports copy into
+  `<project>/textures/<uuid>.png` + write a
+  `<uuid>.meta.toml` (name, source_filename, original_dims,
+  imported_at_unix). `LayerSource::Imported { path }` stores a
+  project-relative path so a moved project keeps its textures.
+  `SlotResolver::imported_root` (default-method addition) lets
+  the bake resolve relative paths; `AppSlotResolver::with_project_root`
+  threads the `.barmeproj` parent through. PITFALL §17.4: import
+  refuses to run when the project isn't yet saved.
+
+- **Drag-to-reorder gates the 64 MB diffuse re-upload to drop only.**
+  egui 0.33's `dnd_drag_source` / `dnd_drop_zone` per row. In-flight
+  drags mutate a session-only `App::paint_drag_preview_order` so the
+  panel renders the reordered position without committing; the drop
+  fires exactly one `ProjectDiff::ReorderLayer` (via
+  `App::reorder_layer`, which does the cache clear + diffuse
+  re-upload). PITFALL §17.12.
+
+- **`Project.splat_config` becomes `#[serde(skip_serializing)]`** at
+  Commit 6. New saves drop the legacy block; old loads still hydrate
+  via the wire-side `#[serde(default)]` for the one-shot migration.
+  Pinned by `splat_config_skips_serialization` +
+  `legacy_splat_config_round_trip_skips_serializing_after_migration`.
+
+**Alternatives:**
+
+- *Composite blend modes beyond `Normal`*. Considered (Multiply /
+  Screen / Overlay are common). Deferred — the `BlendMode` enum +
+  ComboBox surface ship empty so Sprint 18+ slots them in cheaply.
+
+- *Pen-pressure painting*. Considered. Deferred — egui 0.33 doesn't
+  surface tablet pressure natively. Sprint 20+ when a wrapper crate
+  is wired.
+
+- *Live full-resolution composite preview at > 4096²/axis*. Stays
+  capped per ADR-039. The CPU bake at `.sd7`-build time is the
+  authoritative full-res output.
+
+- *Garbage collection of orphaned imported textures*. Considered.
+  Undoing an import leaves the on-disk PNG behind (the layer's
+  `Source` reverts but the file stays). Sprint 18 can add a
+  "Sweep unused imports" affordance; not a Sprint 17 deliverable.
+
+- *Multi-select layer ops*. Considered (Photoshop has it).
+  Deferred — single-active model fits the current pointer-dispatch
+  shape. Sprint 19+.
+
+- *Layer groups / folders*. Deferred — most BAR maps land ≤ 6
+  layers; groups would be over-design.
+
+**Consequence:**
+
+- `Tool::ALL` shrinks 10 → 9 (no more `SplatPaint`). Keyboard `T`
+  is freed.
+- `App` loses six fields (`splat_config`, `splat_distribution`,
+  `splat_brushes`, `splat_brush_state`, `splat_picker_open_for`) +
+  ~700 LoC of `inspector_splat` + `apply_splat_brush_at` +
+  helpers.
+- `barme-pipeline` gains `LayerSplatBakeInputs`, `LintWarning`,
+  `stage_splat_assets_from_layers`, `materialize_splat_distribution_from_layers`,
+  `populate_resources_from_layers`. The legacy entries
+  (`stage_splat_assets`, `compute_active_channels`,
+  `write_splat_distribution_png`, `populate_resources`,
+  `SplatBakeInputs`) stay one more sprint as dead-callable code;
+  Sprint 18 polish sweep.
+- Tests: 264 in `barme-core`, 240 in `barme-app`, 117 in
+  `barme-pipeline`. The mask-undo + DNTS-hybrid + slot-picker
+  surfaces are pinned by 11 net new tests across the three crates.
+- The user's 2026-05-19 "the textures of the end map are quite
+  incredibly ugly" report closes: unlimited stylistic layers
+  compose into the diffuse BMP at full resolution; bottom 4
+  DNTS-bound layers drive runtime per-fragment normal mapping in
+  BAR; the legacy 4-channel inspector is gone; stock textures are
+  one click away (no upload required).
+
+Critical files:
+- NEW `crates/barme-app/src/ui/layers_panel.rs`
+- `crates/barme-app/src/ui/widgets.rs` — `slot_picker_grid` +
+  `SlotPickerEntry`.
+- `crates/barme-app/src/ui/paint_view.rs` — `mask_only_preview`
+  overlay render.
+- `crates/barme-app/src/main.rs` — net −800 LoC (panel relocation
+  + inspector_splat deletion + retirement of splat-painter App
+  fields; offset by new helpers `add_layer_with_slot`,
+  `layer_thumbnail`, `active_mask_overlay_texture`,
+  `migrate_imported_layer_paths`, `import_layer_texture` rewrite).
+- `crates/barme-core/src/layers/mod.rs` — `dnts_layers()` accessor,
+  `dnts_tex_scale` + `dnts_tex_mult` fields, migration extension.
+- `crates/barme-core/src/layers/mask.rs` — `pub Tile`,
+  `clone_tile` / `restore_tile` / `tile_coords_overlapping_rect` /
+  `brush_bbox`.
+- `crates/barme-core/src/undo.rs` — `HistoryEntry::Mask`,
+  `MaskEntry`, `OpenMaskStroke`, `snapshot_mask_tile` /
+  `end_mask_stroke` / `mask_stroke_open`,
+  `LayerPropertyValue::DntsTexScale` + `DntsTexMult`.
+- `crates/barme-core/src/project.rs` — `Project.dnts_diffuse_in_alpha`,
+  `Project.migration_toast_dismissed`, `splat_config`
+  `#[serde(skip_serializing)]`.
+- `crates/barme-pipeline/src/splat_pipeline.rs` —
+  `stage_splat_assets_from_layers`, `materialize_splat_distribution_from_layers`,
+  `populate_resources_from_layers`, `LayerSplatBakeInputs`,
+  `LintWarning`.
+- `crates/barme-pipeline/src/lib.rs::build_sd7` — `layer_inputs:
+  Option<LayerSplatBakeInputs>` parameter + dispatch branch.
 
 ## ADR template
 

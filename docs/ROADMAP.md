@@ -425,6 +425,73 @@ Implements SRS F1–F12. Ships a Windows `.exe` and a Linux AppImage.
       toggle + blend-mode selector + per-layer transform UI +
       mask-only preview's grayscale render + mask symmetry +
       per-stroke mask undo.
+- [x] **STATUS UPDATE 2026-05-20 (Sprint 17 / D10 — ADR-041).**
+      Layered painter trio complete. F4 closes end-to-end. The
+      user's 2026-05-19 "the textures of the end map are quite
+      incredibly ugly" report is resolved: the `.sd7` ships a
+      composited diffuse from an unlimited stylistic layer stack
+      at full texture resolution, and the bottom ≤4 DNTS-bound
+      layers drive runtime per-fragment normal mapping in BAR.
+      Full Photoshop-style Layers panel in `ui::layers_panel`
+      (drag-to-reorder, lock chip, per-layer thumbnail, DNTS
+      channel chip with R/G/B/A/∅ cycle + right-click picker
+      + conflict-transfer, opacity slider, expanded properties
+      for Source / Transform / Color / Blend / DNTS bindings,
+      footer chips). User-driven addition mid-sprint: a stock-
+      slot picker dropdown opens from the Add-layer primary
+      action + the active-layer "Change slot…" affordance —
+      `widgets::slot_picker_grid` extracted from the deleted
+      `inspector_splat`. Stock textures are one click away;
+      uploads are the secondary path. Custom imports copy into
+      `<project>/textures/<uuid>.png` with a `meta.toml` sidecar.
+      Load-time migration carries pre-Sprint-17 absolute paths
+      forward. Mask brushes fan through `App::symmetry`. Mask-
+      only grayscale preview chip renders (red where mask = 0).
+      Per-stroke mask undo via tile-granular snapshots adapts
+      ADR-033 onto Sprint-16's tiled-COW masks (`MaskEntry +
+      OpenMaskStroke`, dedup-on-touch to avoid 15 MB/sec clone
+      churn on continuous drags). DNTS hybrid emission
+      (`stage_splat_assets_from_layers + materialize_splat_
+      distribution_from_layers + populate_resources_from_layers`)
+      box-filter-downsamples each DNTS-bound layer's mask to
+      1024² + bakes a per-slot DDS via `bake_dnts`. Imported-
+      source DNTS layers emit `LintWarning::ImportedLayerDnts`
+      and skip the DDS bake. Runtime DNTS shader uniforms now
+      derive from `LayerStack::dnts_layers()` (per-layer
+      `dnts_tex_scale` / `dnts_tex_mult` / channel binding).
+      Retired: `Tool::SplatPaint` variant + every match arm + ~470
+      LoC of `inspector_splat` + ~90 LoC of `apply_splat_brush_at`
+      + `App::splat_brush_state` + `SplatBrushState` struct +
+      `App::splat_picker_open_for` + `App::splat_config` mirror +
+      `App::splat_distribution` mirror + `App::splat_brushes` +
+      `App::reupload_bound_slot_diffuses` +
+      `App::reupload_splat_distribution`. `Project.splat_config`
+      marked `#[serde(skip_serializing)]` — new saves drop the
+      legacy block; old loads still hydrate via the wire-side
+      default so `after_load_migrate` can seed the layer stack.
+      `Tool::ALL` shrinks 10 → 9; keyboard `T` is freed.
+      One-time migration toast on pre-Sprint-14 project open
+      (dismissable, persists per-project via
+      `Project.migration_toast_dismissed`). ADR-041 added;
+      ADR-027 amended with the `<project>/textures/<uuid>.png`
+      sidecar layout. Tests: barme-core 253 → 264 (+11 net: mask
+      snapshot/restore, mask undo round-trip, imported-root
+      resolution, splat_config-skip-serialize, layer DNTS
+      uniforms + ProjectDiff bytes accounting); barme-pipeline
+      114 → 117 (+3: box-filter downsample smoothness, RGBA
+      invariant, imported-layer lint); barme-app 247 → 240 (−7
+      legacy splat-painter tests deleted + the layers panel
+      smoke-tests live end-to-end via the smoke run). Workspace
+      total 614 → 621. 7 commits + 1 hotfix on `main`. Known
+      Sprint 18 polish followups: GPU compositor extension to
+      take per-layer color + transform uniforms (color slider
+      edits don't reflect in the live RT preview today, only in
+      the CPU bake at `.sd7` time), garbage collection of
+      orphaned imported textures on undo, and a 16-SMU
+      memory-pressure investigation (the user hit an OOM on
+      Tool::PaintLayer entry; this rollup's dedup-snapshot fix
+      mitigates the worst per-stamp allocation churn but
+      doesn't root-cause the entry transient).
 - [ ] Beherith (or active mapper) reviews `.sd7` byte-for-byte against PyMapConv
       reference output on three test maps
 - [ ] Listed on `beyondallreason.info/guide/mapmaking-resources` as beta
