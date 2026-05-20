@@ -312,11 +312,42 @@ struct App {
     /// on `drag_stopped` so a fresh LMB press doesn't carry a stale
     /// `prev` from the prior stroke.
     paint_last_drag_pos: Option<glam::Vec2>,
+    /// D10 / Sprint 17 (ADR-041): per-layer 32² thumbnail cache. Keyed
+    /// by `layer.id` because `LayerSource::Imported` thumbnails are
+    /// derived from the imported PNG (one-shot decode on first surface),
+    /// not the slot id. Survives a project switch because the live
+    /// thumbnail cache is cheap and the entries' ids are unique per
+    /// layer.
+    layer_thumbnails: std::collections::HashMap<String, egui::TextureHandle>,
+    /// D10 / Sprint 17 (ADR-041): in-flight drag-to-reorder state.
+    /// `Some(ids)` when the user is mid-drag — the Layers panel renders
+    /// in this order without committing. On drop, the panel emits one
+    /// `ProjectDiff::ReorderLayer` (which goes through
+    /// [`Self::reorder_layer`] and triggers the 64 MB diffuse re-upload
+    /// exactly once); during the drag itself the re-upload stays
+    /// suppressed.
+    paint_drag_preview_order: Option<Vec<String>>,
+    /// D10 / Sprint 17 (ADR-041): active layer's mask preview overlay.
+    /// `Some((layer_id, mask_version, handle))` when the cache is up to
+    /// date; the per-frame helper invalidates when either changes.
+    layer_mask_preview_cache: Option<(String, u64, egui::TextureHandle)>,
+    /// D10 / Sprint 17 (ADR-041): the layers panel's last-rendered
+    /// screen rect, captured so the drag-drop handler can route file
+    /// drops onto the layers panel vs the central viewport. `None`
+    /// when the panel isn't on screen this frame.
+    layers_panel_rect: Option<egui::Rect>,
     /// D5 / Sprint 9: persisted per-channel slot bindings, scales,
     /// mults, and the ADR-034 placeholder toggle. Round-trips through
     /// `Project.splat_config` on save / open. Replaces the Phase-7
     /// `SplatState` scaffolding.
     splat_config: SplatConfig,
+    /// D10 / Sprint 17 (ADR-041): mirrors
+    /// [`barme_core::Project::dnts_diffuse_in_alpha`]. Drives the
+    /// Layers panel footer toggle + the splat pipeline's per-build
+    /// `BakeOptions.diffuse_in_alpha`. Replaces the per-channel
+    /// `splat_config.diffuse_in_alpha`; migration copies the legacy
+    /// value across on first load of a pre-Sprint-17 project.
+    dnts_diffuse_in_alpha: bool,
     /// D5 / Sprint 9: the painted RGBA distribution. Allocated on
     /// first stamp; not persisted to `.barmeproj` (D6 / Sprint 12 will
     /// ship PNG sidecar persistence). Mirrors
@@ -638,7 +669,11 @@ impl Default for PaintBrushState {
 /// on undo and `to` on redo — single-direction routing keeps the
 /// path symmetric. Mask edits intentionally aren't here; they live
 /// on a separate Sprint 16 / D9 path.
-fn apply_layer_property(layer: &mut TextureLayer, value: &LayerPropertyValue) {
+///
+/// D10 / Sprint 17 (ADR-041) — `pub(crate)` so [`crate::ui::layers_panel`]
+/// can reuse it. The dispatcher in [`App::apply_project_diff`] remains
+/// the canonical caller.
+pub(crate) fn apply_layer_property(layer: &mut TextureLayer, value: &LayerPropertyValue) {
     match value {
         LayerPropertyValue::Name(s) => layer.name = s.clone(),
         LayerPropertyValue::Transform(t) => layer.transform = *t,
@@ -649,6 +684,8 @@ fn apply_layer_property(layer: &mut TextureLayer, value: &LayerPropertyValue) {
         LayerPropertyValue::Opacity(o) => layer.opacity = *o,
         LayerPropertyValue::DntsChannel(c) => layer.dnts_channel = *c,
         LayerPropertyValue::Source(s) => layer.source = s.clone(),
+        LayerPropertyValue::DntsTexScale(s) => layer.dnts_tex_scale = *s,
+        LayerPropertyValue::DntsTexMult(m) => layer.dnts_tex_mult = *m,
     }
 }
 
@@ -1182,7 +1219,12 @@ impl App {
             paint_brush_state: PaintBrushState::default(),
             mask_brushes: barme_core::MaskBrushRegistry::default_set(),
             paint_last_drag_pos: None,
+            layer_thumbnails: std::collections::HashMap::new(),
+            paint_drag_preview_order: None,
+            layer_mask_preview_cache: None,
+            layers_panel_rect: None,
             splat_config: SplatConfig::default(),
+            dnts_diffuse_in_alpha: false,
             splat_distribution: None,
             splat_brush_state: SplatBrushState::default(),
             splat_brushes: SplatBrushRegistry::default(),
@@ -1312,6 +1354,7 @@ impl App {
         // distribution. Slot thumbnails stay cached — the registry +
         // PNGs on disk don't change with project lifecycle.
         self.splat_config = SplatConfig::default();
+        self.dnts_diffuse_in_alpha = false;
         self.splat_distribution = None;
         self.splat_picker_open_for = None;
         // D8 / Sprint 15 (ADR-038): a fresh "New project" gets a
@@ -1332,6 +1375,10 @@ impl App {
         // view's pan/zoom resets to auto-fit.
         self.paint_active_layer_id = None;
         self.paint_view_state = PaintViewState::default();
+        self.layer_thumbnails.clear();
+        self.paint_drag_preview_order = None;
+        self.layer_mask_preview_cache = None;
+        self.layers_panel_rect = None;
         // GPU side resets via the next-frame TerrainCallback (uniforms
         // re-write to defaults; distribution texture is left holding
         // the prior session's pixels — irrelevant since active_mask = 0
@@ -1388,6 +1435,7 @@ impl App {
             mapinfo_overrides: self.mapinfo_overrides.clone(),
             next_steps_dismissed: self.next_steps_dismissed,
             splat_config: self.splat_config.clone(),
+            dnts_diffuse_in_alpha: self.dnts_diffuse_in_alpha,
             layers: self.layer_stack.clone(),
             splat_distribution: self.splat_distribution.clone(),
             metal_spots: self.metal_spots.clone(),
@@ -2253,6 +2301,133 @@ impl App {
         Some(handle)
     }
 
+    /// D10 / Sprint 17 (ADR-041) — produce a 96² thumbnail handle for
+    /// the layer identified by `layer_id`. For `Slot`-sourced layers
+    /// this delegates to [`Self::slot_thumbnail`] (slot-id-keyed cache;
+    /// already shared by the slot picker). For `Imported`-sourced
+    /// layers it decodes the imported PNG once and caches it on
+    /// [`App::layer_thumbnails`] keyed by layer id.
+    fn layer_thumbnail(
+        &mut self,
+        ctx: &egui::Context,
+        layer_id: &str,
+    ) -> Option<egui::TextureHandle> {
+        let layer = self.layer_stack.layer_by_id(layer_id)?;
+        match layer.source.clone() {
+            barme_core::LayerSource::Slot { id } => self.slot_thumbnail(ctx, id),
+            barme_core::LayerSource::Imported { path } => {
+                if let Some(h) = self.layer_thumbnails.get(layer_id) {
+                    return Some(h.clone());
+                }
+                // Imported paths in pre-Sprint-17 projects may be
+                // absolute; Sprint 17 normalises them to project-relative
+                // `textures/<uuid>.png`. The current project path isn't
+                // tracked on `App` directly, so we trust the absolute /
+                // CWD-relative form and fall back to `None` on decode
+                // failure. Sprint 17 / Commit 2 wires the project-root
+                // base into a helper.
+                let img = match image::open(&path) {
+                    Ok(i) => i,
+                    Err(e) => {
+                        warn!(
+                            layer_id,
+                            path = %path.display(),
+                            error = %e,
+                            "layer_thumbnail: imported source decode failed",
+                        );
+                        return None;
+                    }
+                };
+                let rgba = image::imageops::resize(
+                    &img.to_rgba8(),
+                    96,
+                    96,
+                    image::imageops::FilterType::Triangle,
+                );
+                let (w, h) = rgba.dimensions();
+                let color = egui::ColorImage::from_rgba_unmultiplied(
+                    [w as usize, h as usize],
+                    rgba.as_raw(),
+                );
+                let handle = ctx.load_texture(
+                    format!("layer-thumb-{layer_id}"),
+                    color,
+                    egui::TextureOptions::LINEAR,
+                );
+                self.layer_thumbnails
+                    .insert(layer_id.to_string(), handle.clone());
+                Some(handle)
+            }
+        }
+    }
+
+    /// D10 / Sprint 17 (ADR-041) — build (or hit the cache for) the
+    /// active layer's grayscale mask preview. Returned texture is sized
+    /// at most 512² (downsampled via box filter), with red wherever the
+    /// mask reads 0. `None` when no active layer is selected.
+    ///
+    /// Cache key = `(active_layer_id, mask.version())`. The mask version
+    /// bumps once per brush stamp, so a stroke pushes ~one new texture
+    /// upload per frame; idle frames hit the cache and return the
+    /// existing handle.
+    fn active_mask_overlay_texture(&mut self, ctx: &egui::Context) -> Option<egui::TextureHandle> {
+        let layer_id = self.paint_active_layer_id.clone()?;
+        let layer = self.layer_stack.layer_by_id(&layer_id)?;
+        let version = layer.mask.version();
+        if let Some((cached_id, cached_v, handle)) = self.layer_mask_preview_cache.as_ref()
+            && cached_id == &layer_id
+            && *cached_v == version
+        {
+            return Some(handle.clone());
+        }
+        // Downsample mask to max 512² with a simple box filter.
+        let src_w = layer.mask.width;
+        let src_h = layer.mask.height;
+        if src_w == 0 || src_h == 0 {
+            return None;
+        }
+        let max_dim = 512u32;
+        let scale = (src_w.max(src_h) as f32 / max_dim as f32).max(1.0).ceil() as u32;
+        let scale = scale.max(1);
+        let dst_w = (src_w / scale).max(1);
+        let dst_h = (src_h / scale).max(1);
+        let mut pixels: Vec<u8> = Vec::with_capacity((dst_w as usize) * (dst_h as usize) * 4);
+        for dy in 0..dst_h {
+            for dx in 0..dst_w {
+                // Box-filter: average a `scale × scale` block.
+                let mut sum: u32 = 0;
+                let mut count: u32 = 0;
+                let sx0 = dx * scale;
+                let sy0 = dy * scale;
+                let sx1 = (sx0 + scale).min(src_w);
+                let sy1 = (sy0 + scale).min(src_h);
+                for sy in sy0..sy1 {
+                    for sx in sx0..sx1 {
+                        sum += u32::from(layer.mask.sample(sx, sy));
+                        count += 1;
+                    }
+                }
+                let m = sum.checked_div(count).map(|v| v as u8).unwrap_or(0);
+                if m == 0 {
+                    // Red where mask is zero — visually pops the "no
+                    // contribution" region.
+                    pixels.extend_from_slice(&[224, 32, 32, 255]);
+                } else {
+                    pixels.extend_from_slice(&[m, m, m, 255]);
+                }
+            }
+        }
+        let color =
+            egui::ColorImage::from_rgba_unmultiplied([dst_w as usize, dst_h as usize], &pixels);
+        let handle = ctx.load_texture(
+            format!("layer-mask-{layer_id}"),
+            color,
+            egui::TextureOptions::NEAREST,
+        );
+        self.layer_mask_preview_cache = Some((layer_id, version, handle.clone()));
+        Some(handle)
+    }
+
     /// Inspector entry point: bind `slot_id` to `channel` (0..=3 = R/G/
     /// B/A). Mutates `splat_config`, marks dirty, and triggers a
     /// re-upload of the slot's diffuse into the matching texture-array
@@ -2479,29 +2654,53 @@ impl App {
     }
 
     /// D9 / Sprint 16 (ADR-040) — apply the active mask brush at the
-    /// given cursor position (in mask-elmo coords). Returns the brush
-    /// dispatch's [`DirtyRect`] for the per-frame `sync_composite_
-    /// mask_tiles` to pick up next frame. No-op when no active layer
-    /// is selected / the layer doesn't exist / the brush id resolves
-    /// to nothing.
-    fn apply_mask_brush_at_elmos(
-        &mut self,
-        world_x: f32,
-        world_z: f32,
-    ) -> Option<barme_core::DirtyRect> {
-        let layer_id = self.paint_active_layer_id.clone()?;
-        let brush_id = self.paint_brush_state.brush_id.clone();
-        let brush = self.mask_brushes.get(&brush_id)?;
-        let stamp = barme_core::MaskStamp {
-            world_x,
-            world_z,
-            radius: self.paint_brush_state.radius,
-            strength: self.paint_brush_state.strength,
-            target_visible: self.paint_brush_state.fill_target_visible,
+    /// given cursor position (in mask-elmo coords). No-op when no
+    /// active layer is selected / the layer doesn't exist / the brush
+    /// id resolves to nothing.
+    ///
+    /// D10 / Sprint 17 (ADR-041): fans the stamp through
+    /// [`Self::symmetry`] like the heightmap + splat paths do, so a
+    /// single LMB stroke under e.g. `SymmetryAxis::Horizontal` paints
+    /// both halves of the map. The compositor picks up the per-tile
+    /// version bumps via [`Self::sync_composite_mask_tiles`] next
+    /// frame; no per-stamp dirty-rect plumbing is needed.
+    fn apply_mask_brush_at_elmos(&mut self, world_x: f32, world_z: f32) {
+        let Some(layer_id) = self.paint_active_layer_id.clone() else {
+            return;
         };
-        let rect = self.layer_stack.apply_brush(&layer_id, brush, stamp)?;
-        self.dirty = true;
-        Some(rect)
+        let brush_id = self.paint_brush_state.brush_id.clone();
+        let Some(brush) = self.mask_brushes.get(&brush_id) else {
+            return;
+        };
+        let extents = self.map_size.elmo_extents();
+        let extents = (extents.0 as f32, extents.1 as f32);
+        let centers = self.symmetry.replicate((world_x, world_z), extents);
+        if centers.is_empty() {
+            return;
+        }
+        let radius = self.paint_brush_state.radius;
+        let strength = self.paint_brush_state.strength;
+        let target_visible = self.paint_brush_state.fill_target_visible;
+        let mut touched_any = false;
+        for (cx, cz) in centers {
+            let stamp = barme_core::MaskStamp {
+                world_x: cx,
+                world_z: cz,
+                radius,
+                strength,
+                target_visible,
+            };
+            if self
+                .layer_stack
+                .apply_brush(&layer_id, brush, stamp)
+                .is_some()
+            {
+                touched_any = true;
+            }
+        }
+        if touched_any {
+            self.dirty = true;
+        }
     }
 
     /// D9 / Sprint 16 (ADR-040) — interpolate stamps along the drag
@@ -2609,6 +2808,17 @@ impl App {
 
         let mask_preview_on = self.paint_brush_state.mask_only_preview;
         let radius = self.paint_brush_state.radius;
+        // D10 / Sprint 17 (ADR-041): build / cache the active layer's
+        // grayscale mask preview only when the chip is on. Idle frames
+        // pay one hash-map lookup; brush frames pay a downsample but
+        // only when the mask version changed.
+        let active_mask_overlay = if mask_preview_on {
+            let ctx_handle = ui.ctx().clone();
+            self.active_mask_overlay_texture(&ctx_handle)
+                .map(|h| h.id())
+        } else {
+            None
+        };
         let out = crate::ui::paint_view::paint_view(
             ui,
             rect,
@@ -2618,6 +2828,7 @@ impl App {
                 view_state: &mut self.paint_view_state,
                 brush_radius_elmos: radius,
                 mask_only_preview: mask_preview_on,
+                active_mask_overlay,
                 background: t.bg,
                 mask_value_at_cursor,
                 active_layer_name,
@@ -4088,6 +4299,7 @@ impl App {
                 // next frame. The distribution itself stays None until
                 // D6 (Sprint 12) wires PNG sidecar persistence.
                 self.splat_config = p.splat_config;
+                self.dnts_diffuse_in_alpha = p.dnts_diffuse_in_alpha;
                 self.splat_distribution = p.splat_distribution;
                 self.splat_picker_open_for = None;
                 self.reupload_bound_slot_diffuses();
@@ -4099,20 +4311,23 @@ impl App {
                 // their persisted `splat_config`. `after_load_migrate`
                 // is idempotent — a stack the user has touched in
                 // Sprint 17+ survives unchanged.
-                self.layer_stack = {
+                //
+                // D10 / Sprint 17 (ADR-041): the same migration also
+                // promotes the legacy `splat_config.diffuse_in_alpha`
+                // to the new per-project `dnts_diffuse_in_alpha`. Pull
+                // both fields back out of the shadow.
+                let (stack, diffuse_in_alpha) = {
                     let resolver = AppSlotResolver::new(&self.slot_registry);
-                    // Build a minimal Project shadow on the values we
-                    // already hoisted, run the migration, and pull the
-                    // resulting stack back out. We can't re-borrow `p`
-                    // here because `splat_distribution` was moved out
-                    // a few lines above.
                     let mut shadow = Project::new("__migrate__", self.map_size.smu_x);
                     shadow.layers = p.layers;
                     shadow.splat_config = self.splat_config.clone();
+                    shadow.dnts_diffuse_in_alpha = self.dnts_diffuse_in_alpha;
                     shadow.size = self.map_size;
                     shadow.after_load_migrate(&resolver);
-                    shadow.layers
+                    (shadow.layers, shadow.dnts_diffuse_in_alpha)
                 };
+                self.layer_stack = stack;
+                self.dnts_diffuse_in_alpha = diffuse_in_alpha;
                 // D9 / Sprint 16 (ADR-039): loaded project may have
                 // painted layer masks from a prior session; force a
                 // full mask resync next frame + push every layer's
@@ -4125,6 +4340,12 @@ impl App {
                 // exist.
                 self.paint_active_layer_id = None;
                 self.paint_view_state = PaintViewState::default();
+                // D10 / Sprint 17 (ADR-041): per-layer caches keyed by
+                // layer id are invalid for the loaded project.
+                self.layer_thumbnails.clear();
+                self.paint_drag_preview_order = None;
+                self.layer_mask_preview_cache = None;
+                self.layers_panel_rect = None;
 
                 // C4/C5 (Sprint 11): metal-spot + geo-vent persistence.
                 // The Project model owns the sources; the inspector
@@ -6717,224 +6938,17 @@ impl App {
     /// owned these affordances; bringing them forward keeps the
     /// painting workflow self-sufficient without waiting on the
     /// full Photoshop-style panel.
+    /// D10 / Sprint 17 (ADR-041) — `Tool::PaintLayer` Inspector. The
+    /// Layers panel lives in [`crate::ui::layers_panel`]; the brush
+    /// section stays here because it owns session-only
+    /// [`PaintBrushState`].
     fn inspector_paint_layer(&mut self, ui: &mut egui::Ui) {
         let t = crate::ui::theme::Tokens::DARK;
 
-        // Deferred actions — collected during the iteration so we
-        // don't mutate the stack mid-walk (Rust borrow rules + the
-        // potential for index drift after delete / reorder).
-        enum LayerAction {
-            SetActive(String),
-            ToggleVisible(String),
-            Rename(String, String),
-            Delete(String),
-            MoveUp(usize),
-            MoveDown(usize),
-            SetOpacity(String, f32),
-            ImportTexture(String),
-            AddLayer,
-        }
-        // RefCell so the two `section` closures (header + body) can
-        // both push without fighting over the borrow.
-        let actions: std::cell::RefCell<Vec<LayerAction>> = std::cell::RefCell::new(Vec::new());
+        // Layers panel (rows + active-layer properties + footer).
+        crate::ui::layers_panel::render(self, ui);
 
-        crate::ui::widgets::section(
-            ui,
-            "Layers",
-            false,
-            |ui| {
-                if ui.small_button("+ Add").clicked() {
-                    actions.borrow_mut().push(LayerAction::AddLayer);
-                }
-            },
-            |ui| {
-                if self.layer_stack.layers.is_empty() {
-                    ui.label(
-                        egui::RichText::new("Empty stack — click '+ Add' to start.")
-                            .small()
-                            .weak(),
-                    );
-                    return;
-                }
-                let n = self.layer_stack.layers.len();
-                let active = self.paint_active_layer_id.clone();
-                // Iterate top-of-stack first (Photoshop convention)
-                // even though the vec is bottom-first.
-                for vec_idx_from_top in 0..n {
-                    let vec_idx = n - 1 - vec_idx_from_top;
-                    let layer = &self.layer_stack.layers[vec_idx];
-                    let is_active = active.as_ref() == Some(&layer.id);
-                    let id = layer.id.clone();
-                    let name = layer.name.clone();
-                    let visible = layer.visible;
-                    let opacity = layer.opacity;
-                    let source_label = match &layer.source {
-                        barme_core::LayerSource::Slot { id } => format!("Slot {id:02}"),
-                        barme_core::LayerSource::Imported { path } => path
-                            .file_name()
-                            .and_then(|s| s.to_str())
-                            .map(|s| format!("imp: {s}"))
-                            .unwrap_or_else(|| "imp: ?".to_string()),
-                    };
-                    let bg = if is_active { t.accent_dim } else { t.panel2 };
-
-                    egui::Frame::group(ui.style())
-                        .fill(bg)
-                        .corner_radius(4.0)
-                        .inner_margin(egui::Margin::symmetric(6, 4))
-                        .show(ui, |ui| {
-                            // Top row: select-by-name + visibility +
-                            // up/down arrows + delete.
-                            ui.horizontal(|ui| {
-                                let eye = if visible { "👁" } else { "—" };
-                                if ui
-                                    .add(egui::Button::new(eye).small())
-                                    .on_hover_text("Toggle visibility")
-                                    .clicked()
-                                {
-                                    actions.borrow_mut().push(LayerAction::ToggleVisible(id.clone()));
-                                }
-                                // Rename via TextEdit. Submit on
-                                // focus-loss / Enter.
-                                let mut name_mut = name.clone();
-                                let name_resp = ui.add(
-                                    egui::TextEdit::singleline(&mut name_mut)
-                                        .desired_width(ui.available_width() - 100.0)
-                                        .frame(false),
-                                );
-                                if name_resp.lost_focus() && name_mut != name {
-                                    actions.borrow_mut().push(LayerAction::Rename(id.clone(), name_mut));
-                                }
-                                if name_resp.clicked() {
-                                    actions.borrow_mut().push(LayerAction::SetActive(id.clone()));
-                                }
-                                // Up = move toward top of stack (= +1
-                                // in the bottom-first vec).
-                                let can_up = vec_idx + 1 < n;
-                                if ui
-                                    .add_enabled(can_up, egui::Button::new("↑").small())
-                                    .on_hover_text("Move up (toward top of stack)")
-                                    .clicked()
-                                {
-                                    actions.borrow_mut().push(LayerAction::MoveUp(vec_idx));
-                                }
-                                let can_down = vec_idx > 0;
-                                if ui
-                                    .add_enabled(can_down, egui::Button::new("↓").small())
-                                    .on_hover_text("Move down")
-                                    .clicked()
-                                {
-                                    actions.borrow_mut().push(LayerAction::MoveDown(vec_idx));
-                                }
-                                if ui
-                                    .add(egui::Button::new("×").small())
-                                    .on_hover_text("Delete layer")
-                                    .clicked()
-                                {
-                                    actions.borrow_mut().push(LayerAction::Delete(id.clone()));
-                                }
-                            });
-                            // Second row: source label + opacity slider.
-                            ui.horizontal(|ui| {
-                                ui.label(
-                                    egui::RichText::new(&source_label)
-                                        .color(t.muted)
-                                        .size(10.0)
-                                        .monospace(),
-                                );
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| {
-                                        if ui
-                                            .add(egui::Button::new("Import…").small())
-                                            .on_hover_text(
-                                                "Replace this layer's source with a PNG/JPG from disk",
-                                            )
-                                            .clicked()
-                                        {
-                                            actions.borrow_mut().push(LayerAction::ImportTexture(id.clone()));
-                                        }
-                                        let mut op = opacity;
-                                        if ui
-                                            .add(
-                                                egui::Slider::new(&mut op, 0.0..=1.0)
-                                                    .show_value(false),
-                                            )
-                                            .on_hover_text(format!("Opacity: {:.0}%", op * 100.0))
-                                            .changed()
-                                        {
-                                            actions.borrow_mut().push(LayerAction::SetOpacity(id.clone(), op));
-                                        }
-                                    },
-                                );
-                            });
-                            // Click anywhere on the card to make it
-                            // active (matches Photoshop's row-click
-                            // behaviour; the rename TextEdit above
-                            // owns focus when the user clicks the name
-                            // specifically).
-                            let resp = ui.interact(
-                                ui.min_rect(),
-                                ui.id().with(("layer_card", &id)),
-                                egui::Sense::click(),
-                            );
-                            if resp.clicked() {
-                                actions.borrow_mut().push(LayerAction::SetActive(id.clone()));
-                            }
-                        });
-                    ui.add_space(3.0);
-                }
-            },
-        );
-
-        // ---- Apply collected actions ----
-        for action in actions.into_inner() {
-            match action {
-                LayerAction::SetActive(id) => self.paint_active_layer_id = Some(id),
-                LayerAction::ToggleVisible(id) => {
-                    if let Some(l) = self.layer_stack.active_layer_mut(&id) {
-                        l.visible = !l.visible;
-                        self.mark_dirty();
-                    }
-                }
-                LayerAction::Rename(id, new_name) => {
-                    if let Some(l) = self.layer_stack.active_layer_mut(&id) {
-                        l.name = new_name;
-                        self.mark_dirty();
-                    }
-                }
-                LayerAction::Delete(id) => self.delete_layer(&id),
-                LayerAction::MoveUp(from) => self.reorder_layer(
-                    from,
-                    (from + 1).min(self.layer_stack.layers.len().saturating_sub(1)),
-                ),
-                LayerAction::MoveDown(from) => {
-                    if from > 0 {
-                        self.reorder_layer(from, from - 1);
-                    }
-                }
-                LayerAction::SetOpacity(id, v) => {
-                    if let Some(l) = self.layer_stack.active_layer_mut(&id) {
-                        l.opacity = v;
-                        self.mark_dirty();
-                    }
-                }
-                LayerAction::ImportTexture(id) => {
-                    if let Some(path) = rfd::FileDialog::new()
-                        .add_filter("Texture image", &["png", "jpg", "jpeg"])
-                        .pick_file()
-                    {
-                        self.import_layer_texture(&id, path);
-                    }
-                }
-                LayerAction::AddLayer => {
-                    let new_id = self.add_layer_at_top();
-                    self.paint_active_layer_id = Some(new_id);
-                }
-            }
-        }
-
-        // ---- BRUSH section ----
+        // ---- BRUSH section (session-only state, stays inline) ----
         crate::ui::widgets::section(
             ui,
             "Brush",
@@ -9304,7 +9318,12 @@ mod tests {
             paint_brush_state: PaintBrushState::default(),
             mask_brushes: barme_core::MaskBrushRegistry::default_set(),
             paint_last_drag_pos: None,
+            layer_thumbnails: std::collections::HashMap::new(),
+            paint_drag_preview_order: None,
+            layer_mask_preview_cache: None,
+            layers_panel_rect: None,
             splat_config: SplatConfig::default(),
+            dnts_diffuse_in_alpha: false,
             splat_distribution: None,
             splat_brush_state: SplatBrushState::default(),
             splat_brushes: SplatBrushRegistry::default(),

@@ -7,6 +7,7 @@
 pub mod cheat_sheet;
 pub mod icons;
 pub mod intro;
+pub mod layers_panel;
 pub mod markers;
 pub mod minimap;
 pub mod next_steps;

@@ -248,6 +248,15 @@ pub enum LayerPropertyValue {
     Opacity(f32),
     DntsChannel(Option<SplatChannel>),
     Source(LayerSource),
+    /// D10 / Sprint 17 (ADR-041): per-layer DNTS `texScale`. Only
+    /// meaningful when the layer carries a `DntsChannel(Some(_))`
+    /// binding; the diff still rides through undo when the binding is
+    /// `None` so a user toggling the binding and tweaking the slider in
+    /// any order produces a consistent history.
+    DntsTexScale(f32),
+    /// D10 / Sprint 17 (ADR-041): per-layer DNTS `texMult`. See
+    /// [`Self::DntsTexScale`].
+    DntsTexMult(f32),
 }
 
 /// C9 / Sprint 14: which water-related field an [`ProjectDiff::EditWaterField`]

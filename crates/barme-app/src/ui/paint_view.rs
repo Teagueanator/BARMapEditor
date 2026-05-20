@@ -43,11 +43,17 @@ pub struct PaintViewInput<'a> {
     /// Active brush radius in elmos. Drives the brush-ring overlay.
     pub brush_radius_elmos: f32,
     /// When set, render only the active layer's mask as grayscale
-    /// (red overlay where mask = 0). Sprint 16 leaves this as a
-    /// future enhancement — the basic toggle UI is in place but the
-    /// per-frame mask preview rendering ships in Sprint 17 when the
-    /// Layers panel adds the mask sidecar workflow.
+    /// (red overlay where mask = 0). Sprint 17 (ADR-041) wires the
+    /// actual overlay — the texture is built CPU-side by
+    /// [`crate::App::active_mask_overlay_texture`] and supplied here.
     pub mask_only_preview: bool,
+    /// D10 / Sprint 17 (ADR-041): grayscale mask preview texture for
+    /// the active layer. `None` either because no active layer is
+    /// selected or because the cache hasn't been populated yet (the
+    /// caller only builds the texture when `mask_only_preview` is on,
+    /// to keep idle frames cheap). Rendered as an overlay above the
+    /// composite RT at the same `map_rect`.
+    pub active_mask_overlay: Option<egui::TextureId>,
     /// Background colour for the letterbox bands.
     pub background: egui::Color32,
     /// Active layer's mask value at the cursor position, for the
@@ -136,6 +142,21 @@ pub fn paint_view(
             "Allocating composite preview …",
             egui::FontId::proportional(14.0),
             ui.visuals().weak_text_color(),
+        );
+    }
+
+    // D10 / Sprint 17 (ADR-041): mask-only preview overlay. Painted
+    // OVER the composite at the same rect — opaque grayscale + red
+    // where mask = 0. The caller built the texture from a downsampled
+    // mask snapshot; this view just composites.
+    if input.mask_only_preview
+        && let Some(overlay_id) = input.active_mask_overlay
+    {
+        painter.image(
+            overlay_id,
+            map_rect,
+            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+            egui::Color32::WHITE,
         );
     }
 

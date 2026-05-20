@@ -90,8 +90,23 @@ pub struct Project {
     /// and the ADR-034 placeholder toggle. Round-trips through TOML;
     /// `#[serde(default)]` materialises the engine defaults for
     /// pre-Sprint-9 `.barmeproj` files.
+    ///
+    /// **Sprint 17 (ADR-041):** retired at the project boundary. The
+    /// load path still hydrates this for pre-Sprint-14 projects so
+    /// [`Self::after_load_migrate`] can seed [`Self::layers`] +
+    /// [`Self::dnts_diffuse_in_alpha`] from it, but Commit 6 of
+    /// Sprint 17 marks it `#[serde(skip_serializing)]` so new saves
+    /// drop the legacy block.
     #[serde(default)]
     pub splat_config: SplatConfig,
+    /// D10 / Sprint 17 (ADR-041): mirrors
+    /// `mapinfo.resources.splatDetailNormalDiffuseAlpha`. Replaces the
+    /// per-channel `SplatConfig.diffuse_in_alpha` flag (which lived in
+    /// the legacy splat block) with a per-project setting that the
+    /// Layers panel surfaces in its footer toggle. Migration in
+    /// [`Self::after_load_migrate`] copies the legacy value across.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub dnts_diffuse_in_alpha: bool,
     /// D8 / Sprint 15 (ADR-038): the Photoshop-style texture layer
     /// stack. Drives the `.sd7` diffuse bake. `#[serde(default)]` so
     /// pre-Sprint-15 projects load with an empty stack and then
@@ -443,6 +458,8 @@ struct ProjectWire {
     #[serde(default)]
     splat_config: SplatConfig,
     #[serde(default)]
+    dnts_diffuse_in_alpha: bool,
+    #[serde(default)]
     layers: LayerStack,
     #[serde(default)]
     metal_spots: Vec<MetalSpot>,
@@ -480,6 +497,7 @@ impl From<ProjectWire> for Project {
             mapinfo_overrides: w.mapinfo_overrides,
             next_steps_dismissed: w.next_steps_dismissed,
             splat_config: w.splat_config,
+            dnts_diffuse_in_alpha: w.dnts_diffuse_in_alpha,
             splat_distribution: None,
             layers: w.layers,
             metal_spots: w.metal_spots,
@@ -606,6 +624,7 @@ impl Project {
             mapinfo_overrides: HashMap::new(),
             next_steps_dismissed: false,
             splat_config: SplatConfig::default(),
+            dnts_diffuse_in_alpha: false,
             splat_distribution: None,
             // D8 / Sprint 15 (ADR-038): single-layer biome-base seed
             // so fresh projects always have a non-empty stack.
@@ -651,6 +670,12 @@ impl Project {
                 "project: seeding layer stack from pre-D8 splat_config"
             );
             self.layers = seeded;
+            // D10 / Sprint 17 (ADR-041): the legacy
+            // `splat_config.diffuse_in_alpha` flag becomes a per-project
+            // setting. Carry it over once at migration time. If the
+            // project already had `dnts_diffuse_in_alpha = true` (a
+            // mid-sprint hand-edit) we preserve that.
+            self.dnts_diffuse_in_alpha = self.dnts_diffuse_in_alpha || cfg.diffuse_in_alpha;
         }
         let _ = slot_resolver; // future: warn when bound slot ids miss the registry
     }

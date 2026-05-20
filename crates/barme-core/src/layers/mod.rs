@@ -184,6 +184,17 @@ pub struct TextureLayer {
     /// the mask data live for inspection.
     #[serde(default = "default_one_f32")]
     pub opacity: f32,
+    /// D10 / Sprint 17 (ADR-041): per-DNTS-bound-layer `texScale`. Only
+    /// meaningful when `dnts_channel.is_some()` — the splat emitter
+    /// reads this into `mapinfo.splats.texScales[channel]`. Mirrors the
+    /// retired `SplatConfig.tex_scales[channel]`; migration copies the
+    /// legacy value across at `after_load_migrate` time.
+    #[serde(default = "default_dnts_tex_scale")]
+    pub dnts_tex_scale: f32,
+    /// D10 / Sprint 17 (ADR-041): per-DNTS-bound-layer `texMult`.
+    /// Mirror counterpart to [`Self::dnts_tex_scale`].
+    #[serde(default = "default_one_f32")]
+    pub dnts_tex_mult: f32,
     pub mask: LayerMask,
 }
 
@@ -192,6 +203,9 @@ fn default_true() -> bool {
 }
 fn default_one_f32() -> f32 {
     1.0
+}
+fn default_dnts_tex_scale() -> f32 {
+    0.02
 }
 
 impl TextureLayer {
@@ -214,6 +228,8 @@ impl TextureLayer {
             locked: false,
             dnts_channel: None,
             opacity: 1.0,
+            dnts_tex_scale: default_dnts_tex_scale(),
+            dnts_tex_mult: default_one_f32(),
             mask: LayerMask::filled(size, mask_fill),
         }
     }
@@ -313,6 +329,12 @@ impl LayerStack {
             let fill = if layers.is_empty() { 255 } else { 0 };
             let mut layer = TextureLayer::new(LayerSource::Slot { id: slot_id }, size, fill);
             layer.dnts_channel = Some(channel_index_to_enum(ch_idx));
+            // D10 / Sprint 17 (PITFALL §17.8): copy the legacy
+            // per-channel `tex_scales` / `tex_mults` into the new
+            // per-layer fields so the migrated project's DNTS bake
+            // matches the pre-Sprint-14 visuals.
+            layer.dnts_tex_scale = config.tex_scales[ch_idx as usize];
+            layer.dnts_tex_mult = config.tex_mults[ch_idx as usize];
             // Cosmetic: name reflects the channel binding so users
             // recognise migrated layers in Sprint 17's Layers panel.
             layer.name = format!("Slot {slot_id:02} (channel {})", ch_idx_label(ch_idx));
@@ -323,8 +345,38 @@ impl LayerStack {
         // also matches the mask-byte-budget ceiling discussed in the
         // module docs.
         debug_assert!(layers.len() <= 4);
-        let _ = config; // future: surface tex_scales in the layer transform if needed
         Self { layers }
+    }
+
+    /// D10 / Sprint 17 (ADR-041): the bottom-most DNTS-bound layer per
+    /// channel, in R/G/B/A order. Returns `[None; 4]` for a project with
+    /// no DNTS-bound layers (engine falls back to grey-untextured).
+    ///
+    /// "Bottom-most wins" if multiple layers bind the same channel —
+    /// the UI enforces the one-layer-per-channel invariant on rebind,
+    /// but the data model permits violations (a future CLI / scripting
+    /// path could bypass the UI). When that happens this accessor logs
+    /// `warn!` once per channel collision so the build artefact stays
+    /// reproducible and the user sees the conflict.
+    pub fn dnts_layers(&self) -> [Option<&TextureLayer>; 4] {
+        let mut out: [Option<&TextureLayer>; 4] = [None; 4];
+        for layer in &self.layers {
+            let Some(ch) = layer.dnts_channel else {
+                continue;
+            };
+            let idx = ch.index();
+            if let Some(prev) = out[idx] {
+                warn!(
+                    channel = ch_idx_label(idx as u8),
+                    prev_layer = %prev.name,
+                    new_layer = %layer.name,
+                    "dnts_layers: multiple layers bound to the same channel; keeping bottom-most",
+                );
+                continue;
+            }
+            out[idx] = Some(layer);
+        }
+        out
     }
 
     /// Bake all visible layers into an RGB8 diffuse image. Output
@@ -840,6 +892,8 @@ mod tests {
             locked: false,
             dnts_channel: None,
             opacity: 1.0,
+            dnts_tex_scale: default_dnts_tex_scale(),
+            dnts_tex_mult: default_one_f32(),
             mask: m,
         };
         let stack = LayerStack {
@@ -874,11 +928,31 @@ mod tests {
         // R, G, A bound; B unbound.
         let cfg = SplatConfig {
             channels: [Some(0), Some(3), None, Some(5)],
+            tex_scales: [0.005, 0.012, 0.02, 0.04],
+            tex_mults: [0.9, 1.1, 1.0, 1.3],
             ..SplatConfig::default()
         };
         let stack =
             LayerStack::migrate_from_splat_config(&cfg, |i| cfg.channels[i as usize], tiny_size());
         assert_eq!(stack.layers.len(), 3, "one layer per bound channel");
+        // PITFALL §17.8: scales + mults must migrate into the new
+        // per-layer fields. Channel R → layer 0, Channel G → layer 1,
+        // Channel A → layer 2 (B was unbound so it doesn't seed a layer).
+        assert!(
+            (stack.layers[0].dnts_tex_scale - 0.005).abs() < 1e-6,
+            "R tex_scale should migrate to layer 0",
+        );
+        assert!(
+            (stack.layers[1].dnts_tex_scale - 0.012).abs() < 1e-6,
+            "G tex_scale should migrate to layer 1",
+        );
+        assert!(
+            (stack.layers[2].dnts_tex_scale - 0.04).abs() < 1e-6,
+            "A tex_scale should migrate to layer 2 (B skipped)",
+        );
+        assert!((stack.layers[0].dnts_tex_mult - 0.9).abs() < 1e-6);
+        assert!((stack.layers[1].dnts_tex_mult - 1.1).abs() < 1e-6);
+        assert!((stack.layers[2].dnts_tex_mult - 1.3).abs() < 1e-6);
         // Order matches channel order R, G, A → slot ids 0, 3, 5.
         assert!(matches!(
             stack.layers[0].source,
@@ -900,6 +974,47 @@ mod tests {
         assert_eq!(stack.layers[0].mask.sample(512, 512), 255);
         assert_eq!(stack.layers[1].mask.sample(512, 512), 0);
         assert_eq!(stack.layers[2].mask.sample(512, 512), 0);
+    }
+
+    #[test]
+    fn dnts_layers_returns_bound_layers_per_channel() {
+        // Build a stack with three bound layers: R / B / A (G unbound).
+        let cfg = SplatConfig {
+            channels: [Some(0), None, Some(2), Some(3)],
+            ..SplatConfig::default()
+        };
+        let stack =
+            LayerStack::migrate_from_splat_config(&cfg, |i| cfg.channels[i as usize], tiny_size());
+        let dnts = stack.dnts_layers();
+        assert!(dnts[0].is_some(), "R channel should be bound");
+        assert!(dnts[1].is_none(), "G channel was unbound");
+        assert!(dnts[2].is_some(), "B channel should be bound");
+        assert!(dnts[3].is_some(), "A channel should be bound");
+        assert_eq!(
+            dnts[0].unwrap().dnts_channel,
+            Some(SplatChannel::R),
+            "channel index 0 returns the R-bound layer",
+        );
+        assert_eq!(dnts[3].unwrap().dnts_channel, Some(SplatChannel::A));
+    }
+
+    #[test]
+    fn dnts_layers_keeps_bottom_most_winner_on_collision() {
+        // Two layers bound to channel R — the data model permits the
+        // collision; `dnts_layers` picks the bottom-most (= idx 0).
+        let mut stack = LayerStack::from_biome("Flat plain", tiny_size());
+        stack.layers[0].dnts_channel = Some(SplatChannel::R);
+        let mut top = TextureLayer::new(LayerSource::Slot { id: 1 }, tiny_size(), 0);
+        top.dnts_channel = Some(SplatChannel::R);
+        let top_name = top.name.clone();
+        stack.layers.push(top);
+        let dnts = stack.dnts_layers();
+        let winner_name = dnts[0].map(|l| l.name.clone()).unwrap_or_default();
+        // Bottom layer wins (idx 0 in the bottom-first vec).
+        assert_ne!(
+            winner_name, top_name,
+            "the top-of-stack duplicate must NOT win — bottom-most wins",
+        );
     }
 
     #[test]
