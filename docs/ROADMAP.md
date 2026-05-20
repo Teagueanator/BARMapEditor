@@ -294,6 +294,37 @@ Implements SRS F1–F12. Ships a Windows `.exe` and a Linux AppImage.
       order under orbit. Remaining parity work (DNTS lighting,
       atmosphere, water polish, shadows, S3O features, grass,
       emission, validation) is **Sprints 20–27**.
+- [x] **STATUS UPDATE 2026-05-19 (Sprint 14 / C9 — ADR-042).** Water
+      + Lava authoring shipped as a map-property tool. Closes the
+      silent emission gap (`From<&Project> for MapInfo` always left
+      `info.water = None`; `bar_default_with_water()` was dead code).
+      Six commits on `main`: (1) `WaterMode` enum + per-preset
+      `WaterBlock` literals anchored to real BAR maps (Coastlines,
+      Gecko Isle, Acidic Quarry; synth Lava/Magma at the
+      ground-block damage threshold) + `Project.{water_overrides,
+      void_water, tidal_strength, schema_v}` with one-shot migration
+      `min_height < 0 → Ocean`; (2) `water.wgsl` MVP — flat
+      alpha-blended quad at Y=0, depth-test on / depth-write off,
+      drawn between terrain and lines per Sprint 13's translucent
+      contract; (3) `Tool::Water` (keyboard `W`, `Icon::Water` wave
+      glyph) + `inspector_water` form (Preset chips / Behaviour /
+      Appearance / Flood / Advanced) + `apply_brush_id_at` refactor
+      so the Water tool reuses Sculpt's Brush::Lower + symmetry +
+      undo machinery; (4) Lava/Magma atmosphere offer
+      (`Project.lava_atmosphere: bool` + hardcoded fog/sun/cloud
+      patch); (5) validation-chip warnings for DNTS+water LOS bug
+      (PITFALL §8), terrain-vs-mode mismatch (both directions), and
+      cross-tool ghosting at 0.5× alpha; (6) ADR-042 + this STATUS
+      UPDATE. `App.min_height` now plumbs end-to-end (Stage-1 bug
+      where `snapshot_project` hard-coded 0.0). Test counts:
+      barme-core 166 → 196 (+30 water_presets module + project
+      migration + emission merges + new ProjectDiff variants);
+      barme-app 221 → 231 (+10 water_draw / cross-tool / validation /
+      WaterU layout pins); barme-pipeline 110 → 114 (+4
+      `surfaceAlpha` / `waveFoamIntensity` Lua emission). Polished
+      water (foam / fresnel / caustics / lava
+      emission / perlin wave motion) deferred to the renderer-parity
+      arc as agreed in the C9 prompt's "Out of scope" section.
 - [ ] Beherith (or active mapper) reviews `.sd7` byte-for-byte against PyMapConv
       reference output on three test maps
 - [ ] Listed on `beyondallreason.info/guide/mapmaking-resources` as beta

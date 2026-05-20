@@ -2819,6 +2819,159 @@ markers). Devlog: `devlog/stage-1-renderer-depth-rework-hotfix/`.
 phase log: `docs/prompts/sprint-13-renderer-depth-rework.md`,
 `devlog/stage-1-renderer-depth-rework/`.
 
+## ADR-042 — Water + Lava as a map property (Sprint 14 / C9)
+
+**Status:** Accepted (2026-05-19). Closes the "water emission gap"
+flagged by the 2026-05-19 water-lava engine research
+(`devlog/research-water-lava/logs/2026-05-19T10-59-15__water-lava-engine-research.md`).
+Polished water rendering (foam / fresnel / caustics / lava emission)
+deferred to the renderer-parity arc.
+
+**Context.** Through Sprint 13 the editor had a complete
+`barme_core::WaterBlock` (30+ fields, `bar_default_with_water()`
+already populated) and an emitter (`barme-pipeline::mapinfo::water_block`)
+that wrote every field with the correct Lua key. But `From<&Project>
+for MapInfo` (`mapinfo_schema.rs:758`) always called plain
+`bar_default()`, leaving `info.water = None` and shipping no `water = {
+… }` sub-table even on maps with `min_height < 0`. BAR loaded those
+maps with its engine-default blue ocean — visually wrong, but more
+importantly, every mod gadget that read `mapinfo.water.X` would nil-
+crash if it ever ran (cf. PITFALL §"three-gate"). The 30-field
+`WaterBlock` was dead code; `bar_default_with_water` had no callers.
+
+The research report also reframed the user's mental model:
+`Ground.h::GetWaterPlaneLevel` is `consteval 0.0f`, so there's no
+such thing as "paint where water is" or "place a lake at height 50"
+— water is wherever `heightmap.y < 0`, period. A user clicking a
+"water tool" expects to either pick a global palette (ocean / acid /
+lava) AND/OR carve the heightmap below 0 with a brush. Both
+affordances are missing in Stage 1 today.
+
+**Decision.** Five coupled pieces:
+
+1. **`WaterMode` preset enum** (`barme_core::water_presets`):
+   `None | Ocean | Tropical | Acid | Lava | Magma | Custom`. Each
+   non-None variant has a hand-written `WaterBlock` literal anchored
+   to a real BAR map (Coastlines Dry, Gecko Isle Remake, Acidic
+   Quarry, plus synthesised Lava / Magma). `#[serde(other)]` on
+   `Custom` means a future preset (e.g. "Geyser") loaded by an
+   older editor degrades to `Custom` instead of crashing —
+   forward-compat by design.
+
+2. **`Project.water_overrides: WaterBlock`** — sparse `Option<…>`
+   overlay on top of the active preset. Per-field merge
+   (`override.field.or(preset.field)`) so switching presets keeps
+   the user's tweaks intact (Photoshop-style; `damage = 30` rides
+   through Ocean → Acid → Magma). The emission path
+   `From<&Project>` calls `preset_water_block(p.water_mode)` →
+   `merge_overrides(&preset, &p.water_overrides)` → assigns the
+   result to `info.water`. The `Custom` mode uses an empty preset
+   so the user's overrides bleed through verbatim.
+
+3. **Schema-versioned migration**: `Project.schema_v: u32` (current
+   `Project::SCHEMA_V == 1`). On load, if `schema_v == 0`,
+   `min_height < 0`, AND `water_mode` is default (None), the
+   migration sets `water_mode = Ocean`. Bumps `schema_v` to 1 after.
+   Runs exactly once per project — re-saved files carry `v = 1`
+   and skip the rule. Critical for the "user explicitly chose None
+   on an `min_height < 0` map" case: that choice survives reload.
+
+4. **`Tool::Water` + flat plane MVP**: a 9th tool variant, keyboard
+   `W`, `Icon::Water` (two stacked tilde waves). LMB-drag floods
+   via `Brush::Lower`; RMB-drag raises. New `water.wgsl` renders a
+   single alpha-blended quad at `y = 0` covering the map's XZ
+   extent, tinted by `merged.surface_color * surface_alpha` (CPU
+   pre-multiplied). Depth-test on / depth-write off; draws between
+   terrain (writes depth) and markers (depth-test only), so
+   cliffs occlude the plane but brush rings stay on top. Polished
+   water (fresnel, foam, caustics, lava emission) is deferred to the
+   renderer-parity arc — the MVP cut alone makes the feature
+   self-explanatory.
+
+5. **Mutual-exclusion auto-resolve** (PITFALL §6): the emission path
+   forces `merged.plane_color = None` when `info.void_water == true`
+   and emits a `warn!`. Setting both keys silently breaks `voidWater`
+   per `MapInfo.cpp`. The inspector greys the plane-colour picker
+   while `void_water` is on so the user sees the gating.
+
+**Alternatives considered.**
+
+- **Paint water zones onto a mask layer.** Rejected — the engine
+  has no per-zone water (`consteval` water level), so any
+  zone-paint UI would be a lie. The "carve heightmap below 0"
+  approach matches what the engine actually consumes.
+- **Full-fledged `AtmosphereField` + per-field atmosphere
+  overrides** to power the Lava / Magma atmosphere offer.
+  Rejected for Sprint 14 — ~200 LOC of mirror machinery for a
+  single one-click toggle. Shipped as a coarser
+  `Project.lava_atmosphere: bool` + hardcoded patch (red-orange
+  fog, dim warm sun, dusty clouds) the emission path applies on
+  top of `bar_default()`. Sprint 18's F9 form ships the granular
+  surface.
+- **Generic `mapinfo_overrides: HashMap<String, toml::Value>`** as
+  the only override storage. Rejected for water — the typed
+  `WaterBlock` lets the inspector form-bind sliders to specific
+  fields without a string-keyed indirection. The free-form HashMap
+  stays for F9's general-purpose form (Sprint 18) but doesn't try
+  to subsume the typed water / atmosphere paths.
+- **Drag finalisation on slider edits (one diff per gesture
+  instead of per frame).** Acknowledged as a polish gap; per-frame
+  diffs give fine-grained but busy undo. Deferred to a follow-up
+  — the `dragging_*_from` snapshot pattern (used by metal / geo /
+  feature drags) maps cleanly here when it lands.
+
+**Consequences.**
+
+- Builds visually-correct water blocks for every preset, fixing the
+  silent omission that shipped with Sprints 12 / 13. BAR mod
+  gadgets reading `mapinfo.water.X` get real values instead of nil
+  crashes.
+- The editor's 3D preview shows where BAR's water level sits as a
+  translucent plane any time `water_mode != None`. Active tool gets
+  full alpha; otherwise 0.5× cross-tool ghost.
+- The Inspector exposes ~10 water-block fields directly (Preset
+  chips + Behaviour + Appearance + Flood + Advanced placeholder) +
+  the lava-atmosphere offer. The remaining ~20 fields are reachable
+  via Sprint 18's F9 raw-fields form, which reuses the same
+  `Project.water_overrides` shape.
+- Three new validation-chip warnings catch silent
+  misconfigurations (`DNTS + water LOS bug`, `min_height < 0 with
+  no water preset`, `water preset set with no below-zero terrain`).
+- Schema version stamps every `.barmeproj`; future migrations
+  append to `Project::run_migrations` without re-firing v1.
+- `App.min_height: f32` plumbed (closes a bug where
+  `snapshot_project` hard-coded `0.0` and dropped any wizard-set
+  value on first save).
+
+**Pitfalls (operational notes for follow-up sprints).**
+
+- Water-block fields are exclusively `Option<…>`; `None` means "use
+  the preset value." The emission path's per-field `or` chain
+  preserves the right semantic — never `unwrap_or_default()` a
+  user-facing field, that's the wrong sentinel.
+- `void_water` and `tidal_strength` live at MapInfo TOP LEVEL, not
+  inside `water = {}`. The inspector co-locates them for UX but
+  the schema field is `Project.{void_water, tidal_strength}`. Don't
+  confuse `Project.water_overrides` (sparse `WaterBlock`) with the
+  top-level shadows.
+- The "Auto-set min_height" button sets `min_height =
+  min(0, water_carve_depth)`, NOT `min(0, observed_min)`. The
+  original formula in the C9 prompt assumed the heightmap encoded
+  signed world Y directly; in practice the u16 lives in
+  `[0, u16::MAX]` linearly mapped to `[min_height, max_height]`,
+  and the observed-min computation collapses to `min_height`
+  itself.
+- Lava / Magma damage thresholds: `>= 1e3` blocks ground;
+  `>= 1e4` blocks hovers. Lava sits at 1000 (ground-block, hovers
+  allowed); Magma at 5000 (deep ground-block, hover-block ceiling
+  untouched). Never silently land damage `>= 1e4` — hover gameplay
+  is BAR-central.
+
+**Reference.** Research report:
+`devlog/research-water-lava/logs/2026-05-19T10-59-15__water-lava-engine-research.md`.
+Sprint prompt: `docs/prompts/sprint-14-water-and-lava.md`. Devlogs:
+`devlog/stage-1-water-{data-and-emission,preview-plane,tool-and-inspector}/`.
+
 ```
 ## ADR-NNN — One-line decision
 
