@@ -777,6 +777,19 @@ impl History {
         self.mask_open.is_some()
     }
 
+    /// D10 / Sprint 17 hotfix — `true` when the in-flight mask
+    /// stroke already snapshotted `coord` for `layer_id`. The brush
+    /// dispatch uses this to skip a redundant tile clone — promoted
+    /// `Pixels` tiles clone to 64 KB each, so a continuous drag
+    /// re-touching the same tiles every frame would churn ~15 MB/sec
+    /// of redundant allocations at 60 FPS without this guard.
+    pub fn mask_stroke_has_snapshot(&self, layer_id: &str, coord: TileCoord) -> bool {
+        match self.mask_open.as_ref() {
+            Some(s) if s.layer_id == layer_id => s.pre.contains_key(&coord),
+            _ => false,
+        }
+    }
+
     // ───────── heightmap-stroke capture (unchanged from ADR-033) ─────────
 
     /// Capture pre-edit values for novel pixels in `rect`. Lazy: opens a

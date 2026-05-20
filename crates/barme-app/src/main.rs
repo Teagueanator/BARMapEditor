@@ -2911,12 +2911,30 @@ impl App {
                 }
             }
         }
+        // D10 / Sprint 17 hotfix — skip the 64 KB clone for tiles
+        // the open stroke already snapshotted. A continuous 60-FPS
+        // drag over the same tiles was churning ~15 MB/sec of
+        // redundant clones; this dedup brings second-and-later
+        // stamps over the same tiles to zero allocation.
         if !tiles_to_snapshot.is_empty()
             && let Some(layer) = self.layer_stack.layer_by_id(&layer_id)
         {
+            let mut snapshotted = 0usize;
             for coord in &tiles_to_snapshot {
+                if self.history.mask_stroke_has_snapshot(&layer_id, *coord) {
+                    continue;
+                }
                 let current = layer.mask.clone_tile(*coord);
                 self.history.snapshot_mask_tile(&layer_id, *coord, current);
+                snapshotted += 1;
+            }
+            if snapshotted > 16 {
+                tracing::warn!(
+                    layer_id = %layer_id,
+                    tiles_snapshotted = snapshotted,
+                    "Sprint 17 mask stroke: > 16 tiles snapshotted in one stamp; \
+                     consider reducing brush radius for memory headroom"
+                );
             }
         }
         let mut touched_any = false;
