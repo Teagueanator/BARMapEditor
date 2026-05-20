@@ -24,7 +24,7 @@
 use std::path::{Path, PathBuf};
 
 use barme_core::{Project, SlotResolver};
-use barme_pipeline::{PyMapConvDriver, SplatBakeInputs, build_sd7};
+use barme_pipeline::{LayerSplatBakeInputs, PyMapConvDriver, SplatBakeInputs, build_sd7};
 use image::{ImageBuffer, Rgb};
 use tracing::{info, warn};
 
@@ -183,12 +183,14 @@ pub fn install_sd7(src: &Path, dst_dir: &Path) -> Result<PathBuf, LauncherError>
 /// `slot_resolver` is the same registry adapter the layer bake uses to
 /// map slot ids → `diffuse.png` paths. Empty-stack projects don't read
 /// it (the fallback path doesn't need slot resolution).
+#[allow(clippy::too_many_arguments)]
 pub fn build_and_install(
     driver: &PyMapConvDriver,
     project: &Project,
     heightmap_png: &Path,
     texture_bmp: Option<&Path>,
     splat_inputs: SplatBakeInputs,
+    layer_inputs: Option<LayerSplatBakeInputs>,
     slot_resolver: &dyn SlotResolver,
     dst_dir: &Path,
 ) -> Result<PathBuf, LauncherError> {
@@ -269,6 +271,7 @@ pub fn build_and_install(
         heightmap_png,
         tex,
         splat_inputs,
+        layer_inputs,
         work,
         &out_sd7,
     )?;

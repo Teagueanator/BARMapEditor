@@ -72,6 +72,9 @@ fn main() -> Result<()> {
         &hm_png,
         &tex_bmp,
         barme_pipeline::SplatBakeInputs::default(),
+        // D10 / Sprint 17: smoke example uses the legacy path; no
+        // DNTS bindings.
+        None,
         work,
         &out_sd7,
     )

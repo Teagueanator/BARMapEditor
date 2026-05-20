@@ -1534,6 +1534,56 @@ impl App {
         out
     }
 
+    /// D10 / Sprint 17 (ADR-041) — resolve the layer-driven splat
+    /// pipeline inputs from `project.layers.dnts_layers()`. For each
+    /// DNTS-bound channel: capture the layer's slot dir (if
+    /// `Slot`-sourced; `None` for `Imported`), clone the mask, copy
+    /// the per-layer `dnts_tex_scale` / `dnts_tex_mult` / name /
+    /// imported-flag. Returns defaults (all-None / zero) when the
+    /// stack carries no DNTS bindings.
+    fn resolve_layer_splat_bake_inputs(
+        &self,
+        project: &Project,
+    ) -> barme_pipeline::LayerSplatBakeInputs {
+        use barme_core::LayerSource;
+        // Default the scales/mults to engine baseline so unbound
+        // channels emit the FINDINGS-§1.6 defaults rather than zero.
+        let mut out = barme_pipeline::LayerSplatBakeInputs {
+            channel_tex_scales: [0.02; 4],
+            channel_tex_mults: [1.0; 4],
+            ..Default::default()
+        };
+
+        let dnts_layers = project.layers.dnts_layers();
+        for (ch, maybe_layer) in dnts_layers.iter().enumerate() {
+            let Some(layer) = maybe_layer else { continue };
+            out.channel_masks[ch] = Some(layer.mask.clone());
+            out.channel_tex_scales[ch] = layer.dnts_tex_scale;
+            out.channel_tex_mults[ch] = layer.dnts_tex_mult;
+            out.channel_layer_names[ch] = Some(layer.name.clone());
+            match &layer.source {
+                LayerSource::Slot { id } => {
+                    if let Some(slot) = self.slot_registry.iter().find(|m| m.id == *id) {
+                        out.channel_slot_dirs[ch] = Some(slot.dir.clone());
+                    } else {
+                        warn!(
+                            channel = ch,
+                            slot_id = *id,
+                            "Sprint 17 layer splat: bound slot id not in registry; skipping DDS bake"
+                        );
+                    }
+                }
+                LayerSource::Imported { .. } => {
+                    // No stock normal map for imported diffuses.
+                    // `stage_splat_assets_from_layers` will emit a
+                    // `LintWarning::ImportedLayerDnts` for this channel.
+                    out.channel_imported[ch] = true;
+                }
+            }
+        }
+        out
+    }
+
     fn save_to(&mut self, path: PathBuf) {
         let mut p = self.snapshot_project();
         let abs_before = p.heightmap.clone();
@@ -4564,6 +4614,10 @@ impl App {
         // `bake_dnts` per active channel. Unbound channels stay None;
         // the splat pipeline skips them.
         let splat_inputs = self.resolve_splat_bake_inputs(&project);
+        // D10 / Sprint 17 (ADR-041) — also resolve the layer-driven
+        // splat inputs. When the project has any DNTS-bound layers,
+        // the pipeline uses this in place of the legacy splat path.
+        let layer_inputs = self.resolve_layer_splat_bake_inputs(&project);
         info!(
             name = %project.name,
             smu_x = self.map_size.smu_x,
@@ -4588,6 +4642,7 @@ impl App {
             &hm_path,
             None,
             splat_inputs,
+            Some(layer_inputs),
             &layer_resolver,
             &dst_dir,
         ) {

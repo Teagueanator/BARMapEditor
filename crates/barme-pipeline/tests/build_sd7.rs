@@ -65,6 +65,11 @@ fn build_sd7_end_to_end() {
         &hm_png,
         &tex_bmp,
         barme_pipeline::SplatBakeInputs::default(),
+        // D10 / Sprint 17: layer-driven inputs are optional; this
+        // integration test still drives the legacy path (no DNTS
+        // bindings — the empty Project has no layers + no splat
+        // config).
+        None,
         work,
         &out_sd7,
     )

@@ -39,7 +39,8 @@ pub use dnts::{BakeOptions, DntsBakeError, bake_dnts};
 pub use pymapconv::{CompileInputs, CompileOutputs, PyMapConvDriver, PyMapConvError};
 pub use sd7::{Sd7Error, StagedFile};
 pub use splat_pipeline::{
-    SplatBakeInputs, SplatPipelineError, StagedSplatAssets, stage_splat_assets,
+    LayerSplatBakeInputs, LintWarning, SplatBakeInputs, SplatPipelineError, StagedSplatAssets,
+    stage_splat_assets, stage_splat_assets_from_layers,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -79,12 +80,14 @@ pub enum BuildError {
 ///
 /// On success returns `out_sd7`. On failure, returns a typed `BuildError`
 /// with the underlying subprocess streams attached (via the variant chain).
+#[allow(clippy::too_many_arguments)]
 pub fn build_sd7(
     driver: &PyMapConvDriver,
     project: &Project,
     heightmap_png: &Path,
     texture_bmp: &Path,
     splat_inputs: SplatBakeInputs,
+    layer_inputs: Option<LayerSplatBakeInputs>,
     work_dir: &Path,
     out_sd7: &Path,
 ) -> Result<PathBuf, BuildError> {
@@ -122,24 +125,44 @@ pub fn build_sd7(
     // The baked DNTS DDS files + splat distribution PNG + specular
     // fallback all flow into the .sd7 alongside SMF/SMT. PyMapConv
     // does NOT touch any of these files (FINDINGS §10).
-    let splat_staged = splat_pipeline::stage_splat_assets(
-        project,
-        &splat_inputs,
-        work_dir,
-        BakeOptions {
-            yflip_normal: false,
+    //
+    // D10 / Sprint 17 (ADR-041): when `layer_inputs` is present AND
+    // the project has a non-empty layer stack, drive the splat
+    // distribution PNG + DDS bake from the DNTS-bound layer masks +
+    // per-layer tex_scale / tex_mult. Sprint 17 / Commit 6 deletes
+    // the legacy fallback below once the runtime DNTS path is fully
+    // layer-fed.
+    let use_layers = layer_inputs.is_some() && !project.layers.layers.is_empty();
+    let bake_opts = BakeOptions {
+        yflip_normal: false,
+        diffuse_in_alpha: if use_layers {
+            project.dnts_diffuse_in_alpha
+        } else {
             // ADR-025 baseline — `splatDetailNormalDiffuseAlpha = false`.
-            // ADR-034 (high-pass workflow) flips this when it lands.
-            diffuse_in_alpha: project.splat_config.diffuse_in_alpha,
+            project.splat_config.diffuse_in_alpha
         },
-    )?;
+    };
+    let (splat_staged, _lints) = if use_layers {
+        let li = layer_inputs.as_ref().expect("guarded by use_layers");
+        splat_pipeline::stage_splat_assets_from_layers(project, li, work_dir, bake_opts)?
+    } else {
+        (
+            splat_pipeline::stage_splat_assets(project, &splat_inputs, work_dir, bake_opts)?,
+            Vec::new(),
+        )
+    };
 
     // Build the typed `MapInfo`, then let the splat pipeline populate
     // its resources block with the staged file references. This is
     // the seam C8 (Sprint 14) plugs its lint pass into; D6 just
     // produces the data.
     let mut info: barme_core::MapInfo = project.into();
-    splat_pipeline::populate_resources(&mut info, project, &splat_staged);
+    if use_layers {
+        let li = layer_inputs.as_ref().expect("guarded by use_layers");
+        splat_pipeline::populate_resources_from_layers(&mut info, project, li, &splat_staged);
+    } else {
+        splat_pipeline::populate_resources(&mut info, project, &splat_staged);
+    }
 
     // Lua sidecars — written to scratch paths under work_dir, then
     // staged into the archive at their canonical layout (mapinfo.lua at
