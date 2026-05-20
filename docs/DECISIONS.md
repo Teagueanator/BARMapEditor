@@ -3019,6 +3019,209 @@ Test counts after smoke follow-ups: barme-core 196 / barme-app
 `pick_nice_step` and `interp_screen_pos` ruler-math pins). cargo
 fmt / clippy / test all green.
 
+## ADR-038 — Layered texture stack data model + CPU bake-to-diffuse (Sprint 15 / D8)
+
+**Status:** Accepted (2026-05-19). Lands the data + bake half of
+the layered-painter trio. The paint viewport and GPU composite are
+ADR-039 / ADR-040 (Sprint 16); the Layers panel + DNTS hybrid
+emission is ADR-041 (Sprint 17).
+
+**Context.** Through Sprint 14 the `.sd7` diffuse was the synthetic
+biome ramp baked by `crates/barme-app/src/launcher.rs::synth_biome_bmp`
+(introduced commit `f1ab09b`). On 2026-05-19 the user reported that
+the exported map textures are "incredibly ugly." The root cause is
+twofold: (1) the synth ramp is height-keyed, so a flat map ships
+with a flat single-tone diffuse; (2) BAR's actual diffuse channel
+is `512 × SMU` per side (8192² for 16 SMU) and meant to be hand-
+composited from multiple texture layers — what the 4-channel splat
+distribution wires up in Sprint 12 is the **DNTS detail** path
+(BAR's per-fragment normal/specular detail overlay), NOT the
+diffuse itself. The two channels live ON TOP OF each other in the
+engine's frag shader (`SMFFragProg.glsl::GetFragmentDiffuse` +
+`GetSplatDetailNormal` per FINDINGS §7.3).
+
+The painter rebuild is split across three sprints to keep blast
+radius bounded and let the data shape stabilise before any UI
+lands on top:
+
+- **Sprint 15 / D8 (this ADR):** data model + CPU bake + .sd7
+  hookup. **No UI.**
+- **Sprint 16 / D9:** tiled-COW masks + paint viewport + GPU
+  composite preview shader.
+- **Sprint 17 / D10:** Photoshop-style Layers panel + custom
+  texture import + DNTS hybrid emission (bottom ≤ 4 DNTS-bound
+  layers drive the splat distribution + DDS bake too, retiring
+  `inspector_splat` + `Tool::SplatPaint`).
+
+**Decision.** New `barme-core::layers` module:
+
+- **`LayerStack`** — `Vec<TextureLayer>` ordered bottom-first (idx
+  0 = bottom). The compositor iterates naturally; the Sprint 17
+  Layers panel renders the view in reverse to match Photoshop
+  convention.
+
+- **`TextureLayer`** carries a stable `id: String` (16-hex-char
+  time + counter mix — UUID-shape but dependency-free), a
+  user-visible `name`, a `LayerSource` (`Slot { id }` or
+  `Imported { path }`), an affine `LayerTransform` (offset +
+  scale + rotation + mirror_x/y), a `LayerColor` (RGB tint +
+  brightness), a `BlendMode::Normal` (alpha-over only for v1 —
+  the enum is reserved so a future `Multiply` doesn't silently
+  degrade in the compositor), `visible` / `locked` / `opacity`,
+  an optional `dnts_channel: Option<SplatChannel>` (Sprint 17
+  uses this to identify the bottom ≤ 4 layers that drive the
+  splat distribution + DNTS DDS bake), and a per-layer
+  `LayerMask`.
+
+- **`LayerMask`** is `width × height × Vec<u8>`, sized to the
+  diffuse (`512 × SMU` per side). Sprint 15 ships the flat
+  allocation with a `// TODO(tiled-cow)` flag at the alloc site
+  — Sprint 16 (D9) swaps the storage for a tiled-COW structure
+  adapted from ADR-018's heightmap pattern; the public API
+  (`filled` / `sample` / `write_rect`) stays. TOML serde uses
+  base64 (`mask_bytes_b64` mod) for now; D9's migration ships
+  sidecar PNGs at `<project>/masks/<layer_id>.png` once tiled-
+  COW is in place.
+
+- **`SlotResolver` trait** — `fn diffuse_path(&self, slot_id: u8)
+  -> Option<PathBuf>`. The trait requires `Sync` so the bake can
+  decode per-layer diffuses in parallel via rayon. `barme-app`
+  ships `AppSlotResolver` wrapping its `slot_registry:
+  Vec<SlotMeta>`; tests use the `ClosureSlotResolver` adapter.
+
+**Compositor (`LayerStack::bake_diffuse`).**
+
+1. Filter visible-and-non-zero-opacity layers, then **rayon
+   `par_iter`** to decode each layer's source PNG concurrently —
+   `image::open` blocks the calling thread, so an 8-layer stack
+   would otherwise serialise 8 PNG decodes.
+
+2. Allocate an RGB8 output buffer at `size.texture_dims()`. The
+   debug-assert `width / height ≥ 1024 AND multiple of 1024`
+   pins the PyMapConv contract (`mapx = width / 8` requires
+   multiples of 8 × 128 = 1024 — `512 × SMU` for `SMU ≥ 2`
+   trivially satisfies).
+
+3. **rayon `par_chunks_mut`** over rows — every output row is an
+   independent destination. The per-pixel hot loop walks layers
+   back-to-front and accumulates an alpha-over composite
+   (`dst = src*α + dst*(1-α)`), flattens against a 0.18 sRGB
+   mid-grey background to keep under-painted pixels readable,
+   then rounds to u8.
+
+4. Per-layer sampling is **wallpaper-tiled** (modulo) bilinear
+   — edge-clamp would produce a "stretched smear at the seams"
+   look the user explicitly rejected. The affine transform
+   applies `mirror` BEFORE `rotation` (pinned by
+   `bake_mirror_then_rotate_matches_reference`); reversing the
+   order rotates the post-mirror axis the wrong way for any
+   non-axis-aligned angle.
+
+**Perf budget.** Target: ≤ 1.5 s release for 16-SMU × 8 layers.
+Smoke shows 4-SMU × 2 layers at ~72 ms; linear-scaling gives
+~4.5 s at 16-SMU × 8 — over budget. The rayon row parallelism
+gives ~Nx speedup for N cores (8x on a typical dev box → ~570 ms
+projected). The per-layer rayon decode helps at high layer
+counts. If Sprint 17's bake still misses budget, the next lever
+is to cache decoded sources on `LayerStack` rather than
+re-decoding per bake.
+
+**`Project.layers` + migration.** `Project` grows `pub layers:
+LayerStack` with `#[serde(default)]` so pre-Sprint-15 .barmeproj
+files load with an empty stack. `Project::after_load_migrate(&dyn
+SlotResolver)` — idempotent, gated on `layers.is_empty()` — seeds
+one layer per bound DNTS channel via
+`LayerStack::migrate_from_splat_config`. The pre-D8
+`splat_config` field stays as the source of truth for the
+runtime DNTS path until Sprint 17; both live side-by-side
+through Sprint 16.
+
+**`ProjectDiff` variants.** Four new — `AddLayer { index, layer:
+Box<TextureLayer> }`, `RemoveLayer { index, layer }`,
+`ReorderLayer { from, to }`, `SetLayerProperty { layer_id, from,
+to: LayerPropertyValue }`. `LayerPropertyValue` is a typed union
+covering name / transform / color / blend / visible / locked /
+opacity / dnts_channel / source. Mask-pixel edits are **NOT** a
+ProjectDiff in Sprint 15 — no brushes touch the mask yet;
+Sprint 16 (D9) lands a separate per-stroke COW path adapted from
+ADR-033's heightmap-undo. The bytes accounting in
+`ProjectDiff::bytes()` folds mask + string capacities so the
+100 MB undo-cap eviction stays honest (a 16-SMU mask is 64 MB
+and would otherwise sandbag the cap silently).
+
+**Export hookup.** `barme-app::launcher::build_and_install` grows
+a `slot_resolver: &dyn SlotResolver` parameter and a three-way
+texture branch: (a) caller-supplied BMP → use as-is; (b)
+non-empty `Project.layers` → bake via
+`LayerStack::bake_diffuse`; (c) empty stack → fall back to the
+Sprint 1 `synth_biome_bmp`. The fallback covers in-process
+callers that build a bare `Project` (`barme-pipeline::examples::
+build_smoke`, the integration tests). Splat distribution + DNTS
+DDS emission continues to come from Sprint 12 / D6's
+`splat_pipeline::stage_splat_assets` unchanged — Sprint 17
+introduces the hybrid path.
+
+**Caveat — DXT1 chroma drift.** PyMapConv DXT1-compresses the
+output BMP per BAR's `compressionType=1, tileSize=32` mandate
+(SRS §1.2 / PITFALL §4). Gradients and saturated chromas land
+softer in the .sd7 than in the bake preview. Sprint 19's lint
+pass will surface this if it gets bad; Sprint 15 just notes
+it. The editor's preview composites against the same source
+PNGs so the WYSIWYG gap is bounded to DXT1's quantisation —
+within the renderer-parity arc's ΔE < 5.0 target.
+
+**Alternatives considered.**
+
+- *Keep `synth_biome_bmp` and improve the ramp.* Rejected: the
+  biome ramp is height-keyed by definition; flat maps stay
+  single-tone no matter how nice the ramp curves get. The
+  user's "ugly" complaint is fundamentally about composition,
+  not colour selection.
+
+- *Skip the layered model; have the user paint directly into a
+  full-resolution diffuse RGBA.* Rejected: a 16-SMU diffuse is
+  192 MB raw; undoing strokes against the same buffer would
+  push undo past the 100 MB cap on every long stroke. A layered
+  model lets the masks stay 1 byte per pixel (¼ the raw cost)
+  and per-stroke undo gates onto a single layer's mask via
+  ADR-018's COW pattern in Sprint 16.
+
+- *Bake on the GPU.* Deferred to Sprint 16 (D9 / ADR-039). The
+  GPU pipeline gives a live preview shader; the CPU bake is
+  authoritative for the `.sd7` because PyMapConv's input is a
+  CPU-side BMP anyway. Two pipelines is a maintenance burden
+  but the CPU side is needed regardless and lands first.
+
+- *Use `LayerSource::Imported` only (no slot abstraction).*
+  Rejected: the slot registry is the ADR-027 contract for
+  cross-project diffuse reuse; making every base layer an
+  imported path would force every fresh project to ship its
+  own copy of `00-grass-meadow/diffuse.png` (~1 MB).
+
+**Consequence.**
+
+- `Project.layers` is the new authoritative source for the
+  exported diffuse. `synth_biome_bmp` survives as a fallback
+  for the empty-stack path; it is NOT a hot path post-Sprint
+  15.
+- `splat_config` stays as the source of truth for runtime DNTS
+  through Sprint 16. Sprint 17 (ADR-041) retires it.
+- The renderer's editor preview is unchanged in Sprint 15 — the
+  3D viewport still composites via the Sprint 9 WGSL splat
+  shader from the slot-bound diffuses. Sprint 16 lands the
+  layered preview shader.
+- The 100 MB undo cap honestly accounts for mask bytes via the
+  new `ProjectDiff` variants. A 16-SMU mask under
+  `AddLayer` / `RemoveLayer` is 64 MB and will dominate
+  eviction priority — the largest-first policy (ADR-033) keeps
+  smaller diffs alive.
+- 4-SMU × 2 layers smoke baseline: 72 ms (recorded in
+  `devlog/stage-1-layers-data-model/`). 16-SMU × 8 layers
+  perf will be measured in Sprint 16's first commit cycle once
+  the paint viewport can produce realistic stacks.
+
+## ADR template
+
 ```
 ## ADR-NNN — One-line decision
 

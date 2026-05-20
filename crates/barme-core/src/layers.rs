@@ -31,7 +31,7 @@
 use std::path::PathBuf;
 
 use image::{Rgb, RgbImage};
-use rayon::iter::{IndexedParallelIterator, ParallelIterator};
+use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
 use rayon::slice::ParallelSliceMut;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
@@ -450,11 +450,17 @@ impl LayerStack {
         // Resolve every visible layer's source. Missing diffuse paths
         // produce a grey placeholder rather than aborting the bake;
         // a `warn!` makes the regression visible without breaking
-        // export.
-        let resolved: Vec<ResolvedLayer> = self
+        // export. The decode step is rayon-parallel across layers so
+        // 8+ layer stacks don't serialise the I/O — `image::open`
+        // blocks the calling thread for the full PNG decode, and
+        // texture-pack PNGs are typically 1024² × ~1 MB.
+        let visible: Vec<&TextureLayer> = self
             .layers
             .iter()
             .filter(|l| l.visible && l.opacity > 0.0)
+            .collect();
+        let resolved: Vec<ResolvedLayer> = visible
+            .par_iter()
             .map(|l| ResolvedLayer::prepare(l, slot_resolver))
             .collect();
 
@@ -554,14 +560,19 @@ impl LayerStack {
 /// How the bake reaches a slot id's diffuse PNG. The app provides this
 /// by wrapping its `slot_registry: Vec<SlotMeta>`; tests substitute a
 /// closure-backed implementation via [`ClosureSlotResolver`].
-pub trait SlotResolver {
+///
+/// `Sync` is required so [`LayerStack::bake_diffuse`] can decode
+/// layer diffuses in parallel via rayon — every implementor must
+/// share safely across threads. `AppSlotResolver` (slice of static
+/// metadata) and `ClosureSlotResolver` (Sync closure) both satisfy.
+pub trait SlotResolver: Sync {
     fn diffuse_path(&self, slot_id: u8) -> Option<PathBuf>;
 }
 
 /// Convenience adapter for ad-hoc callers (tests, smoke binaries).
-pub struct ClosureSlotResolver<F: Fn(u8) -> Option<PathBuf>>(pub F);
+pub struct ClosureSlotResolver<F: Fn(u8) -> Option<PathBuf> + Sync>(pub F);
 
-impl<F: Fn(u8) -> Option<PathBuf>> SlotResolver for ClosureSlotResolver<F> {
+impl<F: Fn(u8) -> Option<PathBuf> + Sync> SlotResolver for ClosureSlotResolver<F> {
     fn diffuse_path(&self, slot_id: u8) -> Option<PathBuf> {
         (self.0)(slot_id)
     }

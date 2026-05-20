@@ -348,6 +348,40 @@ Implements SRS F1–F12. Ships a Windows `.exe` and a Linux AppImage.
       `Ground.h::GetWaterPlaneLevel` `consteval` constraint + the
       `min_height` shader-plumbing requirement. ADR-042 carries the
       same details in its post-C9 STATUS UPDATE block.
+- [x] **STATUS UPDATE 2026-05-19 (Sprint 15 / D8 — ADR-038).**
+      Layered texture stack data model + CPU bake shipped. New
+      `barme-core::layers` module — `LayerStack`,
+      `TextureLayer`, `LayerSource { Slot | Imported }`,
+      `LayerTransform`, `LayerColor`, `BlendMode::Normal`,
+      `LayerMask` (flat `Vec<u8>` + base64 TOML serde;
+      tiled-COW lands in D9 / Sprint 16). The CPU compositor
+      `LayerStack::bake_diffuse` is per-row rayon parallel with
+      a second per-layer rayon `par_iter` for PNG decode,
+      wallpaper-tiled bilinear sampling, mirror-then-rotate
+      transform, alpha-over composite back-to-front. 4-SMU /
+      2-layer smoke clocks ~72 ms — well inside the
+      1.5 s / 16-SMU / 8-layer budget in ADR-038. `Project.layers`
+      is now the source of truth for the exported diffuse;
+      `synth_biome_bmp` survives as the empty-stack fallback
+      (the `barme-pipeline` smoke example + integration tests
+      build bare `Project`s and still hit it). Four new
+      `ProjectDiff` variants (`AddLayer` / `RemoveLayer` /
+      `ReorderLayer` / `SetLayerProperty`) plus a
+      `LayerPropertyValue` enum; the 100 MB undo cap eviction
+      stays honest by folding mask + string capacities into
+      `ProjectDiff::bytes()`. `barme-app::launcher::
+      build_and_install` grows a `SlotResolver` parameter and a
+      three-way texture branch. New
+      `crates/barme-app/examples/bake_layered_smoke.rs`
+      exercises a two-layer composite end-to-end. Test
+      counts: barme-core 196 → 221 (+25); barme-app 232 → 234
+      (+2 launcher pins); barme-pipeline 114 unchanged. **No
+      paint UI** — Sprint 16 (D9, ADR-039 / ADR-040) lands the
+      top-down 2D paint viewport + GPU composite preview +
+      tiled-COW masks; Sprint 17 (D10, ADR-041) lands the
+      Photoshop-style Layers panel + custom texture import +
+      DNTS hybrid emission (retires `inspector_splat` and
+      `Tool::SplatPaint`).
 - [ ] Beherith (or active mapper) reviews `.sd7` byte-for-byte against PyMapConv
       reference output on three test maps
 - [ ] Listed on `beyondallreason.info/guide/mapmaking-resources` as beta
