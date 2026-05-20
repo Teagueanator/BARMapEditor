@@ -5,6 +5,7 @@
 //! grows it with `gizmo`, `cheat_sheet`, and `intro`.
 
 pub mod cheat_sheet;
+pub mod help_text;
 pub mod icons;
 pub mod inspector_mapinfo;
 pub mod intro;

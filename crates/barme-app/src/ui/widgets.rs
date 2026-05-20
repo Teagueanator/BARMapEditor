@@ -33,6 +33,39 @@ pub fn section<R>(
     right: impl FnOnce(&mut Ui),
     body: impl FnOnce(&mut Ui) -> R,
 ) -> R {
+    section_inner(ui, title, accent, None, right, body)
+}
+
+/// Sprint 19 / U1 — variant of [`section`] that attaches a hover-text
+/// tooltip to the section title. The interaction region covers the
+/// title label only (and the accent rail when present), so right-side
+/// chips and `+ Add` buttons keep their own per-widget tooltips
+/// untouched.
+///
+/// Callers who don't need a tooltip should keep using [`section`];
+/// adding a `_hover` variant rather than changing the signature
+/// avoids churning the 50+ existing call sites for Sprint 19's
+/// annotative pass.
+#[allow(dead_code)] // Sprint 19 / U1: lands first; inspector commits use it
+pub fn section_with_hover<R>(
+    ui: &mut Ui,
+    title: &str,
+    accent: bool,
+    header_hover: &str,
+    right: impl FnOnce(&mut Ui),
+    body: impl FnOnce(&mut Ui) -> R,
+) -> R {
+    section_inner(ui, title, accent, Some(header_hover), right, body)
+}
+
+fn section_inner<R>(
+    ui: &mut Ui,
+    title: &str,
+    accent: bool,
+    header_hover: Option<&str>,
+    right: impl FnOnce(&mut Ui),
+    body: impl FnOnce(&mut Ui) -> R,
+) -> R {
     let t = Tokens::DARK;
     egui::Frame::new()
         .inner_margin(egui::Margin {
@@ -48,12 +81,22 @@ pub fn section<R>(
                     ui.painter().rect_filled(rect, 1.0, t.accent);
                     ui.add_space(4.0);
                 }
-                ui.label(
-                    egui::RichText::new(title.to_uppercase())
-                        .color(t.text)
-                        .size(11.0)
-                        .strong(),
+                let label_resp = ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(title.to_uppercase())
+                            .color(t.text)
+                            .size(11.0)
+                            .strong(),
+                    )
+                    .sense(if header_hover.is_some() {
+                        Sense::hover()
+                    } else {
+                        Sense::empty()
+                    }),
                 );
+                if let Some(hover) = header_hover {
+                    label_resp.on_hover_text(hover);
+                }
                 // Right-aligned trailing content.
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), right);
             });
