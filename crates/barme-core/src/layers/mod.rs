@@ -576,6 +576,16 @@ impl LayerStack {
 /// metadata) and `ClosureSlotResolver` (Sync closure) both satisfy.
 pub trait SlotResolver: Sync {
     fn diffuse_path(&self, slot_id: u8) -> Option<PathBuf>;
+    /// D10 / Sprint 17 (ADR-041): the directory that
+    /// [`LayerSource::Imported`] relative paths resolve against.
+    /// Default `None` keeps the pre-Sprint-17 behaviour (interpret
+    /// paths verbatim — works when the editor is run from the project
+    /// directory and breaks otherwise). The app's resolver returns
+    /// the `.barmeproj` parent directory; the pipeline's resolver
+    /// matches.
+    fn imported_root(&self) -> Option<&std::path::Path> {
+        None
+    }
 }
 
 /// Convenience adapter for ad-hoc callers (tests, smoke binaries).
@@ -718,7 +728,19 @@ fn load_layer_diffuse(source: &LayerSource, resolver: &dyn SlotResolver) -> RgbI
                 return placeholder_grey();
             }
         },
-        LayerSource::Imported { path } => path.clone(),
+        LayerSource::Imported { path } => {
+            // D10 / Sprint 17 (ADR-041): relative imported paths
+            // resolve against the resolver's `imported_root`. Absolute
+            // paths pass through unchanged. Pre-Sprint-17 projects
+            // (no resolver root) keep the CWD-relative behaviour.
+            if path.is_absolute() {
+                path.clone()
+            } else if let Some(root) = resolver.imported_root() {
+                root.join(path)
+            } else {
+                path.clone()
+            }
+        }
     };
     match image::open(&path) {
         Ok(img) => img.into_rgb8(),
@@ -1233,6 +1255,58 @@ mod tests {
         let s = toml::to_string(&stack).unwrap();
         let stack2: LayerStack = toml::from_str(&s).unwrap();
         assert_eq!(stack, stack2);
+    }
+
+    /// D10 / Sprint 17 (ADR-041): relative `LayerSource::Imported`
+    /// paths resolve against the resolver's `imported_root`. The bake
+    /// loads the PNG from the resolved location; if the trait method
+    /// returned `None` (pre-Sprint-17 behaviour), `image::open` would
+    /// look in CWD and fail in a test harness.
+    #[test]
+    fn bake_resolves_relative_imported_paths_through_imported_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let textures_dir = tmp.path().join("textures");
+        std::fs::create_dir_all(&textures_dir).unwrap();
+        // Solid blue 64² PNG at <tmp>/textures/foo.png.
+        let dest = textures_dir.join("foo.png");
+        let mut img = RgbImage::new(64, 64);
+        for px in img.pixels_mut() {
+            *px = Rgb([10, 20, 230]);
+        }
+        img.save(&dest).unwrap();
+
+        // Resolver: no slot mappings, but provides imported_root.
+        struct RootedResolver {
+            root: PathBuf,
+        }
+        impl SlotResolver for RootedResolver {
+            fn diffuse_path(&self, _slot_id: u8) -> Option<PathBuf> {
+                None
+            }
+            fn imported_root(&self) -> Option<&std::path::Path> {
+                Some(&self.root)
+            }
+        }
+        let resolver = RootedResolver {
+            root: tmp.path().to_path_buf(),
+        };
+
+        // Stack carries an imported layer with the project-relative
+        // path Sprint 17 stores after import.
+        let mut stack = LayerStack::default();
+        stack.layers.push(TextureLayer::new(
+            LayerSource::Imported {
+                path: PathBuf::from("textures").join("foo.png"),
+            },
+            tiny_size(),
+            255,
+        ));
+        let baked = stack.bake_diffuse(tiny_size(), &resolver);
+        // The solid blue should show through (alpha = 1 from a full
+        // mask), modulated lightly by the bg-flatten step.
+        let p = baked.get_pixel(0, 0).0;
+        assert!(p[2] > 200, "blue channel should dominate, got {p:?}");
+        assert!(p[0] < 30, "red channel should be near 0, got {p:?}");
     }
 
     #[test]

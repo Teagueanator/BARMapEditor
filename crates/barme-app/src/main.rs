@@ -673,6 +673,26 @@ impl Default for PaintBrushState {
 /// D10 / Sprint 17 (ADR-041) — `pub(crate)` so [`crate::ui::layers_panel`]
 /// can reuse it. The dispatcher in [`App::apply_project_diff`] remains
 /// the canonical caller.
+/// D10 / Sprint 17 (ADR-041) — escape a value for embedding inside a
+/// double-quoted TOML basic-string. Handles backslash, double quote,
+/// and the standard control chars. Used by the imported-texture
+/// sidecar's `meta.toml`.
+fn escape_toml(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04X}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 pub(crate) fn apply_layer_property(layer: &mut TextureLayer, value: &LayerPropertyValue) {
     match value {
         LayerPropertyValue::Name(s) => layer.name = s.clone(),
@@ -704,13 +724,24 @@ struct SlotMeta {
 /// D8 / Sprint 15 (ADR-038): adapter so the [`LayerStack`] bake can
 /// reach the App's slot registry without depending on `barme-app`.
 /// Wraps `&[SlotMeta]` and resolves each slot id to its `diffuse.png`.
+///
+/// D10 / Sprint 17 (ADR-041): also carries an optional project root,
+/// used to resolve relative `LayerSource::Imported` paths (the
+/// project-local sidecar lives at `<root>/textures/<uuid>.png`).
 struct AppSlotResolver<'a> {
     slots: &'a [SlotMeta],
+    project_root: Option<&'a Path>,
 }
 
 impl<'a> AppSlotResolver<'a> {
-    fn new(slots: &'a [SlotMeta]) -> Self {
-        Self { slots }
+    /// Build a resolver with an optional project root attached so
+    /// relative `LayerSource::Imported` paths resolve to the sidecar
+    /// directory. Pass `None` for paths-as-CWD-relative behaviour.
+    fn with_project_root(slots: &'a [SlotMeta], project_root: Option<&'a Path>) -> Self {
+        Self {
+            slots,
+            project_root,
+        }
     }
 }
 
@@ -720,6 +751,9 @@ impl<'a> SlotResolver for AppSlotResolver<'a> {
             .iter()
             .find(|s| s.id == slot_id)
             .map(|s| s.dir.join("diffuse.png"))
+    }
+    fn imported_root(&self) -> Option<&std::path::Path> {
+        self.project_root
     }
 }
 
@@ -2591,14 +2625,29 @@ impl App {
         info!(from, to, "Sprint 16 Layers: reordered layer");
     }
 
-    /// D9 / Sprint 16 — import a PNG / JPG from disk into the layer
-    /// identified by `layer_id`. The image is resized to
-    /// `SLOT_COMPOSITE_DIM` (1024²) and uploaded to the composite
-    /// slot array at the layer's vec index; the layer's source flips
-    /// to `LayerSource::Imported { path }`. The default name "Slot
-    /// XX" updates to the file stem if the user hasn't renamed it.
+    /// D10 / Sprint 17 (ADR-041) — import a PNG / JPG into the layer
+    /// identified by `layer_id` via the project-local sidecar:
+    ///
+    /// 1. Validate the source decodes + dims ∈ [16, 8192].
+    /// 2. Re-encode the source as PNG at
+    ///    `<project_root>/textures/<uuid>.png`. Larger sources
+    ///    downsample to 8192² via Lanczos3 (PNG re-encode normalises
+    ///    any JPEG artefacts).
+    /// 3. Write a `<uuid>.meta.toml` sidecar with `name`,
+    ///    `source_filename`, `original_dims`, `imported_at_unix`.
+    /// 4. Update the layer's `LayerSource` to the project-relative
+    ///    path `textures/<uuid>.png`. Renames the layer's auto-default
+    ///    name to the source file stem.
+    /// 5. Resize a 1024² copy for the GPU composite slot at this
+    ///    layer's vec index.
+    /// 6. Push `ProjectDiff::SetLayerProperty(Source)` for undo.
+    ///
+    /// Bails with a `last_error` toast when the project hasn't been
+    /// saved yet (no `<project>/textures/` directory to write into).
     fn import_layer_texture(&mut self, layer_id: &str, path: PathBuf) {
         use barme_core::LayerSource;
+        use barme_core::undo::LayerPropertyValue;
+
         let Some(idx) = self
             .layer_stack
             .layers
@@ -2607,33 +2656,112 @@ impl App {
         else {
             return;
         };
+
+        // Require a saved project so we have a textures/ sidecar dir
+        // to write into. PITFALL §17.4 — imports MUST live under the
+        // project, otherwise a project move dangles the layer.
+        let Some(project_path) = self.current_project_path.clone() else {
+            self.last_error = Some(
+                "Save the project before importing textures (textures live next to the \
+                 .barmeproj)."
+                    .into(),
+            );
+            warn!("Sprint 17 Layers: import refused — project not yet saved (no textures sidecar)");
+            return;
+        };
+        let Some(project_root) = project_path.parent().map(Path::to_path_buf) else {
+            return;
+        };
+
+        // Decode + validate.
         let img = match image::open(&path) {
             Ok(i) => i,
             Err(e) => {
                 warn!(
                     path = %path.display(),
                     error = %e,
-                    "Sprint 16 Layers: import failed; layer unchanged"
+                    "Sprint 17 Layers: import failed; layer unchanged"
                 );
                 self.last_error = Some(format!("Texture import failed: {e:#}"));
                 return;
             }
         };
+        let (orig_w, orig_h) = (img.width(), img.height());
+        if orig_w < 16 || orig_h < 16 {
+            self.last_error = Some(format!(
+                "Imported texture too small ({orig_w}×{orig_h}); must be at least 16×16.",
+            ));
+            return;
+        }
         let mut rgba = img.to_rgba8();
-        if rgba.width() != crate::render::SLOT_COMPOSITE_DIM
-            || rgba.height() != crate::render::SLOT_COMPOSITE_DIM
+        let max_dim = 8192u32;
+        let mut did_downsample = false;
+        if orig_w > max_dim || orig_h > max_dim {
+            let scale = (max_dim as f32) / (orig_w.max(orig_h) as f32);
+            let nw = ((orig_w as f32) * scale).round().max(1.0) as u32;
+            let nh = ((orig_h as f32) * scale).round().max(1.0) as u32;
+            rgba = image::imageops::resize(&rgba, nw, nh, image::imageops::FilterType::Lanczos3);
+            did_downsample = true;
+        }
+        let (final_w, final_h) = rgba.dimensions();
+
+        // Sidecar directory + UUID-named PNG + meta.toml.
+        let textures_dir = project_root.join("textures");
+        if let Err(e) = std::fs::create_dir_all(&textures_dir) {
+            self.last_error = Some(format!("Could not create textures dir: {e}"));
+            return;
+        }
+        let uuid = barme_core::alloc_layer_id();
+        let dest_filename = format!("{uuid}.png");
+        let dest_disk = textures_dir.join(&dest_filename);
+        if let Err(e) = rgba.save(&dest_disk) {
+            self.last_error = Some(format!("Could not save imported texture: {e}"));
+            return;
+        }
+        let source_filename = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown");
+        let imported_at_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let layer_name_for_meta = self.layer_stack.layers[idx].name.clone();
+        let meta = format!(
+            "name = \"{}\"\n\
+             source_filename = \"{}\"\n\
+             original_dims = [{}, {}]\n\
+             imported_at_unix = {}\n",
+            escape_toml(&layer_name_for_meta),
+            escape_toml(source_filename),
+            orig_w,
+            orig_h,
+            imported_at_unix,
+        );
+        let _ = std::fs::write(textures_dir.join(format!("{uuid}.meta.toml")), meta);
+
+        // Resize for the GPU composite slot.
+        let rgba_gpu = if final_w != crate::render::SLOT_COMPOSITE_DIM
+            || final_h != crate::render::SLOT_COMPOSITE_DIM
         {
-            rgba = image::imageops::resize(
+            image::imageops::resize(
                 &rgba,
                 crate::render::SLOT_COMPOSITE_DIM,
                 crate::render::SLOT_COMPOSITE_DIM,
                 image::imageops::FilterType::Lanczos3,
-            );
-        }
+            )
+        } else {
+            rgba.clone()
+        };
+
+        // Update layer + push undo diff. The relative path keeps the
+        // project portable (move the .barmeproj + textures/ together).
+        let new_source = LayerSource::Imported {
+            path: PathBuf::from("textures").join(&dest_filename),
+        };
+        let prev_source = self.layer_stack.layers[idx].source.clone();
+        let auto_name = prev_source.default_label();
         let layer = &mut self.layer_stack.layers[idx];
-        // Update the name when it still looks like the auto-default
-        // ("Slot XX" / "Imported"); a user-renamed name survives.
-        let auto_name = layer.source.default_label();
         if layer.name == auto_name {
             layer.name = path
                 .file_stem()
@@ -2641,16 +2769,144 @@ impl App {
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| "Imported".to_string());
         }
-        layer.source = LayerSource::Imported { path: path.clone() };
+        layer.source = new_source.clone();
+        // Bust the thumbnail cache so the next render picks up the new
+        // PNG.
+        self.layer_thumbnails.remove(layer_id);
         self.mark_dirty();
         if let Some(rs) = self.render_state.as_ref() {
-            crate::render::upload_composite_slot_diffuse(rs, idx as u32, rgba.as_raw());
+            crate::render::upload_composite_slot_diffuse(rs, idx as u32, rgba_gpu.as_raw());
+        }
+        self.history
+            .push_project_diff(barme_core::ProjectDiff::SetLayerProperty {
+                layer_id: layer_id.to_string(),
+                from: LayerPropertyValue::Source(prev_source),
+                to: LayerPropertyValue::Source(new_source),
+            });
+        if did_downsample {
+            self.last_error = Some(format!(
+                "Imported {orig_w}×{orig_h} → downsampled to {final_w}×{final_h} (8192² cap).",
+            ));
         }
         info!(
             layer_id,
-            path = %path.display(),
-            "Sprint 16 Layers: imported texture"
+            disk = %dest_disk.display(),
+            orig_w,
+            orig_h,
+            "Sprint 17 Layers: copied imported texture into project-local sidecar"
         );
+    }
+
+    /// D10 / Sprint 17 (ADR-041) — walk the loaded layer stack and
+    /// migrate any pre-Sprint-17 `LayerSource::Imported` paths that
+    /// either (a) are absolute or (b) don't start with `textures/`
+    /// into the project-local sidecar. Source files are copied into
+    /// `<project>/textures/<uuid>.png` (PNG re-encode) and the
+    /// layer's `LayerSource::Imported.path` rewrites to the relative
+    /// form.
+    ///
+    /// No-op when no migration is needed. Called from the load path
+    /// AFTER `Project::after_load_migrate` has hydrated the layer
+    /// stack.
+    fn migrate_imported_layer_paths(&mut self) {
+        use barme_core::LayerSource;
+
+        let Some(project_path) = self.current_project_path.clone() else {
+            return;
+        };
+        let Some(project_root) = project_path.parent().map(Path::to_path_buf) else {
+            return;
+        };
+        let textures_dir = project_root.join("textures");
+
+        // Pass 1: identify layers that need migrating. Pass 2 mutates
+        // (avoids holding `&mut self.layer_stack` across the per-layer
+        // I/O which may also need `self`).
+        let plan: Vec<(String, PathBuf)> = self
+            .layer_stack
+            .layers
+            .iter()
+            .filter_map(|l| {
+                let LayerSource::Imported { path } = &l.source else {
+                    return None;
+                };
+                if !path.is_absolute() && path.starts_with("textures") {
+                    return None;
+                }
+                Some((l.id.clone(), path.clone()))
+            })
+            .collect();
+        if plan.is_empty() {
+            return;
+        }
+        if !textures_dir.exists()
+            && let Err(e) = std::fs::create_dir_all(&textures_dir)
+        {
+            warn!(
+                dir = %textures_dir.display(),
+                error = %e,
+                "Sprint 17 import migration: failed to create textures dir; skipping",
+            );
+            return;
+        }
+        let mut migrated_any = false;
+        for (layer_id, orig_path) in plan {
+            let src = if orig_path.is_absolute() {
+                orig_path.clone()
+            } else {
+                project_root.join(&orig_path)
+            };
+            if !src.is_file() {
+                warn!(
+                    layer_id = %layer_id,
+                    path = %src.display(),
+                    "Sprint 17 import migration: source file missing; leaving placeholder",
+                );
+                continue;
+            }
+            let img = match image::open(&src) {
+                Ok(i) => i,
+                Err(e) => {
+                    warn!(
+                        layer_id = %layer_id,
+                        src = %src.display(),
+                        error = %e,
+                        "Sprint 17 import migration: source decode failed",
+                    );
+                    continue;
+                }
+            };
+            let rgba = img.to_rgba8();
+            let uuid = barme_core::alloc_layer_id();
+            let dest_filename = format!("{uuid}.png");
+            let dest = textures_dir.join(&dest_filename);
+            if let Err(e) = rgba.save(&dest) {
+                warn!(
+                    layer_id = %layer_id,
+                    dest = %dest.display(),
+                    error = %e,
+                    "Sprint 17 import migration: PNG save failed",
+                );
+                continue;
+            }
+            // Rewrite the layer's source — `active_layer_mut` is the
+            // existing accessor.
+            if let Some(layer) = self.layer_stack.active_layer_mut(&layer_id) {
+                layer.source = LayerSource::Imported {
+                    path: PathBuf::from("textures").join(&dest_filename),
+                };
+                migrated_any = true;
+            }
+            info!(
+                layer_id = %layer_id,
+                from = %src.display(),
+                to = %dest.display(),
+                "Sprint 17 import migration: copied texture into project-local sidecar",
+            );
+        }
+        if migrated_any {
+            self.mark_dirty();
+        }
     }
 
     /// D9 / Sprint 16 (ADR-040) — apply the active mask brush at the
@@ -4228,7 +4484,11 @@ impl App {
         // layer bake can resolve slot ids → `diffuse.png` paths. The
         // resolver borrows the App's `slot_registry` which is built
         // once at startup; it lives for the duration of this call.
-        let layer_resolver = AppSlotResolver::new(&self.slot_registry);
+        // D10 / Sprint 17 (ADR-041): attach the project root so the
+        // layer bake can resolve relative `LayerSource::Imported`
+        // paths against the project-local `textures/` sidecar.
+        let project_root = self.current_project_path.as_ref().and_then(|p| p.parent());
+        let layer_resolver = AppSlotResolver::with_project_root(&self.slot_registry, project_root);
         match launcher::build_and_install(
             &driver,
             &project,
@@ -4317,7 +4577,9 @@ impl App {
                 // to the new per-project `dnts_diffuse_in_alpha`. Pull
                 // both fields back out of the shadow.
                 let (stack, diffuse_in_alpha) = {
-                    let resolver = AppSlotResolver::new(&self.slot_registry);
+                    let project_root = self.current_project_path.as_ref().and_then(|p| p.parent());
+                    let resolver =
+                        AppSlotResolver::with_project_root(&self.slot_registry, project_root);
                     let mut shadow = Project::new("__migrate__", self.map_size.smu_x);
                     shadow.layers = p.layers;
                     shadow.splat_config = self.splat_config.clone();
@@ -4328,6 +4590,11 @@ impl App {
                 };
                 self.layer_stack = stack;
                 self.dnts_diffuse_in_alpha = diffuse_in_alpha;
+                // D10 / Sprint 17 (ADR-041): pre-Sprint-17 imported
+                // textures live at arbitrary disk paths; migrate them
+                // into the project-local sidecar so the project stays
+                // portable.
+                self.migrate_imported_layer_paths();
                 // D9 / Sprint 16 (ADR-039): loaded project may have
                 // painted layer masks from a prior session; force a
                 // full mask resync next frame + push every layer's
@@ -9195,6 +9462,46 @@ impl eframe::App for App {
 
         self.drain_action(action);
         self.symmetry_popover(ctx);
+
+        // D10 / Sprint 17 (ADR-041) — file drag-drop dispatch.
+        // Routes any PNG / JPG dropped over the Layers panel into a
+        // freshly-created layer at the top of the stack via the
+        // sidecar import flow. The Layers panel captures its rect on
+        // render (`App::layers_panel_rect`); we read it here. No
+        // central-viewport drop handler exists in earlier sprints, so
+        // unmatched drops are logged + ignored.
+        let dropped = ctx.input(|i| i.raw.dropped_files.clone());
+        if !dropped.is_empty() {
+            let drop_pos = ctx.pointer_interact_pos();
+            let on_layers_panel = drop_pos
+                .zip(self.layers_panel_rect)
+                .is_some_and(|(p, rect)| rect.contains(p));
+            for f in dropped {
+                let Some(path) = f.path else {
+                    continue;
+                };
+                let ext_ok = path
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .map(|s| s.to_ascii_lowercase())
+                    .is_some_and(|e| matches!(e.as_str(), "png" | "jpg" | "jpeg"));
+                if !ext_ok {
+                    info!(path = %path.display(), "drag-drop: ignoring non-image file");
+                    continue;
+                }
+                if on_layers_panel && matches!(self.tool, Tool::PaintLayer) {
+                    let id = self.add_layer_at_top();
+                    self.import_layer_texture(&id, path);
+                    self.paint_active_layer_id = Some(id);
+                } else {
+                    info!(
+                        path = %path.display(),
+                        "drag-drop: dropped outside Layers panel; ignored (\
+                         only the Layers panel imports images today)"
+                    );
+                }
+            }
+        }
 
         // `?` cheat-sheet modal (B3). Builds the per-tool entries from
         // `Tool::ALL` so a new variant in Phase 4 shows up automatically.
