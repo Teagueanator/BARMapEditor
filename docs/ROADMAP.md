@@ -166,8 +166,32 @@ Implements SRS F1–F12. Ships a Windows `.exe` and a Linux AppImage.
       migrate via custom `Deserialize` (legacy `[[start_positions]]`
       → `ally_groups[0]`). C2 / ADR-029 wires the ally tree into
       `mapconfig/map_startboxes.lua`.
-- [ ] **F9** `mapinfo.lua` editor (form + raw Lua tab)
-- [ ] **F10** Minimap auto-generation
+- [x] **F9** `mapinfo.lua` editor (form + raw Lua tab) — Sprint 18 /
+      C7 ships the typed-form editor opened from the top-bar
+      `Icon::MapInfo` button. Non-modal `egui::Window` with 12 tabs
+      (General / Map / SMF / Lighting / Atmosphere / Water /
+      Resources / Splats / Terrain types / Custom / Raw Lua / Minimap).
+      Edits commit on widget release through `ProjectDiff::EditMapInfo
+      { from, to }`. New `MapInfoPatch` enum (49 variants) in
+      `barme-core::mapinfo_schema`; `App::apply_mapinfo_patch` routes
+      to first-class shadows or to `Project.mapinfo_overrides` as a
+      dotted-Lua-path bag for fields without a shadow yet. Sprint 27
+      will promote the most-edited atmosphere / lighting subset to
+      typed shadows. Tab-strip lint-dot rendering stubbed at zero so
+      Sprint 21 populates without UI change. Water tab is read-only
+      in Sprint 18 — the dedicated `Tool::Water` Inspector remains
+      the canonical entry; Sprint 26 polishes the form-side editing.
+- [x] **F10** Minimap auto-generation — Sprint 18 / D7 ships
+      `barme_pipeline::minimap::render_minimap` as a CPU bake
+      (downsampled `LayerStack::bake_diffuse` + heightmap Lambert
+      hill shade keyed on `mapinfo.lighting.sun_dir`). New
+      `Project.minimap_override: Option<PathBuf>` with `SCHEMA_V`
+      bump 1 → 2; when set the bake is bypassed and the user's PNG
+      is copied verbatim after a strict 1024² dim check.
+      `build_sd7` gains an `Option<MinimapInputs>` arg threaded
+      through to PyMapConv's `-p` flag. Headless wgpu was scoped
+      out per the kickoff devlog (the CPU input matches what the
+      `.sd7` ships; a GPU render would only invite drift).
 - [ ] **F11** One-click `.sd7` build via PyMapConv
 - [ ] **F12** "Launch in BAR" button (invokes Recoil with `--map`)
 - [x] **Editor maturity (Phase 2 closer)** — undo/redo over dirty-rect
