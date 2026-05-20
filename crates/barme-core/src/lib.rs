@@ -42,7 +42,8 @@ pub use splat::{
 };
 pub use symmetry::SymmetryAxis;
 pub use undo::{
-    HeightmapEntry, History, HistoryEntry, ProjectDiff, WaterField, WaterValue, WizardSnapshot,
+    HeightmapEntry, History, HistoryEntry, LayerPropertyValue, ProjectDiff, WaterField, WaterValue,
+    WizardSnapshot,
 };
 pub use water_presets::{
     BAR_DEFAULT_SURFACE_ALPHA, BAR_DEFAULT_SURFACE_COLOR, WaterMode, apply_lava_atmosphere_patch,

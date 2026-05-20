@@ -43,8 +43,10 @@ use tracing::{trace, warn};
 use crate::MapSize;
 use crate::brushes::DirtyRect;
 use crate::heightmap::Heightmap;
+use crate::layers::{BlendMode, LayerColor, LayerSource, LayerTransform, TextureLayer};
 use crate::procgen::Domain;
 use crate::project::{AllyGroup, FeatureInstance, GeoVent, MetalSpot, StartPosition};
+use crate::splat::SplatChannel;
 use crate::symmetry::SymmetryAxis;
 use crate::water_presets::WaterMode;
 
@@ -196,6 +198,56 @@ pub enum ProjectDiff {
     /// `bar_default()`. Sprint 18's F9 form will eventually offer
     /// per-field atmosphere overrides.
     SetLavaAtmosphere { from: bool, to: bool },
+    /// D8 / Sprint 15 (ADR-038): a [`TextureLayer`] was added at
+    /// `index` in `Project.layers`. Undo removes it; redo re-adds the
+    /// stored layer verbatim. The full layer snapshot lives in the
+    /// diff so the mask + transform survive the undo round-trip.
+    /// Mask-pixel edits are NOT undoable in Sprint 15 (no brushes
+    /// touch the mask yet) — Sprint 16 / D9 lands a separate per-
+    /// stroke COW path adapted from ADR-033.
+    AddLayer {
+        index: usize,
+        layer: Box<TextureLayer>,
+    },
+    /// D8 / Sprint 15: a [`TextureLayer`] was removed from `index`.
+    /// Undo re-inserts; redo removes again. Captures the full layer
+    /// including mask bytes so the undo restores the pre-delete state
+    /// byte-for-byte.
+    RemoveLayer {
+        index: usize,
+        layer: Box<TextureLayer>,
+    },
+    /// D8 / Sprint 15: layer at `from` moved to `to`. Symmetric on
+    /// undo (swap `from` / `to`).
+    ReorderLayer { from: usize, to: usize },
+    /// D8 / Sprint 15: one non-mask property on the layer identified
+    /// by `layer_id` changed. The dispatcher (in `barme-app`) walks
+    /// `Project.layers.layers` for the matching `id` and applies
+    /// `from` on undo / `to` on redo. Mask edits are excluded —
+    /// they have their own (Sprint 16) per-stroke path.
+    SetLayerProperty {
+        layer_id: String,
+        from: LayerPropertyValue,
+        to: LayerPropertyValue,
+    },
+}
+
+/// D8 / Sprint 15 (ADR-038): typed-union value carried by
+/// [`ProjectDiff::SetLayerProperty`]. Each variant identifies which
+/// scalar / sub-struct on [`TextureLayer`] is being edited. Mask
+/// bytes are intentionally absent — they go through a separate
+/// Sprint 16 path.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LayerPropertyValue {
+    Name(String),
+    Transform(LayerTransform),
+    Color(LayerColor),
+    Blend(BlendMode),
+    Visible(bool),
+    Locked(bool),
+    Opacity(f32),
+    DntsChannel(Option<SplatChannel>),
+    Source(LayerSource),
 }
 
 /// C9 / Sprint 14: which water-related field an [`ProjectDiff::EditWaterField`]
@@ -273,7 +325,8 @@ impl ProjectDiff {
             | ProjectDiff::MoveGeoVent { .. }
             | ProjectDiff::SetWaterMode { .. }
             | ProjectDiff::EditWaterField { .. }
-            | ProjectDiff::SetLavaAtmosphere { .. } => inline,
+            | ProjectDiff::SetLavaAtmosphere { .. }
+            | ProjectDiff::ReorderLayer { .. } => inline,
             ProjectDiff::ApplyWizard(snap) => inline + snap.bytes(),
             // Feature variants carry a String `name`; the heap cost of
             // its capacity is in addition to the enum inline size.
@@ -283,7 +336,39 @@ impl ProjectDiff {
             ProjectDiff::MoveFeature { from, to } => {
                 inline + from.name.capacity() + to.name.capacity()
             }
+            // D8 / Sprint 15 (ADR-038): the heap cost of a layer diff
+            // is dominated by the mask bytes (`width * height`) plus
+            // the source path / id strings. The cap eviction relies on
+            // honest accounting here — a 16-SMU mask is 64 MB and
+            // would otherwise sandbag the 100 MB undo cap.
+            ProjectDiff::AddLayer { layer, .. } | ProjectDiff::RemoveLayer { layer, .. } => {
+                inline + layer_bytes(layer)
+            }
+            ProjectDiff::SetLayerProperty {
+                layer_id, from, to, ..
+            } => {
+                inline + layer_id.capacity() + layer_property_bytes(from) + layer_property_bytes(to)
+            }
         }
+    }
+}
+
+fn layer_bytes(layer: &TextureLayer) -> usize {
+    let mask = layer.mask.bytes.capacity();
+    let source = match &layer.source {
+        LayerSource::Slot { .. } => 0,
+        // OsStr is a thin wrapper; capacity sits on the inner buffer
+        // — approximate by the path's string length.
+        LayerSource::Imported { path } => path.as_os_str().len(),
+    };
+    mask + layer.id.capacity() + layer.name.capacity() + source
+}
+
+fn layer_property_bytes(v: &LayerPropertyValue) -> usize {
+    match v {
+        LayerPropertyValue::Name(s) => s.capacity(),
+        LayerPropertyValue::Source(LayerSource::Imported { path }) => path.as_os_str().len(),
+        _ => 0,
     }
 }
 
@@ -758,11 +843,12 @@ mod tests {
                 }
             }
             ProjectDiff::ApplyWizard(_) => unreachable!("not exercised in this test set"),
-            // C4/C5 variants aren't dispatched against AllyGroup —
-            // they target Project's metal_spots / geo_vents lists,
-            // which live outside this helper's scope. The pinned
-            // unit tests for these variants use the bytes() /
-            // history-stack checks instead.
+            // C4/C5/C9/D8 variants aren't dispatched against
+            // AllyGroup — they target Project's metal_spots /
+            // geo_vents / water / layers lists, which live outside
+            // this helper's scope. The pinned unit tests for these
+            // variants use the bytes() / history-stack checks
+            // instead.
             ProjectDiff::PlaceMetalSpot { .. }
             | ProjectDiff::DeleteMetalSpot { .. }
             | ProjectDiff::MoveMetalSpot { .. }
@@ -775,9 +861,13 @@ mod tests {
             | ProjectDiff::MoveFeature { .. }
             | ProjectDiff::SetWaterMode { .. }
             | ProjectDiff::EditWaterField { .. }
-            | ProjectDiff::SetLavaAtmosphere { .. } => {
+            | ProjectDiff::SetLavaAtmosphere { .. }
+            | ProjectDiff::AddLayer { .. }
+            | ProjectDiff::RemoveLayer { .. }
+            | ProjectDiff::ReorderLayer { .. }
+            | ProjectDiff::SetLayerProperty { .. } => {
                 unreachable!(
-                    "metal/geo/feature/water diffs not exercised through AllyGroup test helper"
+                    "metal/geo/feature/water/layer diffs not exercised through AllyGroup test helper"
                 )
             }
         }
@@ -1489,6 +1579,111 @@ mod tests {
             to: WaterValue::Float(Some(0.4)),
         });
         assert!(!h.can_redo());
+    }
+
+    /// D8 / Sprint 15 (ADR-038): `ReorderLayer` is inline; `AddLayer`
+    /// and `RemoveLayer` carry the mask bytes (capacity) plus the
+    /// id+name string capacities so the cap eviction stays honest.
+    /// The expected size is computed from the cloned-into-Box
+    /// `TextureLayer` (not the source layer) — `String::clone` may
+    /// shrink capacity, so reading the pre-clone capacities would
+    /// over-count by a handful of bytes.
+    #[test]
+    fn layer_diffs_bytes_account_for_mask_and_strings() {
+        let inline = std::mem::size_of::<ProjectDiff>();
+
+        let reorder = ProjectDiff::ReorderLayer { from: 0, to: 1 };
+        assert_eq!(reorder.bytes(), inline);
+
+        let layer = crate::layers::TextureLayer::new(
+            crate::layers::LayerSource::Slot { id: 3 },
+            crate::MapSize::square(2),
+            0,
+        );
+
+        let add = ProjectDiff::AddLayer {
+            index: 0,
+            layer: Box::new(layer.clone()),
+        };
+        let ProjectDiff::AddLayer {
+            layer: ref add_l, ..
+        } = add
+        else {
+            unreachable!()
+        };
+        let expected_add =
+            inline + add_l.mask.bytes.capacity() + add_l.id.capacity() + add_l.name.capacity();
+        assert_eq!(add.bytes(), expected_add);
+
+        let rm = ProjectDiff::RemoveLayer {
+            index: 0,
+            layer: Box::new(layer),
+        };
+        let ProjectDiff::RemoveLayer {
+            layer: ref rm_l, ..
+        } = rm
+        else {
+            unreachable!()
+        };
+        let expected_rm =
+            inline + rm_l.mask.bytes.capacity() + rm_l.id.capacity() + rm_l.name.capacity();
+        assert_eq!(rm.bytes(), expected_rm);
+    }
+
+    /// `SetLayerProperty` round-trips through the history stack and
+    /// clears redo just like every other ProjectDiff variant.
+    #[test]
+    fn set_layer_property_pushes_through_history_and_clears_redo() {
+        let mut h = History::default();
+        h.push_project_diff(ProjectDiff::SetLayerProperty {
+            layer_id: "abc".to_string(),
+            from: LayerPropertyValue::Visible(true),
+            to: LayerPropertyValue::Visible(false),
+        });
+        let popped = h.pop_undo().unwrap();
+        h.push_to_redo(popped);
+        assert!(h.can_redo());
+
+        // A new push of any kind clears redo.
+        h.push_project_diff(ProjectDiff::ReorderLayer { from: 0, to: 1 });
+        assert!(!h.can_redo());
+    }
+
+    /// `AddLayer` of a 16-SMU mask = 64 MB. The cap eviction must
+    /// kick out the mask-heavy entry when smaller ProjectDiffs share
+    /// the stack, matching the `cap_evicts_largest_not_oldest` shape
+    /// of the heightmap path.
+    #[test]
+    fn add_layer_with_big_mask_is_largest_and_gets_evicted_first() {
+        let layer = crate::layers::TextureLayer::new(
+            crate::layers::LayerSource::Slot { id: 0 },
+            crate::MapSize::square(4),
+            255,
+        );
+        let mask_bytes = layer.mask.bytes.capacity();
+
+        // Cap small enough to evict the layer but not the four
+        // ReorderLayer entries (which are inline-sized).
+        let cap = mask_bytes / 2;
+        let mut h = History::new(cap);
+        for i in 0..4 {
+            h.push_project_diff(ProjectDiff::ReorderLayer { from: i, to: i + 1 });
+        }
+        let small_depth = h.undo_depth();
+
+        h.push_project_diff(ProjectDiff::AddLayer {
+            index: 0,
+            layer: Box::new(layer),
+        });
+        // The layer entry exceeded cap on its own; eviction kicks
+        // largest (the AddLayer) before the inline-sized reorders.
+        assert_eq!(h.undo_depth(), small_depth, "all reorders survive");
+        for e in h.undo.iter() {
+            assert!(matches!(
+                e,
+                HistoryEntry::Project(ProjectDiff::ReorderLayer { .. })
+            ));
+        }
     }
 
     /// C9 / Sprint 14 (Slice 4): SetLavaAtmosphere is inline and

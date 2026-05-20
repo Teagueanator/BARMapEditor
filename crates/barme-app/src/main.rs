@@ -9,9 +9,10 @@ use anyhow::Result;
 use barme_core::{
     ALLY_GROUP_PALETTE, AllyGroup, BAR_DEFAULT_SURFACE_ALPHA, BAR_DEFAULT_SURFACE_COLOR, BIOMES,
     BrushRegistry, BrushStamp, DirtyRect, FeatureInstance, GeoVent, Heightmap, History,
-    HistoryEntry, MapSize, MetalSpot, PROJECT_EXTENSION, Project, ProjectDiff, SplatBrushRegistry,
-    SplatChannel, SplatConfig, SplatDistribution, SplatStamp, StartPosition, SymmetryAxis,
-    WaterBlock, WaterField, WaterMode, WaterValue, WizardSnapshot,
+    HistoryEntry, LayerPropertyValue, LayerStack, MapSize, MetalSpot, PROJECT_EXTENSION, Project,
+    ProjectDiff, SlotResolver, SplatBrushRegistry, SplatChannel, SplatConfig, SplatDistribution,
+    SplatStamp, StartPosition, SymmetryAxis, TextureLayer, WaterBlock, WaterField, WaterMode,
+    WaterValue, WizardSnapshot,
     brushes::pixel_bbox,
     default_extractor_radius, merge_overrides, preset_water_block,
     procgen::{
@@ -273,6 +274,13 @@ struct App {
     /// Mex spots use a more generous 20° cap (mex `maxslope = 30`)
     /// — surfaced as a hover-tooltip nuance, not a separate mode.
     buildable_overlay_on: bool,
+    /// D8 / Sprint 15 (ADR-038): the project's texture layer stack —
+    /// the Photoshop-style stack of [`TextureLayer`]s the `.sd7` bake
+    /// composites into the diffuse BMP. Mirrors `Project.layers`;
+    /// persists through `snapshot_project` / `open_from`. Sprint 15 is
+    /// data-only — no inspector surface yet (Sprint 17 lands the
+    /// Layers panel).
+    layer_stack: LayerStack,
     /// D5 / Sprint 9: persisted per-channel slot bindings, scales,
     /// mults, and the ADR-034 placeholder toggle. Round-trips through
     /// `Project.splat_config` on save / open. Replaces the Phase-7
@@ -522,6 +530,25 @@ impl Default for SplatBrushState {
     }
 }
 
+/// D8 / Sprint 15 (ADR-038): apply one [`LayerPropertyValue`] onto
+/// `layer`. The undo dispatcher invokes this with the `from` value
+/// on undo and `to` on redo — single-direction routing keeps the
+/// path symmetric. Mask edits intentionally aren't here; they live
+/// on a separate Sprint 16 / D9 path.
+fn apply_layer_property(layer: &mut TextureLayer, value: &LayerPropertyValue) {
+    match value {
+        LayerPropertyValue::Name(s) => layer.name = s.clone(),
+        LayerPropertyValue::Transform(t) => layer.transform = *t,
+        LayerPropertyValue::Color(c) => layer.color = *c,
+        LayerPropertyValue::Blend(b) => layer.blend = *b,
+        LayerPropertyValue::Visible(v) => layer.visible = *v,
+        LayerPropertyValue::Locked(v) => layer.locked = *v,
+        LayerPropertyValue::Opacity(o) => layer.opacity = *o,
+        LayerPropertyValue::DntsChannel(c) => layer.dnts_channel = *c,
+        LayerPropertyValue::Source(s) => layer.source = s.clone(),
+    }
+}
+
 /// Slot registry entry (ADR-027). Built once from `tools/textures/`.
 #[derive(Debug, Clone)]
 struct SlotMeta {
@@ -532,6 +559,28 @@ struct SlotMeta {
     /// Path to the slot directory, e.g. `tools/textures/00-grass-meadow/`.
     /// `diffuse.png` lives directly inside it.
     dir: PathBuf,
+}
+
+/// D8 / Sprint 15 (ADR-038): adapter so the [`LayerStack`] bake can
+/// reach the App's slot registry without depending on `barme-app`.
+/// Wraps `&[SlotMeta]` and resolves each slot id to its `diffuse.png`.
+struct AppSlotResolver<'a> {
+    slots: &'a [SlotMeta],
+}
+
+impl<'a> AppSlotResolver<'a> {
+    fn new(slots: &'a [SlotMeta]) -> Self {
+        Self { slots }
+    }
+}
+
+impl<'a> SlotResolver for AppSlotResolver<'a> {
+    fn diffuse_path(&self, slot_id: u8) -> Option<PathBuf> {
+        self.slots
+            .iter()
+            .find(|s| s.id == slot_id)
+            .map(|s| s.dir.join("diffuse.png"))
+    }
 }
 
 /// One-time scan of `tools/textures/` building the slot registry. Each
@@ -1004,6 +1053,13 @@ impl App {
             lighting_on: true,
             wireframe_on: false,
             buildable_overlay_on: false,
+            // D8 / Sprint 15: real-app launch seeds a single-layer
+            // biome-base stack so the bake hits the layered path
+            // straight away. `Project::new` seeds the same shape on
+            // its side — the App stays the source of truth across
+            // session lifetime and re-syncs from `Project` on every
+            // open.
+            layer_stack: LayerStack::from_biome("", MapSize::square(16)),
             splat_config: SplatConfig::default(),
             splat_distribution: None,
             splat_brush_state: SplatBrushState::default(),
@@ -1125,6 +1181,10 @@ impl App {
         self.splat_config = SplatConfig::default();
         self.splat_distribution = None;
         self.splat_picker_open_for = None;
+        // D8 / Sprint 15 (ADR-038): a fresh "New project" gets a
+        // single-layer biome-base stack. Sprint 17 will offer the
+        // user a Layers panel to grow / delete / reorder from here.
+        self.layer_stack = LayerStack::from_biome("", self.map_size);
         // GPU side resets via the next-frame TerrainCallback (uniforms
         // re-write to defaults; distribution texture is left holding
         // the prior session's pixels — irrelevant since active_mask = 0
@@ -1181,6 +1241,7 @@ impl App {
             mapinfo_overrides: self.mapinfo_overrides.clone(),
             next_steps_dismissed: self.next_steps_dismissed,
             splat_config: self.splat_config.clone(),
+            layers: self.layer_stack.clone(),
             splat_distribution: self.splat_distribution.clone(),
             metal_spots: self.metal_spots.clone(),
             geo_vents: self.geo_vents.clone(),
@@ -3048,6 +3109,65 @@ impl App {
                 trace!(from, to, "undo: reverted lava-atmosphere toggle");
                 ProjectDiff::SetLavaAtmosphere { from: to, to: from }
             }
+
+            // D8 / Sprint 15 (ADR-038): layer-stack edit dispatch.
+            // Sprint 15 has no UI that pushes these diffs (the Layers
+            // panel lands in Sprint 17); the arms exist so a future
+            // panel can dispatch through the same `apply_project_diff`
+            // pipeline as every other ProjectDiff variant. Mask-pixel
+            // edits go through a separate Sprint 16 / D9 path —
+            // they're NOT a ProjectDiff.
+            ProjectDiff::AddLayer { index, layer } => {
+                // Undo direction: remove the layer that was added.
+                if index < self.layer_stack.layers.len()
+                    && self.layer_stack.layers[index].id == layer.id
+                {
+                    self.layer_stack.layers.remove(index);
+                } else if let Some(pos) = self
+                    .layer_stack
+                    .layers
+                    .iter()
+                    .position(|l| l.id == layer.id)
+                {
+                    // Defensive: the layer was reordered between push
+                    // and undo. Remove by id rather than by index.
+                    self.layer_stack.layers.remove(pos);
+                }
+                trace!(index, layer_id = %layer.id, "undo: removed added layer");
+                ProjectDiff::RemoveLayer { index, layer }
+            }
+            ProjectDiff::RemoveLayer { index, layer } => {
+                let i = index.min(self.layer_stack.layers.len());
+                self.layer_stack.layers.insert(i, *layer.clone());
+                trace!(index = i, layer_id = %layer.id, "undo: restored removed layer");
+                ProjectDiff::AddLayer { index: i, layer }
+            }
+            ProjectDiff::ReorderLayer { from, to } => {
+                let n = self.layer_stack.layers.len();
+                if from < n && to <= n && from != to {
+                    let layer = self.layer_stack.layers.remove(from);
+                    let dst = to.min(self.layer_stack.layers.len());
+                    self.layer_stack.layers.insert(dst, layer);
+                }
+                trace!(from, to, "undo: reverted layer reorder");
+                ProjectDiff::ReorderLayer { from: to, to: from }
+            }
+            ProjectDiff::SetLayerProperty { layer_id, from, to } => {
+                if let Some(layer) = self
+                    .layer_stack
+                    .layers
+                    .iter_mut()
+                    .find(|l| l.id == layer_id)
+                {
+                    apply_layer_property(layer, &from);
+                }
+                trace!(layer_id = %layer_id, "undo: reverted layer property edit");
+                ProjectDiff::SetLayerProperty {
+                    layer_id,
+                    from: to,
+                    to: from,
+                }
+            }
         }
     }
 
@@ -3326,6 +3446,27 @@ impl App {
                 self.splat_picker_open_for = None;
                 self.reupload_bound_slot_diffuses();
                 self.reupload_splat_distribution();
+
+                // D8 / Sprint 15 (ADR-038): hoist the layer stack onto
+                // App, then run the one-shot pre-D8 migration so
+                // pre-Sprint-15 `.barmeproj` files seed a stack from
+                // their persisted `splat_config`. `after_load_migrate`
+                // is idempotent — a stack the user has touched in
+                // Sprint 17+ survives unchanged.
+                self.layer_stack = {
+                    let resolver = AppSlotResolver::new(&self.slot_registry);
+                    // Build a minimal Project shadow on the values we
+                    // already hoisted, run the migration, and pull the
+                    // resulting stack back out. We can't re-borrow `p`
+                    // here because `splat_distribution` was moved out
+                    // a few lines above.
+                    let mut shadow = Project::new("__migrate__", self.map_size.smu_x);
+                    shadow.layers = p.layers;
+                    shadow.splat_config = self.splat_config.clone();
+                    shadow.size = self.map_size;
+                    shadow.after_load_migrate(&resolver);
+                    shadow.layers
+                };
 
                 // C4/C5 (Sprint 11): metal-spot + geo-vent persistence.
                 // The Project model owns the sources; the inspector
@@ -8176,6 +8317,10 @@ mod tests {
             lighting_on: true,
             wireframe_on: false,
             buildable_overlay_on: false,
+            // D8 / Sprint 15: test-harness apps stay empty here — no
+            // implicit biome seed, so smoke tests can opt-in to a
+            // specific stack shape.
+            layer_stack: LayerStack::default(),
             splat_config: SplatConfig::default(),
             splat_distribution: None,
             splat_brush_state: SplatBrushState::default(),

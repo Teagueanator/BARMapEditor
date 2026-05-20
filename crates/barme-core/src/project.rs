@@ -25,6 +25,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::warn;
 
+use crate::layers::{LayerStack, SlotResolver};
 use crate::mapinfo_schema::WaterBlock;
 use crate::water_presets::WaterMode;
 use crate::{MapSize, SplatConfig, SplatDistribution};
@@ -91,6 +92,14 @@ pub struct Project {
     /// pre-Sprint-9 `.barmeproj` files.
     #[serde(default)]
     pub splat_config: SplatConfig,
+    /// D8 / Sprint 15 (ADR-038): the Photoshop-style texture layer
+    /// stack. Drives the `.sd7` diffuse bake. `#[serde(default)]` so
+    /// pre-Sprint-15 projects load with an empty stack and then
+    /// migrate via [`Project::after_load_migrate`]. The legacy
+    /// `splat_config` field above stays as the source of truth for
+    /// the runtime DNTS path until Sprint 17 retires it.
+    #[serde(default, skip_serializing_if = "layer_stack_is_empty")]
+    pub layers: LayerStack,
     /// D5 / Sprint 9: the painted RGBA distribution. Allocated on
     /// first stamp; `#[serde(skip)]` because 4 MB does not belong in
     /// a TOML manifest. D6 (Sprint 12) will ship the PNG sidecar
@@ -211,6 +220,14 @@ pub fn default_extractor_radius() -> f32 {
 /// field.
 fn water_block_is_empty(b: &WaterBlock) -> bool {
     *b == WaterBlock::default()
+}
+
+/// `Project.layers` skip-serialize-if guard. Keeps the TOML quiet for
+/// fresh-from-disk projects whose stack hasn't been seeded yet (e.g.
+/// the `barme-pipeline` smoke example that builds a bare `Project`
+/// directly).
+fn layer_stack_is_empty(stack: &LayerStack) -> bool {
+    stack.layers.is_empty()
 }
 
 /// One ally team's worth of spawn data (ADR-032).
@@ -426,6 +443,8 @@ struct ProjectWire {
     #[serde(default)]
     splat_config: SplatConfig,
     #[serde(default)]
+    layers: LayerStack,
+    #[serde(default)]
     metal_spots: Vec<MetalSpot>,
     #[serde(default)]
     geo_vents: Vec<GeoVent>,
@@ -462,6 +481,7 @@ impl From<ProjectWire> for Project {
             next_steps_dismissed: w.next_steps_dismissed,
             splat_config: w.splat_config,
             splat_distribution: None,
+            layers: w.layers,
             metal_spots: w.metal_spots,
             geo_vents: w.geo_vents,
             features: w.features,
@@ -575,9 +595,10 @@ impl Project {
     pub const SCHEMA_V: u32 = 1;
 
     pub fn new(name: impl Into<String>, smu: u32) -> Self {
+        let size = MapSize::square(smu);
         Self {
             name: name.into(),
-            size: MapSize::square(smu),
+            size,
             min_height: 0.0,
             max_height: 256.0,
             heightmap: None,
@@ -586,6 +607,11 @@ impl Project {
             next_steps_dismissed: false,
             splat_config: SplatConfig::default(),
             splat_distribution: None,
+            // D8 / Sprint 15 (ADR-038): single-layer biome-base seed
+            // so fresh projects always have a non-empty stack.
+            // Callers with a wizard biome label can override by
+            // re-seeding via `LayerStack::from_biome` after `new`.
+            layers: LayerStack::from_biome("", size),
             metal_spots: Vec::new(),
             geo_vents: Vec::new(),
             features: Vec::new(),
@@ -598,6 +624,35 @@ impl Project {
             lava_atmosphere: false,
             schema_v: Self::SCHEMA_V,
         }
+    }
+
+    /// D8 / Sprint 15 (ADR-038): seed [`Self::layers`] from
+    /// [`Self::splat_config`] if (and only if) the stack is currently
+    /// empty. Idempotent — guarded by `layers.layers.is_empty()` so a
+    /// user who explicitly deletes every layer in Sprint 17+ and
+    /// re-opens does NOT get the migration re-fired.
+    ///
+    /// Call this once at load time from the app (after
+    /// [`Self::load_from_file`]). The pre-D8 splat painting is NOT
+    /// migrated to mask pixels in Sprint 15 — Sprint 17 will surface
+    /// a one-time migration prompt when the new emission path takes
+    /// over.
+    pub fn after_load_migrate(&mut self, slot_resolver: &dyn SlotResolver) {
+        if !self.layers.layers.is_empty() {
+            return;
+        }
+        let size = self.size;
+        let cfg = self.splat_config.clone();
+        let seeded =
+            LayerStack::migrate_from_splat_config(&cfg, |i| cfg.channels[i as usize], size);
+        if !seeded.layers.is_empty() {
+            tracing::info!(
+                layer_count = seeded.layers.len(),
+                "project: seeding layer stack from pre-D8 splat_config"
+            );
+            self.layers = seeded;
+        }
+        let _ = slot_resolver; // future: warn when bound slot ids miss the registry
     }
 
     /// Apply load-time migrations in order. Runs exactly once on
@@ -1291,6 +1346,97 @@ smu_z = 4
         assert!(s.contains("lava_atmosphere = true"));
         let p2: Project = toml::from_str(&s).unwrap();
         assert!(p2.lava_atmosphere);
+    }
+
+    // ─────── D8 / Sprint 15 (ADR-038) — layered painter ───────
+
+    /// `Project::new` seeds a single-layer biome-base stack (slot 0),
+    /// so a fresh project's bake hits the layer path rather than the
+    /// `synth_biome_bmp` fallback.
+    #[test]
+    fn new_project_seeds_single_layer_stack() {
+        let p = Project::new("fresh", 4);
+        assert_eq!(p.layers.layers.len(), 1);
+        match &p.layers.layers[0].source {
+            crate::layers::LayerSource::Slot { id } => assert_eq!(*id, 0),
+            other => panic!("expected Slot{{0}}, got {other:?}"),
+        }
+    }
+
+    /// Pre-Sprint-15 `.barmeproj` files have no `[layers]` block — they
+    /// must load with an empty stack (which the app's
+    /// `after_load_migrate` then seeds from `splat_config`).
+    #[test]
+    fn pre_sprint_15_project_loads_with_empty_layer_stack() {
+        let toml_str = r#"
+name = "pre_d8"
+min_height = 0.0
+max_height = 256.0
+
+[size]
+smu_x = 4
+smu_z = 4
+
+[splat_config]
+channels = [0, 1, -1, -1]
+tex_scales = [0.02, 0.02, 0.02, 0.02]
+tex_mults = [1.0, 1.0, 1.0, 1.0]
+"#;
+        let p: Project = toml::from_str(toml_str).unwrap();
+        assert!(p.layers.layers.is_empty());
+        // `splat_config` survives — Sprint 17 retires it; Sprint 15
+        // keeps both side-by-side.
+        assert_eq!(p.splat_config.channels[0], Some(0));
+        assert_eq!(p.splat_config.channels[1], Some(1));
+    }
+
+    /// `after_load_migrate` seeds one layer per bound DNTS channel
+    /// when the stack starts empty. Idempotent on re-run.
+    #[test]
+    fn after_load_migrate_seeds_layers_from_splat_config_once() {
+        struct NullResolver;
+        impl crate::layers::SlotResolver for NullResolver {
+            fn diffuse_path(&self, _slot_id: u8) -> Option<std::path::PathBuf> {
+                None
+            }
+        }
+        let mut p = Project::new("legacy", 4);
+        p.layers.layers.clear(); // pretend we just loaded a pre-D8 file
+        p.splat_config.channels = [Some(0), Some(2), None, Some(7)];
+        p.after_load_migrate(&NullResolver);
+        assert_eq!(p.layers.layers.len(), 3);
+        // Calling again is a no-op (stack non-empty).
+        p.after_load_migrate(&NullResolver);
+        assert_eq!(p.layers.layers.len(), 3);
+    }
+
+    /// User-deletes-everything path: even if `splat_config` has bound
+    /// channels, an explicitly-emptied stack must not be re-seeded by
+    /// `after_load_migrate`.
+    #[test]
+    fn after_load_migrate_does_not_re_seed_an_explicitly_emptied_stack() {
+        // The guard is `layers.is_empty()`. Sprint 17 will surface a
+        // UI to delete every layer; until then this test pins the
+        // contract.
+        struct NullResolver;
+        impl crate::layers::SlotResolver for NullResolver {
+            fn diffuse_path(&self, _slot_id: u8) -> Option<std::path::PathBuf> {
+                None
+            }
+        }
+        let mut p = Project::new("user-empty", 4);
+        p.splat_config.channels = [Some(0), Some(1), None, None];
+        // Seed once.
+        p.layers.layers.clear();
+        p.after_load_migrate(&NullResolver);
+        assert!(!p.layers.layers.is_empty());
+        // Save / re-load: stack persists; migrate is now a no-op
+        // because the stack is non-empty.
+        let s = toml::to_string(&p).unwrap();
+        let mut p2: Project = toml::from_str(&s).unwrap();
+        let layer_count_before = p2.layers.layers.len();
+        p2.after_load_migrate(&NullResolver);
+        assert_eq!(p2.layers.layers.len(), layer_count_before);
     }
 
     #[test]
