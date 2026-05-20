@@ -88,14 +88,12 @@ fn main() -> Result<()> {
 }
 
 fn paint_left_half(mask: &mut LayerMask) {
+    // Sprint 16 (ADR-039): mask storage is tiled COW; the functional
+    // `write_rect_with` writes the left half in one call without
+    // exposing the underlying tile layout.
     let half_w = mask.width / 2;
-    let stride = mask.width as usize;
-    for y in 0..mask.height {
-        let row_start = (y as usize) * stride;
-        for x in 0..half_w {
-            mask.bytes[row_start + x as usize] = 255;
-        }
-    }
+    let h = mask.height;
+    mask.write_rect_with(0, 0, half_w, h, |_, _| 255);
 }
 
 fn repo_root() -> PathBuf {

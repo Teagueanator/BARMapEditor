@@ -1,4 +1,5 @@
-//! Layered texture stack (D8 / Sprint 15, ADR-038).
+//! Layered texture stack (D8 / Sprint 15, ADR-038 + D9 / Sprint 16,
+//! ADR-039 + ADR-040).
 //!
 //! Sits above [`crate::splat`] (the BAR-runtime 4-channel splat
 //! distribution) and below the .sd7 export bake. A [`LayerStack`]
@@ -7,7 +8,7 @@
 //! [`SplatChannel`] binding, and a per-layer alpha mask sized to the
 //! map's diffuse dims (`512 × SMU` per side).
 //!
-//! Sprint 15 ships:
+//! Sprint 15 shipped:
 //! - The data model + serde.
 //! - Migration from `Project.splat_config` (one layer seeded per
 //!   bound DNTS slot at load time).
@@ -20,13 +21,21 @@
 //!   without a layers block, plus the `barme-pipeline` smoke
 //!   example that builds a bare `Project` directly).
 //!
-//! Sprint 16 adds: tiled COW masks, layer mask brushes, the GPU
-//! composite preview shader, the top-down 2D paint viewport.
+//! Sprint 16 (this revision) replaces the flat-bytes [`LayerMask`]
+//! storage with a tiled copy-on-write grid (see [`mask`]) so 8192² ×
+//! 16-layer memory stays bounded by paint coverage, and adds the
+//! four mask brushes (`mask-reveal`, `mask-hide`, `mask-smooth`,
+//! `mask-fill`) in [`brushes`]. The bake compositor is unchanged —
+//! it still iterates [`LayerMask::sample`], which fast-paths
+//! `Uniform` tiles.
 //!
 //! Sprint 17 adds: Photoshop-style Layers panel, custom texture
 //! import (file picker + drag-drop), DNTS hybrid emission
 //! (bottom ≤4 DNTS-bound layers drive splat distribution + DDS
 //! bake), retirement of `inspector_splat`.
+
+pub mod brushes;
+pub mod mask;
 
 use std::path::PathBuf;
 
@@ -37,7 +46,11 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use crate::MapSize;
+use crate::brushes::DirtyRect;
 use crate::splat::{SplatChannel, SplatConfig};
+
+pub use brushes::{MaskBrush, MaskBrushRegistry, MaskFill, MaskHide, MaskReveal, MaskSmooth};
+pub use mask::{LayerMask, MaskStamp, TILE_DIM, TILE_PIXELS, TileCoord};
 
 // ---------------------------------------------------------------------------
 // Source / transform / colour / blend
@@ -130,114 +143,6 @@ impl Default for LayerColor {
 pub enum BlendMode {
     #[default]
     Normal,
-}
-
-// ---------------------------------------------------------------------------
-// Mask
-// ---------------------------------------------------------------------------
-
-/// Grayscale alpha mask sized to the diffuse (`512 × SMU` per side).
-///
-/// Storage is a flat `Vec<u8>` for Sprint 15; Sprint 16 (D9) swaps the
-/// internals for a tiled-COW structure but the public surface
-/// ([`Self::write_rect`], [`Self::sample`]) stays.
-///
-/// `bytes[i] = 255` → layer fully visible at pixel i.
-/// `bytes[i] = 0`   → fully transparent (lower layers show through).
-///
-/// **Memory.** A 16-SMU map mask = `8192² × 1` = 64 MB per layer
-/// resident. The [`LayerStack::bake_diffuse`] path `warn!`s when the
-/// total cross-layer mask cost exceeds 256 MB.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LayerMask {
-    pub width: u32,
-    pub height: u32,
-    #[serde(with = "mask_bytes_b64")]
-    pub bytes: Vec<u8>,
-}
-
-impl LayerMask {
-    /// Allocate a mask filled with `fill` at `size.texture_dims()`.
-    ///
-    /// TODO(tiled-cow): replace the flat allocation with a tiled COW
-    /// structure adapted from ADR-018's heightmap-undo pattern when
-    /// Sprint 16 (D9) lands. The public methods on `LayerMask` stay
-    /// shaped so callers don't need to change.
-    pub fn filled(size: MapSize, fill: u8) -> Self {
-        let (w, h) = size.texture_dims();
-        let bytes = vec![fill; (w as usize) * (h as usize)];
-        Self {
-            width: w,
-            height: h,
-            bytes,
-        }
-    }
-
-    /// Sample the mask at integer pixel coordinates. Returns `0` for
-    /// out-of-bounds reads — the compositor calls this with clamped
-    /// integer indices and never goes off the edge in practice; the
-    /// guard is defensive.
-    pub fn sample(&self, x: u32, y: u32) -> u8 {
-        if x >= self.width || y >= self.height {
-            return 0;
-        }
-        self.bytes[(y as usize) * (self.width as usize) + (x as usize)]
-    }
-
-    /// Stub for Sprint 16's mask-brush write path. The shape mirrors
-    /// the heightmap brushes' dirty-rect upload (ADR-018) so the GPU
-    /// upload in D9 can use it directly. **Not called from Sprint 15.**
-    ///
-    /// `src` must be `rect.w * rect.h` bytes in row-major order; out-
-    /// of-bounds writes are clipped silently. Returns the actual
-    /// clipped rect.
-    pub fn write_rect(
-        &mut self,
-        x: u32,
-        y: u32,
-        w: u32,
-        h: u32,
-        src: &[u8],
-    ) -> Option<(u32, u32, u32, u32)> {
-        if w == 0 || h == 0 || x >= self.width || y >= self.height {
-            return None;
-        }
-        let cw = w.min(self.width - x);
-        let ch = h.min(self.height - y);
-        let stride = self.width as usize;
-        for row in 0..ch {
-            let dst_start = (y as usize + row as usize) * stride + x as usize;
-            let src_start = (row as usize) * (w as usize);
-            self.bytes[dst_start..dst_start + cw as usize]
-                .copy_from_slice(&src[src_start..src_start + cw as usize]);
-        }
-        Some((x, y, cw, ch))
-    }
-}
-
-/// Base64 serde for `LayerMask::bytes`. Sprint 16 (D9) will replace
-/// this with a sidecar-PNG schema once the tiled-COW model lands and
-/// per-layer masks live at `<project>/masks/<layer_id>.png`. The
-/// schema migration is tracked under D9.
-mod mask_bytes_b64 {
-    use base64::Engine;
-    use base64::engine::general_purpose::STANDARD as BASE64;
-    use serde::{Deserialize, Deserializer, Serializer};
-
-    pub fn serialize<S: Serializer>(v: &[u8], s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_str(&BASE64.encode(v))
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
-        // `String::deserialize` rather than `<&str>::deserialize` —
-        // TOML doesn't always hand back a borrowed view (long strings
-        // can land owned), and the borrowed path was failing on the
-        // mask-round-trip test with `invalid type: string`.
-        let s = String::deserialize(d)?;
-        BASE64
-            .decode(s.as_bytes())
-            .map_err(serde::de::Error::custom)
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -464,13 +369,20 @@ impl LayerStack {
             .map(|l| ResolvedLayer::prepare(l, slot_resolver))
             .collect();
 
-        let total_mask_bytes: usize = resolved.iter().map(|r| r.layer_mask.bytes.len()).sum();
-        if total_mask_bytes > 256 * 1024 * 1024 {
+        // Sprint 16: `resident_bytes` reports the LIVE tile cost
+        // (uniform tiles cost ~16 bytes; concrete tiles cost 64 KB).
+        // An unpainted 16-SMU × 16-layer stack lands at ~256 KB; the
+        // historical 1 GB worst case only materialises once every
+        // tile is concrete (i.e. the user has actually painted
+        // wall-to-wall on every layer). Threshold raised to 1 GB to
+        // match the new ceiling.
+        let total_mask_bytes: usize = resolved.iter().map(|r| r.layer_mask.resident_bytes()).sum();
+        if total_mask_bytes > 1024 * 1024 * 1024 {
             warn!(
                 total_mask_mb = total_mask_bytes / (1024 * 1024),
                 layer_count = resolved.len(),
-                "bake_diffuse: layer-mask working set exceeds 256 MB; tiled-COW (D9 / Sprint 16) \
-                 hasn't landed yet"
+                "bake_diffuse: layer-mask working set exceeds 1 GB resident — every layer is \
+                 fully painted; consider flattening before export"
             );
         }
 
@@ -548,8 +460,53 @@ impl LayerStack {
     /// want a heads-up before the bake (e.g. a UI warn-popover before
     /// a click-build). Counts only mask bytes — source diffuses live
     /// off the project model and aren't owned here.
+    ///
+    /// Sprint 16: backed by [`LayerMask::resident_bytes`] which sums
+    /// the per-tile cost. A freshly-filled 16-SMU layer reports
+    /// ~16 KB regardless of `mask_fill`; a fully-painted layer
+    /// reports the same 64 MB the flat-byte storage did.
     pub fn resident_mask_bytes(&self) -> usize {
-        self.layers.iter().map(|l| l.mask.bytes.len()).sum()
+        self.layers.iter().map(|l| l.mask.resident_bytes()).sum()
+    }
+
+    /// Look up a layer by id for in-place mutation. Used by the
+    /// Sprint-16 paint dispatcher (`apply_brush`) and by the
+    /// Sprint-17 Layers panel to drive single-layer edits. Returns
+    /// `None` if no layer carries the id.
+    pub fn active_layer_mut(&mut self, id: &str) -> Option<&mut TextureLayer> {
+        self.layers.iter_mut().find(|l| l.id == id)
+    }
+
+    /// Look up a layer by id (read-only). Used by the Sprint-16
+    /// paint viewport's active-layer strip + the mask-only preview
+    /// toggle.
+    pub fn layer_by_id(&self, id: &str) -> Option<&TextureLayer> {
+        self.layers.iter().find(|l| l.id == id)
+    }
+
+    /// Dispatch a single brush stamp into the named layer. Returns
+    /// the [`DirtyRect`] the brush actually touched, or `None` if
+    /// the layer doesn't exist / the brush's `apply` declined to
+    /// touch any pixels (off-map, zero strength, etc.).
+    ///
+    /// This is the entry point the Sprint-16 paint viewport calls
+    /// per stamp during a drag. The dirty rect feeds the GPU
+    /// composite's `recomposite_dirty` pass + the `dirty_tiles_since`
+    /// upload list.
+    pub fn apply_brush(
+        &mut self,
+        layer_id: &str,
+        brush: &dyn MaskBrush,
+        stamp: MaskStamp,
+    ) -> Option<DirtyRect> {
+        let layer = self.active_layer_mut(layer_id)?;
+        if layer.locked {
+            // Locked layers ignore brush input — keeps the
+            // Sprint-17 lock toggle honest even when the active
+            // layer chip stays selected.
+            return None;
+        }
+        brush.apply(&mut layer.mask, stamp)
     }
 }
 
@@ -831,8 +788,11 @@ mod tests {
         let m = LayerMask::filled(MapSize::square(2), 255);
         assert_eq!(m.width, 1024);
         assert_eq!(m.height, 1024);
-        assert_eq!(m.bytes.len(), 1024 * 1024);
-        assert!(m.bytes.iter().all(|&b| b == 255));
+        // Sprint 16: storage is tiled COW, so byte-len isn't a thing
+        // any more; spot-check via `sample` instead.
+        assert_eq!(m.sample(0, 0), 255);
+        assert_eq!(m.sample(512, 512), 255);
+        assert_eq!(m.sample(1023, 1023), 255);
     }
 
     #[test]
@@ -858,24 +818,41 @@ mod tests {
         assert_eq!(m.sample(u32::MAX, u32::MAX), 0);
     }
 
+    /// Sprint 16: the tiled-wire round-trip lives next to its storage
+    /// in [`mask::tests`]. This test pins the legacy migration path
+    /// from outside the storage module — drop a `LayerMask` into a
+    /// stack, save the stack as TOML, reload it, confirm the painted
+    /// pixels survive.
     #[test]
-    fn mask_bytes_round_trip_through_base64_toml() {
+    fn layer_mask_round_trip_through_stack_toml() {
         let mut m = LayerMask::filled(MapSize::square(2), 0);
-        m.bytes[0] = 1;
-        m.bytes[42] = 200;
-        let last_idx = m.bytes.len() - 1;
-        m.bytes[last_idx] = 99;
-        let s = match toml::to_string(&m) {
-            Ok(s) => s,
-            Err(e) => panic!("toml::to_string error: {e}"),
+        m.set_pixel(0, 0, 1);
+        m.set_pixel(42, 0, 200);
+        m.set_pixel(1023, 1023, 99);
+        let layer = TextureLayer {
+            id: alloc_layer_id(),
+            name: "test".into(),
+            source: LayerSource::Slot { id: 0 },
+            transform: LayerTransform::default(),
+            color: LayerColor::default(),
+            blend: BlendMode::default(),
+            visible: true,
+            locked: false,
+            dnts_channel: None,
+            opacity: 1.0,
+            mask: m,
         };
-        let m2: LayerMask = toml::from_str(&s).unwrap();
-        assert_eq!(m.width, m2.width);
-        assert_eq!(m.height, m2.height);
-        assert_eq!(m.bytes.len(), m2.bytes.len());
-        assert_eq!(m.bytes[0], m2.bytes[0]);
-        assert_eq!(m.bytes[42], m2.bytes[42]);
-        assert_eq!(m.bytes[last_idx], m2.bytes[last_idx]);
+        let stack = LayerStack {
+            layers: vec![layer],
+        };
+        let s = toml::to_string(&stack).unwrap();
+        let stack2: LayerStack = toml::from_str(&s).unwrap();
+        let m2 = &stack2.layers[0].mask;
+        assert_eq!(m2.width, 1024);
+        assert_eq!(m2.height, 1024);
+        assert_eq!(m2.sample(0, 0), 1);
+        assert_eq!(m2.sample(42, 0), 200);
+        assert_eq!(m2.sample(1023, 1023), 99);
     }
 
     #[test]
@@ -886,7 +863,9 @@ mod tests {
             LayerSource::Slot { id } => assert_eq!(*id, 0),
             other => panic!("expected Slot{{0}}, got {other:?}"),
         }
-        assert!(stack.layers[0].mask.bytes.iter().all(|&b| b == 255));
+        // Mask is uniformly 255 (bottom base layer).
+        assert_eq!(stack.layers[0].mask.sample(0, 0), 255);
+        assert_eq!(stack.layers[0].mask.sample(1023, 1023), 255);
         assert!(stack.layers[0].dnts_channel.is_none());
     }
 
@@ -918,9 +897,9 @@ mod tests {
         assert_eq!(stack.layers[1].dnts_channel, Some(SplatChannel::G));
         assert_eq!(stack.layers[2].dnts_channel, Some(SplatChannel::A));
         // Bottom mask full; subsequent empty.
-        assert!(stack.layers[0].mask.bytes.iter().all(|&b| b == 255));
-        assert!(stack.layers[1].mask.bytes.iter().all(|&b| b == 0));
-        assert!(stack.layers[2].mask.bytes.iter().all(|&b| b == 0));
+        assert_eq!(stack.layers[0].mask.sample(512, 512), 255);
+        assert_eq!(stack.layers[1].mask.sample(512, 512), 0);
+        assert_eq!(stack.layers[2].mask.sample(512, 512), 0);
     }
 
     #[test]
@@ -1054,7 +1033,7 @@ mod tests {
     }
 
     #[test]
-    fn resident_mask_bytes_sums_each_layer() {
+    fn resident_mask_bytes_sums_each_layer_under_tile_budget() {
         let cfg = SplatConfig {
             channels: [Some(0), Some(1), None, None],
             ..Default::default()
@@ -1064,9 +1043,41 @@ mod tests {
             |i| cfg.channels[i as usize],
             MapSize::square(2),
         );
-        let (w, h) = MapSize::square(2).texture_dims();
-        let per_layer = (w as usize) * (h as usize);
-        assert_eq!(stack.resident_mask_bytes(), 2 * per_layer);
+        // Sprint 16: two layers with uniformly-filled masks → both
+        // collapse to all-`Uniform` tile grids. Cost is dominated by
+        // the 16-tile metadata, ~16 bytes per Tile + 8 bytes per
+        // version. ~384 bytes per layer; total well under 4 KB.
+        let bytes = stack.resident_mask_bytes();
+        assert!(
+            bytes < 4 * 1024,
+            "freshly-migrated 2-layer stack should fit in 4 KB; got {bytes} B"
+        );
+        // After painting a stamp into layer 0, that layer's cost
+        // jumps by ~one tile (64 KB) for the promoted Pixels tile.
+        // The non-painted layer 1 stays under the metadata budget.
+        let layer_id = stack.layers[0].id.clone();
+        // Sample a brush dispatch through the stack-level API.
+        let mut stack = stack;
+        let brush = MaskReveal;
+        // Stamp well inside a single tile (away from 256-boundary
+        // crossings) so only one Pixels tile materialises.
+        let stamp = MaskStamp {
+            world_x: 100.0,
+            world_z: 100.0,
+            radius: 16.0,
+            strength: 1.0,
+            target_visible: true,
+        };
+        let dirty = stack.apply_brush(&layer_id, &brush, stamp).unwrap();
+        assert!(dirty.w > 0);
+        let after = stack.resident_mask_bytes();
+        assert!(after > bytes, "painting must grow resident bytes");
+        // One tile = 64 KB; allow headroom for both layers' metadata
+        // + the promoted Pixels tile.
+        assert!(
+            after < 4 * 1024 + 64 * 1024 + 1024,
+            "expected ~64 KB jump for one promoted tile; got {after} B"
+        );
     }
 
     /// Pin the layer-id allocator: subsequent ids in the same

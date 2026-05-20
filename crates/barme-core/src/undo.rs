@@ -354,7 +354,12 @@ impl ProjectDiff {
 }
 
 fn layer_bytes(layer: &TextureLayer) -> usize {
-    let mask = layer.mask.bytes.capacity();
+    // Sprint 16: mask cost = LIVE tile cost (Uniform tiles ~16 B
+    // each, Pixels tiles 64 KB each). A freshly-added empty layer
+    // costs ~16 KB on a 16-SMU map regardless of resolution;
+    // diffing it via `AddLayer` no longer sandbags the cap with
+    // 64 MB of zeroed bytes the way Sprint 15 did.
+    let mask = layer.mask.resident_bytes();
     let source = match &layer.source {
         LayerSource::Slot { .. } => 0,
         // OsStr is a thin wrapper; capacity sits on the inner buffer
@@ -1612,7 +1617,7 @@ mod tests {
             unreachable!()
         };
         let expected_add =
-            inline + add_l.mask.bytes.capacity() + add_l.id.capacity() + add_l.name.capacity();
+            inline + add_l.mask.resident_bytes() + add_l.id.capacity() + add_l.name.capacity();
         assert_eq!(add.bytes(), expected_add);
 
         let rm = ProjectDiff::RemoveLayer {
@@ -1626,7 +1631,7 @@ mod tests {
             unreachable!()
         };
         let expected_rm =
-            inline + rm_l.mask.bytes.capacity() + rm_l.id.capacity() + rm_l.name.capacity();
+            inline + rm_l.mask.resident_bytes() + rm_l.id.capacity() + rm_l.name.capacity();
         assert_eq!(rm.bytes(), expected_rm);
     }
 
@@ -1649,18 +1654,36 @@ mod tests {
         assert!(!h.can_redo());
     }
 
-    /// `AddLayer` of a 16-SMU mask = 64 MB. The cap eviction must
-    /// kick out the mask-heavy entry when smaller ProjectDiffs share
-    /// the stack, matching the `cap_evicts_largest_not_oldest` shape
-    /// of the heightmap path.
+    /// `AddLayer` of a fully-painted 16-SMU mask = 64 MB worth of
+    /// concrete tiles. The cap eviction must kick out the mask-heavy
+    /// entry when smaller ProjectDiffs share the stack, matching the
+    /// `cap_evicts_largest_not_oldest` shape of the heightmap path.
+    ///
+    /// Sprint 16 (tiled COW): an uniform-fill mask is ~1 KB resident
+    /// (only the tile metadata + version array). To exercise the
+    /// eviction path, force every tile into `Pixels` by painting a
+    /// stamp that wraps the whole mask before snapshotting the layer.
     #[test]
     fn add_layer_with_big_mask_is_largest_and_gets_evicted_first() {
-        let layer = crate::layers::TextureLayer::new(
+        let mut layer = crate::layers::TextureLayer::new(
             crate::layers::LayerSource::Slot { id: 0 },
             crate::MapSize::square(4),
             255,
         );
-        let mask_bytes = layer.mask.bytes.capacity();
+        // Force every tile to materialise as `Pixels` so the mask
+        // actually consumes its full byte budget. A single stamp
+        // that covers the whole mask + a non-identity value writes
+        // every tile through `write_rect_with`, promoting them all.
+        let (w, h) = (layer.mask.width, layer.mask.height);
+        layer.mask.write_rect_with(0, 0, w, h, |_, _| 200).unwrap();
+        let mask_bytes = layer.mask.resident_bytes();
+        // Sanity: every tile promoted → cost should be at least the
+        // raw pixel count.
+        assert!(
+            mask_bytes >= (w as usize) * (h as usize),
+            "expected fully-painted mask >= {} bytes, got {mask_bytes}",
+            (w as usize) * (h as usize)
+        );
 
         // Cap small enough to evict the layer but not the four
         // ReorderLayer entries (which are inline-sized).
