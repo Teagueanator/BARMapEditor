@@ -225,6 +225,14 @@ struct App {
     show_intro: bool,
     /// Whether the `?` cheat-sheet modal is open this frame.
     show_cheat_sheet: bool,
+    /// Sprint 19 / U1 — is the lint-panel window open this frame? Driven by
+    /// the top-bar validation chip and the status-strip issue-count label.
+    /// Stub today; Sprint 21 / C8 lands the full `LintRule` registry.
+    lint_panel_open: bool,
+    /// Sprint 19 / U1 — previous-frame snapshot so `lint_panel::render`
+    /// can emit `trace!` exactly on the open / close transitions
+    /// without spamming the log every frame.
+    lint_panel_was_open: bool,
     /// Retired by ADR-035 — the nav gizmo was replaced by the
     /// top-down mini-map. Field kept (always-false) only because
     /// removing it churns tests + downstream init blocks; clean
@@ -1287,6 +1295,8 @@ impl App {
             editor_config,
             show_intro,
             show_cheat_sheet: false,
+            lint_panel_open: false,
+            lint_panel_was_open: false,
             nav_gizmo_drag_active: false,
             build_variant: BuildVariant::default(),
             mapinfo_overrides: std::collections::HashMap::new(),
@@ -5637,17 +5647,33 @@ impl App {
     /// `TextEdit` doesn't eat keystrokes and bounce the user out of
     /// Procgen mid-edit.
     fn handle_keyboard(&mut self, ctx: &egui::Context, action: &mut Option<FileAction>) {
-        let (key_undo, key_redo) = ctx.input(|i| {
+        let (key_undo, key_redo, key_save, key_save_as) = ctx.input(|i| {
             let cmd = i.modifiers.command;
             let shift = i.modifiers.shift;
             let z = i.key_pressed(egui::Key::Z);
             let y = i.key_pressed(egui::Key::Y);
-            (cmd && !shift && z, (cmd && shift && z) || (cmd && y))
+            let s = i.key_pressed(egui::Key::S);
+            (
+                cmd && !shift && z,
+                (cmd && shift && z) || (cmd && y),
+                cmd && !shift && s,
+                cmd && shift && s,
+            )
         });
         if key_undo {
             *action = Some(FileAction::Undo);
         } else if key_redo {
             *action = Some(FileAction::Redo);
+        } else if key_save_as {
+            // Sprint 19 / U1 — Ctrl+Shift+S = Save as. Documented in
+            // `cheat_sheet::PROJECT_BINDINGS`; the tooltip catalogue
+            // does not cite it directly today.
+            *action = Some(FileAction::SaveAs);
+        } else if key_save {
+            // Sprint 19 / U1 — Ctrl+S = Save. The top-bar Save
+            // button's hover-text cites this chord; the binding lives
+            // in `cheat_sheet::PROJECT_BINDINGS` for the cheat sheet.
+            *action = Some(FileAction::Save);
         }
 
         if ctx.wants_keyboard_input() {
@@ -6188,6 +6214,7 @@ impl App {
     }
 
     fn top_bar_right_block(&mut self, ui: &mut egui::Ui, action: &mut Option<FileAction>) {
+        use crate::ui::help_text::{HelpId, help};
         use crate::ui::icons::Icon;
         let t = crate::ui::theme::Tokens::DARK;
 
@@ -6197,7 +6224,7 @@ impl App {
         // back without manually orbiting.
         let recenter_resp = ui
             .allocate_response(egui::vec2(30.0, 30.0), egui::Sense::click())
-            .on_hover_text("Recenter camera on map");
+            .on_hover_text(help(HelpId::TopBarRecenter));
         {
             let painter = ui.painter();
             let bg = if recenter_resp.hovered() {
@@ -6230,13 +6257,19 @@ impl App {
             "Build & install",
             can_run, // accent only when actionable
         );
+        let build_hover = match self.build_destination_hint() {
+            Some(path) => format!("{} → {}", help(HelpId::TopBarBuildPrimary), path),
+            None => help(HelpId::TopBarBuildPrimary).to_string(),
+        };
+        let primary = primary.on_hover_text(build_hover);
+        let _caret = caret.on_hover_text(help(HelpId::TopBarBuildVariant));
         if can_run
             && primary.clicked()
             && let Some(act) = self.build_variant.to_file_action()
         {
             *action = Some(act);
         }
-        egui::Popup::menu(&caret)
+        egui::Popup::menu(&_caret)
             .close_behavior(egui::PopupCloseBehavior::CloseOnClick)
             .show(|ui| {
                 ui.set_min_width(220.0);
@@ -6265,6 +6298,7 @@ impl App {
                     .fill(t.panel2)
                     .min_size(egui::vec2(60.0, 30.0)),
             )
+            .on_hover_text(help(HelpId::TopBarSave))
             .clicked()
         {
             *action = Some(FileAction::Save);
@@ -6274,65 +6308,125 @@ impl App {
         // C7 / Sprint 18 (F9): mapinfo form button. Opens an
         // egui::Window with the 12-tab editor. Non-modal so a user
         // can tweak gravity while painting splats.
-        if crate::ui::widgets::icon_button(ui, Icon::MapInfo, 30.0, "Edit mapinfo.lua (F9)")
+        if crate::ui::widgets::icon_button(ui, Icon::MapInfo, 30.0, help(HelpId::TopBarMapInfoForm))
             .clicked()
         {
             self.mapinfo_form_open = !self.mapinfo_form_open;
         }
         ui.add_space(4.0);
 
-        // Validation chip.
+        // Sprint 19 / U1 — top-bar Help (?) icon. Opens the cheat
+        // sheet (also reachable via the `?` chord). Sprint 22
+        // extends this into a full help center.
+        if crate::ui::widgets::icon_button(ui, Icon::Help, 30.0, help(HelpId::TopBarHelpIcon))
+            .clicked()
+        {
+            self.show_cheat_sheet = !self.show_cheat_sheet;
+        }
+        ui.add_space(4.0);
+
+        // Validation chip. Sprint 19 / U1 — clickable, opens the
+        // lint panel stub. Hover text reproduces the summary so the
+        // chip carries the same affordance the cheat-sheet does.
         let (tone, label) = self.validation_summary();
-        crate::ui::widgets::chip(ui, tone, label);
+        let chip_hover = format!("{} — Issue: {}", help(HelpId::TopBarValidationChip), label);
+        let chip_resp = crate::ui::widgets::chip(ui, tone, label).on_hover_text(chip_hover);
+        if chip_resp.clicked() {
+            self.lint_panel_open = !self.lint_panel_open;
+        }
+    }
+
+    /// Sprint 19 / U1 — best-effort string describing where a
+    /// Build & install click will write the `.sd7`. Used by the
+    /// top-bar tooltip. Returns `None` if the project doesn't have
+    /// a name yet (the empty-state placeholder).
+    fn build_destination_hint(&self) -> Option<String> {
+        if self.project_name.is_empty() {
+            None
+        } else {
+            Some(format!("{}.sd7", self.project_name))
+        }
     }
 
     /// Bottom status strip: live camera-orbit readout, project size,
     /// validation-chip placeholder, last-install / last-error state.
     /// C8 wires the validation chip to real lint output later.
     fn status_strip(&mut self, ctx: &egui::Context) {
+        use crate::ui::help_text::{HelpId, help};
         // 1-Hz repaint nudge so the camera readout stays current
         // while idle (pitfall §B4.2 — egui only repaints on input
         // otherwise). The hint is a no-op if a higher-frequency
         // repaint is already scheduled this frame.
         ctx.request_repaint_after(std::time::Duration::from_secs(1));
+        let (issue_tone, issue_label) = self.validation_summary();
+        let issue_count = crate::ui::lint_panel::issue_count(issue_tone);
+        let mut open_lint = false;
         egui::TopBottomPanel::bottom("status_strip").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 let cam = &self.camera;
-                ui.label(format!(
-                    "Cam: yaw {:.0}° pitch {:.0}° dist {:.0}",
-                    cam.yaw.to_degrees(),
-                    cam.pitch.to_degrees(),
-                    cam.distance,
-                ));
+                ui.add(
+                    egui::Label::new(format!(
+                        "Cam: yaw {:.0}° pitch {:.0}° dist {:.0}",
+                        cam.yaw.to_degrees(),
+                        cam.pitch.to_degrees(),
+                        cam.distance,
+                    ))
+                    .sense(egui::Sense::hover()),
+                )
+                .on_hover_text(help(HelpId::StatusCamera));
                 ui.separator();
                 let (hpx_x, hpx_z) = self.map_size.heightmap_dims();
-                ui.label(format!(
-                    "Map: {}×{} SMU ({}×{} px)",
-                    self.map_size.smu_x, self.map_size.smu_z, hpx_x, hpx_z,
-                ));
+                ui.add(
+                    egui::Label::new(format!(
+                        "Map: {}×{} SMU ({}×{} px)",
+                        self.map_size.smu_x, self.map_size.smu_z, hpx_x, hpx_z,
+                    ))
+                    .sense(egui::Sense::hover()),
+                )
+                .on_hover_text(help(HelpId::StatusMapSize));
                 ui.separator();
-                // Validation chip placeholder — wired in C8.
-                ui.label(egui::RichText::new("0 issues").weak());
+                // Sprint 19 / U1 — live issue count, clickable.
+                let issue_text = if issue_count == 0 {
+                    "0 issues".to_string()
+                } else {
+                    format!("{issue_count} issue · {issue_label}")
+                };
+                let issue_resp = ui
+                    .add(
+                        egui::Label::new(egui::RichText::new(issue_text).weak())
+                            .sense(egui::Sense::click()),
+                    )
+                    .on_hover_text(help(HelpId::StatusIssueCount));
+                if issue_resp.clicked() {
+                    open_lint = true;
+                }
                 ui.separator();
-                match &self.last_install {
-                    Some(Ok(p)) => {
-                        ui.colored_label(
-                            egui::Color32::GREEN,
-                            format!(
+                let install_resp = match &self.last_install {
+                    Some(Ok(p)) => ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(format!(
                                 "Installed: {}",
                                 p.file_name()
                                     .and_then(|s| s.to_str())
                                     .unwrap_or_else(|| p.to_str().unwrap_or("?")),
-                            ),
-                        );
-                    }
-                    Some(Err(msg)) => {
-                        ui.colored_label(egui::Color32::RED, format!("Install failed: {msg}"));
-                    }
-                    None => {
-                        ui.label(egui::RichText::new("Build: idle").weak());
-                    }
-                }
+                            ))
+                            .color(egui::Color32::GREEN),
+                        )
+                        .sense(egui::Sense::hover()),
+                    ),
+                    Some(Err(msg)) => ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(format!("Install failed: {msg}"))
+                                .color(egui::Color32::RED),
+                        )
+                        .sense(egui::Sense::hover()),
+                    ),
+                    None => ui.add(
+                        egui::Label::new(egui::RichText::new("Build: idle").weak())
+                            .sense(egui::Sense::hover()),
+                    ),
+                };
+                install_resp.on_hover_text(help(HelpId::StatusInstall));
                 if let Some(err) = &self.last_error {
                     ui.separator();
                     ui.colored_label(egui::Color32::RED, err);
@@ -6354,11 +6448,18 @@ impl App {
                 };
                 if let Some(text) = brush_chip {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(egui::RichText::new(text).monospace().weak());
+                        ui.add(
+                            egui::Label::new(egui::RichText::new(text).monospace().weak())
+                                .sense(egui::Sense::hover()),
+                        )
+                        .on_hover_text(help(HelpId::StatusBrushChip));
                     });
                 }
             });
         });
+        if open_lint {
+            self.lint_panel_open = true;
+        }
     }
 
     /// Left tool strip: 40 px fixed-width column of one selectable
@@ -9839,6 +9940,17 @@ impl eframe::App for App {
             );
         }
 
+        // Sprint 19 / U1 — lint-panel stub. Opens from the top-bar
+        // validation chip and the status-strip issue count; the panel
+        // itself owns close behaviour via the egui Window's X button.
+        let summary = self.validation_summary();
+        crate::ui::lint_panel::render(
+            ctx,
+            &mut self.lint_panel_open,
+            summary,
+            &mut self.lint_panel_was_open,
+        );
+
         // First-launch hint (B3). Renders ONLY after the wizard closes
         // so the two don't compete; this also serves a project on disk
         // that auto-applied via the wizard's default state.
@@ -10023,6 +10135,8 @@ mod tests {
             editor_config: config::EditorConfig::default(),
             show_intro: false,
             show_cheat_sheet: false,
+            lint_panel_open: false,
+            lint_panel_was_open: false,
             nav_gizmo_drag_active: false,
             build_variant: BuildVariant::default(),
             mapinfo_overrides: std::collections::HashMap::new(),

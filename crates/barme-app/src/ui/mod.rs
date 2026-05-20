@@ -10,6 +10,7 @@ pub mod icons;
 pub mod inspector_mapinfo;
 pub mod intro;
 pub mod layers_panel;
+pub mod lint_panel;
 pub mod markers;
 pub mod minimap;
 pub mod next_steps;

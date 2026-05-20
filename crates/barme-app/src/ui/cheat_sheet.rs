@@ -45,7 +45,9 @@ pub const SCULPT_BINDINGS: &[(&str, &str)] = &[
     ("Shift+drag", "Smooth (reserved)"),
 ];
 
-/// Project lifecycle bindings (ADR-035).
+/// Project lifecycle bindings (ADR-035). Sprint 19 / U1 promoted
+/// Ctrl+S and Ctrl+Shift+S from "reserved" to wired bindings —
+/// `handle_keyboard` now dispatches them. Ctrl+B is still reserved.
 pub const PROJECT_BINDINGS: &[(&str, &str)] = &[
     ("Ctrl+S", "Save"),
     ("Ctrl+Shift+S", "Save as…"),
