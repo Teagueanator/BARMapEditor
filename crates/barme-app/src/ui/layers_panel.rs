@@ -74,6 +74,15 @@ pub fn render(app: &mut App, ui: &mut egui::Ui) {
     // D10 / Sprint 17 (ADR-041) — also pre-resolve stock-slot
     // thumbnails for the Add-layer picker popup + the "Change slot…"
     // popup. The grid widget itself stays free of `&mut App`.
+    //
+    // Hotfix follow-up: per-frame cost is 16 cache lookups (one HashMap
+    // get per slot) after the first frame warms the cache. The first
+    // frame pays 16 PNG decodes serially — each decode peaks at ~8 MB
+    // transient (1024² × RGBA) but frees before the next slot starts,
+    // so sequential peak ≈ one PNG. If the warm-up correlates with
+    // OOM pressure on the user's 16-SMU project, the workaround is
+    // to scan a smaller texture pack or skip the picker (the "Add
+    // empty layer (any unused slot)" fallback in the same popup).
     let slot_registry_view: Vec<(u8, String)> = app
         .slot_registry
         .iter()
@@ -133,9 +142,7 @@ pub fn render(app: &mut App, ui: &mut egui::Ui) {
                                 .strong(),
                         );
                         ui.add_space(4.0);
-                        if let Some(slot_id) =
-                            widgets::slot_picker_grid(ui, &slot_picker_entries)
-                        {
+                        if let Some(slot_id) = widgets::slot_picker_grid(ui, &slot_picker_entries) {
                             actions
                                 .borrow_mut()
                                 .push(LayerAction::AddLayerFromSlot(slot_id));
@@ -655,221 +662,241 @@ fn render_layer_row(
     let name = snap.name.clone();
     let source_label = snap.source.default_label();
 
+    // D10 / Sprint 17 (ADR-041) — active-layer treatment: accent_dim
+    // background + a 3-px accent rail along the left edge so the
+    // selected row reads at a glance.
     let bg = if is_active { t.accent_dim } else { t.panel2 };
+    let stroke = if is_active {
+        egui::Stroke::new(1.5, t.accent)
+    } else {
+        egui::Stroke::new(1.0, t.border)
+    };
     let frame = egui::Frame::group(ui.style())
         .fill(bg)
+        .stroke(stroke)
         .corner_radius(4.0)
         .inner_margin(egui::Margin::symmetric(6, 4));
 
     let payload = layer_id.clone();
     let dnd_id = egui::Id::new(("layer_dnd", &layer_id));
 
-    let drag_source_inner = ui.dnd_drag_source(dnd_id, payload, |ui| {
-        let drop_response = ui.dnd_drop_zone::<String, _>(frame, |ui| {
-            ui.horizontal(|ui| {
-                // ── Drag handle (6 dots) ──
+    // D10 / Sprint 17 hotfix — drag-source is JUST the handle, not
+    // the whole row. Sprint-17 v1 wrapped the entire row body in
+    // `dnd_drag_source` which made every inner button start a drag
+    // instead of firing its click. The drop_zone still scopes the
+    // whole row so dropping anywhere on a target row reorders.
+    let drop_response = ui.dnd_drop_zone::<String, _>(frame, |ui| {
+        // Active-layer left-rail accent (paint manually since
+        // egui::Frame doesn't surface a per-side stroke).
+        if is_active {
+            let painter = ui.painter();
+            let rect = ui.max_rect();
+            let rail = egui::Rect::from_min_size(
+                egui::pos2(rect.left() - 4.0, rect.top() + 2.0),
+                egui::vec2(3.0, rect.height() - 4.0),
+            );
+            painter.rect_filled(rail, CornerRadius::same(1), t.accent);
+        }
+        ui.horizontal(|ui| {
+            // ── Drag handle (6 dots) — ONLY this initiates a drag.
+            ui.dnd_drag_source(dnd_id, payload.clone(), |ui| {
                 let (handle_rect, _) =
                     ui.allocate_exact_size(egui::vec2(10.0, 18.0), Sense::hover());
                 paint_drag_handle(ui, handle_rect, t.muted);
+            })
+            .response
+            .on_hover_text("Drag to reorder");
 
-                // ── Eye visibility ──
-                let eye = if visible { "👁" } else { "—" };
-                if ui
-                    .add(egui::Button::new(eye).small())
-                    .on_hover_text("Toggle visibility")
-                    .clicked()
-                {
-                    actions
-                        .borrow_mut()
-                        .push(LayerAction::ToggleVisible(layer_id.clone()));
-                }
+            // ── Eye visibility ──
+            let eye = if visible { "👁" } else { "—" };
+            if ui
+                .add(egui::Button::new(eye).small())
+                .on_hover_text("Toggle visibility")
+                .clicked()
+            {
+                actions
+                    .borrow_mut()
+                    .push(LayerAction::ToggleVisible(layer_id.clone()));
+            }
 
-                // ── Lock chip ──
-                let lock_label = if locked { "🔒" } else { "🔓" };
-                let lock_color = if locked { t.amber } else { t.muted };
-                let lock_resp = ui.add(
-                    egui::Button::new(egui::RichText::new(lock_label).color(lock_color)).small(),
-                );
-                if lock_resp
-                    .on_hover_text("Lock layer (mask brushes ignore locked layers)")
-                    .clicked()
-                {
-                    actions
-                        .borrow_mut()
-                        .push(LayerAction::ToggleLocked(layer_id.clone()));
-                }
+            // ── Lock chip ──
+            let lock_label = if locked { "🔒" } else { "🔓" };
+            let lock_color = if locked { t.amber } else { t.muted };
+            let lock_resp = ui
+                .add(egui::Button::new(egui::RichText::new(lock_label).color(lock_color)).small());
+            if lock_resp
+                .on_hover_text("Lock layer (mask brushes ignore locked layers)")
+                .clicked()
+            {
+                actions
+                    .borrow_mut()
+                    .push(LayerAction::ToggleLocked(layer_id.clone()));
+            }
 
-                // ── Thumbnail ──
-                paint_thumbnail(ui, thumb);
+            // ── Thumbnail ──
+            paint_thumbnail(ui, thumb);
 
-                // ── Name (inline rename) ──
-                let mut name_mut = name.clone();
-                let name_resp = ui.add(
-                    egui::TextEdit::singleline(&mut name_mut)
-                        .desired_width(ui.available_width() - 96.0)
-                        .frame(false),
-                );
-                if name_resp.lost_focus() && name_mut != name {
-                    actions
-                        .borrow_mut()
-                        .push(LayerAction::Rename(layer_id.clone(), name_mut));
-                }
-                if name_resp.clicked() {
-                    actions
-                        .borrow_mut()
-                        .push(LayerAction::SetActive(layer_id.clone()));
-                }
-
-                // ── DNTS chip ──
-                let chip_label = match dnts_channel {
-                    Some(SplatChannel::R) => "R",
-                    Some(SplatChannel::G) => "G",
-                    Some(SplatChannel::B) => "B",
-                    Some(SplatChannel::A) => "A",
-                    None => "∅",
-                };
-                let chip_color = match dnts_channel {
-                    Some(SplatChannel::R) => t.red,
-                    Some(SplatChannel::G) => t.green,
-                    Some(SplatChannel::B) => t.accent,
-                    Some(SplatChannel::A) => t.text,
-                    None => t.muted,
-                };
-                let chip_resp = ui.add(
-                    egui::Button::new(
-                        egui::RichText::new(chip_label)
-                            .color(chip_color)
-                            .monospace()
-                            .strong(),
-                    )
-                    .small(),
-                );
-                let chip_resp = chip_resp.on_hover_text(
-                    "DNTS channel — click to cycle R→G→B→A→∅\n\
-                     Right-click for picker (at most one layer per channel).",
-                );
-                if chip_resp.clicked() {
-                    let next = cycle_channel(dnts_channel);
-                    actions.borrow_mut().push(LayerAction::SetDntsChannel {
-                        layer_id: layer_id.clone(),
-                        new_channel: next,
-                    });
-                }
-                egui::Popup::context_menu(&chip_resp)
-                    .close_behavior(egui::PopupCloseBehavior::CloseOnClick)
-                    .show(|ui| {
-                        ui.set_min_width(140.0);
-                        for ch in [
-                            None,
-                            Some(SplatChannel::R),
-                            Some(SplatChannel::G),
-                            Some(SplatChannel::B),
-                            Some(SplatChannel::A),
-                        ] {
-                            let lbl = match ch {
-                                None => "None".to_string(),
-                                Some(SplatChannel::R) => "R (red)".to_string(),
-                                Some(SplatChannel::G) => "G (green)".to_string(),
-                                Some(SplatChannel::B) => "B (blue)".to_string(),
-                                Some(SplatChannel::A) => "A (alpha)".to_string(),
-                            };
-                            if ui
-                                .add(egui::Button::selectable(dnts_channel == ch, lbl))
-                                .clicked()
-                            {
-                                actions.borrow_mut().push(LayerAction::SetDntsChannel {
-                                    layer_id: layer_id.clone(),
-                                    new_channel: ch,
-                                });
-                            }
-                        }
-                    });
-
-                // ── Delete ──
-                if ui
-                    .add(egui::Button::new("×").small())
-                    .on_hover_text("Delete layer")
-                    .clicked()
-                {
-                    actions
-                        .borrow_mut()
-                        .push(LayerAction::Delete(layer_id.clone()));
-                }
-            });
-            // Second row: source label + opacity slider + import.
-            ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new(&source_label)
-                        .color(t.muted)
-                        .size(10.0)
-                        .monospace(),
-                );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
-                        .add(egui::Button::new("Import…").small())
-                        .on_hover_text("Replace this layer's source with a PNG/JPG from disk")
-                        .clicked()
-                    {
-                        actions
-                            .borrow_mut()
-                            .push(LayerAction::ImportTexture(layer_id.clone()));
-                    }
-                    let mut op = opacity;
-                    if ui
-                        .add(egui::Slider::new(&mut op, 0.0..=1.0).show_value(false))
-                        .on_hover_text(format!("Opacity: {:.0}%", op * 100.0))
-                        .changed()
-                    {
-                        actions
-                            .borrow_mut()
-                            .push(LayerAction::SetOpacity(layer_id.clone(), op));
-                    }
-                });
-            });
-
-            // Click on the card surface (anywhere not yet
-            // interactive) makes the layer active.
-            let body_resp = ui.interact(
-                ui.min_rect(),
-                ui.id().with(("layer_card_body", &layer_id)),
-                Sense::click(),
+            // ── Name (inline rename) ──
+            let mut name_mut = name.clone();
+            let name_resp = ui.add(
+                egui::TextEdit::singleline(&mut name_mut)
+                    .desired_width(ui.available_width() - 96.0)
+                    .frame(false),
             );
-            if body_resp.clicked() {
+            if name_resp.lost_focus() && name_mut != name {
+                actions
+                    .borrow_mut()
+                    .push(LayerAction::Rename(layer_id.clone(), name_mut));
+            }
+            if name_resp.clicked() {
                 actions
                     .borrow_mut()
                     .push(LayerAction::SetActive(layer_id.clone()));
             }
+
+            // ── DNTS chip ──
+            let chip_label = match dnts_channel {
+                Some(SplatChannel::R) => "R",
+                Some(SplatChannel::G) => "G",
+                Some(SplatChannel::B) => "B",
+                Some(SplatChannel::A) => "A",
+                None => "∅",
+            };
+            let chip_color = match dnts_channel {
+                Some(SplatChannel::R) => t.red,
+                Some(SplatChannel::G) => t.green,
+                Some(SplatChannel::B) => t.accent,
+                Some(SplatChannel::A) => t.text,
+                None => t.muted,
+            };
+            let chip_resp = ui.add(
+                egui::Button::new(
+                    egui::RichText::new(chip_label)
+                        .color(chip_color)
+                        .monospace()
+                        .strong(),
+                )
+                .small(),
+            );
+            let chip_resp = chip_resp.on_hover_text(
+                "DNTS channel — click to cycle R→G→B→A→∅\n\
+                     Right-click for picker (at most one layer per channel).",
+            );
+            if chip_resp.clicked() {
+                let next = cycle_channel(dnts_channel);
+                actions.borrow_mut().push(LayerAction::SetDntsChannel {
+                    layer_id: layer_id.clone(),
+                    new_channel: next,
+                });
+            }
+            egui::Popup::context_menu(&chip_resp)
+                .close_behavior(egui::PopupCloseBehavior::CloseOnClick)
+                .show(|ui| {
+                    ui.set_min_width(140.0);
+                    for ch in [
+                        None,
+                        Some(SplatChannel::R),
+                        Some(SplatChannel::G),
+                        Some(SplatChannel::B),
+                        Some(SplatChannel::A),
+                    ] {
+                        let lbl = match ch {
+                            None => "None".to_string(),
+                            Some(SplatChannel::R) => "R (red)".to_string(),
+                            Some(SplatChannel::G) => "G (green)".to_string(),
+                            Some(SplatChannel::B) => "B (blue)".to_string(),
+                            Some(SplatChannel::A) => "A (alpha)".to_string(),
+                        };
+                        if ui
+                            .add(egui::Button::selectable(dnts_channel == ch, lbl))
+                            .clicked()
+                        {
+                            actions.borrow_mut().push(LayerAction::SetDntsChannel {
+                                layer_id: layer_id.clone(),
+                                new_channel: ch,
+                            });
+                        }
+                    }
+                });
+
+            // ── Delete ──
+            if ui
+                .add(egui::Button::new("×").small())
+                .on_hover_text("Delete layer")
+                .clicked()
+            {
+                actions
+                    .borrow_mut()
+                    .push(LayerAction::Delete(layer_id.clone()));
+            }
+        });
+        // Second row: source label + opacity slider + import.
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new(&source_label)
+                    .color(t.muted)
+                    .size(10.0)
+                    .monospace(),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .add(egui::Button::new("Import…").small())
+                    .on_hover_text("Replace this layer's source with a PNG/JPG from disk")
+                    .clicked()
+                {
+                    actions
+                        .borrow_mut()
+                        .push(LayerAction::ImportTexture(layer_id.clone()));
+                }
+                let mut op = opacity;
+                if ui
+                    .add(egui::Slider::new(&mut op, 0.0..=1.0).show_value(false))
+                    .on_hover_text(format!("Opacity: {:.0}%", op * 100.0))
+                    .changed()
+                {
+                    actions
+                        .borrow_mut()
+                        .push(LayerAction::SetOpacity(layer_id.clone(), op));
+                }
+            });
         });
 
-        // Drop happened ON this row — insert above it (Photoshop
-        // convention: dropping a layer onto another puts it above).
-        // egui 0.33's `dnd_drop_zone` returns `(InnerResponse<R>,
-        // Option<Arc<Payload>>)`; `.1` is the payload (Some only on
-        // the frame the drop actually fires).
-        let payload_arc = drop_response.1.clone();
-        if let Some(payload_id) = payload_arc.map(|arc| (*arc).clone())
-            && let Some(src_display_pos) = display_ids.iter().position(|id| id == &payload_id)
-            && src_display_pos != display_idx
-        {
-            // display order is top-of-stack first; vec is
-            // bottom-first. Convert to vec indices for the
-            // ProjectDiff::ReorderLayer.
-            let n = display_ids.len();
-            let from = n - 1 - src_display_pos;
-            let to = n - 1 - display_idx;
-            actions.borrow_mut().push(LayerAction::Reorder { from, to });
-            // Clear the drag preview so the canonical order
-            // renders on the next frame.
-            *pending_preview_order.borrow_mut() = None;
+        // Click on the card surface (anywhere not yet
+        // interactive) makes the layer active.
+        let body_resp = ui.interact(
+            ui.min_rect(),
+            ui.id().with(("layer_card_body", &layer_id)),
+            Sense::click(),
+        );
+        if body_resp.clicked() {
+            actions
+                .borrow_mut()
+                .push(LayerAction::SetActive(layer_id.clone()));
         }
     });
 
-    // While the user is dragging this row over a different one, mirror
-    // the in-progress insertion in the session-only preview order so
-    // the layer visually slides. egui surfaces the active drag payload
-    // via `dragged_id`; on hover we compute a tentative reorder and
-    // stash it.
-    let _ = drag_source_inner; // Response intentionally unused — drag state lives on egui's side.
+    // Drop happened ON this row — insert above it (Photoshop
+    // convention: dropping a layer onto another puts it above).
+    // egui 0.33's `dnd_drop_zone` returns `(InnerResponse<R>,
+    // Option<Arc<Payload>>)`; `.1` is the payload (Some only on
+    // the frame the drop actually fires).
+    let payload_arc = drop_response.1.clone();
+    if let Some(payload_id) = payload_arc.map(|arc| (*arc).clone())
+        && let Some(src_display_pos) = display_ids.iter().position(|id| id == &payload_id)
+        && src_display_pos != display_idx
+    {
+        // display order is top-of-stack first; vec is
+        // bottom-first. Convert to vec indices for the
+        // ProjectDiff::ReorderLayer.
+        let n = display_ids.len();
+        let from = n - 1 - src_display_pos;
+        let to = n - 1 - display_idx;
+        actions.borrow_mut().push(LayerAction::Reorder { from, to });
+        // Clear the drag preview so the canonical order
+        // renders on the next frame.
+        *pending_preview_order.borrow_mut() = None;
+    }
+    let _ = payload; // payload moved into dnd_drag_source above
 }
 
 fn paint_drag_handle(ui: &mut egui::Ui, rect: egui::Rect, color: egui::Color32) {
