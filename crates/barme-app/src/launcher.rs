@@ -23,8 +23,10 @@
 
 use std::path::{Path, PathBuf};
 
-use barme_core::{Project, SlotResolver};
-use barme_pipeline::{LayerSplatBakeInputs, PyMapConvDriver, SplatBakeInputs, build_sd7};
+use barme_core::{Heightmap, Project, SlotResolver};
+use barme_pipeline::{
+    LayerSplatBakeInputs, MinimapInputs, PyMapConvDriver, SplatBakeInputs, build_sd7,
+};
 use image::{ImageBuffer, Rgb};
 use tracing::{info, warn};
 
@@ -183,6 +185,11 @@ pub fn install_sd7(src: &Path, dst_dir: &Path) -> Result<PathBuf, LauncherError>
 /// `slot_resolver` is the same registry adapter the layer bake uses to
 /// map slot ids → `diffuse.png` paths. Empty-stack projects don't read
 /// it (the fallback path doesn't need slot resolution).
+///
+/// `project_path` is forwarded to the minimap module so relative
+/// `Project.minimap_override` paths resolve against the `.barmeproj`
+/// dir. Pass `None` when the project hasn't been saved to disk yet —
+/// overrides then need to be absolute.
 #[allow(clippy::too_many_arguments)]
 pub fn build_and_install(
     driver: &PyMapConvDriver,
@@ -192,6 +199,7 @@ pub fn build_and_install(
     splat_inputs: SplatBakeInputs,
     layer_inputs: Option<LayerSplatBakeInputs>,
     slot_resolver: &dyn SlotResolver,
+    project_path: Option<&Path>,
     dst_dir: &Path,
 ) -> Result<PathBuf, LauncherError> {
     let workdir = tempfile::tempdir().map_err(|source| LauncherError::Io {
@@ -265,6 +273,23 @@ pub fn build_and_install(
 
     let out_sd7 = work.join(format!("{}.sd7", project.name));
     info!(name = %project.name, ?dst_dir, "build_and_install: compiling");
+
+    // D7 / Sprint 18: load the heightmap PNG back as a `Heightmap`
+    // so the minimap bake can sample it without a second decode at
+    // the pipeline boundary. The PNG was written from the editor's
+    // in-memory state just above, so this round-trips through disk
+    // — cheap (~50 ms for 1025²) and keeps `build_sd7` signature
+    // free of `&Heightmap` (smoke binaries pass `None`).
+    let hm = Heightmap::load_png(heightmap_png).map_err(|e| LauncherError::Io {
+        path: heightmap_png.to_path_buf(),
+        source: std::io::Error::other(format!("heightmap reload for minimap: {e:#}")),
+    })?;
+    let minimap_inputs = MinimapInputs {
+        heightmap: &hm,
+        slot_resolver,
+        project_path,
+    };
+
     let built = build_sd7(
         driver,
         project,
@@ -272,6 +297,7 @@ pub fn build_and_install(
         tex,
         splat_inputs,
         layer_inputs,
+        Some(minimap_inputs),
         work,
         &out_sd7,
     )?;

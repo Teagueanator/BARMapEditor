@@ -219,11 +219,23 @@ pub struct Project {
     /// C9's "lava-atmosphere link" slice.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub lava_atmosphere: bool,
+    /// D7 / Sprint 18 (F10): optional path to a user-supplied minimap
+    /// override. When `Some`, the build pipeline copies this PNG into
+    /// the `.sd7` verbatim instead of running the auto-bake in
+    /// [`barme_pipeline::minimap`]. The PNG must be exactly 1024×1024
+    /// (SRS §1.2 — every SMF minimap is 1024² regardless of map size);
+    /// the build path validates and surfaces a clear error otherwise.
+    /// Paths resolve against the `.barmeproj` directory like
+    /// [`Self::heightmap`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub minimap_override: Option<PathBuf>,
     /// C9 / Sprint 14: monotonic project-file schema version. Bumped
     /// every time a load-time migration runs, so subsequent loads of
     /// the same project skip the migration. Sprint 14 introduced
-    /// `v = 1` — the water-mode migration. Pre-Sprint-14 files load
-    /// as `v = 0`, run the migration, save back as `v = 1`.
+    /// `v = 1` — the water-mode migration. Sprint 18 / D7 introduced
+    /// `v = 2` — the [`Self::minimap_override`] field default-init
+    /// (no field rewrite needed; serde `#[serde(default)]` handles it,
+    /// but the bump keeps the migration table honest).
     ///
     /// Future migrations append: bump the constant in
     /// [`Project::SCHEMA_V`] and add a step in `From<ProjectWire>`.
@@ -493,6 +505,8 @@ struct ProjectWire {
     #[serde(default)]
     lava_atmosphere: bool,
     #[serde(default)]
+    minimap_override: Option<PathBuf>,
+    #[serde(default)]
     schema_v: u32,
 }
 
@@ -522,6 +536,7 @@ impl From<ProjectWire> for Project {
             void_water: w.void_water,
             tidal_strength: w.tidal_strength,
             lava_atmosphere: w.lava_atmosphere,
+            minimap_override: w.minimap_override,
             schema_v: w.schema_v,
         };
         Project::run_migrations(&mut p);
@@ -622,7 +637,11 @@ impl Project {
     /// - `v = 0`: pre-Sprint-14 (no water_mode tracking).
     /// - `v = 1`: Sprint 14 / C9 — water-mode derivation from
     ///   `min_height < 0`.
-    pub const SCHEMA_V: u32 = 1;
+    /// - `v = 2`: Sprint 18 / D7 — `minimap_override` field added.
+    ///   No field rewrite needed (serde `#[serde(default)]` handles
+    ///   `None`); the bump exists so the migration table records the
+    ///   schema change.
+    pub const SCHEMA_V: u32 = 2;
 
     pub fn new(name: impl Into<String>, smu: u32) -> Self {
         let size = MapSize::square(smu);
@@ -654,6 +673,7 @@ impl Project {
             void_water: false,
             tidal_strength: None,
             lava_atmosphere: false,
+            minimap_override: None,
             schema_v: Self::SCHEMA_V,
         }
     }
@@ -715,6 +735,13 @@ impl Project {
             }
             p.schema_v = 1;
         }
+        // v1 -> v2: `minimap_override` field added. Old projects
+        // default to `None` via serde, so the only action is bumping
+        // the version so subsequent loads skip this branch.
+        if p.schema_v < 2 {
+            tracing::info!("project schema migration v1->v2: minimap_override defaults to None");
+            p.schema_v = 2;
+        }
         // Future migrations append here.
     }
 
@@ -722,6 +749,18 @@ impl Project {
     /// Returns `None` if no heightmap is set.
     pub fn resolve_heightmap(&self, project_path: &Path) -> Option<PathBuf> {
         let rel = self.heightmap.as_ref()?;
+        if rel.is_absolute() {
+            return Some(rel.clone());
+        }
+        let base = project_path.parent().unwrap_or_else(|| Path::new("."));
+        Some(base.join(rel))
+    }
+
+    /// D7 / Sprint 18 (F10): resolve [`Self::minimap_override`] against
+    /// the project file's parent directory. Returns `None` when no
+    /// override is set (auto-bake path applies).
+    pub fn resolve_minimap_override(&self, project_path: &Path) -> Option<PathBuf> {
+        let rel = self.minimap_override.as_ref()?;
         if rel.is_absolute() {
             return Some(rel.clone());
         }
@@ -1558,5 +1597,67 @@ diffuse_in_alpha = true
         assert_eq!(p.heightmap, Some(PathBuf::from("heightmap.png")));
         let resolved = p.resolve_heightmap(&project_path).unwrap();
         assert_eq!(resolved, hm_abs);
+    }
+
+    /// D7 / Sprint 18 (F10): `minimap_override` defaults to `None`,
+    /// round-trips through TOML when set, and is omitted from the
+    /// serialised form when absent.
+    #[test]
+    fn minimap_override_round_trips_and_omits_when_none() {
+        let mut p = Project::new("mini", 4);
+        assert!(p.minimap_override.is_none());
+        let s = toml::to_string(&p).unwrap();
+        assert!(
+            !s.contains("minimap_override"),
+            "None override must not serialise; got:\n{s}"
+        );
+        p.minimap_override = Some(PathBuf::from("custom_minimap.png"));
+        let s = toml::to_string(&p).unwrap();
+        assert!(
+            s.contains("minimap_override = \"custom_minimap.png\""),
+            "set override must serialise; got:\n{s}"
+        );
+        let p2: Project = toml::from_str(&s).unwrap();
+        assert_eq!(
+            p2.minimap_override,
+            Some(PathBuf::from("custom_minimap.png"))
+        );
+    }
+
+    /// D7 / Sprint 18: `resolve_minimap_override` resolves relative
+    /// paths against the project file's parent directory, mirroring
+    /// the heightmap-resolution rule.
+    #[test]
+    fn resolve_minimap_override_against_project_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let project_path = dir.path().join("demo.barmeproj");
+        let mut p = Project::new("demo", 4);
+        p.minimap_override = Some(PathBuf::from("minimap.png"));
+        let resolved = p.resolve_minimap_override(&project_path).unwrap();
+        assert_eq!(resolved, dir.path().join("minimap.png"));
+        // None → None.
+        p.minimap_override = None;
+        assert!(p.resolve_minimap_override(&project_path).is_none());
+    }
+
+    /// D7 / Sprint 18: a v=1 project (Sprint 14-era, no
+    /// `minimap_override` field) loads cleanly with the field
+    /// defaulted to `None` and schema_v bumped to 2.
+    #[test]
+    fn v1_project_loads_with_none_minimap_override_and_bumps_to_v2() {
+        let toml_v1 = r#"
+name = "v1_project"
+min_height = 0.0
+max_height = 256.0
+schema_v = 1
+
+[size]
+smu_x = 4
+smu_z = 4
+"#;
+        let p: Project = toml::from_str(toml_v1).unwrap();
+        assert!(p.minimap_override.is_none());
+        assert_eq!(p.schema_v, Project::SCHEMA_V);
+        assert_eq!(Project::SCHEMA_V, 2);
     }
 }

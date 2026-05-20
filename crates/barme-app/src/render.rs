@@ -2700,6 +2700,93 @@ pub fn update_composite_uniforms(render_state: &egui_wgpu::RenderState, cu: &Com
     res.write_composite_uniforms(&render_state.queue, cu);
 }
 
+/// Encode the layered composite pass into the composite RT. Shared by
+/// the 3D path (`TerrainCallback::prepare`) and the 2D paint-view path
+/// (`CompositeCallback::prepare`) so both viewports see the same
+/// composited preview without one-frame lag.
+///
+/// Returns silently when the composite RT isn't allocated yet — the
+/// caller is responsible for `ensure_composite_rt` before dispatch.
+fn encode_composite_pass(
+    res: &RenderResources,
+    queue: &wgpu::Queue,
+    encoder: &mut wgpu::CommandEncoder,
+    cu: &CompositeU,
+) {
+    let Some(rt) = res.composite.rt.as_ref() else {
+        return;
+    };
+    res.write_composite_uniforms(queue, cu);
+    let mut cpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some("composite.pass"),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view: &rt.view,
+            resolve_target: None,
+            ops: wgpu::Operations {
+                // Clear to fully-opaque mid-grey so a no-layer pass
+                // produces the same background tone the CPU bake's
+                // `bg = 0.18` flattens against.
+                load: wgpu::LoadOp::Clear(wgpu::Color {
+                    r: 0.18,
+                    g: 0.18,
+                    b: 0.18,
+                    a: 1.0,
+                }),
+                store: wgpu::StoreOp::Store,
+            },
+            depth_slice: None,
+        })],
+        depth_stencil_attachment: None,
+        timestamp_writes: None,
+        occlusion_query_set: None,
+    });
+    cpass.set_pipeline(&res.composite.pipeline);
+    cpass.set_bind_group(0, &res.composite.bind_group, &[]);
+    cpass.draw(0..3, 0..1);
+    drop(cpass);
+    trace!(rt_size = ?rt.size, "composite RT recomposited");
+}
+
+/// Standalone composite-pass dispatcher for the 2D paint viewport
+/// (`Tool::PaintLayer`). The 3D path's `TerrainCallback::prepare`
+/// re-runs the same pass per frame and writes the same uniforms, so
+/// dropping this into `central_paint_layer` keeps the 2D viewport in
+/// sync with live mask, opacity, tint, and transform edits.
+///
+/// `paint()` is a deliberate no-op: this callback only writes the
+/// composite RT. egui samples the RT separately via
+/// `ui.painter().image(composite_rt_id, …)` after the prepare hook.
+pub struct CompositeCallback {
+    pub composite: CompositeU,
+}
+
+impl egui_wgpu::CallbackTrait for CompositeCallback {
+    fn prepare(
+        &self,
+        _device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        _screen: &egui_wgpu::ScreenDescriptor,
+        encoder: &mut wgpu::CommandEncoder,
+        resources: &mut egui_wgpu::CallbackResources,
+    ) -> Vec<wgpu::CommandBuffer> {
+        let Some(res) = resources.get::<RenderResources>() else {
+            return Vec::new();
+        };
+        encode_composite_pass(res, queue, encoder, &self.composite);
+        Vec::new()
+    }
+
+    fn paint(
+        &self,
+        _info: egui::PaintCallbackInfo,
+        _render_pass: &mut wgpu::RenderPass<'static>,
+        _resources: &egui_wgpu::CallbackResources,
+    ) {
+        // Intentionally empty — the composite RT is sampled by an
+        // egui::Painter::image() call after this callback returns.
+    }
+}
+
 /// Push the latest splat uniforms (active mask, scales, mults,
 /// diffuse-in-alpha flag) to the GPU. The TerrainCallback also
 /// writes these every frame via `prepare`, so this helper is only
@@ -2853,45 +2940,11 @@ impl egui_wgpu::CallbackTrait for TerrainCallback {
         // follows samples from the same RT (via binding 7) so the
         // composite must land first. Skipped when the project has no
         // layer stack OR the composite RT hasn't been allocated yet.
-        if let (Some(cu), Some(_rt)) = (self.composite.as_ref(), res.composite.rt.as_ref()) {
-            res.write_composite_uniforms(queue, cu);
-            let composite_view = res
-                .composite
-                .rt
-                .as_ref()
-                .map(|rt| &rt.view)
-                .expect("matched on Some above");
-            let mut cpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("composite.pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: composite_view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        // Clear to fully-opaque mid-grey so a no-layer
-                        // pass produces the same background tone the
-                        // CPU bake's `bg = 0.18` flattens against.
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.18,
-                            g: 0.18,
-                            b: 0.18,
-                            a: 1.0,
-                        }),
-                        store: wgpu::StoreOp::Store,
-                    },
-                    depth_slice: None,
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
-            cpass.set_pipeline(&res.composite.pipeline);
-            cpass.set_bind_group(0, &res.composite.bind_group, &[]);
-            cpass.draw(0..3, 0..1);
-            drop(cpass);
-            trace!(
-                rt_size = ?res.composite.rt.as_ref().map(|r| r.size),
-                "composite RT recomposited"
-            );
+        // The 2D paint viewport runs the same encode via
+        // `CompositeCallback` so live edits stay synced across both
+        // viewports.
+        if let Some(cu) = self.composite.as_ref() {
+            encode_composite_pass(res, queue, encoder, cu);
         }
 
         // Step 1b — marker uniforms + instance upload (Sprint 13 /

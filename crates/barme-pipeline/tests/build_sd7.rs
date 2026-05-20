@@ -70,6 +70,11 @@ fn build_sd7_end_to_end() {
         // bindings — the empty Project has no layers + no splat
         // config).
         None,
+        // D7 / Sprint 18: smoke build skips the minimap bake;
+        // PyMapConv synthesises one from `-t` automatically. The
+        // integration test asserts the .sd7 builds end-to-end —
+        // dedicated minimap tests live in `crates/barme-pipeline/src/minimap.rs::tests`.
+        None,
         work,
         &out_sd7,
     )

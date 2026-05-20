@@ -75,6 +75,9 @@ fn main() -> Result<()> {
         // D10 / Sprint 17: smoke example uses the legacy path; no
         // DNTS bindings.
         None,
+        // D7 / Sprint 18: smoke example skips the minimap bake;
+        // PyMapConv synthesises one from `-t` automatically.
+        None,
         work,
         &out_sd7,
     )

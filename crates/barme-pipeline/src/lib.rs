@@ -22,7 +22,7 @@
 
 use std::path::{Path, PathBuf};
 
-use barme_core::Project;
+use barme_core::{Heightmap, Project, SlotResolver};
 use tracing::info;
 
 pub mod dnts;
@@ -30,12 +30,16 @@ pub mod featureplacer;
 pub mod lua_ast;
 pub mod mapinfo;
 pub mod metal_layout;
+pub mod minimap;
 pub mod pymapconv;
 pub mod sd7;
 pub mod splat_pipeline;
 pub mod startboxes;
 
 pub use dnts::{BakeOptions, DntsBakeError, bake_dnts};
+pub use minimap::{
+    MINIMAP_DIM, MinimapError, copy_minimap_override, render_minimap, stage_minimap,
+};
 pub use pymapconv::{CompileInputs, CompileOutputs, PyMapConvDriver, PyMapConvError};
 pub use sd7::{Sd7Error, StagedFile};
 pub use splat_pipeline::{
@@ -54,12 +58,37 @@ pub enum BuildError {
     #[error(transparent)]
     Splat(#[from] SplatPipelineError),
 
+    #[error(transparent)]
+    Minimap(#[from] MinimapError),
+
     #[error("io error on {path}: {source}")]
     Io {
         path: PathBuf,
         #[source]
         source: std::io::Error,
     },
+}
+
+/// D7 / Sprint 18 (F10) — extra inputs the minimap bake needs that
+/// the heightmap-PNG-only signature can't provide. Bundled into a
+/// single struct so adding fields here doesn't add yet another
+/// positional arg to [`build_sd7`].
+///
+/// The build path threads this through to
+/// [`minimap::stage_minimap`], which either copies
+/// `project.minimap_override` (after dim validation) or auto-bakes a
+/// 1024² PNG.
+pub struct MinimapInputs<'a> {
+    /// In-memory heightmap (may include unsaved brush edits — same
+    /// invariant the launcher upholds when staging `heightmap_png`).
+    pub heightmap: &'a Heightmap,
+    /// Resolver for `LayerSource::Slot` → on-disk `diffuse.png`.
+    /// Re-uses the same adapter the layer bake takes.
+    pub slot_resolver: &'a dyn SlotResolver,
+    /// Path to the `.barmeproj` file (if any) for resolving relative
+    /// `minimap_override` paths. `None` when the project hasn't been
+    /// saved yet — overrides then need to be absolute.
+    pub project_path: Option<&'a Path>,
 }
 
 /// Orchestrate a full build: PyMapConv → 4-file Lua emit → 7-Zip
@@ -78,6 +107,12 @@ pub enum BuildError {
 /// a `tools/textures/<NN-slug>/` path via its slot registry. Inactive
 /// channels pass `None`; the pipeline skips them.
 ///
+/// `minimap_inputs` carries the heightmap + slot resolver + project
+/// path the minimap bake (D7 / Sprint 18) needs. When `None`,
+/// PyMapConv synthesises a minimap from the diffuse BMP (`-t`) — a
+/// noticeably blurrier fallback. Production callers always pass
+/// `Some`; the smoke binary in `examples/` passes `None` for brevity.
+///
 /// On success returns `out_sd7`. On failure, returns a typed `BuildError`
 /// with the underlying subprocess streams attached (via the variant chain).
 #[allow(clippy::too_many_arguments)]
@@ -88,6 +123,7 @@ pub fn build_sd7(
     texture_bmp: &Path,
     splat_inputs: SplatBakeInputs,
     layer_inputs: Option<LayerSplatBakeInputs>,
+    minimap_inputs: Option<MinimapInputs<'_>>,
     work_dir: &Path,
     out_sd7: &Path,
 ) -> Result<PathBuf, BuildError> {
@@ -111,12 +147,32 @@ pub fn build_sd7(
         Some(path)
     };
 
+    // D7 / Sprint 18 (F10): bake or copy the minimap PNG before the
+    // compile so it lands in PyMapConv's `-p` arg below. Skipped
+    // when `minimap_inputs` is `None` (smoke binary path); PyMapConv
+    // then synthesises one from the diffuse BMP.
+    let minimap_path = if let Some(mi) = minimap_inputs {
+        let path = work_dir.join(format!("{}_minimap.png", project.name));
+        minimap::stage_minimap(
+            project,
+            mi.project_path,
+            mi.heightmap,
+            mi.slot_resolver,
+            &path,
+        )?;
+        Some(path)
+    } else {
+        info!("build_sd7: no minimap_inputs — PyMapConv will synthesise from diffuse");
+        None
+    };
+
     info!(name = %project.name, "build_sd7: compiling SMF/SMT");
     let outputs = driver.compile(CompileInputs {
         project,
         heightmap_png,
         texture_bmp,
         metalmap_png: metalmap_path.as_deref(),
+        minimap_png: minimap_path.as_deref(),
         out_dir: &compile_out,
     })?;
 

@@ -53,11 +53,17 @@ Read these in order:
 7. `/home/teague/code/BARMapEditor/docs/research/textures/claude-findings-from-research.md`
    — Claude's deep research.
 8. `/home/teague/code/BARMapEditor/docs/research/textures/Gemini BAR Editor Texture Pack Scoping.md`
-   — Gemini's deep research. **Adopt Gemini's 16-slot palette verbatim**
-   (no duplicate IDs, coherent biome coverage, primary-source-justified
-   industrial set). **Adopt Gemini's bundle-the-normal-map stance** over
-   Claude's synthesise-from-luminance — see phase-3-plan.md D1 for the
-   rationale.
+   — Gemini's deep research. **Adopt Gemini's 16-slot biome
+   structure** (4 biome groups × 4 textures, coherent coverage,
+   primary-source-justified industrial set) **but NOT the source URLs
+   verbatim** — Gemini's table mixes ambientCG (12 slots) with Poly
+   Haven (4 slots, indices 3 / 5 / 9 / 13). Per the
+   "Poly Haven divergence" pitfall below, **drop all 4 Poly Haven
+   slots and replace each with an ambientCG equivalent at the same
+   biome role**. The candidate ambientCG IDs to evaluate are listed in
+   Step 3 §"Palette decision." **Adopt Gemini's bundle-the-normal-map
+   stance** over Claude's synthesise-from-luminance — see
+   phase-3-plan.md D1 for the rationale.
 9. **`/home/teague/code/BARMapEditor/docs/research/source-audit-2026-05-18/FINDINGS.md`**
    §7 — the corrected splat-rendering math. This affects D2's bake
    pipeline (Sprint 8) but knowing it now informs the palette choice:
@@ -96,15 +102,42 @@ rollup commit.
 **D1 deliverable:**
 
 - **Palette decision** (in ADR-025):
-  - 16 slots, 4 biome groups × 4 textures, from Gemini's research §
-    "Bundled textures" verbatim. Reproduce the table in ADR-025 with:
-    slot id (00–15), name, biome group, ambientCG asset id, source URL,
-    licence (must be CC0-1.0), default `tex_scale` (start at 0.02 per
-    Claude+Gemini agreement), default `tex_mult` (1.0).
+  - 16 slots, 4 biome groups × 4 textures, structured per Gemini's
+    research §"Bundled textures" (Earth-Temperate / Arid / Snow-Alpine
+    / Alien-Industrial — 4 textures each). Reproduce the table in
+    ADR-025 with: slot id (00–15), name, biome group, ambientCG
+    asset id, source URL, licence (must be CC0-1.0), default
+    `tex_scale` (start at 0.02 per Claude+Gemini agreement), default
+    `tex_mult` (1.0).
+  - **Poly Haven divergence — required substitution.** Gemini's table
+    routes slots 3 (rocky-outcrop-grey), 5 (dry-rock-sandstone),
+    9 (jagged-ice-frozen), and 13 (rusty-metal-plates) to
+    `polyhaven.com`. Three problems: (i) per-asset Poly Haven licences
+    vary — not all are CC0; (ii) Poly Haven ZIPs ship GL+DX normal
+    pairs + 16-bit displacement and weigh 77–99 MB per slot (Claude
+    research, "Excluded but considered"), inflating the fetch budget;
+    (iii) Poly Haven's download UX is a direct file picker, not the
+    `_1K-JPG.zip` pattern the fetch script targets. **Substitute each
+    with an ambientCG equivalent**, taking the role from Gemini's
+    biome map. Candidate IDs to evaluate before pinning sha256
+    (the Sprint 7 session verifies each URL HEADs 200 and the ZIP
+    contains a `*_Color.*` member):
+    - Slot 3 (Earth-Temperate, rocky outcrop): `Rock030` (Claude's
+      slot 4 swatch).
+    - Slot 5 (Arid, sandstone): `Rock023` (Claude's slot 7) or
+      `Rock040` if visually too orange.
+    - Slot 9 (Snow-Alpine, jagged ice): `Snow006` (Claude's slot 9),
+      or `Ice004` if available.
+    - Slot 13 (Alien-Industrial, rusty metal plates): `Metal009`
+      (rust panels). If it 404s, try `MetalPlates003`.
+    Document the substitution in ADR-025's "Alternatives considered"
+    block so future readers can trace the divergence from Gemini's
+    research.
   - Each slot includes BOTH diffuse and normal map. Diffuse can be JPG
     (smaller); normals MUST be PNG (JPG 4:2:0 destroys X/Y vectors).
-  - Reject anything non-CC0. Reject Poly Haven unless it's their CC0 BY
-    licence. Reject OpenGameArt (mixed licences).
+  - Reject anything non-CC0. **No Poly Haven in this pack** — keeps
+    the fetch script simple and per-slot disk under control. Reject
+    OpenGameArt (mixed licences).
 - **`scripts/fetch-textures.sh`**:
   - sha256-pinned per ZIP. Failed checksum → script exits 1.
   - Downloads each ZIP from ambientCG into a temp dir.
@@ -173,12 +206,13 @@ rollup commit.
 
 ## Step 6 — Critical pitfalls (read twice)
 
-From phase-3-plan.md D1 + the research digests:
+From phase-3-plan.md D1 + the research digests + the
+`docs/research/source-audit-2026-05-18/FINDINGS.md` corrections:
 
 1. **License hygiene**: bundling anything non-CC0 (GPL / share-alike)
-   would poison the user's `.sd7` output. CC0-1.0 only, period. Poly
-   Haven assets vary — verify each individual asset's licence on the
-   product page, don't assume "Poly Haven = CC0."
+   would poison the user's `.sd7` output. CC0-1.0 only, period. The
+   Poly Haven divergence (above) takes the safer route — no Poly Haven
+   in this pack.
 
 2. **JPEG normal maps are silently wrong**. 4:2:0 chroma subsampling
    destroys X/Y vectors. Force PNG for `*_NormalGL.*` extraction. Diffuse
@@ -197,40 +231,43 @@ From phase-3-plan.md D1 + the research digests:
 
 5. **`default_tex_scale = 0.02`** is the engine-historical default
    (`SMF_DETAILTEX_RES = 0.02` in
-   `RecoilEngine/cont/base/springcontent/shaders/GLSL/SMFFragProg.glsl:25`).
-   Real BAR maps use 0.0015–0.008 per channel (Enceladus: `[0.004,
-   0.007, 0.008, 0.0015]`). 0.02 is correct as a baseline default but
-   the D5 UI in the Splat inspector should surface the smaller
-   real-world range — Sprint 9 wires that as a tooltip on the
-   `ramp_slider_labelled` for `tex_scale`. Note in ADR-025.
+   `RecoilEngine/cont/base/springcontent/shaders/GLSL/SMFFragProg.glsl:25`,
+   verified at HEAD 2026-05-18). Real BAR maps use 0.0015–0.008 per
+   channel (Comet Catcher Remake's mapinfo.lua:
+   `texScales = {0.004, 0.007, 0.003, 0.0018}` — see
+   `scratch/bar-maps/extracted/comet/mapinfo.lua:116`). 0.02 is
+   correct as a baseline default but the D5 UI in the Splat inspector
+   should surface the smaller real-world range — Sprint 9 wires that
+   as a tooltip on the `ramp_slider_labelled` for `tex_scale`. Note
+   in ADR-025.
 
-10. **Normal-map convention is OpenGL tangent space** —
-    `SMFFragProg.glsl:276-278` builds the TBN from the per-fragment
-    normal, then decodes each splat texture as `* 2 - 1`. OpenGL
-    convention's Y points up; the Y-flip (D2's job) inverts the green
-    channel of DirectX-source normals. ambientCG ships
-    `*_NormalGL.*` (already OpenGL); ensure the fetch script extracts
-    the GL variant, not the DX variant.
+6. **Normal-map convention is OpenGL tangent space** —
+   `SMFFragProg.glsl:276-278` builds the TBN from the per-fragment
+   normal (`cross(normal, vec3(-1, 0, 0))`), then decodes each splat
+   texture as `* 2 - 1` (line 183). OpenGL convention's Y points up;
+   the Y-flip (D2's job) inverts the green channel of DirectX-source
+   normals. ambientCG ships `*_NormalGL.*` (already OpenGL); ensure
+   the fetch script extracts the GL variant, not the DX variant.
 
-6. **Single CREDITS.md is enough** under CC0 — no per-texture in-app
+7. **Single CREDITS.md is enough** under CC0 — no per-texture in-app
    attribution UI needed. Don't over-engineer.
 
-7. **`splatDetailNormalDiffuseAlpha = 0` baseline** (Gemini's safer
+8. **`splatDetailNormalDiffuseAlpha = 0` baseline** (Gemini's safer
    default). The high-pass-diffuse-in-alpha workflow is deferred to
    ADR-034 once the splat preview lands in D4. Don't bake the high-pass
    into the fetch script.
 
-8. **Asset filename hygiene**: ambientCG ZIPs vary in member naming
+9. **Asset filename hygiene**: ambientCG ZIPs vary in member naming
    conventions (`Ground012_1K_Color.jpg`, `Ground012_2K_Color.png`,
    etc.). The fetch script's extractor should glob `*_Color.*` /
    `*_NormalGL.*` rather than hardcoding filenames. Pick the 1K
    resolution variant where multiple resolutions exist (1024² is the
    BAR-normative tile size per both research reports).
 
-9. **Renaming asset slots later is painful** — the meta.toml is the
-   contract D3's registry depends on. Get the slot id + name right
-   first time. Slot ids are 00..15 in source order; names are short-
-   kebab-case (e.g. `grass-meadow`, `metal-brushed`).
+10. **Renaming asset slots later is painful** — the meta.toml is the
+    contract D3's registry depends on. Get the slot id + name right
+    first time. Slot ids are 00..15 in source order; names are short-
+    kebab-case (e.g. `grass-meadow`, `metal-brushed`).
 
 ## Step 7 — Exit criteria
 

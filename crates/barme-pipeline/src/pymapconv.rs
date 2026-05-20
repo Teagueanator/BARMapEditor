@@ -66,6 +66,14 @@ pub struct CompileInputs<'a> {
     /// non-zero, so we force the Lua-spots-are-source-of-truth path.
     /// When `None`, PyMapConv's default 1×1 black metalmap applies.
     pub metalmap_png: Option<&'a Path>,
+    /// D7 / Sprint 18 (F10): optional 1024×1024 RGB PNG to embed as
+    /// the SMF minimap. PyMapConv accepts via `-p / --minimap` and
+    /// fails the compile if the dims are wrong. When `None`,
+    /// PyMapConv synthesises from `-t` (the diffuse BMP) — that
+    /// fallback produces a noticeably blurry result on detailed maps
+    /// so the build pipeline always supplies a bake from
+    /// [`crate::minimap::stage_minimap`].
+    pub minimap_png: Option<&'a Path>,
     /// Directory PyMapConv writes `<name>.smf` and `<name>.smt` into. The
     /// directory must exist; the driver does not create it.
     pub out_dir: &'a Path,
@@ -171,6 +179,7 @@ impl PyMapConvDriver {
             heightmap_png,
             texture_bmp,
             metalmap_png,
+            minimap_png,
             out_dir,
         } = inputs;
 
@@ -213,6 +222,17 @@ impl PyMapConvDriver {
         // `map_metal_spot_placer.lua` gadget pick up our Lua spots.
         if let Some(mm) = metalmap_png {
             cmd.arg("-m").arg(mm);
+        }
+
+        // D7 / Sprint 18 (F10): optional 1024² minimap PNG via
+        // `-p / --minimap` (flag verified in
+        // `devlog/stage-0-validation/logs/2026-05-17T16-57-48__pymapconv-vendoring.md`).
+        // PyMapConv hard-requires 1024² when the flag is present;
+        // `barme_pipeline::minimap` validates dims upstream so a
+        // wrong-size PNG surfaces a typed `MinimapError::OverrideWrongDim`
+        // before we ever shell out to the compiler.
+        if let Some(mp) = minimap_png {
+            cmd.arg("-p").arg(mp);
         }
 
         if let Some(dir) = &self.compressonator_dir {

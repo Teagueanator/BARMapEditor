@@ -23,7 +23,15 @@ use glam::{Mat4, Vec2, Vec3};
 /// Vertical lift (in elmos) applied to every marker's world Y before
 /// projection so a marker at `y = 0` doesn't z-fight terrain at the
 /// same elevation (pitfall #10).
-pub const MARKER_Y_LIFT_ELMOS: f32 = 2.0;
+///
+/// Sprint 19 — bumped 2.0 → 32.0. With `height_scale` defaulting to
+/// 256 elmos, a 2-elmo lift was ~0.8% of typical map relief; the
+/// screen-space marker sprite is a flat quad and its lower edge
+/// routinely fell below visible terrain at shallow viewing angles,
+/// burying metal / vent / start-pos / feature markers. 32 elmos is
+/// ~12% of the default height range — comfortable headroom regardless
+/// of view angle without divorcing the marker from its XZ anchor.
+pub const MARKER_Y_LIFT_ELMOS: f32 = 32.0;
 
 /// Visual shape variants supported by the Sprint-13 marker shader.
 /// IDs are mapped to the WGSL `Instance.shape_id` field by
@@ -328,10 +336,16 @@ mod tests {
     }
 
     #[test]
-    fn marker_y_lift_constant_is_two() {
-        // Tiny safeguard against a future "tune it down to 0.5" PR that
-        // would silently reintroduce z-fight at sea level.
-        assert_eq!(MARKER_Y_LIFT_ELMOS, 2.0);
+    fn marker_y_lift_constant_in_safe_range() {
+        // Sprint 19 bumped 2.0 → 32.0 so screen-space marker sprites
+        // clear typical terrain relief at shallow viewing angles.
+        // The pin keeps the lift in a reasonable band — too small and
+        // markers get buried again; too large and they detach
+        // visually from their XZ anchor.
+        assert!(
+            (16.0..=64.0).contains(&MARKER_Y_LIFT_ELMOS),
+            "lift {MARKER_Y_LIFT_ELMOS} elmos outside safe range",
+        );
     }
 
     #[test]

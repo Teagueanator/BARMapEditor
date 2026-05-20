@@ -252,6 +252,14 @@ struct App {
     /// the next save; load_project / new_project sync this with
     /// `Project::next_steps_dismissed`.
     next_steps_dismissed: bool,
+    /// D7 / Sprint 18 (F10): mirrors `Project.minimap_override`. When
+    /// `Some`, the build pipeline copies this PNG into the `.sd7`
+    /// verbatim (after a 1024² dim check) instead of running the
+    /// auto-bake. The F9 form's Minimap tab surfaces the file picker
+    /// and "Clear override" button that drive this field; until C7
+    /// lands the field round-trips silently so the path survives
+    /// save/open.
+    minimap_override: Option<PathBuf>,
     /// D10 / Sprint 17 (ADR-041): mirrors
     /// `Project.migration_toast_dismissed`. Persists across save /
     /// open so the "your splat layers were migrated" toast stays
@@ -485,21 +493,84 @@ impl Default for FeatureState {
     }
 }
 
-/// Parsed shape of `assets/mapfeatures_catalog.json` (C6 / Sprint 12).
+/// Parsed shape of `assets/mapfeatures_catalog.json` (C6 / Sprint 12;
+/// extended Sprint 19 with `category_visuals` + per-entry `metal`).
 /// Loaded once at App start; `Default` is the empty catalog.
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 struct FeatureCatalog {
     #[serde(default)]
     categories: std::collections::BTreeMap<String, Vec<CatalogEntry>>,
+    #[serde(default)]
+    category_visuals: std::collections::BTreeMap<String, CategoryVisual>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
 struct CatalogEntry {
     name: String,
     display: String,
+    /// Metal value the feature yields when reclaimed. Falls back to 0
+    /// (the BAR-engine default for un-reclaimable features) when the
+    /// catalog entry doesn't specify; rocks / wreckage / crates have
+    /// non-zero defaults curated in the JSON.
+    #[serde(default)]
+    metal: u32,
     #[serde(default)]
     #[allow(dead_code)] // surfaced in inspector tooltip in a future polish pass
     tags: Vec<String>,
+}
+
+/// Per-category visual hint used by the marker batch + minimap.
+/// Loaded from `category_visuals` in the catalog JSON; deserialised
+/// case-sensitively so the JSON matches `MarkerShape` variant names
+/// byte-for-byte.
+#[derive(Debug, Clone, serde::Deserialize)]
+struct CategoryVisual {
+    shape: String,
+    /// CSS-style `#RRGGBB` colour. Parsed to `egui::Color32` on first
+    /// use; falls back to `LIGHT_GRAY` if malformed.
+    color: String,
+    radius_px: f32,
+}
+
+/// Resolved per-feature visual hint — what the marker / minimap
+/// renderer needs without re-walking the catalog every frame.
+#[derive(Debug, Clone, Copy)]
+struct ResolvedFeatureVisual {
+    shape: crate::ui::markers::MarkerShape,
+    color: egui::Color32,
+    radius_px: f32,
+}
+
+/// Fallback visual for catalog miss-hits. Distinct enough from the
+/// curated category palettes that an unknown FeatureDef stands out as
+/// "needs catalog work" rather than blending in with a stock category.
+const FALLBACK_FEATURE_VISUAL: ResolvedFeatureVisual = ResolvedFeatureVisual {
+    shape: crate::ui::markers::MarkerShape::OutlineRing,
+    color: egui::Color32::from_rgb(0xD1, 0xD5, 0xDB),
+    radius_px: 6.0,
+};
+
+fn parse_hex_color(s: &str) -> Option<egui::Color32> {
+    let s = s.trim().trim_start_matches('#');
+    if s.len() != 6 {
+        return None;
+    }
+    let r = u8::from_str_radix(&s[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&s[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&s[4..6], 16).ok()?;
+    Some(egui::Color32::from_rgb(r, g, b))
+}
+
+fn parse_marker_shape(s: &str) -> Option<crate::ui::markers::MarkerShape> {
+    use crate::ui::markers::MarkerShape;
+    match s {
+        "FilledCircle" => Some(MarkerShape::FilledCircle),
+        "OutlineRing" => Some(MarkerShape::OutlineRing),
+        "FilledWithStroke" => Some(MarkerShape::FilledWithStroke),
+        "Triangle" => Some(MarkerShape::Triangle),
+        "OutlineTriangle" => Some(MarkerShape::OutlineTriangle),
+        _ => None,
+    }
 }
 
 impl FeatureCatalog {
@@ -539,6 +610,45 @@ impl FeatureCatalog {
             .get(category)
             .map(|v| v.as_slice())
             .unwrap_or(&[])
+    }
+
+    /// Find an entry by FeatureDef name. Returns the `(category,
+    /// entry)` pair so the caller can resolve visuals via
+    /// `category_visuals`. None on a catalog miss-hit.
+    fn lookup_entry(&self, name: &str) -> Option<(&str, &CatalogEntry)> {
+        for (cat_name, entries) in &self.categories {
+            if let Some(e) = entries.iter().find(|e| e.name == name) {
+                return Some((cat_name.as_str(), e));
+            }
+        }
+        None
+    }
+
+    /// Resolve the visual hint for a placed feature. Falls back to
+    /// [`FALLBACK_FEATURE_VISUAL`] for unknown names so the renderer
+    /// always has something to draw — orphaned features are common
+    /// during round-trip with custom feature packs (engine logs +
+    /// skips at game start; the editor should not).
+    fn resolved_visual(&self, name: &str) -> ResolvedFeatureVisual {
+        let Some((cat, _)) = self.lookup_entry(name) else {
+            return FALLBACK_FEATURE_VISUAL;
+        };
+        let Some(v) = self.category_visuals.get(cat) else {
+            return FALLBACK_FEATURE_VISUAL;
+        };
+        let shape = parse_marker_shape(&v.shape).unwrap_or(FALLBACK_FEATURE_VISUAL.shape);
+        let color = parse_hex_color(&v.color).unwrap_or(FALLBACK_FEATURE_VISUAL.color);
+        ResolvedFeatureVisual {
+            shape,
+            color,
+            radius_px: v.radius_px,
+        }
+    }
+
+    /// Metal value for a placed feature by name. `None` on catalog
+    /// miss-hit so the caller can distinguish "0 known" from "unknown".
+    fn metal_for(&self, name: &str) -> Option<u32> {
+        self.lookup_entry(name).map(|(_, e)| e.metal)
     }
 }
 
@@ -1176,6 +1286,7 @@ impl App {
             mapinfo_overrides: std::collections::HashMap::new(),
             show_next_steps: false,
             next_steps_dismissed: false,
+            minimap_override: None,
             migration_toast_dismissed: false,
             pending_migration_toast: false,
             dirty: false,
@@ -1312,6 +1423,10 @@ impl App {
         self.ally_groups.clear();
         self.active_ally_group_id = 0;
         self.mapinfo_overrides.clear();
+        // D7 / Sprint 18: fresh projects opt into the auto-bake path
+        // by default. A user-supplied override is opt-in via the F9
+        // form's Minimap tab (C7).
+        self.minimap_override = None;
         self.dragging_start_pos = None;
         self.dragging_start_pos_from = None;
         self.drag_paint_origin = None;
@@ -1427,6 +1542,12 @@ impl App {
             void_water: self.void_water,
             tidal_strength: self.tidal_strength,
             lava_atmosphere: self.lava_atmosphere,
+            // D7 / Sprint 18 (F10): round-trip the user's minimap
+            // override path through save / open. The F9 form's
+            // Minimap tab (C7) surfaces the file picker that mutates
+            // `self.minimap_override`; until then the field passes
+            // through silently.
+            minimap_override: self.minimap_override.clone(),
             // Re-saved projects always carry the current schema version
             // so subsequent loads skip migrations.
             schema_v: Project::SCHEMA_V,
@@ -3013,6 +3134,22 @@ impl App {
         // so this needs to land BEFORE the egui paint that uses the RT.
         self.sync_composite_mask_tiles();
 
+        // The 3D viewport's `TerrainCallback::prepare` re-runs the
+        // composite pass every frame and writes the per-layer uniforms.
+        // `Tool::PaintLayer` never dispatches `TerrainCallback`, so
+        // without this we'd show a stale RT — paint strokes would lag,
+        // opacity / tint / transform slider edits wouldn't reflect, and
+        // making a layer transparent wouldn't reveal the layer below.
+        // Drop in a no-op-paint `CompositeCallback` that runs the
+        // shared composite pass via the same encode helper.
+        if let Some(cu) = self.composite_uniforms_for_render() {
+            ui.painter()
+                .add(eframe::egui_wgpu::Callback::new_paint_callback(
+                    rect,
+                    crate::render::CompositeCallback { composite: cu },
+                ));
+        }
+
         let cursor_world = ui.ctx().pointer_interact_pos().and_then(|p| {
             // Cheap world-elmo conversion via the same math the
             // paint_view uses internally — we need it ahead of the
@@ -4459,6 +4596,7 @@ impl App {
             splat_inputs,
             Some(layer_inputs),
             &layer_resolver,
+            self.current_project_path.as_deref(),
             &dst_dir,
         ) {
             Ok(installed) => {
@@ -4599,6 +4737,7 @@ impl App {
                 self.void_water = p.void_water;
                 self.tidal_strength = p.tidal_strength;
                 self.lava_atmosphere = p.lava_atmosphere;
+                self.minimap_override = p.minimap_override;
                 self.metal_state = MetalState::default();
                 self.geo_state = GeoState::default();
                 self.dragging_metal_spot = None;
@@ -5453,6 +5592,12 @@ impl App {
                 ui.horizontal(|ui| {
                     self.top_bar_brand(ui);
                     ui.add_space(8.0);
+                    // Sprint 19 — active-tool chip between brand and
+                    // menus. Click to open a Popup that mirrors the
+                    // left tool strip; gives the user a clear top-bar
+                    // indicator + a second way to switch tools.
+                    self.top_bar_tool_chip(ui);
+                    ui.add_space(8.0);
                     self.top_bar_menus(ui, action);
 
                     // Centred symmetry cluster. Implemented as a sized
@@ -5472,6 +5617,63 @@ impl App {
                     });
                 });
             });
+    }
+
+    /// Active-tool chip + dropdown for the top action bar. Mirrors
+    /// `symmetry_mode_dropdown` styling so the two chips read as a
+    /// consistent set; the Popup lists every `Tool::ALL` variant with
+    /// its icon + label + accelerator. The left 48 px tool strip
+    /// stays the primary picker; this is the up-top indicator.
+    fn top_bar_tool_chip(&mut self, ui: &mut egui::Ui) {
+        let t = crate::ui::theme::Tokens::DARK;
+        let tool = self.tool;
+        let label = format!("{}  ·  {}", tool.label(), tool.accel());
+        let icon = tool.icon_kind();
+        let resp = egui::Frame::new()
+            .fill(t.accent_alpha(0x2E))
+            .stroke(egui::Stroke::new(1.0, t.accent_dim))
+            .corner_radius(egui::CornerRadius::same(6))
+            .inner_margin(egui::Margin::symmetric(8, 4))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let (rect, _) =
+                        ui.allocate_exact_size(egui::vec2(13.0, 13.0), egui::Sense::hover());
+                    crate::ui::icons::paint_icon(ui.painter(), rect, icon, t.text, 1.4);
+                    ui.label(egui::RichText::new(&label).color(t.text).size(12.0));
+                    let (caret_rect, _) =
+                        ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+                    crate::ui::icons::paint_icon(
+                        ui.painter(),
+                        caret_rect,
+                        crate::ui::icons::Icon::ChevDown,
+                        t.muted,
+                        1.4,
+                    );
+                });
+            })
+            .response
+            .interact(egui::Sense::click());
+        let mut selected_tool: Option<Tool> = None;
+        egui::Popup::menu(&resp)
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClick)
+            .show(|ui| {
+                ui.set_min_width(220.0);
+                for &candidate in &Tool::ALL {
+                    let row_label = format!("{}  ({})", candidate.label(), candidate.accel());
+                    let selected = candidate == self.tool;
+                    if ui
+                        .add(egui::Button::selectable(selected, row_label))
+                        .clicked()
+                    {
+                        selected_tool = Some(candidate);
+                    }
+                }
+            });
+        if let Some(new_tool) = selected_tool
+            && new_tool != self.tool
+        {
+            self.set_tool(new_tool);
+        }
     }
 
     fn top_bar_brand(&self, ui: &mut egui::Ui) {
@@ -5868,6 +6070,26 @@ impl App {
                 if let Some(err) = &self.last_error {
                     ui.separator();
                     ui.colored_label(egui::Color32::RED, err);
+                }
+                // Sprint 19 — brush readout chip (right-aligned).
+                // Surfaces brush radius + strength for the active
+                // brush-bearing tools so the user always knows their
+                // brush size without opening the Inspector.
+                let brush_chip = match self.tool {
+                    Tool::Sculpt | Tool::Water => Some(format!(
+                        "Brush · {:.0} elmos · {:.2}",
+                        self.brush_radius, self.brush_strength,
+                    )),
+                    Tool::PaintLayer => Some(format!(
+                        "Brush · {:.0} elmos · {:.2}",
+                        self.paint_brush_state.radius, self.paint_brush_state.strength,
+                    )),
+                    _ => None,
+                };
+                if let Some(text) = brush_chip {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(egui::RichText::new(text).monospace().weak());
+                    });
                 }
             });
         });
@@ -6960,6 +7182,75 @@ impl App {
         // the one-click affordance. When the patch IS on, surface
         // a "Revert" button so the user can undo from the same card.
         self.inspector_water_atmosphere_offer(ui);
+
+        // ── HEIGHTMAP RANGE ──────────────────────────────
+        // Sprint 19 — surface min / max height edits inside the Water
+        // tool so the user can fix "water spawned in the wrong place"
+        // without scrolling back to the persistent header. BAR's water
+        // plane is fixed at Y=0 (`Ground.h::GetWaterPlaneLevel` is
+        // `consteval`); the user adjusts the heightmap range to slide
+        // terrain above / below it.
+        crate::ui::widgets::section(
+            ui,
+            "Heightmap range",
+            false,
+            |_ui| {},
+            |ui| {
+                ui.label(
+                    egui::RichText::new(
+                        "Water plane is fixed at Y = 0. Lower the floor below 0 \
+                         so basins fill with water; raise the ceiling above 0 \
+                         so mountains stand clear of it.",
+                    )
+                    .color(t.dim)
+                    .size(10.0),
+                );
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Floor (min)").color(t.muted).size(11.0));
+                    let before = self.min_height;
+                    let mut current = self.min_height;
+                    ui.add(
+                        egui::DragValue::new(&mut current)
+                            .range(-2048.0..=0.0)
+                            .speed(1.0)
+                            .suffix(" elmos"),
+                    )
+                    .on_hover_text(
+                        "World Y at raw heightmap value 0. Set negative to \
+                         carve below sea level.",
+                    );
+                    if (current - before).abs() > 1e-3 {
+                        self.min_height = current;
+                        self.mark_dirty();
+                    }
+                });
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("Ceiling (max)")
+                            .color(t.muted)
+                            .size(11.0),
+                    );
+                    let before = self.height_scale;
+                    let mut current = self.height_scale;
+                    ui.add(
+                        egui::DragValue::new(&mut current)
+                            .range(1.0..=4096.0)
+                            .speed(1.0)
+                            .suffix(" elmos"),
+                    )
+                    .on_hover_text(
+                        "World Y at raw heightmap value 65535. Raise to give \
+                         peaks room above the water plane.",
+                    );
+                    if (current - before).abs() > 1e-3 {
+                        self.height_scale = current;
+                        self.mark_dirty();
+                    }
+                });
+            },
+        );
 
         // ── BEHAVIOUR ────────────────────────────────────
         // Damage / void_water / tidal_strength. Tidal lives at
@@ -8596,6 +8887,52 @@ impl App {
                 }
             }
 
+            // Sprint 19 — placed-feature markers. Catalog-driven shape +
+            // colour by category (tree / rock / wreck / prop / geo) with
+            // the same cross-tool ghost + symmetry-mirror pattern as
+            // metal / vents. Falls back to a generic outline ring on
+            // catalog miss-hits so orphaned FeatureDef names from
+            // round-tripped projects still surface.
+            if !self.features.is_empty() {
+                let cross_tool_ghost = !matches!(self.tool, Tool::Feature);
+                let alpha_mul: u8 = if cross_tool_ghost { 128 } else { 255 };
+                for (i, f) in self.features.iter().enumerate() {
+                    let v = self.feature_state.manifest.resolved_visual(&f.name);
+                    let dragging = self.dragging_feature == Some(i);
+                    let r = if dragging {
+                        v.radius_px + 3.0
+                    } else {
+                        v.radius_px
+                    };
+                    let [cr, cg, cb, _] = v.color.to_array();
+                    let color = egui::Color32::from_rgba_unmultiplied(cr, cg, cb, alpha_mul);
+                    let y = self.terrain_y_at(f.x_elmo as f32, f.z_elmo as f32);
+                    marker_batch.push(crate::ui::markers::Marker {
+                        world_pos: glam::Vec3::new(f.x_elmo as f32, y, f.z_elmo as f32),
+                        radius_px: r,
+                        color,
+                        shape: v.shape,
+                    });
+                    if !matches!(self.symmetry, SymmetryAxis::None) {
+                        let mirrors = self
+                            .symmetry
+                            .replicate((f.x_elmo as f32, f.z_elmo as f32), extents);
+                        for (mx, mz) in mirrors.into_iter().skip(1) {
+                            if mx < 0.0 || mx > extents.0 || mz < 0.0 || mz > extents.1 {
+                                continue;
+                            }
+                            let my = self.terrain_y_at(mx, mz);
+                            marker_batch.push(crate::ui::markers::Marker {
+                                world_pos: glam::Vec3::new(mx, my, mz),
+                                radius_px: (v.radius_px * 0.75).max(4.0),
+                                color,
+                                shape: crate::ui::markers::MarkerShape::OutlineRing,
+                            });
+                        }
+                    }
+                }
+            }
+
             // Sprint 13 / Phase 5 — build the world-space line vertex
             // buffer: symmetry axes (dashed) + geo-vent plumes
             // (solid). LineList topology: every consecutive pair is
@@ -8798,6 +9135,89 @@ impl App {
                 }
             }
 
+            // Sprint 19 — brush radius readout next to the cursor
+            // ring. The GPU marker pipeline doesn't draw text; we
+            // project the world cursor here and paint a small chip
+            // via egui::Painter so the user always knows the brush
+            // size in elmos without opening the Inspector.
+            if matches!(self.tool, Tool::Sculpt)
+                && self.brush_id.is_some()
+                && let Some(cursor) = ctx.pointer_interact_pos()
+                && rect.contains(cursor)
+            {
+                let cursor_in = glam::Vec2::new(cursor.x - rect.min.x, cursor.y - rect.min.y);
+                let rect_size_v = glam::Vec2::new(rect.width(), rect.height());
+                if let Some(world) =
+                    render::screen_to_world_y0(cursor_in, rect_size_v, &self.camera)
+                {
+                    let world_v3 = glam::Vec3::new(world.x, 0.0, world.z);
+                    if let Some(screen) =
+                        render::world_to_screen(world_v3, rect_size_v, &self.camera)
+                    {
+                        let p = egui::Pos2::new(
+                            rect.min.x + screen.x + 12.0,
+                            rect.min.y + screen.y + 12.0,
+                        );
+                        overlay_painter.text(
+                            p,
+                            egui::Align2::LEFT_TOP,
+                            format!(
+                                "r {:.0} elmos · s {:.2}",
+                                self.brush_radius, self.brush_strength
+                            ),
+                            egui::FontId::monospace(10.0),
+                            egui::Color32::from_rgba_unmultiplied(240, 240, 240, 220),
+                        );
+                    }
+                }
+            }
+
+            // Sprint 19 — feature metal-value chips. Always visible
+            // when Tool::Feature is active so the user can see at a
+            // glance how much metal each placed feature yields; switches
+            // to hover-only otherwise to keep the viewport readable when
+            // editing other layers. Catalog miss-hits render "?m" so
+            // missing entries are visible rather than silent.
+            if !self.features.is_empty() {
+                let rect_size = glam::Vec2::new(rect.width(), rect.height());
+                let cross_tool_ghost = !matches!(self.tool, Tool::Feature);
+                let alpha_mul: u8 = if cross_tool_ghost { 128 } else { 255 };
+                let label_color = egui::Color32::from_rgba_unmultiplied(255, 255, 255, alpha_mul);
+                let pointer = if cross_tool_ghost {
+                    ctx.pointer_interact_pos()
+                } else {
+                    None
+                };
+                for f in &self.features {
+                    let world = glam::Vec3::new(f.x_elmo as f32, 0.0, f.z_elmo as f32);
+                    let Some(screen) = render::world_to_screen(world, rect_size, &self.camera)
+                    else {
+                        continue;
+                    };
+                    let p = egui::Pos2::new(rect.min.x + screen.x, rect.min.y + screen.y);
+                    // Hover-only path: skip when the cursor isn't
+                    // within ~14 px of the projected marker.
+                    if let Some(cursor) = pointer
+                        && (cursor - p).length() > 14.0
+                    {
+                        continue;
+                    }
+                    let metal = self.feature_state.manifest.metal_for(&f.name);
+                    let chip = match metal {
+                        Some(0) => continue, // skip 0-metal trees / props to keep canvas tidy
+                        Some(m) => format!("{m}m"),
+                        None => "?m".to_string(),
+                    };
+                    overlay_painter.text(
+                        p + egui::Vec2::new(0.0, -12.0),
+                        egui::Align2::CENTER_BOTTOM,
+                        chip,
+                        egui::FontId::proportional(11.0),
+                        label_color,
+                    );
+                }
+            }
+
             // C5 (Sprint 11): geo-vent markers. Orange triangle with
             // a faint upward gradient (steam-plume hint). Cross-tool
             // ghost falloff identical to metal.
@@ -8809,7 +9229,32 @@ impl App {
             crate::ui::viewport_chrome::paint_rulers(&overlay_painter, rect, &self.camera);
 
             // Mini-map. Uses its own painter inside ui scope.
-            let metal_spots: &[(f32, f32, f32)] = &[]; // populated by Phase 7
+            // Sprint 19 — minimap now shows real metal spots + geo
+            // vents + placed features as overlay glyphs, so the user
+            // has a reliable top-down readout even when 3D markers are
+            // occluded by terrain relief.
+            let metal_spots: Vec<(f32, f32, f32)> = self
+                .metal_spots
+                .iter()
+                .map(|s| (s.x_elmo as f32, s.z_elmo as f32, s.metal))
+                .collect();
+            let geo_vents: Vec<(f32, f32)> = self
+                .geo_vents
+                .iter()
+                .map(|v| (v.x_elmo as f32, v.z_elmo as f32))
+                .collect();
+            let features_mini: Vec<crate::ui::minimap::MinimapFeature> = self
+                .features
+                .iter()
+                .map(|f| {
+                    let v = self.feature_state.manifest.resolved_visual(&f.name);
+                    crate::ui::minimap::MinimapFeature {
+                        x_elmo: f.x_elmo as f32,
+                        z_elmo: f.z_elmo as f32,
+                        color: v.color,
+                    }
+                })
+                .collect();
             let heightmap_data = self.heightmap.as_ref().map(|h| &h.data);
             // D10 / Sprint 17 (ADR-041): `App::splat_distribution`
             // retired. The minimap loses its low-res splat overlay
@@ -8821,7 +9266,9 @@ impl App {
                 heightmap_data,
                 splat_data,
                 &self.ally_groups,
-                metal_spots,
+                &metal_spots,
+                &geo_vents,
+                &features_mini,
                 extents,
                 &self.camera,
             );
@@ -9120,6 +9567,7 @@ mod tests {
             mapinfo_overrides: std::collections::HashMap::new(),
             show_next_steps: false,
             next_steps_dismissed: false,
+            minimap_override: None,
             migration_toast_dismissed: false,
             pending_migration_toast: false,
             dirty: false,

@@ -17,6 +17,15 @@ in Sprint 11.
 **Prerequisites:** Sprint 8 (D2 + D3) MUST be ticked. D2 owns the DNTS bake
 pipeline; D3 owns `SplatDistribution` + `SplatBrush`. D4 reuses both.
 
+**Sequencing note:** Sprint 10 (mapinfo audit fix) can run before OR
+after Sprint 9. If Sprint 10 lands first, the `validation_summary`
+extension in D5 inherits the corrected schema (esp. the
+`splatDetailNormalTex` subtable form + the `sundir`/`sunDir` dual
+emit). If Sprint 9 lands first, the `validation_summary` chip wired
+in D5 will surface against the OLD schema and Sprint 10 will need to
+re-touch one call site. Sprint 9 itself does NOT touch the mapinfo
+emitter — D6 wires emission in Sprint 12.
+
 This sprint is **performance-sensitive**: the splat distribution is 1–4 MB
 of `rgba8unorm` data that has to upload to GPU on every brush stroke.
 Dirty-rect uploads (from D3) are mandatory; full-texture uploads will

@@ -79,3 +79,8 @@ See `docs/ROADMAP.md`. We are in **Stage 0 (validation)**.
   source lives at `github.com/Beherith/springrts_smf_compiler` (CC0-1.0).
 - Recoil engine. The launcher invokes the user's installed BAR.
 - Test `.sd7` archives. Keep them out of git — they are large and binary.
+
+
+## Always write dev logs. 
+- Inside of the devlog folder, each issue should get it's own subfolder where your notes go
+- we must log all aspects of our work, all logs should have the date / time in thier file name

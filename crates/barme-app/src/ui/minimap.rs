@@ -39,6 +39,15 @@ impl Minimap {
 /// `splat_distribution`, when supplied, is composited over the
 /// heightfield thumbnail at 50 % opacity so the user can see at a
 /// glance where they've painted (D5 / Sprint 9).
+/// One placed feature, ready to paint as a minimap dot. The colour
+/// is resolved by the caller via the feature catalog so this module
+/// stays pure-rendering (no JSON/serde dependency).
+pub struct MinimapFeature {
+    pub x_elmo: f32,
+    pub z_elmo: f32,
+    pub color: Color32,
+}
+
 #[allow(clippy::too_many_arguments)] // pure-rendering helper, easier to read than a struct
 pub fn paint_minimap(
     ui: &mut Ui,
@@ -47,6 +56,8 @@ pub fn paint_minimap(
     splat_distribution: Option<&SplatDistribution>,
     ally_groups: &[AllyGroup],
     metal_spots: &[(f32, f32, f32)],
+    geo_vents: &[(f32, f32)],
+    features: &[MinimapFeature],
     extents: (f32, f32),
     camera: &OrbitCamera,
 ) -> Rect {
@@ -139,6 +150,36 @@ pub fn paint_minimap(
             3.5,
             Stroke::new(1.0, Color32::from_rgba_premultiplied(0, 0, 0, 160)),
         );
+    }
+
+    // Sprint 19 — placed features (under start pins so team colours
+    // win on overlap). Catalog-resolved colour by category.
+    for f in features {
+        let p = world_to_mini(body_rect, (f.x_elmo, f.z_elmo), extents);
+        painter.circle_filled(p, 2.5, f.color);
+        painter.circle_stroke(
+            p,
+            2.5,
+            Stroke::new(1.0, Color32::from_rgba_premultiplied(0, 0, 0, 140)),
+        );
+    }
+
+    // Sprint 19 — geo vents (orange triangle, matches the 3D marker
+    // colour). Small upward-pointing equilateral so it reads at 3 px.
+    let geo_color = Color32::from_rgb(0xF5, 0x9E, 0x0B);
+    let geo_outline = Color32::from_rgba_premultiplied(0, 0, 0, 160);
+    for (x, z) in geo_vents {
+        let c = world_to_mini(body_rect, (*x, *z), extents);
+        let pts = [
+            Pos2::new(c.x, c.y - 3.5),
+            Pos2::new(c.x - 3.0, c.y + 2.5),
+            Pos2::new(c.x + 3.0, c.y + 2.5),
+        ];
+        painter.add(egui::Shape::convex_polygon(
+            pts.to_vec(),
+            geo_color,
+            Stroke::new(1.0, geo_outline),
+        ));
     }
 
     // Start pins.

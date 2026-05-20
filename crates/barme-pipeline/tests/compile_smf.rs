@@ -70,6 +70,11 @@ fn pymapconv_compiles_minimum_legal_map() {
             // so the metalmap PNG is not staged and PyMapConv's
             // default 1×1 black applies.
             metalmap_png: None,
+            // D7 / Sprint 18: this single-purpose `pymapconv::compile`
+            // test doesn't bake the minimap; the bake path is exercised
+            // via the dedicated `barme_pipeline::minimap::tests` and
+            // by the end-to-end `build_sd7` integration test.
+            minimap_png: None,
             out_dir: &out_dir,
         })
         .unwrap_or_else(|e| panic!("compile failed:\n{e}"));

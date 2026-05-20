@@ -25,9 +25,11 @@ material (PDFs, screenshots, extracted code, sample mapinfo files).
 
 | Topic | Status | Drives | Becomes ADR |
 |---|---|---|---|
-| `textures/` | Prompt drafted, session pending | F4 splat painting | ADR-025 |
-| `ui/` | Prompt drafted, session pending | UX overhaul across Phase 3 | ADR-028 (anticipated) |
-| `mapinfo/` | Prompt drafted, session pending | F5, F6, F7, F8 allyTeam gap, F9 | ADR-027 |
+| `textures/` | Findings landed (Claude + Gemini); reviewed in phase-3-plan.md D1 | F4 splat painting | ADR-025 |
+| `ui/` | Findings landed (Claude + Gemini); reviewed in phase-3-plan.md B1–B8 | UX overhaul across Phase 3 | ADR-030, 031, 032 (+ smaller follow-ups) |
+| `mapinfo/` | Findings landed (Claude + Gemini); reviewed in phase-3-plan.md C1–C8; **source-audit 2026-05-18 adds 10 new pitfalls + schema corrections** | F5, F6, F7, F8 allyTeam, F9, lint pass | ADR-028, 029 (+ follow-ups) |
+| `splat-rendering/` | Findings landed; **source-audit 2026-05-18 corrects 5 load-bearing shader formulas — re-verify before adoption** | F4 fragment shader (Sprint 9 / D4) | ADR-035 (anticipated) |
+| `source-audit-2026-05-18/` | Findings landed; cross-references all four other topics against the actual BAR source clones | Multi-topic: corrections feed into mapinfo defaults (C3), splat shader (D4), PITFALLS additions | n/a (corrections folded into existing ADRs) |
 
 Update this table when a topic transitions:
 - *Prompt drafted* → *Session pending*: we've handed PROMPT.md off

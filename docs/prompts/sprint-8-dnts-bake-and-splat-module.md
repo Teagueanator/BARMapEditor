@@ -8,8 +8,9 @@ You are continuing work on the BAR Map Editor, a Rust + egui + wgpu desktop
 GUI for authoring Beyond All Reason / Recoil maps. Branch is `main`.
 
 This is **Sprint 8** from `devlog/stage-1-mvp/phase-3-plan.md` § "Order of
-attack." You ship **D2 + D3** — the DNTS bake pipeline (Y-flip +
-Compressonator + DDS emit) and the `barme-core::splat` module
+attack." You ship **D2 + D3** — the DNTS bake pipeline (normal-prep +
+Compressonator + DDS emit, with a configurable Y-flip for non-GL
+sources) and the `barme-core::splat` module
 (distribution + brush trait + dirty-rect pattern). Together they form the
 data + pipeline foundation for splat painting; D4 (Sprint 9) wires the
 shader, D5 (Sprint 9) wires the UI.
@@ -53,9 +54,15 @@ Read these in order:
    read D2 and D3 in full. Skim D4 / D5 / D6 to understand what consumes
    your output.
 7. `/home/teague/code/BARMapEditor/docs/research/textures/Gemini BAR Editor Texture Pack Scoping.md`
-   — sections on Y-flip (Recoil's OpenGL tangent space requires inverted
-   green channel — primary-source evidence: `_flipped` suffix in shipped
-   BAR DNTS files) and the `splatDetailNormalDiffuseAlpha = 0` baseline.
+   — section on Y-flip (Recoil's OpenGL tangent space). **Read alongside
+   source-audit FINDINGS §7.4**: the engine uses OpenGL convention, so
+   the Y-flip is needed ONLY when the source normal is DirectX (e.g.
+   Beherith's `_flipped.dds` files, originally Substance / Quixel
+   exports). The D1-shipped starter pack uses ambientCG `_NormalGL.png`
+   sources, which are ALREADY OpenGL — the flip is OFF by default for
+   it. Keep the flip as a configurable knob (`BakeOptions::yflip_normal`)
+   for F23 user-imports. The doc's `splatDetailNormalDiffuseAlpha = 0`
+   baseline guidance is still correct.
 8. `/home/teague/code/BARMapEditor/docs/research/textures/claude-findings-from-research.md`
    — section on the `splatDetailNormalTex requires specularTex` silent
    disable. **The source-audit at
@@ -119,15 +126,26 @@ In order, one commit per item:
      ) -> Result<()>;
      ```
    - Bake pipeline:
-     1. Read `diffuse.{jpg,png}` and `normal.png` from `slot_dir` via the
-        `image` crate (already a workspace dep).
-     2. **Y-flip the normal map green channel** — non-negotiable. Recoil
-        uses OpenGL tangent-space normals; ambientCG ships DirectX-
-        convention. Write a dedicated unit test that loads a known-
-        direction normal map, runs the flip, and asserts each pixel's
-        green channel inverted (`255 - g`).
+     1. Read `diffuse.{png,jpg}` and `normal.png` from `slot_dir` via the
+        `image` crate (already a workspace dep). The D1-shipped starter
+        pack always provides PNG diffuse; the JPG fallback is for future
+        F23 user-imported assets.
+     2. **Y-flip the normal map green channel** — configurable, default
+        OFF for the starter pack. Recoil uses OpenGL tangent-space
+        normals (per source-audit FINDINGS §7.4:
+        `SMFFragProg.glsl:276-278` builds the TBN with the standard
+        +Y-up basis). The D1-shipped starter pack extracts
+        `*_NormalGL.png` from ambientCG, which is **already OpenGL
+        convention** — no Y-flip required. The flip stays as a
+        configurable `BakeOptions { yflip_normal: bool }` knob for
+        F23 user-imports where the source is DirectX-convention
+        (e.g. Substance / Quixel exports). Write a dedicated unit
+        test against a known-direction synthetic normal map that
+        asserts `yflip_normal: true` inverts the green channel
+        (`255 - g`) and `yflip_normal: false` is a passthrough.
      3. Compose to a `splatDetailNormalTex`-format image:
-        - RGB ← Y-flipped normal.
+        - RGB ← normal (Y-flipped iff `opts.yflip_normal == true`;
+          OFF for the ambientCG starter pack).
         - A ← `0xFF` if `opts.diffuse_in_alpha == false` (ADR-025
           baseline); otherwise high-pass-filtered diffuse. **Ship with
           `diffuse_in_alpha: false` this sprint; the high-pass path is
@@ -169,26 +187,37 @@ In order, one commit per item:
      }
      pub struct SplatBrushRegistry { /* mirrors BrushRegistry */ }
      ```
-   - Dims convention: distribution is `(128 * smu_x, 128 * smu_z)` —
-     **NOT** 512 px/SMU. Verify against `crates/barme-pipeline/src/mapinfo.rs`
-     and the SMF format docs in SRS §1.2 before locking. The BAR splat
-     distribution texture is `4096²` at 16-SMU per ZK reference; that's
-     256 px/SMU, halfway between metalmap (32 px/SMU) and SMF tile pool
-     (512 px/SMU). **Find the canonical dimension before sizing the
-     buffer**; don't assume.
-   - **Important math finding from the audit:** in the engine shader
-     (`SMFFragProg.glsl:177`), the distribution texture is sampled at
+   - **Dims convention: ship a fixed 1024 × 1024 RGBA distribution
+     (4 MB) regardless of map size.** This is the recommended default
+     after auditing real BAR maps:
+     `scratch/bar-maps/extracted/titanduel/maps/titandueldist.png` is
+     1024 × 1024;
+     `scratch/bar-maps/extracted/comet/maps/splat_distr.png` is
+     2048 × 1024 (non-square, ~half the resolution per axis vs the
+     SMT 8192² diffuse). The engine accepts ANY dimension — see the
+     "resolution-flexible" note below.
+   - **Important math finding from the audit** (verified against
+     `RecoilEngine/cont/base/springcontent/shaders/GLSL/SMFFragProg.glsl`
+     line 177 + `rts/Map/SMF/SMFReadMap.cpp` line 281–282 at HEAD
+     2026-05-18): the distribution texture is sampled at
      `texture2D(splatDistrTex, uv)` with `uv` in `[0,1]^2` spanning
      the whole map — same UV space as the base SMT diffuse. The
-     per-channel weight is then multiplied by `splats.texMults` from
-     mapinfo. This means the distribution texture itself is
-     resolution-flexible: 4096² is BAR convention, but the shader
-     never assumes it. Pick a dim that fits the editor's brush
-     resolution; 256 px/SMU is reasonable. Sanity-check via a
-     paint-and-export smoke test — paint a single green stamp in the
-     editor at world (4096, 4096) on a 16-SMU map, build the `.sd7`,
-     load it in BAR, confirm the green DNTS slot blends where you
-     painted.
+     engine reads `splatDistrTexBM.xsize/ysize` from whatever the
+     `.png`/`.tga` happens to be and uses those values; there is no
+     fixed convention. The per-channel weight is then multiplied by
+     `splats.texMults` from mapinfo.
+   - **Sizing rationale**: 1024² × 4 = 4 MB CPU buffer, a comfortable
+     middle ground vs the heightmap (2 MB at 16 SMU). Painting at this
+     resolution gives ~64 elmos / pixel on a 16-SMU map (the SMT
+     diffuse is 8 elmos / pixel for reference; metalmap is 16
+     elmos / pixel). Larger map → coarser per-pixel coverage; rely on
+     `splats.texScales` to drive visible detail tile size, NOT the
+     distribution resolution. **Document this as ADR-027 if the
+     fixed-1024² choice isn't already captured there from D1.**
+   - Sanity-check via a paint-and-export smoke test — paint a single
+     green stamp in the editor at world (4096, 4096) on a 16-SMU map,
+     build the `.sd7`, load it in BAR, confirm the green DNTS slot
+     blends where you painted.
    - Three initial brushes (struct-per-brush, registry pattern from
      ADR-018):
      - `PaintChannel` — writes 255 to the stamp's channel with a
@@ -244,10 +273,16 @@ boxes in phase-3-plan.md, closing devlog log.
 
 From phase-3-plan.md D2 / D3 + research digests + SRS §2.1:
 
-1. **Y-flip is mandatory and silent-failure.** Skipping it produces
-   inverted concavity under lighting — subtle enough to ship and embarrass
-   us. The dedicated unit test is the single most important deliverable
-   in D2.
+1. **Y-flip is silent-failure if misapplied** (either direction).
+   The D1-shipped starter pack ships ambientCG `*_NormalGL.png` which
+   is **already OpenGL convention** — flip OFF is the correct call,
+   per source-audit FINDINGS §7.4. Flipping ON for a GL source
+   produces inverted concavity (lighting upside-down on a slope);
+   leaving OFF for a DX source produces the same artifact in the
+   other direction. Default the `BakeOptions::yflip_normal` to
+   `false` for the starter pack; expose a per-import override at
+   F23. Both branches need unit-test coverage against a
+   known-direction synthetic normal.
 
 2. **JPEG normal maps**: D1 enforces PNG; D2 must defensively re-check.
    If `normal.png` doesn't exist or `image::open` reports a non-PNG
@@ -262,11 +297,12 @@ From phase-3-plan.md D2 / D3 + research digests + SRS §2.1:
    input. Otherwise toggling `diffuse_in_alpha` won't invalidate the
    cache.
 
-5. **Splat distribution dimension**: **verify against canonical BAR
-   source before allocating**. Wrong dimension means the splat map is
-   misaligned with the metalmap / typemap / heightmap. If unsure, write
-   a 4-SMU smoke test: paint G on the centre 100-elmo radius, dump to
-   PNG, eyeball alignment against the heightmap centre.
+5. **Splat distribution dimension is NOT alignment-sensitive**: the
+   engine samples `splatDistrTex` at `uv ∈ [0,1]²` covering the whole
+   map (`SMFFragProg.glsl:177`), so 1024² is fine regardless of
+   `smu_x × smu_z`. The risk is visual ("brush feels chunky on a
+   32-SMU map") not correctness. If a smoke test shows alignment
+   drift, the bug is in `world_to_uv`, NOT in the buffer size.
 
 6. **Channel sum invariant**: BAR's renderer caps the normal-blend
    strength at `min(1.0, dot(splatCofac, vec4(1.0)))` (per
@@ -278,9 +314,10 @@ From phase-3-plan.md D2 / D3 + research digests + SRS §2.1:
    writes 255 to G, the other 3 channels must clamp down proportionally.
    Test asserts the invariant.
 
-7. **Distribution memory at 16 SMU**: at 256 px/SMU (verify) that's
-   4096² × 4 bytes = 64 MB. **DO NOT** copy-snapshot for undo — see the
-   "No undo integration" scope note. The dirty-rect upload pattern from
+7. **Distribution memory at the 1024² fixed dim**: 4 MB resident. Still
+   too large to copy-snapshot per stroke (would evict 25-ish heightmap
+   strokes from the 100 MB undo cap) — defer splat-undo per "No undo
+   integration" scope note. The dirty-rect upload pattern from
    ADR-018 still applies for *shader* updates (D4), not undo.
 
 8. **Brush trait `Send + Sync + 'static`**: matches the existing `Brush`
@@ -311,8 +348,10 @@ From phase-3-plan.md D2 / D3 + research digests + SRS §2.1:
   - `bake_dnts(grass_meadow_slot, "out.dds", BakeOptions::default())`
     produces a valid BC3 DDS (inspect with a DDS viewer or `dds-info`
     CLI — file header reports DXT5 / BC3).
-  - Y-flip unit test passes (deterministic input → expected green channel
-    inversion).
+  - Y-flip unit tests pass: a deterministic synthetic normal map fed
+    through `yflip_normal: true` shows the green channel inverted
+    (`255 - g`); the same input through `yflip_normal: false` is a
+    passthrough. Starter-pack default is `false`.
   - Re-baking with identical inputs is a no-op (cache hit; log shows
     `dnts: cache hit slot=grass-meadow`).
   - Toggling `diffuse_in_alpha` invalidates the cache.
