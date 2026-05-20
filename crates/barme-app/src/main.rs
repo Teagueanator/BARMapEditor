@@ -3379,8 +3379,20 @@ impl App {
             dst = %dst_dir.display(),
             "build & install requested"
         );
-        match launcher::build_and_install(&driver, &project, &hm_path, None, splat_inputs, &dst_dir)
-        {
+        // D8 / Sprint 15: hand a SlotResolver to the launcher so the
+        // layer bake can resolve slot ids → `diffuse.png` paths. The
+        // resolver borrows the App's `slot_registry` which is built
+        // once at startup; it lives for the duration of this call.
+        let layer_resolver = AppSlotResolver::new(&self.slot_registry);
+        match launcher::build_and_install(
+            &driver,
+            &project,
+            &hm_path,
+            None,
+            splat_inputs,
+            &layer_resolver,
+            &dst_dir,
+        ) {
             Ok(installed) => {
                 let bytes = std::fs::metadata(&installed).map(|m| m.len()).unwrap_or(0);
                 info!(
