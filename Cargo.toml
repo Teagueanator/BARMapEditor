@@ -43,6 +43,13 @@ evalexpr = "13"
 # DNTS bake cache key (sha256 over inputs + BakeOptions)
 sha2 = "0.10"
 
+# Mask byte-vec TOML encoding (D8 / Sprint 15). Switching to sidecar
+# PNGs lands in Sprint 16 (D9) once the tiled-COW model arrives.
+base64 = "0.22"
+
+# Per-row parallel layer bake (D8 / Sprint 15).
+rayon = "1.10"
+
 # Cross-platform user directories (BAR maps-dir lookup; see ADR-015)
 directories = "6"
 

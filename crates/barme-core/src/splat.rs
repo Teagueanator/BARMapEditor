@@ -158,7 +158,11 @@ pub struct SplatDistribution {
 /// One of the four splat distribution channels. Order matches the
 /// inspector's TEXTURE LAYERS row order (D5 / Sprint 9) so the App's
 /// `splat_brush_state.active_channel` indexes into this enum directly.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Serializes as the bare channel letter ("R", "G", "B", "A") for
+/// readable round-trips through TOML (D8 / Sprint 15 — used by
+/// [`crate::layers::TextureLayer::dnts_channel`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SplatChannel {
     R,
     G,

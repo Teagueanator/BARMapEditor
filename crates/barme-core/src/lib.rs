@@ -7,6 +7,7 @@
 
 pub mod brushes;
 pub mod heightmap;
+pub mod layers;
 pub mod map_size;
 pub mod mapinfo_schema;
 pub mod procgen;
@@ -19,6 +20,10 @@ pub mod water_presets;
 
 pub use brushes::{Brush, BrushRegistry, BrushStamp, DirtyRect};
 pub use heightmap::{DimMismatch, Heightmap};
+pub use layers::{
+    BlendMode, ClosureSlotResolver, LayerColor, LayerMask, LayerSource, LayerStack, LayerTransform,
+    SlotResolver, TextureLayer, alloc_layer_id,
+};
 pub use map_size::MapSize;
 pub use mapinfo_schema::{
     AtmosphereBlock, GrassBlock, LightingBlock, MapInfo, ResourcesBlock, Rgb, SmfBlock, SoundBlock,

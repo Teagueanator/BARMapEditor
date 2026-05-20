@@ -16,6 +16,8 @@ bytemuck.workspace = true
 tracing.workspace = true
 image.workspace = true
 evalexpr.workspace = true
+base64.workspace = true
+rayon.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
