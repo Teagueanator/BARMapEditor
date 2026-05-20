@@ -99,13 +99,14 @@ pub struct Project {
     /// `#[serde(default)]` materialises the engine defaults for
     /// pre-Sprint-9 `.barmeproj` files.
     ///
-    /// **Sprint 17 (ADR-041):** retired at the project boundary. The
-    /// load path still hydrates this for pre-Sprint-14 projects so
-    /// [`Self::after_load_migrate`] can seed [`Self::layers`] +
-    /// [`Self::dnts_diffuse_in_alpha`] from it, but Commit 6 of
-    /// Sprint 17 marks it `#[serde(skip_serializing)]` so new saves
-    /// drop the legacy block.
-    #[serde(default)]
+    /// **Sprint 17 (ADR-041) / Commit 6:** retired at the project
+    /// boundary. The load path still hydrates this for pre-Sprint-14
+    /// projects so [`Self::after_load_migrate`] can seed
+    /// [`Self::layers`] + [`Self::dnts_diffuse_in_alpha`] from it,
+    /// but new saves drop the legacy block thanks to
+    /// `#[serde(skip_serializing)]`. The struct itself sticks around
+    /// until a future sprint drops it.
+    #[serde(default, skip_serializing)]
     pub splat_config: SplatConfig,
     /// D10 / Sprint 17 (ADR-041): mirrors
     /// `mapinfo.resources.splatDetailNormalDiffuseAlpha`. Replaces the
@@ -1034,18 +1035,26 @@ smu_z = 4
         }
     }
 
-    /// D5 / Sprint 9: per-channel splat slot bindings persist across
-    /// save / open. Round-trip a non-default config through TOML.
+    /// D5 / Sprint 9 → D10 / Sprint 17 (ADR-041): `Project.splat_config`
+    /// is now `#[serde(skip_serializing)]`. New saves drop it; old
+    /// loads still populate the field via the wire-side `#[serde(default)]`.
+    /// Verify the on-disk shape no longer carries the legacy block.
     #[test]
-    fn splat_config_round_trips() {
+    fn splat_config_skips_serialization() {
         let mut p = Project::new("splat", 8);
         p.splat_config.channels = [Some(0), Some(2), None, Some(8)];
         p.splat_config.tex_scales = [0.02, 0.004, 0.02, 0.0015];
         p.splat_config.tex_mults = [1.0, 1.5, 1.0, 0.8];
         p.splat_config.diffuse_in_alpha = true;
         let s = toml::to_string(&p).unwrap();
+        assert!(
+            !s.contains("splat_config"),
+            "splat_config block must NOT serialise on new saves; got:\n{s}"
+        );
+        // Round-trip: reload picks up engine defaults (the legacy
+        // values are gone from disk).
         let p2: Project = toml::from_str(&s).unwrap();
-        assert_eq!(p.splat_config, p2.splat_config);
+        assert_eq!(p2.splat_config, SplatConfig::default());
     }
 
     /// `splat_distribution` is `#[serde(skip)]` — the 4 MB RGBA buffer
@@ -1474,6 +1483,68 @@ tex_mults = [1.0, 1.0, 1.0, 1.0]
         let layer_count_before = p2.layers.layers.len();
         p2.after_load_migrate(&NullResolver);
         assert_eq!(p2.layers.layers.len(), layer_count_before);
+    }
+
+    /// D10 / Sprint 17 (ADR-041) — Commit 6 marks
+    /// `Project.splat_config` `#[serde(skip_serializing)]`. A
+    /// round-trip of a migrated project should:
+    /// 1. Load a legacy on-disk TOML (with `[splat_config]` + bound
+    ///    channels). Migration seeds the layer stack.
+    /// 2. Save the migrated project — the saved TOML must NOT
+    ///    contain a `splat_config` block.
+    /// 3. Reload — the layer stack persists; no legacy data needed.
+    #[test]
+    fn legacy_splat_config_round_trip_skips_serializing_after_migration() {
+        struct NullResolver;
+        impl crate::layers::SlotResolver for NullResolver {
+            fn diffuse_path(&self, _slot_id: u8) -> Option<std::path::PathBuf> {
+                None
+            }
+        }
+        // Pre-Sprint-17 wire shape: includes `[splat_config]` with
+        // bound channels + tex_scales / tex_mults.
+        let legacy_toml = r#"
+name = "legacy"
+min_height = 0.0
+max_height = 256.0
+[size]
+smu_x = 2
+smu_z = 2
+[splat_config]
+channels = [0, 3, -1, -1]
+tex_scales = [0.01, 0.02, 0.02, 0.02]
+tex_mults = [0.5, 1.0, 1.0, 1.0]
+diffuse_in_alpha = true
+"#;
+        let mut p: Project = toml::from_str(legacy_toml).unwrap();
+        assert!(p.layers.layers.is_empty(), "legacy file has no layers");
+        // Run the migration the editor runs on load.
+        p.after_load_migrate(&NullResolver);
+        assert_eq!(
+            p.layers.layers.len(),
+            2,
+            "two bound channels → two seeded layers"
+        );
+        assert!(
+            p.dnts_diffuse_in_alpha,
+            "splat_config.diffuse_in_alpha should migrate forward"
+        );
+        // Now save. The on-disk shape should NOT carry `splat_config`.
+        let saved = toml::to_string(&p).unwrap();
+        assert!(
+            !saved.contains("splat_config"),
+            "saved TOML should not carry the legacy splat_config block:\n{saved}"
+        );
+        // Reload + confirm the layer stack survives the round-trip.
+        let p2: Project = toml::from_str(&saved).unwrap();
+        assert_eq!(p2.layers.layers.len(), 2);
+        assert!(p2.dnts_diffuse_in_alpha);
+        // Re-running migration on the saved-then-reloaded project
+        // is a no-op (the stack is non-empty).
+        let mut p3 = p2.clone();
+        let layer_count = p3.layers.layers.len();
+        p3.after_load_migrate(&NullResolver);
+        assert_eq!(p3.layers.layers.len(), layer_count);
     }
 
     #[test]

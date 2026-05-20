@@ -10,9 +10,8 @@ use barme_core::{
     ALLY_GROUP_PALETTE, AllyGroup, BAR_DEFAULT_SURFACE_ALPHA, BAR_DEFAULT_SURFACE_COLOR, BIOMES,
     BrushRegistry, BrushStamp, DirtyRect, FeatureInstance, GeoVent, Heightmap, History,
     HistoryEntry, LayerPropertyValue, LayerStack, MapSize, MetalSpot, PROJECT_EXTENSION, Project,
-    ProjectDiff, SlotResolver, SplatBrushRegistry, SplatConfig, SplatDistribution, StartPosition,
-    SymmetryAxis, TextureLayer, WaterBlock, WaterField, WaterMode,
-    WaterValue, WizardSnapshot,
+    ProjectDiff, SlotResolver, SplatConfig, StartPosition, SymmetryAxis, TextureLayer, WaterBlock,
+    WaterField, WaterMode, WaterValue, WizardSnapshot,
     brushes::pixel_bbox,
     default_extractor_radius, merge_overrides, preset_water_block,
     procgen::{
@@ -346,11 +345,6 @@ struct App {
     /// drops onto the layers panel vs the central viewport. `None`
     /// when the panel isn't on screen this frame.
     layers_panel_rect: Option<egui::Rect>,
-    /// D5 / Sprint 9: persisted per-channel slot bindings, scales,
-    /// mults, and the ADR-034 placeholder toggle. Round-trips through
-    /// `Project.splat_config` on save / open. Replaces the Phase-7
-    /// `SplatState` scaffolding.
-    splat_config: SplatConfig,
     /// D10 / Sprint 17 (ADR-041): mirrors
     /// [`barme_core::Project::dnts_diffuse_in_alpha`]. Drives the
     /// Layers panel footer toggle + the splat pipeline's per-build
@@ -358,18 +352,6 @@ struct App {
     /// `splat_config.diffuse_in_alpha`; migration copies the legacy
     /// value across on first load of a pre-Sprint-17 project.
     dnts_diffuse_in_alpha: bool,
-    /// D5 / Sprint 9: the painted RGBA distribution. Allocated on
-    /// first stamp; not persisted to `.barmeproj` (D6 / Sprint 12 will
-    /// ship PNG sidecar persistence). Mirrors
-    /// `Project.splat_distribution` for the duration of the session.
-    splat_distribution: Option<SplatDistribution>,
-    /// D3 splat brush registry — kept for the runtime DNTS shader
-    /// path until Sprint 17 Commit 6 + later sprints fully retire
-    /// the legacy splat painter. Sprint 17 Commit 5 deleted the
-    /// `SplatBrushState` + the slot-picker popover state since the
-    /// Layers panel owns equivalent UX now.
-    #[allow(dead_code)]
-    splat_brushes: SplatBrushRegistry,
     /// D1 / ADR-027 slot registry, scanned once at app start from
     /// `tools/textures/<NN-slot>/`. Each entry pairs a slot id with
     /// its display name + dir for the thumbnail loader. Empty when
@@ -1219,10 +1201,7 @@ impl App {
             paint_drag_preview_order: None,
             layer_mask_preview_cache: None,
             layers_panel_rect: None,
-            splat_config: SplatConfig::default(),
             dnts_diffuse_in_alpha: false,
-            splat_distribution: None,
-            splat_brushes: SplatBrushRegistry::default(),
             slot_registry: scan_slot_registry(Path::new("tools/textures")),
             slot_thumbnails: std::collections::HashMap::new(),
             metal_state: MetalState::default(),
@@ -1347,9 +1326,7 @@ impl App {
         // D5: fresh project starts with no slots bound and no painted
         // distribution. Slot thumbnails stay cached — the registry +
         // PNGs on disk don't change with project lifecycle.
-        self.splat_config = SplatConfig::default();
         self.dnts_diffuse_in_alpha = false;
-        self.splat_distribution = None;
         // D8 / Sprint 15 (ADR-038): a fresh "New project" gets a
         // single-layer biome-base stack. D9 / Sprint 16 seeds a
         // second accent layer at mask=0 so paint reveal/hide
@@ -1428,10 +1405,14 @@ impl App {
             mapinfo_overrides: self.mapinfo_overrides.clone(),
             next_steps_dismissed: self.next_steps_dismissed,
             migration_toast_dismissed: self.migration_toast_dismissed,
-            splat_config: self.splat_config.clone(),
+            // D10 / Sprint 17 (ADR-041): `splat_config` is
+            // `#[serde(skip_serializing)]` so this default never hits
+            // disk on new saves; legacy projects still load through
+            // the migration path. App-side fields retired.
+            splat_config: SplatConfig::default(),
             dnts_diffuse_in_alpha: self.dnts_diffuse_in_alpha,
             layers: self.layer_stack.clone(),
-            splat_distribution: self.splat_distribution.clone(),
+            splat_distribution: None,
             metal_spots: self.metal_spots.clone(),
             geo_vents: self.geo_vents.clone(),
             features: self.features.clone(),
@@ -1615,7 +1596,9 @@ impl App {
         // artefacts on the terrain. Warn but don't gate (the user
         // might still ship and accept the risk). Sprint 19's lint
         // panel will surface this same condition more loudly.
-        let has_dnts = self.splat_config.channels.iter().any(|c| c.is_some());
+        // D10 / Sprint 17 (ADR-041): derive from layer stack instead
+        // of the retired `splat_config.channels`.
+        let has_dnts = self.layer_stack.dnts_layers().iter().any(|l| l.is_some());
         let has_water = self.water_mode != WaterMode::None || self.min_height < 0.0;
         if has_dnts && has_water {
             return (ChipTone::Warn, "DNTS + water: LOS bug".into());
@@ -2092,18 +2075,31 @@ impl App {
         (qx, qz)
     }
 
-    /// Build the per-frame splat uniforms passed to the GPU. Reads
-    /// `App::splat_config` so any inspector edit (slot bind, tex_scale
-    /// slider, tex_mult slider, diffuse-in-alpha toggle) flows into
-    /// the next-frame fragment composite.
+    /// Build the per-frame splat uniforms passed to the GPU.
+    ///
+    /// D10 / Sprint 17 (ADR-041): now derives from the layer stack
+    /// (per-layer `dnts_tex_scale` / `dnts_tex_mult` / channel
+    /// binding) instead of the retired `App::splat_config`. The
+    /// `diffuse_in_alpha` flag comes from `App::dnts_diffuse_in_alpha`
+    /// (the per-project replacement for the legacy field).
     fn splat_uniforms_for_render(&self) -> SplatUniforms {
         let base = SplatUniforms::default();
+        let mut tex_scales = [0.02f32; 4];
+        let mut tex_mults = [1.0f32; 4];
+        let mut active_mask = 0u32;
+        for (ch, maybe_layer) in self.layer_stack.dnts_layers().iter().enumerate() {
+            if let Some(layer) = maybe_layer {
+                tex_scales[ch] = layer.dnts_tex_scale;
+                tex_mults[ch] = layer.dnts_tex_mult;
+                active_mask |= 1 << ch;
+            }
+        }
         SplatUniforms {
-            tex_scales: self.splat_config.tex_scales,
-            tex_mults: self.splat_config.tex_mults,
+            tex_scales,
+            tex_mults,
             flags: [
-                self.splat_config.active_mask(),
-                u32::from(self.splat_config.diffuse_in_alpha),
+                active_mask,
+                u32::from(self.dnts_diffuse_in_alpha),
                 u32::from(self.buildable_overlay_on),
                 0,
             ],
@@ -2282,45 +2278,6 @@ impl App {
                 "composite mask sync"
             );
         }
-    }
-
-    /// Walk `splat_config.channels` and re-upload every bound slot's
-    /// diffuse into the matching texture-array layer. Called on
-    /// project open (the GPU layers are stale from a prior session)
-    /// and on per-frame churn when a slot rebinds (the inspector calls
-    /// `bind_slot_to_channel` instead, which only touches the affected
-    /// layer).
-    fn reupload_bound_slot_diffuses(&self) {
-        let Some(rs) = self.render_state.as_ref() else {
-            return;
-        };
-        for (channel, opt_slot) in self.splat_config.channels.iter().enumerate() {
-            let Some(slot_id) = opt_slot else { continue };
-            let Some(slot) = self.slot_registry.iter().find(|s| s.id == *slot_id) else {
-                warn!(
-                    slot_id,
-                    "bound slot id not in registry — leaving layer unchanged"
-                );
-                continue;
-            };
-            let Some(rgba) = load_slot_full_rgba(slot) else {
-                continue;
-            };
-            render::upload_diffuse_layer(rs, channel as u32, rgba.as_raw());
-        }
-    }
-
-    /// Re-upload the painted distribution to the GPU. Called on
-    /// project open when a distribution has been (re)hydrated; brush
-    /// stamps go through `render::write_splat_rect` instead.
-    fn reupload_splat_distribution(&self) {
-        let Some(rs) = self.render_state.as_ref() else {
-            return;
-        };
-        let Some(dist) = self.splat_distribution.as_ref() else {
-            return;
-        };
-        render::upload_splat_distribution(rs, dist);
     }
 
     /// Lazily produce + cache a 96² thumbnail for `slot_id`. Returns
@@ -2549,8 +2506,11 @@ impl App {
     /// canvas. Returns the new layer's id, with the GPU composite
     /// slot array re-uploaded so indices stay aligned.
     fn add_layer_with_slot(&mut self, slot_id: u8) -> String {
-        let layer =
-            TextureLayer::new(barme_core::LayerSource::Slot { id: slot_id }, self.map_size, 0);
+        let layer = TextureLayer::new(
+            barme_core::LayerSource::Slot { id: slot_id },
+            self.map_size,
+            0,
+        );
         let id = layer.id.clone();
         let index = self.layer_stack.layers.len();
         self.layer_stack.layers.push(layer.clone());
@@ -4538,16 +4498,13 @@ impl App {
                 self.next_steps_dismissed = p.next_steps_dismissed;
                 self.show_next_steps = false;
 
-                // D5: hoist persisted slot bindings + scales/mults onto
-                // App; reupload the bound slots' diffuse PNGs into the
-                // texture array so the preview reflects them on the
-                // next frame. The distribution itself stays None until
-                // D6 (Sprint 12) wires PNG sidecar persistence.
-                self.splat_config = p.splat_config;
+                // D10 / Sprint 17 (ADR-041): `App::splat_config` +
+                // `App::splat_distribution` retired. The legacy
+                // `Project.splat_config` still exists on the wire
+                // for one more sprint so pre-Sprint-14 projects can
+                // migrate; we read it once below into the migration
+                // shadow and discard.
                 self.dnts_diffuse_in_alpha = p.dnts_diffuse_in_alpha;
-                self.splat_distribution = p.splat_distribution;
-                self.reupload_bound_slot_diffuses();
-                self.reupload_splat_distribution();
 
                 // D8 / Sprint 15 (ADR-038): hoist the layer stack onto
                 // App, then run the one-shot pre-D8 migration so
@@ -4566,7 +4523,7 @@ impl App {
                         AppSlotResolver::with_project_root(&self.slot_registry, project_root);
                     let mut shadow = Project::new("__migrate__", self.map_size.smu_x);
                     shadow.layers = p.layers;
-                    shadow.splat_config = self.splat_config.clone();
+                    shadow.splat_config = p.splat_config;
                     shadow.dnts_diffuse_in_alpha = self.dnts_diffuse_in_alpha;
                     shadow.size = self.map_size;
                     let was_empty = shadow.layers.layers.is_empty();
@@ -8048,11 +8005,8 @@ impl App {
             let feature_active = matches!(self.tool, Tool::Feature);
             // C9 / Sprint 14 — Water tool carves with Lower / Raise.
             let water_active = matches!(self.tool, Tool::Water) && self.heightmap.is_some();
-            let central_interactive = brush_active
-                || start_pos_active
-                || metal_active
-                || geo_active
-                || water_active;
+            let central_interactive =
+                brush_active || start_pos_active || metal_active || geo_active || water_active;
 
             // ADR-035: the top-right nav-gizmo retires in favour of
             // the mini-map. Reserve its rect so brush/start-pos
@@ -8839,7 +8793,10 @@ impl App {
             // Mini-map. Uses its own painter inside ui scope.
             let metal_spots: &[(f32, f32, f32)] = &[]; // populated by Phase 7
             let heightmap_data = self.heightmap.as_ref().map(|h| &h.data);
-            let splat_data = self.splat_distribution.as_ref();
+            // D10 / Sprint 17 (ADR-041): `App::splat_distribution`
+            // retired. The minimap loses its low-res splat overlay
+            // until a future sprint plumbs the composite RT through.
+            let splat_data: Option<&barme_core::SplatDistribution> = None;
             crate::ui::minimap::paint_minimap(
                 ui,
                 rect,
@@ -9167,10 +9124,7 @@ mod tests {
             paint_drag_preview_order: None,
             layer_mask_preview_cache: None,
             layers_panel_rect: None,
-            splat_config: SplatConfig::default(),
             dnts_diffuse_in_alpha: false,
-            splat_distribution: None,
-            splat_brushes: SplatBrushRegistry::default(),
             slot_registry: Vec::new(),
             slot_thumbnails: std::collections::HashMap::new(),
             metal_state: MetalState::default(),
@@ -9731,29 +9685,36 @@ mod tests {
     // `inspector_splat`; the `splat_brush_state_default_is_paint_
     // radius_48` test went with it.
 
-    #[test]
-    fn fresh_app_has_engine_default_splat_config() {
-        let app = make_test_app();
-        let d = SplatConfig::default();
-        assert_eq!(app.splat_config, d);
-        assert!(app.splat_distribution.is_none());
-        // SplatBrushRegistry must ship the three D3 brushes.
-        let ids: Vec<&str> = app.splat_brushes.iter().map(|b| b.id()).collect();
-        assert!(ids.contains(&"paint"));
-        assert!(ids.contains(&"erase"));
-        assert!(ids.contains(&"smooth"));
-    }
+    // D10 / Sprint 17 (ADR-041) — `App::splat_config`,
+    // `App::splat_distribution`, `App::splat_brushes` retired.
+    // `fresh_app_has_engine_default_splat_config` went with them.
 
+    /// D10 / Sprint 17 (ADR-041) — splat uniforms derive from the
+    /// layer stack, not the retired `splat_config`. Build a stack
+    /// with two DNTS-bound layers + per-layer tex_scale / tex_mult,
+    /// assert the uniforms mirror them.
     #[test]
-    fn splat_uniforms_for_render_reflects_splat_config() {
+    fn splat_uniforms_for_render_reflects_layer_dnts() {
+        use barme_core::layers::{LayerSource, TextureLayer};
         let mut app = make_test_app();
-        app.splat_config.tex_scales = [0.004, 0.008, 0.012, 0.016];
-        app.splat_config.tex_mults = [0.5, 1.0, 1.5, 2.0];
-        app.splat_config.channels = [Some(0), None, Some(5), None];
-        app.splat_config.diffuse_in_alpha = true;
+        let mut layer_r = TextureLayer::new(LayerSource::Slot { id: 0 }, app.map_size, 255);
+        layer_r.dnts_channel = Some(barme_core::SplatChannel::R);
+        layer_r.dnts_tex_scale = 0.004;
+        layer_r.dnts_tex_mult = 0.5;
+        let mut layer_b = TextureLayer::new(LayerSource::Slot { id: 5 }, app.map_size, 0);
+        layer_b.dnts_channel = Some(barme_core::SplatChannel::B);
+        layer_b.dnts_tex_scale = 0.012;
+        layer_b.dnts_tex_mult = 1.5;
+        app.layer_stack.layers = vec![layer_r, layer_b];
+        app.dnts_diffuse_in_alpha = true;
         let su = app.splat_uniforms_for_render();
-        assert_eq!(su.tex_scales, [0.004, 0.008, 0.012, 0.016]);
-        assert_eq!(su.tex_mults, [0.5, 1.0, 1.5, 2.0]);
+        assert!((su.tex_scales[0] - 0.004).abs() < 1e-6);
+        assert!((su.tex_scales[2] - 0.012).abs() < 1e-6);
+        // Unbound G + A keep engine baseline (0.02).
+        assert!((su.tex_scales[1] - 0.02).abs() < 1e-6);
+        assert!((su.tex_scales[3] - 0.02).abs() < 1e-6);
+        assert!((su.tex_mults[0] - 0.5).abs() < 1e-6);
+        assert!((su.tex_mults[2] - 1.5).abs() < 1e-6);
         // R + B bound → mask = 0b101 = 5.
         assert_eq!(su.flags[0], 0b101);
         assert_eq!(su.flags[1], 1);
@@ -9904,10 +9865,14 @@ mod tests {
     /// broken in-engine map).
     #[test]
     fn validation_warns_on_dnts_with_water() {
+        use barme_core::layers::{LayerSource, TextureLayer};
         let mut app = make_test_app();
         app.heightmap = Some(test_heightmap_state(app.map_size));
-        // Bind a slot so DNTS is "on" per the chip's check.
-        app.splat_config.channels[0] = Some(0);
+        // D10 / Sprint 17 (ADR-041): bind a layer to DNTS R so the
+        // chip's `dnts_layers().any(_)` check fires.
+        let mut layer = TextureLayer::new(LayerSource::Slot { id: 0 }, app.map_size, 255);
+        layer.dnts_channel = Some(barme_core::SplatChannel::R);
+        app.layer_stack.layers = vec![layer];
         // Active water — either via preset or below-zero terrain.
         app.water_mode = WaterMode::Ocean;
         let (tone, msg) = app.validation_summary();
@@ -9957,11 +9922,16 @@ mod tests {
             max: 0,
             validated_against: Some(app.map_size),
         });
-        // Without a slot bound: should NOT be the DNTS warning.
+        // Without a layer bound to a DNTS channel: should NOT be
+        // the DNTS warning.
         let (tone, label) = app.validation_summary();
         assert!(!label.contains("DNTS"), "got {label} ({tone:?})");
-        // Bind a slot — chip flips to warn-tone DNTS.
-        app.splat_config.channels[0] = Some(0);
+        // D10 / Sprint 17 (ADR-041): bind a DNTS-channel layer so
+        // `dnts_layers()` reports active. The chip flips to warn-tone.
+        use barme_core::layers::{LayerSource, TextureLayer};
+        let mut layer = TextureLayer::new(LayerSource::Slot { id: 0 }, app.map_size, 255);
+        layer.dnts_channel = Some(barme_core::SplatChannel::R);
+        app.layer_stack.layers = vec![layer];
         let (tone, label) = app.validation_summary();
         assert!(matches!(tone, crate::ui::theme::ChipTone::Warn));
         assert!(label.contains("DNTS"), "got {label}");
@@ -10046,17 +10016,15 @@ mod tests {
     // `SplatChannel::{R,G,B,A}.index()` pin moves to barme-core
     // (`splat.rs::tests`).
 
+    /// D10 / Sprint 17 (ADR-041) — `snapshot_project` no longer
+    /// mirrors a per-`App` `splat_config`; it always emits the
+    /// default. Round-trip of new projects sees no `splat_config`
+    /// table on disk (the field is `#[serde(skip_serializing)]`).
     #[test]
-    fn snapshot_project_carries_splat_config() {
-        // Project round-trip through snapshot must preserve persisted
-        // splat config so save/open works as expected.
-        let mut app = make_test_app();
-        app.splat_config.channels = [Some(2), None, Some(7), None];
-        app.splat_config.tex_scales = [0.004, 0.02, 0.008, 0.02];
-        app.splat_config.tex_mults = [1.0, 1.0, 1.5, 1.0];
-        app.splat_config.diffuse_in_alpha = true;
+    fn snapshot_project_emits_default_splat_config() {
+        let app = make_test_app();
         let p = app.snapshot_project();
-        assert_eq!(p.splat_config, app.splat_config);
+        assert_eq!(p.splat_config, SplatConfig::default());
     }
 
     /// C4 (Sprint 11): `MetalState` is now slim view-state — the spot
@@ -10082,7 +10050,6 @@ mod tests {
     #[test]
     fn fresh_app_has_empty_metal_and_geo_state() {
         let app = make_test_app();
-        assert_eq!(app.splat_config, SplatConfig::default());
         assert!(app.metal_spots.is_empty());
         assert!(app.geo_vents.is_empty());
         assert_eq!(app.extractor_radius, default_extractor_radius());
