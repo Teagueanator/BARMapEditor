@@ -89,6 +89,13 @@ struct Uniforms {
     /// The world extents drive the splat-distribution UV math in the
     /// fragment stage (`uv = world_pos.xz / extent`).
     params: [f32; 4],
+    /// `[min_height, 0, 0, 0]` — the world Y at raw heightmap value 0.
+    /// Sprint 14 introduced this for the Water tool: without
+    /// `min_height < 0` the heightmap can't carve below BAR's water
+    /// plane at `Y = 0` and the water preview at the floor of the map
+    /// is invisible. WGSL `sample_y` reads this as `params2.x` and
+    /// linearly maps raw → `min_h + t * (max_h - min_h)`.
+    params2: [f32; 4],
 }
 
 /// CPU mirror of `markers.wgsl::MarkerU`. Drives the per-frame
@@ -1776,6 +1783,9 @@ pub struct WaterDraw {
 pub struct TerrainCallback {
     pub view_proj: [[f32; 4]; 4],
     pub max_height: f32,
+    /// Sprint-14 follow-up: world Y at raw heightmap value 0. Negative
+    /// values let the heightmap dip below BAR's water plane at Y = 0.
+    pub min_height: f32,
     pub world_extent_x: f32,
     pub world_extent_z: f32,
     pub splat: SplatUniforms,
@@ -1804,6 +1814,7 @@ impl TerrainCallback {
         camera: &OrbitCamera,
         rect: egui::Rect,
         max_height: f32,
+        min_height: f32,
         world_extent_x: f32,
         world_extent_z: f32,
         splat: SplatUniforms,
@@ -1816,6 +1827,7 @@ impl TerrainCallback {
         Self {
             view_proj: camera.view_proj_matrix(aspect).to_cols_array_2d(),
             max_height,
+            min_height,
             world_extent_x,
             world_extent_z,
             splat,
@@ -1851,7 +1863,10 @@ impl egui_wgpu::CallbackTrait for TerrainCallback {
             return Vec::new();
         };
 
-        // Step 1 — terrain uniforms (unchanged from Sprint 12).
+        // Step 1 — terrain uniforms. `params2.x` carries
+        // `min_height` (Sprint 14 follow-up) so the WGSL `sample_y`
+        // can map raw heightmap u16 values into `[min_h, max_h]`,
+        // letting the terrain dip below BAR's water plane at Y = 0.
         res.write_uniforms(
             queue,
             &Uniforms {
@@ -1862,6 +1877,7 @@ impl egui_wgpu::CallbackTrait for TerrainCallback {
                     self.world_extent_x.max(1.0),
                     self.world_extent_z.max(1.0),
                 ],
+                params2: [self.min_height, 0.0, 0.0, 0.0],
             },
         );
         res.write_splat_uniforms(queue, &self.splat);

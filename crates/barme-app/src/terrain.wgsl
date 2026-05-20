@@ -31,6 +31,15 @@ struct Uniforms {
     // .z = world extent X (elmos) — for splat-distribution UV math.
     // .w = world extent Z (elmos) — same.
     params: vec4<f32>,
+    // .x = MIN world height (elmos). Negative = the lowest heightmap
+    //   sample (`raw u16 = 0`) sits below BAR's water plane at Y = 0,
+    //   the only way to make a flooded basin visible
+    //   (`Ground.h::GetWaterPlaneLevel` is `consteval 0.0`). Together
+    //   with `params.x` (= max_height), gives the linear mapping
+    //   `y = min_h + (raw / 65535) * (max_h - min_h)`.
+    // .y / .z / .w reserved for future scalars (lighting tuning,
+    //   tide animation, etc.).
+    params2: vec4<f32>,
 };
 
 // Per-channel splat tuning + lighting state (ADR-036).
@@ -77,12 +86,15 @@ struct VsOut {
 };
 
 // Sample heightmap at integer pixel (px, pz), clamped to bounds, and
-// return the world-space Y in elmos.
-fn sample_y(px: i32, pz: i32, dims: vec2<u32>, max_h: f32) -> f32 {
+// return the world-space Y in elmos. The raw `u16` value linearly maps
+// to `[min_h, max_h]` — when `min_h < 0` the heightmap can dip below
+// BAR's water plane at Y = 0.
+fn sample_y(px: i32, pz: i32, dims: vec2<u32>, min_h: f32, max_h: f32) -> f32 {
     let cx = clamp(px, 0, i32(dims.x) - 1);
     let cz = clamp(pz, 0, i32(dims.y) - 1);
     let texel = textureLoad(heightmap, vec2<i32>(cx, cz), 0);
-    return f32(texel.r) * (1.0 / 65535.0) * max_h;
+    let t = f32(texel.r) * (1.0 / 65535.0);
+    return min_h + t * (max_h - min_h);
 }
 
 @vertex
@@ -93,7 +105,8 @@ fn vs_main(@builtin(vertex_index) vid: u32) -> VsOut {
 
     let elmos_per_px = u.params.y;
     let max_h = u.params.x;
-    let y = sample_y(px, pz, dims, max_h);
+    let min_h = u.params2.x;
+    let y = sample_y(px, pz, dims, min_h, max_h);
     let world_pos = vec3<f32>(
         f32(px) * elmos_per_px,
         y,
@@ -104,10 +117,10 @@ fn vs_main(@builtin(vertex_index) vid: u32) -> VsOut {
     // samples a baked SMT normal texture per-fragment; we approximate
     // by hand because the editor doesn't run the normal bake at
     // preview time.
-    let h_l = sample_y(px - 1, pz, dims, max_h);
-    let h_r = sample_y(px + 1, pz, dims, max_h);
-    let h_u = sample_y(px, pz - 1, dims, max_h);
-    let h_d = sample_y(px, pz + 1, dims, max_h);
+    let h_l = sample_y(px - 1, pz, dims, min_h, max_h);
+    let h_r = sample_y(px + 1, pz, dims, min_h, max_h);
+    let h_u = sample_y(px, pz - 1, dims, min_h, max_h);
+    let h_d = sample_y(px, pz + 1, dims, min_h, max_h);
     // Cross-product of the X and Z gradient vectors gives a +Y-up
     // normal in world space (8 elmos per pixel along XZ, height delta
     // along Y). The 2.0 factor accounts for the symmetric finite
@@ -144,6 +157,7 @@ fn biome_ramp(t: f32) -> vec3<f32> {
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let max_h = u.params.x;
+    let min_h = u.params2.x;
 
     // splatCofac = per-pixel distribution × per-channel weight scale
     // (FINDINGS §7.3). The active_slot_mask zeroes layers the user
@@ -188,7 +202,14 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // black-on-painted. `detail_strength` mixes between gradient and
     // splat composite. When fully painted (strength = 1), the gradient
     // disappears.
-    let t = clamp(in.world_pos.y / max(max_h, 1.0), 0.0, 1.0);
+    //
+    // `t` normalises world Y to [0, 1] across the full `[min_h, max_h]`
+    // range so that submerged terrain (`y < 0`) still gets a distinct
+    // ramp colour. Pre-fix the gradient clamped at 0, collapsing all
+    // underwater terrain to the lowest band; that was uninformative
+    // once Sprint 14's water tool let users carve below sea level.
+    let range = max(max_h - min_h, 1.0);
+    let t = clamp((in.world_pos.y - min_h) / range, 0.0, 1.0);
     let fallback = biome_ramp(t);
     let base_rgb = mix(fallback, splat_rgb, detail_strength);
 

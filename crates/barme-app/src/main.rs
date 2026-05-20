@@ -4101,19 +4101,25 @@ impl App {
                 step *= 3.0;
             }
             let (sy, cy) = self.camera.yaw.sin_cos();
-            // Camera-relative XZ axes (derived from yaw):
-            //   right_xz   = ( cos(yaw),  0, -sin(yaw))
-            //   forward_xz = (-sin(yaw),  0, -cos(yaw))   (eye → target on the XZ plane)
-            // ArrowRight → +right_xz; ArrowUp → +forward_xz; left / down negate.
+            // Camera-relative XZ axes. The first pass had the
+            // left / right pair derived from the right-handed cross
+            // product, but glam's `Mat4::look_at_lh` mirrors the X
+            // axis vs the RH convention (s = up × forward at
+            // yaw = 0 lands on world -X, not +X). Up / Down were
+            // already aligned with the LH projection. Empirically
+            // verified after the first user smoke session reported
+            // the inversion.
+            //   screen-right (world) = (-cos(yaw), 0,  sin(yaw))
+            //   screen-up    (world) = (-sin(yaw), 0, -cos(yaw))
             let mut dx = 0.0f32;
             let mut dz = 0.0f32;
             if arrow_right {
-                dx += cy;
-                dz += -sy;
+                dx -= cy;
+                dz += sy;
             }
             if arrow_left {
-                dx -= cy;
-                dz -= -sy;
+                dx += cy;
+                dz -= sy;
             }
             if arrow_up {
                 dx += -sy;
@@ -6173,6 +6179,72 @@ impl App {
             false,
             |_ui| {},
             |ui| {
+                // Explainer — the water plane is fixed at Y = 0
+                // (`Ground.h::GetWaterPlaneLevel` is `consteval 0.0`
+                // in Recoil). The user can't "raise the water";
+                // they raise the SEA FLOOR by setting `min_height
+                // < 0`, which makes raw heightmap value 0 land
+                // below sea level.
+                ui.label(
+                    egui::RichText::new(
+                        "BAR's water plane is fixed at Y = 0. To make water \
+                         visible, set min_height below zero — the lowest part \
+                         of the heightmap then sits underwater.",
+                    )
+                    .color(t.dim)
+                    .size(10.0),
+                );
+                ui.add_space(6.0);
+
+                // min_height DragValue — directly editable. Negative
+                // values give the heightmap room to dip below Y = 0.
+                // 0 = no water visible (lowest heightmap sample sits
+                // AT sea level). −200 = the deepest point sits 200
+                // elmos under sea level.
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("Sea-floor depth")
+                            .color(t.muted)
+                            .size(11.0),
+                    );
+                    let before = self.min_height;
+                    let mut current = self.min_height;
+                    ui.add(
+                        egui::DragValue::new(&mut current)
+                            .range(-2048.0..=0.0)
+                            .speed(1.0)
+                            .suffix(" elmos"),
+                    )
+                    .on_hover_text(
+                        "Sets Project.min_height. The world Y at raw \
+                         heightmap value 0 — i.e. the deepest point your \
+                         basins can reach. More negative = deeper \
+                         floor, more room for visible water above.",
+                    );
+                    if (current - before).abs() > 1e-3 {
+                        self.min_height = current;
+                        self.mark_dirty();
+                    }
+                });
+
+                ui.add_space(6.0);
+
+                // Observed deepest world Y in the current heightmap.
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("Heightmap min observed")
+                            .color(t.muted)
+                            .size(11.0),
+                    );
+                    let mh_chip = format!("{:.0} elmos", self.heightmap_observed_min_height());
+                    ui.label(egui::RichText::new(mh_chip).color(t.text).size(11.0));
+                });
+
+                ui.add_space(6.0);
+
+                // Quick-set shortcut: clamp min_height to the carve
+                // depth so a Tool::Water flood gesture immediately
+                // produces visible water.
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("Carve depth").color(t.muted).size(11.0));
                     ui.add(
@@ -6180,26 +6252,25 @@ impl App {
                             .range(-1024.0..=0.0)
                             .speed(1.0)
                             .suffix(" elmos"),
+                    )
+                    .on_hover_text(
+                        "Per-stamp Lower-brush depth for the Tool::Water \
+                         flood gesture. LMB drag carves toward this depth; \
+                         RMB drag raises.",
                     );
                 });
                 ui.label(
-                    egui::RichText::new("LMB drag → flood (Brush::Lower). RMB drag → raise.")
+                    egui::RichText::new("LMB drag → flood. RMB drag → raise.")
                         .color(t.dim)
                         .size(10.0),
                 );
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("min_height").color(t.muted).size(11.0));
-                    let mh_chip = format!("{:.0}", self.heightmap_observed_min_height());
-                    ui.label(egui::RichText::new(mh_chip).color(t.text).size(11.0));
-                });
                 ui.add_space(4.0);
                 let auto_clicked = ui
-                    .add(egui::Button::new("Auto-set min_height from heightmap"))
+                    .add(egui::Button::new("Set sea floor to carve depth"))
                     .on_hover_text(
-                        "Scan the loaded heightmap and set Project.min_height = \
-                         min(0, observed). Required for BAR to render water in \
-                         carved basins.",
+                        "Shortcut: set min_height = min(0, carve_depth) so a \
+                         Tool::Water flood with LMB-drag immediately produces \
+                         visible water in the basin.",
                     )
                     .clicked();
                 if auto_clicked {
@@ -7740,6 +7811,7 @@ impl App {
                     &self.camera,
                     rect,
                     self.height_scale,
+                    self.min_height,
                     ex,
                     ez,
                     splat_u,
