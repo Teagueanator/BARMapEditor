@@ -9,25 +9,33 @@ use eframe::egui::{
     self, Align2, Color32, CornerRadius, FontId, Pos2, Rect, Sense, Stroke, StrokeKind, Ui,
 };
 
+use crate::render::{OrbitCamera, screen_to_world_y0};
 use crate::ui::icons::{self, Icon};
 use crate::ui::theme::Tokens;
 
-/// Tick spacing for the bottom + left rulers (in elmos). Ticks are
-/// drawn every `MINOR`; labels every `MAJOR`.
-const RULER_MINOR_ELMOS: f32 = 512.0;
-const RULER_MAJOR_ELMOS: f32 = 1024.0;
-
 /// Paint elmo rulers along the bottom and left edges of the viewport
-/// rect. `extents` is the map's world-space size in elmos
-/// ((dims.x - 1) * 8, (dims.z - 1) * 8). Caller passes the same rect
-/// the terrain is rendered into.
-pub fn paint_rulers(painter: &egui::Painter, rect: Rect, extents: (f32, f32)) {
-    let t = Tokens::DARK;
-    let (ex, ez) = extents;
-    if ex <= 0.0 || ez <= 0.0 {
+/// rect. Labels reflect the WORLD coordinates currently visible under
+/// each tick, so as the camera zooms / pans / orbits the labels
+/// rescale automatically. Step size is picked from a 1-2-5 sequence
+/// so ~5-8 ticks fit in the visible range.
+///
+/// **Sprint 14 follow-up**: the pre-rewrite ruler used a fixed
+/// `extent`-linear mapping that ignored the camera projection — at
+/// any zoom level the labels stayed at 1024 / 2048 / ... pinned to
+/// the same fractional positions in the rect, which made them
+/// useless once the user started navigating. The new implementation
+/// projects screen positions back to the world XZ plane and labels
+/// the world coordinate at each tick.
+pub fn paint_rulers(painter: &egui::Painter, rect: Rect, camera: &OrbitCamera) {
+    if rect.width() < 1.0 || rect.height() < 1.0 {
         return;
     }
-    // Tracks.
+    let t = Tokens::DARK;
+    let rect_size = glam::Vec2::new(rect.width(), rect.height());
+
+    // Track backgrounds — drawn unconditionally so the user sees a
+    // consistent UI shape even when the camera projection isn't
+    // resolvable (e.g. mid-orbit at extreme pitches).
     let track_bg = Color32::from_rgba_premultiplied(8, 12, 18, 140);
     painter.rect_filled(
         Rect::from_min_size(
@@ -42,11 +50,21 @@ pub fn paint_rulers(painter: &egui::Painter, rect: Rect, extents: (f32, f32)) {
         CornerRadius::ZERO,
         track_bg,
     );
-    // Bottom ruler.
-    let mut e = 0.0_f32;
-    while e <= ex + 0.5 {
-        let x = rect.left() + (e / ex) * rect.width();
-        let is_major = (e % RULER_MAJOR_ELMOS).abs() < 0.5;
+
+    // ── Bottom ruler — world X under each screen X along the bottom
+    //    edge. Sample 17 evenly-spaced screen positions so the
+    //    piecewise interpolation is accurate enough at extreme
+    //    obliquities without paying per-pixel cost.
+    let sy_bottom = rect.height() - 9.0;
+    let bottom_samples: Vec<(f32, f32)> = (0..=16)
+        .filter_map(|i| {
+            let sx_local = (i as f32 / 16.0) * rect.width();
+            let cursor = glam::Vec2::new(sx_local, sy_bottom);
+            screen_to_world_y0(cursor, rect_size, camera).map(|w| (sx_local, w.x))
+        })
+        .collect();
+    paint_axis_ticks(painter, &bottom_samples, |sx_local, is_major, label| {
+        let x = rect.left() + sx_local;
         let tick_h = if is_major { 8.0 } else { 4.0 };
         painter.line_segment(
             [
@@ -55,22 +73,29 @@ pub fn paint_rulers(painter: &egui::Painter, rect: Rect, extents: (f32, f32)) {
             ],
             Stroke::new(1.0, t.dim),
         );
-        if is_major && e > 0.0 {
+        if let Some(label) = label {
             painter.text(
                 Pos2::new(x, rect.bottom() - 3.0),
                 Align2::CENTER_BOTTOM,
-                format!("{}", e as i32),
+                label,
                 FontId::monospace(9.0),
                 t.muted,
             );
         }
-        e += RULER_MINOR_ELMOS;
-    }
-    // Left ruler.
-    let mut e = 0.0_f32;
-    while e <= ez + 0.5 {
-        let y = rect.top() + (e / ez) * rect.height();
-        let is_major = (e % RULER_MAJOR_ELMOS).abs() < 0.5;
+    });
+
+    // ── Left ruler — world Z down each screen Y along the left
+    //    edge. Same sampling pattern.
+    let sx_left = 9.0;
+    let left_samples: Vec<(f32, f32)> = (0..=16)
+        .filter_map(|i| {
+            let sy_local = (i as f32 / 16.0) * rect.height();
+            let cursor = glam::Vec2::new(sx_left, sy_local);
+            screen_to_world_y0(cursor, rect_size, camera).map(|w| (sy_local, w.z))
+        })
+        .collect();
+    paint_axis_ticks(painter, &left_samples, |sy_local, is_major, label| {
+        let y = rect.top() + sy_local;
         let tick_w = if is_major { 8.0 } else { 4.0 };
         painter.line_segment(
             [
@@ -79,29 +104,144 @@ pub fn paint_rulers(painter: &egui::Painter, rect: Rect, extents: (f32, f32)) {
             ],
             Stroke::new(1.0, t.dim),
         );
-        if is_major && e > 0.0 {
+        if let Some(label) = label {
             painter.text(
                 Pos2::new(rect.left() + 3.0, y),
                 Align2::LEFT_CENTER,
-                format!("{}", e as i32),
+                label,
                 FontId::monospace(9.0),
                 t.muted,
             );
         }
-        e += RULER_MINOR_ELMOS;
+    });
+}
+
+/// Inner helper: given `samples` of `(screen_pos, world_coord)`
+/// along one axis of the ruler, pick a "nice" world step (1-2-5
+/// sequence) that fits ~6 labels into the visible world range, then
+/// invoke `paint(screen_pos, is_major, label)` for each tick.
+/// `samples` must be sorted by `screen_pos` ascending (the caller
+/// produces them that way by walking `i in 0..=16`).
+fn paint_axis_ticks(
+    _painter: &egui::Painter,
+    samples: &[(f32, f32)],
+    mut paint: impl FnMut(f32, bool, Option<String>),
+) {
+    if samples.len() < 2 {
+        return;
+    }
+    // Compute visible world range. Use min/max rather than first/last
+    // so an oblique camera (where world coords aren't monotonic in
+    // screen position) doesn't get a tighter-than-real range.
+    let mut world_min = f32::INFINITY;
+    let mut world_max = f32::NEG_INFINITY;
+    for &(_, w) in samples {
+        if w < world_min {
+            world_min = w;
+        }
+        if w > world_max {
+            world_max = w;
+        }
+    }
+    if !world_min.is_finite() || !world_max.is_finite() || world_max <= world_min {
+        return;
+    }
+    let range = world_max - world_min;
+    let major_step = pick_nice_step(range, 6);
+    let minor_step = major_step / 2.0;
+
+    // Walk world values in minor-step increments, drawing a tick
+    // (and a label every other tick) at the interpolated screen
+    // position. Skip ticks whose interpolation fails (rare — only
+    // at sample-table edges).
+    let start = (world_min / minor_step).ceil() * minor_step;
+    let mut w = start;
+    // Cap the loop count so a degenerate camera (massive range) can't
+    // freeze the UI. 200 ticks across the visible range is far more
+    // than the human eye can resolve.
+    let mut emitted = 0;
+    while w <= world_max && emitted < 200 {
+        let Some(screen_pos) = interp_screen_pos(w, samples) else {
+            w += minor_step;
+            emitted += 1;
+            continue;
+        };
+        let is_major = (w / major_step).round() * major_step;
+        let is_major_tick = (w - is_major).abs() < minor_step * 0.5;
+        let label = if is_major_tick {
+            Some(format_label(w))
+        } else {
+            None
+        };
+        paint(screen_pos, is_major_tick, label);
+        w += minor_step;
+        emitted += 1;
     }
 }
 
-/// Pure helper: how many major-labelled ticks would the bottom ruler
-/// emit for `extent` elmos? Unit-tested so changing the tick
-/// constants doesn't silently break the visual.
-#[allow(dead_code)]
-pub fn ruler_label_count(extent_elmos: f32) -> u32 {
-    if extent_elmos <= 0.0 {
-        return 0;
+/// Find the screen position at which `target_world` falls, by
+/// linear interpolation between consecutive `(screen, world)`
+/// samples. Returns `None` if `target_world` is outside every
+/// sample-pair range.
+fn interp_screen_pos(target_world: f32, samples: &[(f32, f32)]) -> Option<f32> {
+    for pair in samples.windows(2) {
+        let (s0, w0) = pair[0];
+        let (s1, w1) = pair[1];
+        let (lo, hi) = if w0 < w1 { (w0, w1) } else { (w1, w0) };
+        if target_world >= lo && target_world <= hi {
+            if (w1 - w0).abs() < 1e-6 {
+                return Some(s0);
+            }
+            let t = (target_world - w0) / (w1 - w0);
+            return Some(s0 + t * (s1 - s0));
+        }
     }
-    // Inclusive of 0; matches the painter's while-loop bound.
-    (extent_elmos / RULER_MAJOR_ELMOS).floor() as u32 + 1
+    None
+}
+
+/// Pick a "nice" tick step from the 1-2-5 sequence. `range` is the
+/// span of values that should be subdivided into roughly `target`
+/// ticks. The result is the smallest 1-2-5×10^k value that produces
+/// at most `target` ticks in `range`.
+///
+/// `range = 5000, target = 6` → step = 1000 (5 ticks).
+/// `range = 800, target = 6` → step = 200 (4 ticks).
+/// `range = 80, target = 6` → step = 20 (4 ticks).
+pub fn pick_nice_step(range: f32, target: u32) -> f32 {
+    if range <= 0.0 || target == 0 {
+        return 1.0;
+    }
+    let raw = range / target as f32;
+    let pow10 = 10f32.powf(raw.log10().floor());
+    let normalized = raw / pow10;
+    let step_n = if normalized <= 1.0 {
+        1.0
+    } else if normalized <= 2.0 {
+        2.0
+    } else if normalized <= 5.0 {
+        5.0
+    } else {
+        10.0
+    };
+    step_n * pow10
+}
+
+/// Render a world coordinate as a ruler label. Integers under 10 000
+/// render as plain integers; >= 10 000 renders in `k` (kilo) units
+/// to keep the label short ("12500" → "12.5k").
+fn format_label(w: f32) -> String {
+    let wi = w.round() as i32;
+    if wi.abs() >= 10_000 {
+        let k = (w / 1000.0).round() as i32;
+        // Whole-thousand values render as bare k; fractions get one decimal.
+        if (w / 1000.0 - k as f32).abs() < 0.05 {
+            format!("{k}k")
+        } else {
+            format!("{:.1}k", w / 1000.0)
+        }
+    } else {
+        format!("{wi}")
+    }
 }
 
 /// Floating viewport-options toolbar — top-left of the viewport (inside
@@ -328,22 +468,58 @@ pub enum EmptyStateClick {
 mod tests {
     use super::*;
 
+    /// Sprint 14 follow-up: the dynamic ruler picks tick spacing
+    /// from a 1-2-5 sequence so labels stay round at every zoom
+    /// level. Verify the math on a few representative ranges.
     #[test]
-    fn ruler_label_count_matches_extent() {
-        // 16 × 16 SMU → 8192 elmos. Labels every 1024 elmos including
-        // 0 → ⌊8192 / 1024⌋ + 1 = 9.
-        assert_eq!(ruler_label_count(8192.0), 9);
+    fn nice_step_picks_clean_values_for_typical_ranges() {
+        // 16-SMU map fully framed: visible range ≈ 8000 elmos →
+        // step 1000 (8 ticks fits in 6 target).
+        assert_eq!(pick_nice_step(8000.0, 6), 2000.0);
+        // 4-SMU map: ≈ 2000 elmos → step 500.
+        assert_eq!(pick_nice_step(2000.0, 6), 500.0);
+        // Zoomed-in: ≈ 800 elmos → step 200.
+        assert_eq!(pick_nice_step(800.0, 6), 200.0);
+        // Heavy zoom: ≈ 80 elmos → step 20.
+        assert_eq!(pick_nice_step(80.0, 6), 20.0);
+        // Zoomed way out: ≈ 50_000 elmos → step 10000.
+        assert_eq!(pick_nice_step(50_000.0, 6), 10_000.0);
     }
 
     #[test]
-    fn ruler_label_count_handles_zero() {
-        assert_eq!(ruler_label_count(0.0), 0);
-        assert_eq!(ruler_label_count(-100.0), 0);
+    fn nice_step_rejects_degenerate_inputs() {
+        assert_eq!(pick_nice_step(0.0, 6), 1.0);
+        assert_eq!(pick_nice_step(-100.0, 6), 1.0);
+        assert_eq!(pick_nice_step(1000.0, 0), 1.0);
+    }
+
+    /// At an oblique camera angle the world coordinate isn't a
+    /// strictly-linear function of screen position; the piecewise
+    /// interpolator should still resolve a screen position for any
+    /// world value contained in at least one segment. First match
+    /// wins by design.
+    #[test]
+    fn interp_screen_pos_handles_non_monotone_samples() {
+        // Samples where world coord increases (0→50: 100→200) then
+        // decreases (50→100: 200→150).
+        let samples = [(0.0, 100.0), (50.0, 200.0), (100.0, 150.0)];
+        // 175 falls on the first ascending segment (75% of the way
+        // through 100→200) — returns screen 37.5.
+        let p = interp_screen_pos(175.0, &samples).unwrap();
+        assert!((p - 37.5).abs() < 1e-3, "got {p}");
+        // 150 is reachable on both segments — first match wins.
+        let _ = interp_screen_pos(150.0, &samples).unwrap();
+        // Descending segment alone: 175 falls halfway from 200 → 150
+        // → screen at 50 % of (0..50) = 25.
+        let descending = [(0.0, 200.0), (50.0, 150.0)];
+        let q = interp_screen_pos(175.0, &descending).unwrap();
+        assert!((q - 25.0).abs() < 1e-3, "got {q}");
     }
 
     #[test]
-    fn ruler_label_count_round_extent() {
-        // 4096 elmos → labels at 0, 1024, 2048, 3072, 4096 = 5.
-        assert_eq!(ruler_label_count(4096.0), 5);
+    fn interp_screen_pos_returns_none_for_out_of_range() {
+        let samples = [(0.0, 100.0), (50.0, 200.0)];
+        assert!(interp_screen_pos(50.0, &samples).is_none()); // below range
+        assert!(interp_screen_pos(250.0, &samples).is_none()); // above range
     }
 }

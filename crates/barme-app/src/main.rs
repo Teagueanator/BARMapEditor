@@ -2077,6 +2077,20 @@ impl App {
         }
     }
 
+    /// Reset the orbit camera to the default framing for the current
+    /// map extents. Wired to the top-bar "recenter" button and a
+    /// future `Home` keyboard accelerator. Idempotent — clicking
+    /// repeatedly is a no-op after the first call.
+    fn recenter_camera(&mut self) {
+        let (ex, ez) = self.world_extents();
+        self.camera = OrbitCamera::framing(ex, ez);
+        tracing::info!(
+            extent_x = ex,
+            extent_z = ez,
+            "camera recentered to default framing"
+        );
+    }
+
     /// World-space Y of the terrain surface at `(x_elmo, z_elmo)`.
     /// Returns 0.0 when no heightmap is loaded.
     ///
@@ -4056,25 +4070,35 @@ impl App {
 
         // Arrow-key camera pan (post-Sprint-14 follow-up). Uses
         // `key_down` (level-triggered, not edge-triggered) so holding
-        // an arrow gives continuous motion. Shift = 5× speed for
-        // long traversals. Speed scales with orbit distance so the
-        // pan feels consistent at any zoom level.
-        let (arrow_left, arrow_right, arrow_up, arrow_down, shift_held) = ctx.input(|i| {
+        // an arrow gives continuous motion. Shift = 3× speed for
+        // long traversals. Velocity scales with orbit distance so
+        // the pan feels consistent at any zoom level, and is
+        // scaled by `stable_dt` so frame-rate variance doesn't
+        // affect feel.
+        let (arrow_left, arrow_right, arrow_up, arrow_down, shift_held, dt) = ctx.input(|i| {
             (
                 i.key_down(egui::Key::ArrowLeft),
                 i.key_down(egui::Key::ArrowRight),
                 i.key_down(egui::Key::ArrowUp),
                 i.key_down(egui::Key::ArrowDown),
                 i.modifiers.shift,
+                // `stable_dt` is the previous frame's duration. Clamp
+                // to avoid huge jumps when the editor was paused / in
+                // the background and resumes — > 100 ms gets clamped.
+                i.stable_dt.min(0.1),
             )
         });
         if arrow_left || arrow_right || arrow_up || arrow_down {
-            // Base = 1 % of orbit distance per frame (~1.2 s to
-            // cross a 16-SMU map at 60 fps); shift bumps to 5× for
-            // long jumps.
-            let mut speed = self.camera.distance * 0.01;
+            // Velocity = 0.25 × orbit distance per SECOND (so at
+            // the default framing of an 8192-elmo map, distance ≈
+            // 11 500, velocity ≈ 2 900 elmos/sec — ~2.8 s to cross
+            // a 16-SMU map). Shift bumps to 3× for long jumps
+            // (~0.9 s to cross). dt scaling means the same feel at
+            // 30 / 60 / 120 fps.
+            let base_per_sec = self.camera.distance * 0.25;
+            let mut step = base_per_sec * dt;
             if shift_held {
-                speed *= 5.0;
+                step *= 3.0;
             }
             let (sy, cy) = self.camera.yaw.sin_cos();
             // Camera-relative XZ axes (derived from yaw):
@@ -4099,8 +4123,8 @@ impl App {
                 dx -= -sy;
                 dz -= -cy;
             }
-            self.camera.target.x += dx * speed;
-            self.camera.target.z += dz * speed;
+            self.camera.target.x += dx * step;
+            self.camera.target.z += dz * step;
             // egui only repaints on input events by default; request
             // a follow-up frame so the camera keeps sliding while
             // the key is held without producing visible stalls.
@@ -4108,7 +4132,7 @@ impl App {
             trace!(
                 dx,
                 dz,
-                speed,
+                step,
                 target_x = self.camera.target.x,
                 target_z = self.camera.target.z,
                 "arrow-key camera pan"
@@ -4445,6 +4469,37 @@ impl App {
     fn top_bar_right_block(&mut self, ui: &mut egui::Ui, action: &mut Option<FileAction>) {
         use crate::ui::icons::Icon;
         let t = crate::ui::theme::Tokens::DARK;
+
+        // Recenter-camera button (icon-only, Compass). One-click
+        // reset to the default framing — pairs with the arrow-key
+        // pan controls so a user who's panned off the map can get
+        // back without manually orbiting.
+        let recenter_resp = ui
+            .allocate_response(egui::vec2(30.0, 30.0), egui::Sense::click())
+            .on_hover_text("Recenter camera on map");
+        {
+            let painter = ui.painter();
+            let bg = if recenter_resp.hovered() {
+                t.hover
+            } else {
+                t.panel2
+            };
+            painter.rect_filled(recenter_resp.rect, egui::CornerRadius::same(4), bg);
+            painter.rect_stroke(
+                recenter_resp.rect,
+                egui::CornerRadius::same(4),
+                egui::Stroke::new(1.0, t.border),
+                egui::StrokeKind::Middle,
+            );
+            let icon_rect =
+                egui::Rect::from_center_size(recenter_resp.rect.center(), egui::vec2(18.0, 18.0));
+            crate::ui::icons::paint_icon(painter, icon_rect, Icon::Compass, t.muted, 1.6);
+        }
+        if recenter_resp.clicked() {
+            self.recenter_camera();
+        }
+        ui.add_space(4.0);
+
         // Build & install split-button (rightmost so it's the eye
         // anchor — the user's most-used action).
         let can_run = self.heightmap.is_some();
@@ -7805,7 +7860,7 @@ impl App {
             // 2. mini-map (top-right)
             // 3. viewport-options toolbar (top-left)
             // 4. hint card (bottom-centre, first-launch only)
-            crate::ui::viewport_chrome::paint_rulers(&overlay_painter, rect, extents);
+            crate::ui::viewport_chrome::paint_rulers(&overlay_painter, rect, &self.camera);
 
             // Mini-map. Uses its own painter inside ui scope.
             let metal_spots: &[(f32, f32, f32)] = &[]; // populated by Phase 7
