@@ -28,6 +28,7 @@ pub const CAMERA_BINDINGS: &[(&str, &str)] = &[
     ("LMB drag", "Sculpt (in Sculpt mode), orbit otherwise"),
     ("RMB drag", "Orbit camera (in tool mode)"),
     ("Scroll wheel", "Zoom in / out"),
+    ("Arrow keys", "Pan camera (Shift = 5× faster)"),
     ("Ctrl+Z", "Undo"),
     ("Ctrl+Shift+Z / Ctrl+Y", "Redo"),
     ("?", "Open this cheat-sheet"),

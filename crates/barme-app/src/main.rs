@@ -4053,6 +4053,67 @@ impl App {
                 self.dismiss_intro();
             }
         }
+
+        // Arrow-key camera pan (post-Sprint-14 follow-up). Uses
+        // `key_down` (level-triggered, not edge-triggered) so holding
+        // an arrow gives continuous motion. Shift = 5× speed for
+        // long traversals. Speed scales with orbit distance so the
+        // pan feels consistent at any zoom level.
+        let (arrow_left, arrow_right, arrow_up, arrow_down, shift_held) = ctx.input(|i| {
+            (
+                i.key_down(egui::Key::ArrowLeft),
+                i.key_down(egui::Key::ArrowRight),
+                i.key_down(egui::Key::ArrowUp),
+                i.key_down(egui::Key::ArrowDown),
+                i.modifiers.shift,
+            )
+        });
+        if arrow_left || arrow_right || arrow_up || arrow_down {
+            // Base = 1 % of orbit distance per frame (~1.2 s to
+            // cross a 16-SMU map at 60 fps); shift bumps to 5× for
+            // long jumps.
+            let mut speed = self.camera.distance * 0.01;
+            if shift_held {
+                speed *= 5.0;
+            }
+            let (sy, cy) = self.camera.yaw.sin_cos();
+            // Camera-relative XZ axes (derived from yaw):
+            //   right_xz   = ( cos(yaw),  0, -sin(yaw))
+            //   forward_xz = (-sin(yaw),  0, -cos(yaw))   (eye → target on the XZ plane)
+            // ArrowRight → +right_xz; ArrowUp → +forward_xz; left / down negate.
+            let mut dx = 0.0f32;
+            let mut dz = 0.0f32;
+            if arrow_right {
+                dx += cy;
+                dz += -sy;
+            }
+            if arrow_left {
+                dx -= cy;
+                dz -= -sy;
+            }
+            if arrow_up {
+                dx += -sy;
+                dz += -cy;
+            }
+            if arrow_down {
+                dx -= -sy;
+                dz -= -cy;
+            }
+            self.camera.target.x += dx * speed;
+            self.camera.target.z += dz * speed;
+            // egui only repaints on input events by default; request
+            // a follow-up frame so the camera keeps sliding while
+            // the key is held without producing visible stalls.
+            ctx.request_repaint();
+            trace!(
+                dx,
+                dz,
+                speed,
+                target_x = self.camera.target.x,
+                target_z = self.camera.target.z,
+                "arrow-key camera pan"
+            );
+        }
     }
 
     /// Mark the first-launch hint as seen for the current editor
