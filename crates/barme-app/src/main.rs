@@ -6470,7 +6470,7 @@ impl App {
                         self.inspector_header(ui);
                         ui.separator();
                         match self.tool {
-                            Tool::Select => Self::inspector_select(ui),
+                            Tool::Select => self.inspector_select(ui),
                             Tool::Sculpt => self.inspector_sculpt(ui),
                             Tool::StartPositions => self.inspector_start_positions(ui),
                             Tool::MetalSpots => self.inspector_metal(ui),
@@ -6488,6 +6488,7 @@ impl App {
     /// dirty chip; then heightmap card with path/dims/sample as a
     /// 2-col grid + a valid/invalid chip in the section header.
     fn inspector_header(&mut self, ui: &mut egui::Ui) {
+        use crate::ui::help_text::{HelpId, help};
         let t = crate::ui::theme::Tokens::DARK;
         // PROJECT section.
         let dirty = self.dirty;
@@ -6502,15 +6503,18 @@ impl App {
                     crate::ui::theme::ChipTone::Neutral
                 };
                 let label = if dirty { "Unsaved" } else { "Saved" };
-                crate::ui::widgets::chip(ui, tone, label);
+                crate::ui::widgets::chip(ui, tone, label)
+                    .on_hover_text(help(HelpId::HeaderProjectSavedChip));
             },
             |ui| {
-                let name_resp = ui.add(
-                    egui::TextEdit::singleline(&mut self.project_name)
-                        .desired_width(f32::INFINITY)
-                        .frame(false)
-                        .font(egui::FontId::proportional(15.0)),
-                );
+                let name_resp = ui
+                    .add(
+                        egui::TextEdit::singleline(&mut self.project_name)
+                            .desired_width(f32::INFINITY)
+                            .frame(false)
+                            .font(egui::FontId::proportional(15.0)),
+                    )
+                    .on_hover_text(help(HelpId::HeaderProjectName));
                 if name_resp.changed() {
                     self.dirty = true;
                 }
@@ -6522,13 +6526,15 @@ impl App {
                         egui::DragValue::new(&mut self.map_size.smu_x)
                             .range(2..=96)
                             .speed(0.1),
-                    );
+                    )
+                    .on_hover_text(help(HelpId::HeaderMapSizeX));
                     ui.label(egui::RichText::new("×").color(t.dim).size(11.0));
                     ui.add(
                         egui::DragValue::new(&mut self.map_size.smu_z)
                             .range(2..=96)
                             .speed(0.1),
-                    );
+                    )
+                    .on_hover_text(help(HelpId::HeaderMapSizeZ));
                     ui.label(egui::RichText::new("SMU").color(t.muted).size(11.0));
                     if prev_size != self.map_size {
                         self.dirty = true;
@@ -6567,7 +6573,8 @@ impl App {
                     crate::ui::theme::ChipTone::Err
                 };
                 let label = if valid { "Valid" } else { "Invalid" };
-                crate::ui::widgets::chip(ui, tone, label);
+                crate::ui::widgets::chip(ui, tone, label)
+                    .on_hover_text(help(HelpId::HeaderHeightmapValidChip));
             },
             |ui| {
                 egui::Grid::new("inspector_hm_grid")
@@ -6575,12 +6582,16 @@ impl App {
                     .spacing([8.0, 4.0])
                     .striped(false)
                     .show(ui, |ui| {
-                        for (k, v) in [
-                            ("Path", path_str.as_str()),
-                            ("Dims", dims_str.as_str()),
-                            ("Sample", sample_str.as_str()),
+                        for (k, v, help_id) in [
+                            ("Path", path_str.as_str(), HelpId::HeaderHeightmapPath),
+                            ("Dims", dims_str.as_str(), HelpId::HeaderHeightmapDims),
+                            ("Sample", sample_str.as_str(), HelpId::HeaderHeightmapSample),
                         ] {
-                            ui.label(egui::RichText::new(k).color(t.muted).size(11.0));
+                            ui.add(
+                                egui::Label::new(egui::RichText::new(k).color(t.muted).size(11.0))
+                                    .sense(egui::Sense::hover()),
+                            )
+                            .on_hover_text(help(help_id));
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
@@ -6598,7 +6609,8 @@ impl App {
                                     .range(1.0..=4096.0)
                                     .speed(1.0)
                                     .suffix(" elmos"),
-                            );
+                            )
+                            .on_hover_text(help(HelpId::HeaderHeightScale));
                         });
                         ui.end_row();
                     });
@@ -6606,11 +6618,55 @@ impl App {
         );
     }
 
-    fn inspector_select(ui: &mut egui::Ui) {
-        ui.heading("Select / orbit");
+    /// Sprint 19 / U1 — sticky chip row rendered at the top of every
+    /// tool's Inspector body, just below the persistent header. Echoes
+    /// the active symmetry mode (which drives the tool's strokes) plus
+    /// the map size (in SMU). Each chip carries its own hover-text via
+    /// [`crate::ui::help_text`].
+    fn inspector_sticky_chips(&self, ui: &mut egui::Ui) {
+        use crate::ui::help_text::{HelpId, help};
+        use crate::ui::theme::{ChipTone, Tokens};
+        let t = Tokens::DARK;
+        let sym_label = self.symmetry.label();
+        let sym_tone = match self.symmetry {
+            SymmetryAxis::None => ChipTone::Neutral,
+            _ => ChipTone::Ok,
+        };
+        let size_label = format!("{}×{} SMU", self.map_size.smu_x, self.map_size.smu_z);
+        egui::Frame::new()
+            .inner_margin(egui::Margin {
+                left: 14,
+                right: 14,
+                top: 6,
+                bottom: 4,
+            })
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    crate::ui::widgets::chip(ui, sym_tone, format!("Sym · {sym_label}"))
+                        .on_hover_text(help(HelpId::InspectorSymmetryChip));
+                    crate::ui::widgets::chip(ui, ChipTone::Neutral, size_label)
+                        .on_hover_text(help(HelpId::InspectorMapSizeChip));
+                });
+                ui.add_space(2.0);
+                // 1-px divider line so the chip row reads as a band.
+                let avail = ui.available_width();
+                let (rect, _) =
+                    ui.allocate_exact_size(egui::vec2(avail, 1.0), egui::Sense::hover());
+                ui.painter().rect_filled(rect, 0.0, t.border);
+            });
+    }
+
+    fn inspector_select(&self, ui: &mut egui::Ui) {
+        use crate::ui::help_text::{HelpId, help};
+        self.inspector_sticky_chips(ui);
+        ui.add(
+            egui::Label::new(egui::RichText::new("Select / orbit").heading())
+                .sense(egui::Sense::hover()),
+        )
+        .on_hover_text(help(HelpId::SelectModeInfo));
         ui.label(
             egui::RichText::new(
-                "Camera-only mode. LMB orbits, scroll zooms.\n\
+                "Camera-only mode. LMB orbits, MMB pans, RMB orbits, scroll zooms.\n\
                  Pick a tool on the left strip to start editing.",
             )
             .small()
@@ -6629,8 +6685,10 @@ impl App {
     ///   `DragValue` 0.5..=8.0, delete button) plus "+ Add spot" at
     ///   the bottom (places at map centre, metal = 2.0).
     fn inspector_metal(&mut self, ui: &mut egui::Ui) {
+        use crate::ui::help_text::{HelpId, help};
         let t = crate::ui::theme::Tokens::DARK;
         let (ex, ez) = self.world_extents();
+        self.inspector_sticky_chips(ui);
 
         // GLOBAL section — extractor_radius. The closure captures
         // its own working copy so the header chip + body DragValue
@@ -6649,7 +6707,8 @@ impl App {
                     crate::ui::theme::ChipTone::Warn
                 };
                 let label = if is_default { "BAR default" } else { "Custom" };
-                crate::ui::widgets::chip(ui, tone, label);
+                crate::ui::widgets::chip(ui, tone, label)
+                    .on_hover_text(help(HelpId::MetalGlobalChip));
             },
             |ui| {
                 ui.horizontal(|ui| {
@@ -6658,18 +6717,13 @@ impl App {
                             .color(t.muted)
                             .size(11.0),
                     );
-                    let resp = ui.add(
+                    ui.add(
                         egui::DragValue::new(&mut radius_edit)
                             .range(16.0..=200.0)
                             .speed(1.0)
                             .suffix(" elmos"),
-                    );
-                    resp.on_hover_text(
-                        "BAR convention is 80 elmos (the BAR mod overrides Spring's 500). \
-                         Setting this to the engine default 500 silently breaks mex-snap \
-                         (PITFALL §6). The F9 form (Sprint 13) will surface the same value as \
-                         mapinfo.extractor_radius.",
-                    );
+                    )
+                    .on_hover_text(help(HelpId::MetalExtractorRadius));
                 });
             },
         );
@@ -6698,7 +6752,7 @@ impl App {
             |ui| {
                 if ui
                     .add(egui::Button::new("+ Add"))
-                    .on_hover_text("Place a new metal spot at the map centre (metal = 2.0)")
+                    .on_hover_text(help(HelpId::MetalAddSpot))
                     .clicked()
                 {
                     add_clicked = true;
@@ -6742,13 +6796,15 @@ impl App {
                                                 .range(0..=(ex as i32))
                                                 .speed(8.0)
                                                 .prefix("x "),
-                                        );
+                                        )
+                                        .on_hover_text(help(HelpId::MetalSpotX));
                                         ui.add(
                                             egui::DragValue::new(&mut edited.z_elmo)
                                                 .range(0..=(ez as i32))
                                                 .speed(8.0)
                                                 .prefix("z "),
-                                        );
+                                        )
+                                        .on_hover_text(help(HelpId::MetalSpotZ));
                                         // PITFALL: don't artificially cap the metal value —
                                         // BAR maps strategically place high-value central mexes
                                         // (e.g. 5.2) and low-value perimeter mexes (e.g. 0.5)
@@ -6760,15 +6816,10 @@ impl App {
                                                 .speed(0.1)
                                                 .fixed_decimals(2),
                                         )
-                                        .on_hover_text(
-                                            "Per-spot metal multiplier. BAR convention: 2.0 \
-                                             standard mex, 4.0 strong central mex. Larger values \
-                                             are valid for high-yield strategic spots; click the \
-                                             field to type any value.",
-                                        );
+                                        .on_hover_text(help(HelpId::MetalSpotValue));
                                         if ui
                                             .small_button("×")
-                                            .on_hover_text("Delete spot")
+                                            .on_hover_text(help(HelpId::MetalSpotDelete))
                                             .clicked()
                                         {
                                             to_delete = Some(i);
@@ -6813,8 +6864,10 @@ impl App {
     /// general trees / rocks / wreckage placement; that's the
     /// scaffolded library / scatter UI's eventual home.
     fn inspector_geo(&mut self, ui: &mut egui::Ui) {
+        use crate::ui::help_text::{HelpId, help};
         let t = crate::ui::theme::Tokens::DARK;
         let (ex, ez) = self.world_extents();
+        self.inspector_sticky_chips(ui);
 
         // SPOTS section — same row pattern as metal, minus the value
         // column.
@@ -6825,14 +6878,15 @@ impl App {
         let vents_snapshot: Vec<GeoVent> = self.geo_vents.clone();
         let vent_count = vents_snapshot.len();
         let title = format!("Geo vents · {}", vent_count);
-        crate::ui::widgets::section(
+        crate::ui::widgets::section_with_hover(
             ui,
             &title,
             true,
+            "Geo vents = unique economy slots that produce steam plumes in-game. Emitted via the Springboard featureplacer trio's `geovent` entries (PITFALL §14 / §21).",
             |ui| {
                 if ui
                     .add(egui::Button::new("+ Add"))
-                    .on_hover_text("Place a new geo vent at the map centre")
+                    .on_hover_text(help(HelpId::GeoAddVent))
                     .clicked()
                 {
                     add_clicked = true;
@@ -6876,16 +6930,18 @@ impl App {
                                                 .range(0..=(ex as i32))
                                                 .speed(8.0)
                                                 .prefix("x "),
-                                        );
+                                        )
+                                        .on_hover_text(help(HelpId::GeoVentX));
                                         ui.add(
                                             egui::DragValue::new(&mut edited.z_elmo)
                                                 .range(0..=(ez as i32))
                                                 .speed(8.0)
                                                 .prefix("z "),
-                                        );
+                                        )
+                                        .on_hover_text(help(HelpId::GeoVentZ));
                                         if ui
                                             .small_button("×")
-                                            .on_hover_text("Delete geo vent")
+                                            .on_hover_text(help(HelpId::GeoVentDelete))
                                             .clicked()
                                         {
                                             to_delete = Some(i);
@@ -6931,8 +6987,10 @@ impl App {
     ///     fields + delete button. Rotation displays as 0..359 deg
     ///     (`rot_heading * 360 / 65536` rounding to nearest int).
     fn inspector_feature(&mut self, ui: &mut egui::Ui) {
+        use crate::ui::help_text::{HelpId, help};
         let t = crate::ui::theme::Tokens::DARK;
         let (ex, ez) = self.world_extents();
+        self.inspector_sticky_chips(ui);
 
         // CATEGORY section.
         let categories: Vec<String> = self.feature_state.manifest.category_names();
@@ -6954,7 +7012,7 @@ impl App {
                     return;
                 }
                 ui.horizontal(|ui| {
-                    egui::ComboBox::from_id_salt("feature_category")
+                    let combo_resp = egui::ComboBox::from_id_salt("feature_category")
                         .selected_text(self.feature_state.active_category.clone())
                         .show_ui(ui, |ui| {
                             for cat in &categories {
@@ -6973,6 +7031,9 @@ impl App {
                                 }
                             }
                         });
+                    combo_resp
+                        .response
+                        .on_hover_text(help(HelpId::FeatureCategoryCombo));
                 });
             },
         );
@@ -7003,7 +7064,8 @@ impl App {
             |ui| {
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("Filter").color(t.muted).size(11.0));
-                    ui.text_edit_singleline(&mut self.feature_state.filter);
+                    ui.text_edit_singleline(&mut self.feature_state.filter)
+                        .on_hover_text(help(HelpId::FeatureFilter));
                 });
                 ui.add_space(4.0);
                 egui::ScrollArea::vertical()
@@ -7044,7 +7106,8 @@ impl App {
                                     });
                                 })
                                 .response
-                                .interact(egui::Sense::click());
+                                .interact(egui::Sense::click())
+                                .on_hover_text(help(HelpId::FeaturePickerRow));
                             if row.clicked() {
                                 self.feature_state.selected_feature = Some(entry.name.clone());
                             }
@@ -7106,7 +7169,7 @@ impl App {
                                             );
                                             if ui
                                                 .small_button("×")
-                                                .on_hover_text("Delete feature")
+                                                .on_hover_text(help(HelpId::FeaturePlacedDelete))
                                                 .clicked()
                                             {
                                                 to_delete = Some(i);
@@ -7118,13 +7181,15 @@ impl App {
                                                     .range(0..=(ex as i32))
                                                     .speed(8.0)
                                                     .prefix("x "),
-                                            );
+                                            )
+                                            .on_hover_text(help(HelpId::FeaturePlacedX));
                                             ui.add(
                                                 egui::DragValue::new(&mut edited.z_elmo)
                                                     .range(0..=(ez as i32))
                                                     .speed(8.0)
                                                     .prefix("z "),
-                                            );
+                                            )
+                                            .on_hover_text(help(HelpId::FeaturePlacedZ));
                                             // Display rotation as integer
                                             // degrees 0..359; convert
                                             // back through the heading
@@ -7135,12 +7200,14 @@ impl App {
                                                 .round()
                                                 as i32)
                                                 .rem_euclid(360);
-                                            let resp = ui.add(
-                                                egui::DragValue::new(&mut deg)
-                                                    .range(0..=359)
-                                                    .speed(1.0)
-                                                    .suffix("°"),
-                                            );
+                                            let resp = ui
+                                                .add(
+                                                    egui::DragValue::new(&mut deg)
+                                                        .range(0..=359)
+                                                        .speed(1.0)
+                                                        .suffix("°"),
+                                                )
+                                                .on_hover_text(help(HelpId::FeaturePlacedRot));
                                             if resp.changed() {
                                                 let deg_u = deg.rem_euclid(360) as u32;
                                                 edited.rot_heading = ((deg_u * 65536) / 360) as u16;
@@ -7189,7 +7256,9 @@ impl App {
     /// section stays here because it owns session-only
     /// [`PaintBrushState`].
     fn inspector_paint_layer(&mut self, ui: &mut egui::Ui) {
+        use crate::ui::help_text::{HelpId, help};
         let t = crate::ui::theme::Tokens::DARK;
+        self.inspector_sticky_chips(ui);
 
         // Layers panel (rows + active-layer properties + footer).
         crate::ui::layers_panel::render(self, ui);
@@ -7201,17 +7270,18 @@ impl App {
             false,
             |_ui| {},
             |ui| {
-                let brushes: [(&str, &str, egui::Color32); 4] = [
-                    ("mask-reveal", "Reveal", t.green),
-                    ("mask-hide", "Hide", t.red),
-                    ("mask-smooth", "Smooth", t.accent),
-                    ("mask-fill", "Fill", t.amber),
+                let brushes: [(&str, &str, egui::Color32, HelpId); 4] = [
+                    ("mask-reveal", "Reveal", t.green, HelpId::PaintBrushReveal),
+                    ("mask-hide", "Hide", t.red, HelpId::PaintBrushHide),
+                    ("mask-smooth", "Smooth", t.accent, HelpId::PaintBrushSmooth),
+                    ("mask-fill", "Fill", t.amber, HelpId::PaintBrushFill),
                 ];
                 let mut new_brush_id: Option<String> = None;
                 ui.columns(4, |cols| {
-                    for (i, (id, label, color)) in brushes.iter().enumerate() {
+                    for (i, (id, label, color, help_id)) in brushes.iter().enumerate() {
                         let active = self.paint_brush_state.brush_id == *id;
-                        let resp = Self::brush_card(&mut cols[i], label, *color, active);
+                        let resp = Self::brush_card(&mut cols[i], label, *color, active)
+                            .on_hover_text(help(*help_id));
                         if resp.clicked() {
                             new_brush_id = Some((*id).to_string());
                         }
@@ -7226,46 +7296,68 @@ impl App {
                     ui.add(
                         egui::Slider::new(&mut self.paint_brush_state.radius, 8.0..=512.0)
                             .suffix(" e"),
-                    );
+                    )
+                    .on_hover_text(help(HelpId::PaintRadius));
                 });
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("Strength").color(t.muted).size(11.0));
                     ui.add(egui::Slider::new(
                         &mut self.paint_brush_state.strength,
                         0.0..=1.0,
-                    ));
+                    ))
+                    .on_hover_text(help(HelpId::PaintStrength));
                 });
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("Spacing").color(t.muted).size(11.0));
                     ui.add(egui::Slider::new(
                         &mut self.paint_brush_state.spacing,
                         0.05..=2.0,
-                    ));
+                    ))
+                    .on_hover_text(help(HelpId::PaintSpacing));
                 });
                 if self.paint_brush_state.brush_id == "mask-fill" {
                     ui.add_space(4.0);
                     ui.checkbox(
                         &mut self.paint_brush_state.fill_target_visible,
                         "Fill makes layer visible (else hide)",
-                    );
+                    )
+                    .on_hover_text(help(HelpId::PaintFillTargetVisible));
                 }
                 ui.add_space(4.0);
                 ui.checkbox(
                     &mut self.paint_brush_state.mask_only_preview,
                     "Mask-only preview",
-                );
+                )
+                .on_hover_text(help(HelpId::PaintMaskOnlyPreview));
             },
         );
     }
 
     fn inspector_sculpt(&mut self, ui: &mut egui::Ui) {
+        use crate::ui::help_text::{HelpId, help};
         let t = crate::ui::theme::Tokens::DARK;
+        self.inspector_sticky_chips(ui);
         // BRUSH section: 4-card picker.
-        let brushes_info: Vec<(Option<String>, &str, egui::Color32)> = vec![
-            (None, "Off", t.muted),
-            (Some("raise".to_string()), "Raise", t.green),
-            (Some("lower".to_string()), "Lower", t.red),
-            (Some("smooth".to_string()), "Smooth", t.accent),
+        let brushes_info: Vec<(Option<String>, &str, egui::Color32, HelpId)> = vec![
+            (None, "Off", t.muted, HelpId::SculptBrushOff),
+            (
+                Some("raise".to_string()),
+                "Raise",
+                t.green,
+                HelpId::SculptBrushRaise,
+            ),
+            (
+                Some("lower".to_string()),
+                "Lower",
+                t.red,
+                HelpId::SculptBrushLower,
+            ),
+            (
+                Some("smooth".to_string()),
+                "Smooth",
+                t.accent,
+                HelpId::SculptBrushSmooth,
+            ),
         ];
         let mut new_brush: Option<Option<String>> = None;
         crate::ui::widgets::section(
@@ -7275,9 +7367,10 @@ impl App {
             |_ui| {},
             |ui| {
                 ui.columns(4, |cols| {
-                    for (i, (id, label, color)) in brushes_info.iter().enumerate() {
+                    for (i, (id, label, color, help_id)) in brushes_info.iter().enumerate() {
                         let active = self.brush_id == *id;
-                        let resp = Self::brush_card(&mut cols[i], label, *color, active);
+                        let resp = Self::brush_card(&mut cols[i], label, *color, active)
+                            .on_hover_text(help(*help_id));
                         if resp.clicked() {
                             new_brush = Some(id.clone());
                         }
@@ -7306,7 +7399,8 @@ impl App {
                     8.0..=4096.0,
                     t.accent,
                     r_label,
-                );
+                )
+                .on_hover_text(help(HelpId::SculptRadius));
                 ui.add_space(8.0);
                 let s_label = format!("{:.2}", *strength_raw);
                 crate::ui::widgets::ramp_slider_labelled(
@@ -7316,9 +7410,14 @@ impl App {
                     0.0..=1.0,
                     t.accent,
                     s_label,
-                );
+                )
+                .on_hover_text(help(HelpId::SculptStrength));
                 ui.add_space(8.0);
-                ui.label(egui::RichText::new("Falloff").color(t.muted).size(11.0));
+                ui.add(
+                    egui::Label::new(egui::RichText::new("Falloff").color(t.muted).size(11.0))
+                        .sense(egui::Sense::hover()),
+                )
+                .on_hover_text(help(HelpId::SculptFalloff));
                 // Decorative falloff preview — pure painter, no state.
                 let (rect, _) = ui.allocate_exact_size(
                     egui::vec2(ui.available_width(), 34.0),
@@ -7369,13 +7468,13 @@ impl App {
                 ui.horizontal_wrapped(|ui| {
                     let _ = ui
                         .add(egui::Button::selectable(true, "Continuous"))
-                        .on_hover_text("Always-on brush stamping. Default.");
+                        .on_hover_text(help(HelpId::SculptBehaviorContinuous));
                     let _ = ui
                         .add_enabled(false, egui::Button::new("Pressure"))
-                        .on_hover_text("Tablet pressure input — not yet wired.");
+                        .on_disabled_hover_text(help(HelpId::SculptBehaviorPressure));
                     let _ = ui
                         .add_enabled(false, egui::Button::new("Lock Z"))
-                        .on_hover_text("Clamp brush to a target elevation — Phase F2+");
+                        .on_disabled_hover_text(help(HelpId::SculptBehaviorLockZ));
                 });
             },
         );
@@ -7394,7 +7493,9 @@ impl App {
     /// stack. A follow-up sprint can ship per-slider drag-start /
     /// drag-stop tracking analogous to `dragging_metal_spot_from`.
     fn inspector_water(&mut self, ui: &mut egui::Ui) {
+        use crate::ui::help_text::{HelpId, help};
         let t = crate::ui::theme::Tokens::DARK;
+        self.inspector_sticky_chips(ui);
 
         // ── PRESET ────────────────────────────────────────
         let active_mode = self.water_mode;
@@ -7415,7 +7516,18 @@ impl App {
                             }
                             _ => m.label().to_string(),
                         };
-                        let resp = ui.add(egui::Button::selectable(active, label_owned));
+                        let preset_help = match m {
+                            WaterMode::None => HelpId::WaterPresetNone,
+                            WaterMode::Custom => HelpId::WaterPresetCustom,
+                            WaterMode::Ocean => HelpId::WaterPresetOcean,
+                            WaterMode::Tropical => HelpId::WaterPresetTropical,
+                            WaterMode::Acid => HelpId::WaterPresetAcid,
+                            WaterMode::Lava => HelpId::WaterPresetLava,
+                            WaterMode::Magma => HelpId::WaterPresetMagma,
+                        };
+                        let resp = ui
+                            .add(egui::Button::selectable(active, label_owned))
+                            .on_hover_text(help(preset_help));
                         if resp.clicked() && m != active_mode {
                             new_mode = Some(m);
                         }
@@ -7482,10 +7594,7 @@ impl App {
                             .speed(1.0)
                             .suffix(" elmos"),
                     )
-                    .on_hover_text(
-                        "World Y at raw heightmap value 0. Set negative to \
-                         carve below sea level.",
-                    );
+                    .on_hover_text(help(HelpId::WaterFloorMin));
                     if (current - before).abs() > 1e-3 {
                         self.min_height = current;
                         self.mark_dirty();
@@ -7506,10 +7615,7 @@ impl App {
                             .speed(1.0)
                             .suffix(" elmos"),
                     )
-                    .on_hover_text(
-                        "World Y at raw heightmap value 65535. Raise to give \
-                         peaks room above the water plane.",
-                    );
+                    .on_hover_text(help(HelpId::WaterCeilingMax));
                     if (current - before).abs() > 1e-3 {
                         self.height_scale = current;
                         self.mark_dirty();
@@ -7535,6 +7641,7 @@ impl App {
                     |o| o.damage,
                     0.0..=10000.0,
                     " HP/tick",
+                    help(HelpId::WaterDamage),
                 );
                 self.water_field_void_toggle(ui);
                 self.water_field_tidal_slider(ui);
@@ -7548,16 +7655,26 @@ impl App {
             false,
             |_ui| {},
             |ui| {
-                self.water_field_color(ui, "Surface", WaterField::SurfaceColor, |o| {
-                    o.surface_color
-                });
+                self.water_field_color(
+                    ui,
+                    "Surface",
+                    WaterField::SurfaceColor,
+                    |o| o.surface_color,
+                    help(HelpId::WaterSurfaceColor),
+                );
                 // Plane colour disabled while voidWater is on
                 // (PITFALL §6 — they're mutually exclusive; the
                 // emission path auto-clears plane_color but we
                 // surface the gating here too).
                 let plane_enabled = !self.void_water;
                 ui.add_enabled_ui(plane_enabled, |ui| {
-                    self.water_field_color(ui, "Plane", WaterField::PlaneColor, |o| o.plane_color);
+                    self.water_field_color(
+                        ui,
+                        "Plane",
+                        WaterField::PlaneColor,
+                        |o| o.plane_color,
+                        help(HelpId::WaterPlaneColor),
+                    );
                 });
                 if !plane_enabled {
                     ui.label(
@@ -7575,6 +7692,7 @@ impl App {
                     |o| o.surface_alpha,
                     0.0..=1.0,
                     "",
+                    help(HelpId::WaterSurfaceAlpha),
                 );
                 self.water_field_float_slider(
                     ui,
@@ -7583,6 +7701,7 @@ impl App {
                     |o| o.perlin_amplitude,
                     0.0..=2.0,
                     "",
+                    help(HelpId::WaterWaveSize),
                 );
                 self.water_field_float_slider(
                     ui,
@@ -7591,6 +7710,7 @@ impl App {
                     |o| o.wave_foam_intensity,
                     0.0..=2.0,
                     "",
+                    help(HelpId::WaterFoamStrength),
                 );
             },
         );
@@ -7638,12 +7758,7 @@ impl App {
                             .speed(1.0)
                             .suffix(" elmos"),
                     )
-                    .on_hover_text(
-                        "Sets Project.min_height. The world Y at raw \
-                         heightmap value 0 — i.e. the deepest point your \
-                         basins can reach. More negative = deeper \
-                         floor, more room for visible water above.",
-                    );
+                    .on_hover_text(help(HelpId::WaterFloorMin));
                     if (current - before).abs() > 1e-3 {
                         self.min_height = current;
                         self.mark_dirty();
@@ -7676,11 +7791,7 @@ impl App {
                             .speed(1.0)
                             .suffix(" elmos"),
                     )
-                    .on_hover_text(
-                        "Per-stamp Lower-brush depth for the Tool::Water \
-                         flood gesture. LMB drag carves toward this depth; \
-                         RMB drag raises.",
-                    );
+                    .on_hover_text(help(HelpId::WaterCarveDepth));
                 });
                 ui.label(
                     egui::RichText::new("LMB drag → flood. RMB drag → raise.")
@@ -7690,11 +7801,7 @@ impl App {
                 ui.add_space(4.0);
                 let auto_clicked = ui
                     .add(egui::Button::new("Set sea floor to carve depth"))
-                    .on_hover_text(
-                        "Shortcut: set min_height = min(0, carve_depth) so a \
-                         Tool::Water flood with LMB-drag immediately produces \
-                         visible water in the basin.",
-                    )
+                    .on_hover_text(help(HelpId::WaterAutoMinHeight))
                     .clicked();
                 if auto_clicked {
                     self.auto_set_min_height_from_heightmap();
@@ -7754,17 +7861,20 @@ impl App {
                 ui.add_space(6.0);
                 let mut clicked_toggle = false;
                 if applied {
-                    let resp = ui.add(egui::Button::new("Revert atmosphere"));
+                    let resp = ui
+                        .add(egui::Button::new("Revert atmosphere"))
+                        .on_hover_text(crate::ui::help_text::help(
+                            crate::ui::help_text::HelpId::WaterLavaAtmosphereRevert,
+                        ));
                     if resp.clicked() {
                         clicked_toggle = true;
                     }
                 } else {
                     let resp = ui
                         .add(egui::Button::new("Apply lava-style atmosphere").fill(t.accent))
-                        .on_hover_text(
-                            "Hardcoded patch: fog (0.9, 0.3, 0.1), \
-                             sun (1.0, 0.5, 0.3), cloud (0.4, 0.2, 0.15) @ 0.7.",
-                        );
+                        .on_hover_text(crate::ui::help_text::help(
+                            crate::ui::help_text::HelpId::WaterLavaAtmosphereApply,
+                        ));
                     if resp.clicked() {
                         clicked_toggle = true;
                     }
@@ -7788,6 +7898,7 @@ impl App {
     /// pushed through `EditWaterField` for undo. `accessor` extracts
     /// the current `Option<f32>` so the slider displays either the
     /// user's override or the active preset's value.
+    #[allow(clippy::too_many_arguments)] // helper with field-specific knobs; refactoring is Sprint 27 scope
     fn water_field_float_slider(
         &mut self,
         ui: &mut egui::Ui,
@@ -7796,6 +7907,7 @@ impl App {
         accessor: impl Fn(&WaterBlock) -> Option<f32>,
         range: std::ops::RangeInclusive<f32>,
         suffix: &str,
+        hover_text: &str,
     ) {
         let t = crate::ui::theme::Tokens::DARK;
         // Display value: override → preset → 0.0.
@@ -7809,7 +7921,8 @@ impl App {
                 egui::Slider::new(&mut current, range)
                     .show_value(true)
                     .suffix(suffix),
-            );
+            )
+            .on_hover_text(hover_text);
         });
         if (current - baseline).abs() > 1e-6 {
             let to = WaterValue::Float(Some(current));
@@ -7833,9 +7946,7 @@ impl App {
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("Void water").color(t.muted).size(11.0));
             ui.add(egui::Checkbox::new(&mut current, "")).on_hover_text(
-                "Renders the map without a water plane (the Apophis / \
-                     Quicksilver 'space map' look). Mutually exclusive with \
-                     plane colour — PITFALL §6.",
+                crate::ui::help_text::help(crate::ui::help_text::HelpId::WaterVoidWater),
             );
         });
         if current != before {
@@ -7867,10 +7978,9 @@ impl App {
                     .size(11.0),
             );
             ui.add(egui::Slider::new(&mut current, 0.0..=30.0).show_value(true))
-                .on_hover_text(
-                    "BAR tidal-energy economy. Lives at mapinfo top level, \
-                     not inside water{}. PITFALL §5.",
-                );
+                .on_hover_text(crate::ui::help_text::help(
+                    crate::ui::help_text::HelpId::WaterTidalStrength,
+                ));
         });
         if (current - baseline).abs() > 1e-6 {
             let to = WaterValue::Float(Some(current));
@@ -7894,6 +8004,7 @@ impl App {
         label: &str,
         field: WaterField,
         accessor: impl Fn(&WaterBlock) -> Option<[f32; 3]>,
+        hover_text: &str,
     ) {
         let t = crate::ui::theme::Tokens::DARK;
         let preset = preset_water_block(self.water_mode).unwrap_or_default();
@@ -7902,7 +8013,8 @@ impl App {
         let mut current = baseline;
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new(label).color(t.muted).size(11.0));
-            ui.color_edit_button_rgb(&mut current);
+            ui.color_edit_button_rgb(&mut current)
+                .on_hover_text(hover_text);
         });
         let changed = (current[0] - baseline[0]).abs() > 1e-4
             || (current[1] - baseline[1]).abs() > 1e-4
@@ -8016,8 +8128,10 @@ impl App {
     /// hover-pulse on the canvas. Symmetry-derived positions render
     /// greyed with a `(mirror of …)` label.
     fn inspector_start_positions(&mut self, ui: &mut egui::Ui) {
+        use crate::ui::help_text::{HelpId, help};
         let t = crate::ui::theme::Tokens::DARK;
         let (ex, ez) = self.world_extents();
+        self.inspector_sticky_chips(ui);
 
         // LAYOUT section: preset chip + drag-paint toggle + Balanced chip.
         let balanced = self.start_positions_balanced();
@@ -8032,13 +8146,14 @@ impl App {
                     crate::ui::theme::ChipTone::Warn
                 };
                 let label = if balanced { "Balanced" } else { "Asymmetric" };
-                crate::ui::widgets::chip(ui, tone, label);
+                crate::ui::widgets::chip(ui, tone, label)
+                    .on_hover_text(help(HelpId::StartLayoutBalancedChip));
             },
             |ui| {
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("Preset").color(t.muted).size(11.0));
                     let mut selected: Option<AllyPreset> = None;
-                    egui::ComboBox::from_id_salt("ally_preset")
+                    let combo = egui::ComboBox::from_id_salt("ally_preset")
                         .selected_text("Apply a layout…")
                         .show_ui(ui, |ui| {
                             for preset in AllyPreset::ALL {
@@ -8047,6 +8162,7 @@ impl App {
                                 }
                             }
                         });
+                    combo.response.on_hover_text(help(HelpId::StartPresetCombo));
                     if let Some(p) = selected {
                         self.apply_ally_preset(p);
                     }
@@ -8058,7 +8174,8 @@ impl App {
                         egui::DragValue::new(&mut self.drag_paint_count)
                             .range(1u8..=32)
                             .suffix(" pos"),
-                    );
+                    )
+                    .on_hover_text(help(HelpId::StartDragPaintCount));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(
                             egui::RichText::new("LMB drag a line")
@@ -8091,7 +8208,7 @@ impl App {
             |ui| {
                 if ui
                     .add(egui::Button::new("+ Add"))
-                    .on_hover_text("Add a new ally team")
+                    .on_hover_text(help(HelpId::StartAllyAdd))
                     .clicked()
                 {
                     add_group_clicked = true;
@@ -8125,24 +8242,23 @@ impl App {
                                         );
                                         if ui
                                             .color_edit_button_srgba(&mut c)
-                                            .on_hover_text("AllyGroup colour")
+                                            .on_hover_text(help(HelpId::StartAllyColor))
                                             .changed()
                                         {
                                             g.color = [c.r(), c.g(), c.b()];
                                         }
-                                        ui.text_edit_singleline(&mut g.name);
+                                        ui.text_edit_singleline(&mut g.name)
+                                            .on_hover_text(help(HelpId::StartAllyName));
                                         if ui
                                             .selectable_label(is_active, "★")
-                                            .on_hover_text("Make active (receives new placements)")
+                                            .on_hover_text(help(HelpId::StartAllyActiveStar))
                                             .clicked()
                                         {
                                             new_active = Some(g_id);
                                         }
                                         if ui
                                             .small_button("delete group")
-                                            .on_hover_text(
-                                                "Remove this ally group and all its positions",
-                                            )
+                                            .on_hover_text(help(HelpId::StartAllyDelete))
                                             .clicked()
                                         {
                                             to_delete_group = Some(g_id);
@@ -8163,7 +8279,11 @@ impl App {
                                                 "#{}: ({}, {})",
                                                 i, pos.x_elmo, pos.z_elmo
                                             ));
-                                            if ui.small_button("×").clicked() {
+                                            if ui
+                                                .small_button("×")
+                                                .on_hover_text(help(HelpId::StartPosDelete))
+                                                .clicked()
+                                            {
                                                 to_delete_pos = Some((g_id, *i));
                                             }
                                         });
@@ -8262,7 +8382,9 @@ impl App {
         ui: &mut egui::Ui,
         action: &mut Option<FileAction>,
     ) {
+        use crate::ui::help_text::{HelpId, help};
         let t = crate::ui::theme::Tokens::DARK;
+        self.inspector_sticky_chips(ui);
         let active_preset = PRESETS
             .iter()
             .find(|p| p.expression == self.procgen_expr && p.domain == self.procgen_domain)
@@ -8279,7 +8401,11 @@ impl App {
                     for p in PRESETS {
                         let chosen = Some(p.label) == active_preset;
                         let btn = egui::Button::selectable(chosen, p.label);
-                        if ui.add(btn).clicked() {
+                        if ui
+                            .add(btn)
+                            .on_hover_text(help(HelpId::ProcgenPresetChip))
+                            .clicked()
+                        {
                             self.procgen_expr = p.expression.to_string();
                             self.procgen_domain = p.domain;
                             self.revalidate_procgen();
@@ -8315,13 +8441,15 @@ impl App {
                     .corner_radius(egui::CornerRadius::same(4))
                     .inner_margin(egui::Margin::same(6))
                     .show(ui, |ui| {
-                        let resp = ui.add(
-                            egui::TextEdit::multiline(&mut self.procgen_expr)
-                                .font(egui::FontId::monospace(11.5))
-                                .desired_width(f32::INFINITY)
-                                .desired_rows(2)
-                                .frame(false),
-                        );
+                        let resp = ui
+                            .add(
+                                egui::TextEdit::multiline(&mut self.procgen_expr)
+                                    .font(egui::FontId::monospace(11.5))
+                                    .desired_width(f32::INFINITY)
+                                    .desired_rows(2)
+                                    .frame(false),
+                            )
+                            .on_hover_text(help(HelpId::ProcgenExpression));
                         if resp.changed() {
                             self.revalidate_procgen();
                         }
@@ -8337,6 +8465,7 @@ impl App {
                             self.procgen_domain == Domain::Unit,
                             Domain::Unit.label(),
                         ))
+                        .on_hover_text(help(HelpId::ProcgenDomainUnit))
                         .clicked()
                     {
                         self.procgen_domain = Domain::Unit;
@@ -8346,6 +8475,7 @@ impl App {
                             self.procgen_domain == Domain::Centered,
                             Domain::Centered.label(),
                         ))
+                        .on_hover_text(help(HelpId::ProcgenDomainCentered))
                         .clicked()
                     {
                         self.procgen_domain = Domain::Centered;
@@ -8370,7 +8500,8 @@ impl App {
                 } else {
                     (crate::ui::theme::ChipTone::Warn, "Parse error")
                 };
-                crate::ui::widgets::chip(ui, tone, label);
+                crate::ui::widgets::chip(ui, tone, label)
+                    .on_hover_text(help(HelpId::ProcgenPreviewChip));
             },
             |ui| {
                 if let Some(tex) = self.procgen_thumbnail.as_ref() {
@@ -8391,12 +8522,14 @@ impl App {
                 }
                 ui.add_space(8.0);
                 // Commit button — disabled until parse succeeds.
-                let resp = ui.add_enabled(
-                    valid,
-                    egui::Button::new("Commit to heightmap")
-                        .fill(if valid { t.accent } else { t.panel2 })
-                        .min_size(egui::vec2(ui.available_width(), 32.0)),
-                );
+                let resp = ui
+                    .add_enabled(
+                        valid,
+                        egui::Button::new("Commit to heightmap")
+                            .fill(if valid { t.accent } else { t.panel2 })
+                            .min_size(egui::vec2(ui.available_width(), 32.0)),
+                    )
+                    .on_hover_text(help(HelpId::ProcgenCommitButton));
                 if resp.clicked() {
                     *action = Some(FileAction::ApplyProcGen);
                 }

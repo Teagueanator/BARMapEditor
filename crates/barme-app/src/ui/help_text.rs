@@ -121,7 +121,7 @@ pub enum HelpId {
     // ──────────────── Water / lava tool ────────────────
     WaterPresetNone,
     WaterPresetCustom,
-    WaterPresetPacific,
+    WaterPresetOcean,
     WaterPresetTropical,
     WaterPresetAcid,
     WaterPresetLava,
@@ -252,7 +252,7 @@ impl HelpId {
         // water
         HelpId::WaterPresetNone,
         HelpId::WaterPresetCustom,
-        HelpId::WaterPresetPacific,
+        HelpId::WaterPresetOcean,
         HelpId::WaterPresetTropical,
         HelpId::WaterPresetAcid,
         HelpId::WaterPresetLava,
@@ -298,7 +298,6 @@ impl HelpId {
 
 /// Map an id to its hover-text. The body is an exhaustive `match`
 /// so adding a [`HelpId`] variant produces a compile error here.
-#[allow(dead_code)] // Sprint 19 / U1: catalogue lands first; inspectors wire it in subsequent commits
 pub fn help(id: HelpId) -> &'static str {
     match id {
         // ──────────────── Top-bar chrome ────────────────
@@ -513,8 +512,8 @@ pub fn help(id: HelpId) -> &'static str {
         HelpId::WaterPresetCustom => {
             "Hand-tuned override set. The number in parens shows how many fields you've overridden away from the active preset."
         }
-        HelpId::WaterPresetPacific => {
-            "Cold deep-blue ocean. Standard BAR sea-level preset; pairs with any temperate biome."
+        HelpId::WaterPresetOcean => {
+            "Cool blue ocean (`Coastlines` palette). Standard BAR sea-level preset; pairs with any temperate biome."
         }
         HelpId::WaterPresetTropical => {
             "Bright teal shallows with strong wave foam. Designed for atoll and reef maps."

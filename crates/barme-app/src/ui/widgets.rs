@@ -46,7 +46,6 @@ pub fn section<R>(
 /// adding a `_hover` variant rather than changing the signature
 /// avoids churning the 50+ existing call sites for Sprint 19's
 /// annotative pass.
-#[allow(dead_code)] // Sprint 19 / U1: lands first; inspector commits use it
 pub fn section_with_hover<R>(
     ui: &mut Ui,
     title: &str,
