@@ -399,6 +399,78 @@ pub fn drag_val_pill<Num: egui::emath::Numeric>(
     .inner
 }
 
+/// D10 / Sprint 17 (ADR-041) — one entry the slot-picker grid
+/// renders. The caller pre-resolves thumbnails (via the App's
+/// `slot_thumbnail` cache) so the widget itself stays free of
+/// `&mut App`.
+pub struct SlotPickerEntry<'a> {
+    pub id: u8,
+    pub name: &'a str,
+    pub thumbnail: Option<&'a egui::TextureHandle>,
+}
+
+/// D10 / Sprint 17 (ADR-041) — render a 3-column grid of slot
+/// thumbnails. Each entry is a clickable 64 × 64 tile + a tiny
+/// `"NN · name"` label. Returns `Some(slot_id)` the frame the user
+/// clicks a tile; `None` otherwise.
+///
+/// Extracted from the legacy `inspector_splat`'s inline picker. Used
+/// by Sprint 17's Layers panel for both the Add-layer flow (choose a
+/// stock biome instead of "next-unused slot") and the active-layer
+/// "Change slot…" affordance.
+pub fn slot_picker_grid(ui: &mut Ui, entries: &[SlotPickerEntry<'_>]) -> Option<u8> {
+    let t = Tokens::DARK;
+    let mut clicked: Option<u8> = None;
+    if entries.is_empty() {
+        ui.label(
+            egui::RichText::new(
+                "No slots found under tools/textures/.\n\
+                 Run scripts/fetch-textures.sh.",
+            )
+            .color(t.muted)
+            .size(11.0),
+        );
+        return None;
+    }
+    egui::Grid::new(ui.id().with("slot_picker_grid"))
+        .num_columns(3)
+        .spacing([6.0, 6.0])
+        .show(ui, |ui| {
+            for (i, entry) in entries.iter().enumerate() {
+                ui.vertical(|ui| {
+                    let (thumb_rect, thumb_resp) =
+                        ui.allocate_exact_size(egui::vec2(64.0, 64.0), Sense::click());
+                    if let Some(handle) = entry.thumbnail {
+                        egui::Image::new((handle.id(), thumb_rect.size()))
+                            .corner_radius(4.0)
+                            .paint_at(ui, thumb_rect);
+                    } else {
+                        ui.painter()
+                            .rect_filled(thumb_rect, CornerRadius::same(4), t.bg);
+                    }
+                    ui.painter().rect_stroke(
+                        thumb_rect,
+                        CornerRadius::same(4),
+                        Stroke::new(1.0, t.border),
+                        StrokeKind::Middle,
+                    );
+                    ui.label(
+                        egui::RichText::new(format!("{:02} · {}", entry.id, entry.name))
+                            .color(t.muted)
+                            .size(9.5),
+                    );
+                    if thumb_resp.clicked() {
+                        clicked = Some(entry.id);
+                    }
+                });
+                if (i + 1) % 3 == 0 {
+                    ui.end_row();
+                }
+            }
+        });
+    clicked
+}
+
 /// Compact icon-only button with hover background. Returns the
 /// underlying response so callers can wire `clicked()`.
 pub fn icon_button(ui: &mut Ui, icon: Icon, size: f32, tooltip: &str) -> Response {

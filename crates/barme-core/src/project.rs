@@ -86,6 +86,14 @@ pub struct Project {
     /// click.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub next_steps_dismissed: bool,
+    /// D10 / Sprint 17 (ADR-041): one-shot dismissal flag for the
+    /// "your splat layers were migrated to the new Layers panel"
+    /// toast that surfaces the first time a pre-Sprint-14 project
+    /// loads through the Layers-panel-era editor. Default false;
+    /// flipped to true the first time the user dismisses the toast
+    /// + persisted so re-opens of the same project stay quiet.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub migration_toast_dismissed: bool,
     /// D5 / Sprint 9: per-channel splat slot bindings, scales, mults,
     /// and the ADR-034 placeholder toggle. Round-trips through TOML;
     /// `#[serde(default)]` materialises the engine defaults for
@@ -456,6 +464,8 @@ struct ProjectWire {
     #[serde(default)]
     next_steps_dismissed: bool,
     #[serde(default)]
+    migration_toast_dismissed: bool,
+    #[serde(default)]
     splat_config: SplatConfig,
     #[serde(default)]
     dnts_diffuse_in_alpha: bool,
@@ -496,6 +506,7 @@ impl From<ProjectWire> for Project {
             ally_groups: w.ally_groups,
             mapinfo_overrides: w.mapinfo_overrides,
             next_steps_dismissed: w.next_steps_dismissed,
+            migration_toast_dismissed: w.migration_toast_dismissed,
             splat_config: w.splat_config,
             dnts_diffuse_in_alpha: w.dnts_diffuse_in_alpha,
             splat_distribution: None,
@@ -623,6 +634,7 @@ impl Project {
             ally_groups: Vec::new(),
             mapinfo_overrides: HashMap::new(),
             next_steps_dismissed: false,
+            migration_toast_dismissed: false,
             splat_config: SplatConfig::default(),
             dnts_diffuse_in_alpha: false,
             splat_distribution: None,

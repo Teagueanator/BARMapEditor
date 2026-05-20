@@ -71,6 +71,27 @@ pub fn render(app: &mut App, ui: &mut egui::Ui) {
         .filter_map(|s| app.layer_thumbnail(&ctx, &s.id).map(|h| (s.id.clone(), h)))
         .collect();
 
+    // D10 / Sprint 17 (ADR-041) — also pre-resolve stock-slot
+    // thumbnails for the Add-layer picker popup + the "Change slot…"
+    // popup. The grid widget itself stays free of `&mut App`.
+    let slot_registry_view: Vec<(u8, String)> = app
+        .slot_registry
+        .iter()
+        .map(|s| (s.id, s.name.clone()))
+        .collect();
+    let slot_thumbs: std::collections::HashMap<u8, egui::TextureHandle> = slot_registry_view
+        .iter()
+        .filter_map(|(id, _)| app.slot_thumbnail(&ctx, *id).map(|h| (*id, h)))
+        .collect();
+    let slot_picker_entries: Vec<widgets::SlotPickerEntry<'_>> = slot_registry_view
+        .iter()
+        .map(|(id, name)| widgets::SlotPickerEntry {
+            id: *id,
+            name: name.as_str(),
+            thumbnail: slot_thumbs.get(id),
+        })
+        .collect();
+
     // Deferred actions: the UI walks the layer list with `&self`
     // references; mutations get queued and applied after.
     let actions: std::cell::RefCell<Vec<LayerAction>> = std::cell::RefCell::new(Vec::new());
@@ -94,17 +115,46 @@ pub fn render(app: &mut App, ui: &mut egui::Ui) {
             );
         },
         |ui| {
-            // Add / Import / Duplicate split button row.
+            // D10 / Sprint 17 (ADR-041) — Add-layer flow now opens a
+            // slot-picker popup on PRIMARY click so the user picks a
+            // stock biome instead of "next unused slot" (the
+            // Sprint-16 behaviour). The caret keeps the secondary
+            // affordances (Import / Duplicate / pick-anything-empty).
             ui.horizontal(|ui| {
                 let (primary, caret) = widgets::split_button(ui, None, "Add layer", true);
-                if primary.clicked() {
-                    actions.borrow_mut().push(LayerAction::AddLayer);
-                }
+                egui::Popup::menu(&primary)
+                    .close_behavior(egui::PopupCloseBehavior::CloseOnClick)
+                    .show(|ui| {
+                        ui.set_min_width(260.0);
+                        ui.label(
+                            egui::RichText::new("Pick a stock texture")
+                                .color(Tokens::DARK.muted)
+                                .size(11.0)
+                                .strong(),
+                        );
+                        ui.add_space(4.0);
+                        if let Some(slot_id) =
+                            widgets::slot_picker_grid(ui, &slot_picker_entries)
+                        {
+                            actions
+                                .borrow_mut()
+                                .push(LayerAction::AddLayerFromSlot(slot_id));
+                        }
+                        ui.add_space(6.0);
+                        ui.separator();
+                        ui.add_space(4.0);
+                        if ui.button("Import texture from disk…").clicked() {
+                            actions.borrow_mut().push(LayerAction::AddLayerFromImport);
+                        }
+                        if ui.button("Add empty layer (any unused slot)").clicked() {
+                            actions.borrow_mut().push(LayerAction::AddLayer);
+                        }
+                    });
                 egui::Popup::menu(&caret)
                     .close_behavior(egui::PopupCloseBehavior::CloseOnClick)
                     .show(|ui| {
-                        ui.set_min_width(180.0);
-                        if ui.button("Import texture…").clicked() {
+                        ui.set_min_width(220.0);
+                        if ui.button("Import texture from disk…").clicked() {
                             actions.borrow_mut().push(LayerAction::AddLayerFromImport);
                         }
                         if ui
@@ -152,7 +202,7 @@ pub fn render(app: &mut App, ui: &mut egui::Ui) {
 
     // ── Active layer expanded properties ─────────────────────────
     if let Some(snap) = active_snapshot.as_ref() {
-        render_active_properties(ui, snap, &actions);
+        render_active_properties(ui, snap, &slot_picker_entries, &actions);
     }
 
     // ── Footer chips ─────────────────────────────────────────────
@@ -244,6 +294,16 @@ enum LayerAction {
     SetBlend(String, BlendMode),
     ImportTexture(String),
     AddLayer,
+    /// D10 / Sprint 17 (ADR-041) — explicit-slot variant. Sprint 16's
+    /// "Add layer" picked an arbitrary unused stock slot; Sprint 17's
+    /// slot-picker popup feeds this with the user's chosen id.
+    AddLayerFromSlot(u8),
+    /// D10 / Sprint 17 (ADR-041) — re-bind the active layer's `Slot`
+    /// source to a different slot id.
+    ChangeSlot {
+        layer_id: String,
+        new_slot_id: u8,
+    },
     AddLayerFromImport,
     DuplicateActive,
     SetDntsDiffuseInAlpha(bool),
@@ -397,9 +457,34 @@ fn apply_actions(app: &mut App, actions: Vec<LayerAction>) {
                     app.import_layer_texture(&id, path);
                 }
             }
-            LayerAction::AddLayer => {
-                let id = app.add_layer_at_top();
+            LayerAction::AddLayerFromSlot(slot_id) => {
+                let id = app.add_layer_with_slot(slot_id);
                 app.paint_active_layer_id = Some(id);
+            }
+            LayerAction::ChangeSlot {
+                layer_id,
+                new_slot_id,
+            } => {
+                let Some(prev) = app
+                    .layer_stack
+                    .layer_by_id(&layer_id)
+                    .map(|l| l.source.clone())
+                else {
+                    continue;
+                };
+                let new_source = LayerSource::Slot { id: new_slot_id };
+                if prev == new_source {
+                    continue;
+                }
+                push_layer_property(
+                    app,
+                    &layer_id,
+                    LayerPropertyValue::Source(prev),
+                    LayerPropertyValue::Source(new_source),
+                );
+                app.layer_thumbnails.remove(&layer_id);
+                app.composite_layer_last_version.clear();
+                app.reupload_layer_stack_diffuses();
             }
             LayerAction::AddLayerFromImport => {
                 if let Some(path) = rfd::FileDialog::new()
@@ -410,6 +495,14 @@ fn apply_actions(app: &mut App, actions: Vec<LayerAction>) {
                     app.import_layer_texture(&id, path);
                     app.paint_active_layer_id = Some(id);
                 }
+            }
+            LayerAction::AddLayer => {
+                // Legacy Sprint-16 path — pick the next unused stock
+                // slot. Surfaced behind the dropdown's "Add empty
+                // layer (any unused slot)" entry; the primary
+                // affordance now opens the slot picker.
+                let id = app.add_layer_at_top();
+                app.paint_active_layer_id = Some(id);
             }
             LayerAction::DuplicateActive => {
                 if let Some(active_id) = app.paint_active_layer_id.clone() {
@@ -835,6 +928,7 @@ fn cycle_channel(cur: Option<SplatChannel>) -> Option<SplatChannel> {
 fn render_active_properties(
     ui: &mut egui::Ui,
     snap: &RowSnapshot,
+    slot_picker_entries: &[widgets::SlotPickerEntry<'_>],
     actions: &std::cell::RefCell<Vec<LayerAction>>,
 ) {
     let t = Tokens::DARK;
@@ -863,19 +957,39 @@ fn render_active_properties(
             |ui| match &snap.source {
                 LayerSource::Slot { id } => {
                     ui.horizontal(|ui| {
-                        ui.label(
-                            egui::RichText::new(format!("Slot {id:02}"))
-                                .color(t.muted)
-                                .monospace(),
-                        );
+                        let slot_name = slot_picker_entries
+                            .iter()
+                            .find(|e| e.id == *id)
+                            .map(|e| e.name.to_string())
+                            .unwrap_or_default();
+                        let label = if slot_name.is_empty() {
+                            format!("Slot {id:02}")
+                        } else {
+                            format!("Slot {id:02} · {slot_name}")
+                        };
+                        ui.label(egui::RichText::new(label).color(t.muted).monospace());
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.button("Change slot…").clicked() {
-                                // Future: open the slot picker
-                                // popup; Sprint 17 / Commit 5
-                                // extracts the widget so this can
-                                // share with the legacy splat
-                                // inspector's picker.
-                            }
+                            let change_resp = ui.button("Change slot…");
+                            egui::Popup::menu(&change_resp)
+                                .close_behavior(egui::PopupCloseBehavior::CloseOnClick)
+                                .show(|ui| {
+                                    ui.set_min_width(260.0);
+                                    ui.label(
+                                        egui::RichText::new("Pick a different stock texture")
+                                            .color(t.muted)
+                                            .size(11.0)
+                                            .strong(),
+                                    );
+                                    ui.add_space(4.0);
+                                    if let Some(slot_id) =
+                                        widgets::slot_picker_grid(ui, slot_picker_entries)
+                                    {
+                                        actions.borrow_mut().push(LayerAction::ChangeSlot {
+                                            layer_id: layer_id.clone(),
+                                            new_slot_id: slot_id,
+                                        });
+                                    }
+                                });
                         });
                     });
                 }

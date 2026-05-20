@@ -10,8 +10,8 @@ use barme_core::{
     ALLY_GROUP_PALETTE, AllyGroup, BAR_DEFAULT_SURFACE_ALPHA, BAR_DEFAULT_SURFACE_COLOR, BIOMES,
     BrushRegistry, BrushStamp, DirtyRect, FeatureInstance, GeoVent, Heightmap, History,
     HistoryEntry, LayerPropertyValue, LayerStack, MapSize, MetalSpot, PROJECT_EXTENSION, Project,
-    ProjectDiff, SlotResolver, SplatBrushRegistry, SplatChannel, SplatConfig, SplatDistribution,
-    SplatStamp, StartPosition, SymmetryAxis, TextureLayer, WaterBlock, WaterField, WaterMode,
+    ProjectDiff, SlotResolver, SplatBrushRegistry, SplatConfig, SplatDistribution, StartPosition,
+    SymmetryAxis, TextureLayer, WaterBlock, WaterField, WaterMode,
     WaterValue, WizardSnapshot,
     brushes::pixel_bbox,
     default_extractor_radius, merge_overrides, preset_water_block,
@@ -253,6 +253,16 @@ struct App {
     /// the next save; load_project / new_project sync this with
     /// `Project::next_steps_dismissed`.
     next_steps_dismissed: bool,
+    /// D10 / Sprint 17 (ADR-041): mirrors
+    /// `Project.migration_toast_dismissed`. Persists across save /
+    /// open so the "your splat layers were migrated" toast stays
+    /// quiet once dismissed.
+    migration_toast_dismissed: bool,
+    /// D10 / Sprint 17 (ADR-041): session-only flag set by the open
+    /// path when `after_load_migrate` actually seeded layers from a
+    /// pre-Sprint-14 `splat_config`. Drives the one-frame info toast
+    /// surfaced in `App::update`; cleared on dismiss.
+    pending_migration_toast: bool,
     /// ADR-035: best-effort dirty flag for the top-bar Save chip.
     /// Set by [`Self::mark_dirty`] (called from edit sites); cleared
     /// by `save_to` / `new_project` / `open_from`. Not durable across
@@ -353,18 +363,13 @@ struct App {
     /// ship PNG sidecar persistence). Mirrors
     /// `Project.splat_distribution` for the duration of the session.
     splat_distribution: Option<SplatDistribution>,
-    /// Session-only brush controls: which channel is the inspector
-    /// focused on, which D3 brush is active (`paint` / `erase` /
-    /// `smooth`), and the radius / strength / spacing sliders. None
-    /// of these belong on the project — they're tool preferences,
-    /// matching the heightmap brush pattern.
-    splat_brush_state: SplatBrushState,
-    /// D3 splat brush registry — `paint` / `erase` / `smooth`. Looked
-    /// up by id at stamp time.
+    /// D3 splat brush registry — kept for the runtime DNTS shader
+    /// path until Sprint 17 Commit 6 + later sprints fully retire
+    /// the legacy splat painter. Sprint 17 Commit 5 deleted the
+    /// `SplatBrushState` + the slot-picker popover state since the
+    /// Layers panel owns equivalent UX now.
+    #[allow(dead_code)]
     splat_brushes: SplatBrushRegistry,
-    /// Slot picker popover state: when `Some(channel)`, the row for
-    /// that channel is showing its slot picker grid.
-    splat_picker_open_for: Option<usize>,
     /// D1 / ADR-027 slot registry, scanned once at app start from
     /// `tools/textures/<NN-slot>/`. Each entry pairs a slot id with
     /// its display name + dir for the thumbnail loader. Empty when
@@ -552,43 +557,6 @@ impl FeatureCatalog {
             .get(category)
             .map(|v| v.as_slice())
             .unwrap_or(&[])
-    }
-}
-
-/// D5: session-only splat brush controls. Persisted brush mode +
-/// radius + strength + spacing are not project-scoped; they're tool
-/// preferences for the current editor session, matching the heightmap
-/// brush pattern (App-level `brush_id` / `brush_radius` /
-/// `brush_strength`).
-#[derive(Debug, Clone)]
-struct SplatBrushState {
-    /// Which RGBA channel paints into. 0..=3 — `SplatChannel::R/G/B/A`.
-    /// Mirrors the inspector's TEXTURE LAYERS active radio.
-    active_channel: usize,
-    /// D3 brush id — `"paint"`, `"erase"`, or `"smooth"`. Resolved
-    /// against `App::splat_brushes` at stamp time.
-    brush_id: String,
-    /// Brush radius in elmos. Per-channel range is `8..=512` to match
-    /// the heightmap brush; defaults to `48` (a "medium" stamp).
-    radius: f32,
-    /// Brush strength 0..=1. Per-stamp falloff scale.
-    strength: f32,
-    /// Drag spacing 0..=1 — a future hook for "one stamp per N elmos
-    /// of pointer movement" (currently the painter stamps every frame
-    /// during a drag, matching the heightmap brush). The slider stays
-    /// surfaced so the user can experiment.
-    spacing: f32,
-}
-
-impl Default for SplatBrushState {
-    fn default() -> Self {
-        Self {
-            active_channel: 0,
-            brush_id: "paint".to_string(),
-            radius: 48.0,
-            strength: 0.65,
-            spacing: 0.30,
-        }
     }
 }
 
@@ -953,9 +921,6 @@ enum Tool {
     /// F8 start-position placement (ADR-023). LMB places / drags
     /// markers, RMB deletes.
     StartPositions,
-    /// F4 splat-texture painting (ADR-035 scaffolding; schema work
-    /// pending). LMB paints into the active RGBA channel.
-    SplatPaint,
     /// F5 metal-spot placement (ADR-035 scaffolding; schema work
     /// pending). LMB places spots, RMB deletes.
     MetalSpots,
@@ -1060,11 +1025,10 @@ impl Tool {
     /// by the tool strip *and* the unit tests so adding a variant in
     /// one place doesn't drift from the other. The exhaustive `match`
     /// dispatches in the Inspector enforce the rest of the invariant.
-    const ALL: [Tool; 10] = [
+    const ALL: [Tool; 9] = [
         Tool::Select,
         Tool::Sculpt,
         Tool::StartPositions,
-        Tool::SplatPaint,
         Tool::MetalSpots,
         Tool::GeoFeatures,
         Tool::Feature,
@@ -1083,7 +1047,6 @@ impl Tool {
             Tool::Select => "↺",
             Tool::Sculpt => "✎",
             Tool::StartPositions => "⚑",
-            Tool::SplatPaint => "▦",
             Tool::MetalSpots => "◆",
             Tool::GeoFeatures => "♨",
             Tool::Feature => "🌲",
@@ -1100,7 +1063,6 @@ impl Tool {
             Tool::Select => Icon::Select,
             Tool::Sculpt => Icon::Sculpt,
             Tool::StartPositions => Icon::Pin,
-            Tool::SplatPaint => Icon::Splat,
             Tool::MetalSpots => Icon::Metal,
             Tool::GeoFeatures => Icon::Geo,
             Tool::Feature => Icon::Tree,
@@ -1116,7 +1078,6 @@ impl Tool {
             Tool::Select => "Q",
             Tool::Sculpt => "B",
             Tool::StartPositions => "S",
-            Tool::SplatPaint => "T",
             Tool::MetalSpots => "M",
             // V for "vent" — Sprint 12 freed `F` for the general
             // feature tool below.
@@ -1134,7 +1095,6 @@ impl Tool {
             Tool::Select => "Select / orbit",
             Tool::Sculpt => "Sculpt",
             Tool::StartPositions => "Start positions",
-            Tool::SplatPaint => "Splat paint",
             Tool::MetalSpots => "Metal spots",
             Tool::GeoFeatures => "Geo vents",
             Tool::Feature => "Features",
@@ -1234,6 +1194,8 @@ impl App {
             mapinfo_overrides: std::collections::HashMap::new(),
             show_next_steps: false,
             next_steps_dismissed: false,
+            migration_toast_dismissed: false,
+            pending_migration_toast: false,
             dirty: false,
             last_non_none_symmetry: SymmetryAxis::Horizontal,
             grid_overlay_on: false,
@@ -1260,9 +1222,7 @@ impl App {
             splat_config: SplatConfig::default(),
             dnts_diffuse_in_alpha: false,
             splat_distribution: None,
-            splat_brush_state: SplatBrushState::default(),
             splat_brushes: SplatBrushRegistry::default(),
-            splat_picker_open_for: None,
             slot_registry: scan_slot_registry(Path::new("tools/textures")),
             slot_thumbnails: std::collections::HashMap::new(),
             metal_state: MetalState::default(),
@@ -1390,7 +1350,6 @@ impl App {
         self.splat_config = SplatConfig::default();
         self.dnts_diffuse_in_alpha = false;
         self.splat_distribution = None;
-        self.splat_picker_open_for = None;
         // D8 / Sprint 15 (ADR-038): a fresh "New project" gets a
         // single-layer biome-base stack. D9 / Sprint 16 seeds a
         // second accent layer at mask=0 so paint reveal/hide
@@ -1468,6 +1427,7 @@ impl App {
             ally_groups: self.ally_groups.clone(),
             mapinfo_overrides: self.mapinfo_overrides.clone(),
             next_steps_dismissed: self.next_steps_dismissed,
+            migration_toast_dismissed: self.migration_toast_dismissed,
             splat_config: self.splat_config.clone(),
             dnts_diffuse_in_alpha: self.dnts_diffuse_in_alpha,
             layers: self.layer_stack.clone(),
@@ -2512,49 +2472,6 @@ impl App {
         Some(handle)
     }
 
-    /// Inspector entry point: bind `slot_id` to `channel` (0..=3 = R/G/
-    /// B/A). Mutates `splat_config`, marks dirty, and triggers a
-    /// re-upload of the slot's diffuse into the matching texture-array
-    /// layer so the preview updates on the next frame. Per the pitfall
-    /// list in the prompt, the array form means rebind is a
-    /// `queue.write_texture(layer = N)` — no bind-group rebuild.
-    fn bind_slot_to_channel(&mut self, channel: usize, slot_id: u8) {
-        if channel >= 4 {
-            warn!(channel, "bind_slot_to_channel: out-of-range channel");
-            return;
-        }
-        let prev = self.splat_config.channels[channel];
-        if prev == Some(slot_id) {
-            return;
-        }
-        self.splat_config.channels[channel] = Some(slot_id);
-        self.mark_dirty();
-        info!(channel, slot_id, "splat slot assigned");
-        let Some(rs) = self.render_state.as_ref() else {
-            return;
-        };
-        let Some(slot) = self.slot_registry.iter().find(|s| s.id == slot_id) else {
-            warn!(slot_id, "bind_slot_to_channel: slot id not in registry");
-            return;
-        };
-        let Some(rgba) = load_slot_full_rgba(slot) else {
-            return;
-        };
-        render::upload_diffuse_layer(rs, channel as u32, rgba.as_raw());
-    }
-
-    /// Inspector entry point: clear `channel`'s slot binding. The GPU
-    /// layer's pixels are left intact (the shader's active-slot mask
-    /// flips off to suppress sampling); rebinding flips it back on.
-    fn unbind_channel(&mut self, channel: usize) {
-        if channel >= 4 || self.splat_config.channels[channel].is_none() {
-            return;
-        }
-        self.splat_config.channels[channel] = None;
-        self.mark_dirty();
-        info!(channel, "splat slot unbound");
-    }
-
     /// D9 / Sprint 16 — seed a freshly-built `LayerStack::from_biome`
     /// with a second "accent" layer (slot 1 if it exists, mask = 0)
     /// so the user can immediately paint reveal/hide and see the
@@ -2620,16 +2537,35 @@ impl App {
             .find(|s| !used.contains(&s.id))
             .map(|s| s.id)
             .unwrap_or(0);
-        let layer = TextureLayer::new(barme_core::LayerSource::Slot { id: pick }, self.map_size, 0);
+        self.add_layer_with_slot(pick)
+    }
+
+    /// D10 / Sprint 17 (ADR-041) — add a new layer at the top of the
+    /// stack with `slot_id` as its source. Used by the Layers panel's
+    /// slot-picker popup so the user picks the stock biome they want
+    /// instead of accepting "whatever the next unused slot is."
+    ///
+    /// Mask starts at 0 (transparent) — the new layer is a clean
+    /// canvas. Returns the new layer's id, with the GPU composite
+    /// slot array re-uploaded so indices stay aligned.
+    fn add_layer_with_slot(&mut self, slot_id: u8) -> String {
+        let layer =
+            TextureLayer::new(barme_core::LayerSource::Slot { id: slot_id }, self.map_size, 0);
         let id = layer.id.clone();
-        self.layer_stack.layers.push(layer);
+        let index = self.layer_stack.layers.len();
+        self.layer_stack.layers.push(layer.clone());
         self.mark_dirty();
         self.composite_layer_last_version.clear();
         self.reupload_layer_stack_diffuses();
+        self.history
+            .push_project_diff(barme_core::ProjectDiff::AddLayer {
+                index,
+                layer: Box::new(layer),
+            });
         info!(
-            slot_id = pick,
+            slot_id,
             layer_id = %id,
-            "Sprint 16 Layers: added layer at top of stack"
+            "Sprint 17 Layers: added layer at top of stack with explicit slot"
         );
         id
     }
@@ -3223,105 +3159,6 @@ impl App {
                     );
                 }
             }
-        }
-    }
-
-    /// Apply one splat brush stamp at the cursor position. Mirrors
-    /// `apply_brush_at` for the heightmap brush: resolves cursor →
-    /// world via screen-ray vs y=0 plane, fans through the active
-    /// symmetry axis, runs the D3 brush kernel on each stamp, then
-    /// sub-uploads the unioned dirty rect to the GPU distribution
-    /// texture via `render::write_splat_rect`. No-op when no brush is
-    /// selected or no heightmap is loaded.
-    fn apply_splat_brush_at(&mut self, cursor: egui::Pos2, rect: egui::Rect) {
-        let Some(rs) = self.render_state.as_ref() else {
-            return;
-        };
-        if self.heightmap.is_none() {
-            return;
-        }
-        if !rect.contains(cursor) {
-            return;
-        }
-        let brush_id = self.splat_brush_state.brush_id.clone();
-        let Some(brush) = self.splat_brushes.get(&brush_id) else {
-            warn!(brush_id, "splat brush id not in registry");
-            return;
-        };
-        let channel = match self.splat_brush_state.active_channel {
-            0 => SplatChannel::R,
-            1 => SplatChannel::G,
-            2 => SplatChannel::B,
-            3 => SplatChannel::A,
-            _ => {
-                warn!(
-                    ch = self.splat_brush_state.active_channel,
-                    "splat active_channel out of range"
-                );
-                return;
-            }
-        };
-        let cursor_in = glam::Vec2::new(cursor.x - rect.min.x, cursor.y - rect.min.y);
-        let rect_size = glam::Vec2::new(rect.width(), rect.height());
-        let Some(world) = render::screen_to_world_y0(cursor_in, rect_size, &self.camera) else {
-            trace!(
-                cursor = ?(cursor.x, cursor.y),
-                "splat brush: ray-vs-plane miss"
-            );
-            return;
-        };
-        // Lazily allocate the distribution on first stamp so unpainted
-        // projects don't carry a 4 MB buffer they never used.
-        if self.splat_distribution.is_none() {
-            self.splat_distribution = Some(SplatDistribution::new(self.map_size));
-            // First-allocation: upload the all-zero distribution so the
-            // GPU and CPU agree. (The GPU was zero-initialised in
-            // `install_splat_resources`, but a future change could
-            // skip that; explicit upload here keeps the path robust.)
-            if let Some(dist) = self.splat_distribution.as_ref() {
-                render::upload_splat_distribution(rs, dist);
-            }
-        }
-        let dist = self
-            .splat_distribution
-            .as_mut()
-            .expect("just allocated above");
-        self.dirty = true;
-        let extents = (
-            (self.map_size.elmo_extents().0 as f32).max(1.0),
-            (self.map_size.elmo_extents().1 as f32).max(1.0),
-        );
-        let radius = self.splat_brush_state.radius;
-        let strength = self.splat_brush_state.strength;
-        let centers = self.symmetry.replicate((world.x, world.z), extents);
-        trace!(
-            brush = %brush_id,
-            world_x = world.x,
-            world_z = world.z,
-            radius,
-            strength,
-            symmetry = self.symmetry.id(),
-            mirrors = centers.len(),
-            "splat stamp"
-        );
-        let mut union: Option<DirtyRect> = None;
-        for (cx, cz) in centers {
-            let stamp = SplatStamp {
-                world_x: cx,
-                world_z: cz,
-                radius,
-                strength,
-                channel,
-            };
-            if let Some(r) = brush.apply(dist, stamp) {
-                union = Some(match union {
-                    Some(u) => u.union(r),
-                    None => r,
-                });
-            }
-        }
-        if let Some(rect_dirty) = union {
-            render::write_splat_rect(rs, (dist.width, dist.height), &dist.rgba, rect_dirty);
         }
     }
 
@@ -4709,7 +4546,6 @@ impl App {
                 self.splat_config = p.splat_config;
                 self.dnts_diffuse_in_alpha = p.dnts_diffuse_in_alpha;
                 self.splat_distribution = p.splat_distribution;
-                self.splat_picker_open_for = None;
                 self.reupload_bound_slot_diffuses();
                 self.reupload_splat_distribution();
 
@@ -4724,7 +4560,7 @@ impl App {
                 // promotes the legacy `splat_config.diffuse_in_alpha`
                 // to the new per-project `dnts_diffuse_in_alpha`. Pull
                 // both fields back out of the shadow.
-                let (stack, diffuse_in_alpha) = {
+                let (stack, diffuse_in_alpha, ran_migration) = {
                     let project_root = self.current_project_path.as_ref().and_then(|p| p.parent());
                     let resolver =
                         AppSlotResolver::with_project_root(&self.slot_registry, project_root);
@@ -4733,11 +4569,18 @@ impl App {
                     shadow.splat_config = self.splat_config.clone();
                     shadow.dnts_diffuse_in_alpha = self.dnts_diffuse_in_alpha;
                     shadow.size = self.map_size;
+                    let was_empty = shadow.layers.layers.is_empty();
                     shadow.after_load_migrate(&resolver);
-                    (shadow.layers, shadow.dnts_diffuse_in_alpha)
+                    let ran = was_empty && !shadow.layers.layers.is_empty();
+                    (shadow.layers, shadow.dnts_diffuse_in_alpha, ran)
                 };
                 self.layer_stack = stack;
                 self.dnts_diffuse_in_alpha = diffuse_in_alpha;
+                self.migration_toast_dismissed = p.migration_toast_dismissed;
+                self.pending_migration_toast = ran_migration && !self.migration_toast_dismissed;
+                if ran_migration {
+                    info!("Sprint 17 migration: legacy splat layers seeded into layer stack");
+                }
                 // D10 / Sprint 17 (ADR-041): pre-Sprint-17 imported
                 // textures live at arbitrary disk paths; migrate them
                 // into the project-local sidecar so the project stays
@@ -5440,13 +5283,15 @@ impl App {
         if ctx.wants_keyboard_input() {
             return;
         }
-        let (q, b, s, t_key, m_key, v_key, f_key, w_key, l_key, g, help, esc) = ctx.input(|i| {
+        let (q, b, s, m_key, v_key, f_key, w_key, l_key, g, help, esc) = ctx.input(|i| {
             let shift = i.modifiers.shift;
             (
                 i.key_pressed(egui::Key::Q),
                 i.key_pressed(egui::Key::B),
                 i.key_pressed(egui::Key::S),
-                i.key_pressed(egui::Key::T),
+                // D10 / Sprint 17 (ADR-041): `T` is freed by the retirement
+                // of `Tool::SplatPaint`. Reserved for a future keybinding
+                // pass.
                 i.key_pressed(egui::Key::M),
                 i.key_pressed(egui::Key::V),
                 i.key_pressed(egui::Key::F),
@@ -5467,9 +5312,6 @@ impl App {
         }
         if s {
             self.set_tool(Tool::StartPositions);
-        }
-        if t_key {
-            self.set_tool(Tool::SplatPaint);
         }
         if m_key {
             self.set_tool(Tool::MetalSpots);
@@ -6168,7 +6010,6 @@ impl App {
                             Tool::Select => Self::inspector_select(ui),
                             Tool::Sculpt => self.inspector_sculpt(ui),
                             Tool::StartPositions => self.inspector_start_positions(ui),
-                            Tool::SplatPaint => self.inspector_splat(ui),
                             Tool::MetalSpots => self.inspector_metal(ui),
                             Tool::GeoFeatures => self.inspector_geo(ui),
                             Tool::Feature => self.inspector_feature(ui),
@@ -6312,479 +6153,6 @@ impl App {
             .small()
             .weak(),
         );
-    }
-
-    /// Splat-paint inspector (D5 / Sprint 9). Reads + mutates the
-    /// persisted `Project.splat_config` (mirrored on `App` per the
-    /// existing pattern); session-only brush controls live on
-    /// `App::splat_brush_state`. Slot picker walks the
-    /// `tools/textures/` registry built at app start (ADR-027).
-    fn inspector_splat(&mut self, ui: &mut egui::Ui) {
-        let t = crate::ui::theme::Tokens::DARK;
-        let ctx = ui.ctx().clone();
-
-        // ---- TEXTURE LAYERS section ----
-        // Collect per-row state up front so we can mutate `self` inside
-        // the section body without borrow-checker pain.
-        struct RowSpec {
-            channel: usize,
-            letter: char,
-            chip_color: egui::Color32,
-            slot_id: Option<u8>,
-            slot_name: String,
-            thumb: Option<egui::TextureHandle>,
-            opacity: f32,
-        }
-        let mut rows: Vec<RowSpec> = Vec::with_capacity(4);
-        for i in 0..4 {
-            let letter = match i {
-                0 => 'R',
-                1 => 'G',
-                2 => 'B',
-                _ => 'A',
-            };
-            let chip_color = match letter {
-                'R' => t.red,
-                'G' => t.green,
-                'B' => t.accent,
-                _ => t.text,
-            };
-            let slot_id = self.splat_config.channels[i];
-            let slot_name = slot_id
-                .and_then(|id| self.slot_registry.iter().find(|s| s.id == id))
-                .map(|s| s.name.clone())
-                .unwrap_or_else(|| "Unbound".to_string());
-            let thumb = slot_id.and_then(|id| self.slot_thumbnail(&ctx, id));
-            let opacity = self.splat_config.tex_mults[i].clamp(0.0, 1.0);
-            rows.push(RowSpec {
-                channel: i,
-                letter,
-                chip_color,
-                slot_id,
-                slot_name,
-                thumb,
-                opacity,
-            });
-        }
-        let active_channel = self.splat_brush_state.active_channel;
-        let mut new_active: Option<usize> = None;
-        let mut clicked_thumb: Option<usize> = None;
-        let mut clicked_unbind: Option<usize> = None;
-        let picker_open_for = self.splat_picker_open_for;
-        crate::ui::widgets::section(
-            ui,
-            "Texture layers",
-            true,
-            |ui| {
-                crate::ui::widgets::chip(ui, crate::ui::theme::ChipTone::Neutral, "RGBA");
-            },
-            |ui| {
-                for row in &rows {
-                    let is_active = row.channel == active_channel;
-                    let row_resp = egui::Frame::new()
-                        .fill(if is_active { t.hover } else { t.bg })
-                        .stroke(egui::Stroke::new(
-                            1.0,
-                            if is_active { t.border_hi } else { t.border },
-                        ))
-                        .corner_radius(egui::CornerRadius::same(5))
-                        .inner_margin(egui::Margin::symmetric(8, 6))
-                        .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                // Active radio.
-                                let (radio_rect, _) = ui.allocate_exact_size(
-                                    egui::vec2(14.0, 14.0),
-                                    egui::Sense::hover(),
-                                );
-                                ui.painter().circle_stroke(
-                                    radio_rect.center(),
-                                    7.0,
-                                    egui::Stroke::new(
-                                        1.5,
-                                        if is_active { t.accent } else { t.dim },
-                                    ),
-                                );
-                                if is_active {
-                                    ui.painter()
-                                        .circle_filled(radio_rect.center(), 4.0, t.accent);
-                                }
-                                // Channel chip.
-                                let (chip_rect, _) = ui.allocate_exact_size(
-                                    egui::vec2(18.0, 18.0),
-                                    egui::Sense::hover(),
-                                );
-                                ui.painter().rect_filled(
-                                    chip_rect,
-                                    egui::CornerRadius::same(3),
-                                    t.bg,
-                                );
-                                ui.painter().rect_stroke(
-                                    chip_rect,
-                                    egui::CornerRadius::same(3),
-                                    egui::Stroke::new(1.0, t.border),
-                                    egui::StrokeKind::Middle,
-                                );
-                                ui.painter().text(
-                                    chip_rect.center(),
-                                    egui::Align2::CENTER_CENTER,
-                                    row.letter.to_string(),
-                                    egui::FontId::monospace(10.0),
-                                    row.chip_color,
-                                );
-                                // Slot thumbnail (clickable).
-                                let (sw_rect, sw_resp) = ui.allocate_exact_size(
-                                    egui::vec2(22.0, 22.0),
-                                    egui::Sense::click(),
-                                );
-                                if let Some(handle) = &row.thumb {
-                                    egui::Image::new((handle.id(), sw_rect.size()))
-                                        .corner_radius(3.0)
-                                        .paint_at(ui, sw_rect);
-                                } else {
-                                    ui.painter().rect_filled(
-                                        sw_rect,
-                                        egui::CornerRadius::same(3),
-                                        t.panel2,
-                                    );
-                                    ui.painter().text(
-                                        sw_rect.center(),
-                                        egui::Align2::CENTER_CENTER,
-                                        "?",
-                                        egui::FontId::monospace(11.0),
-                                        t.dim,
-                                    );
-                                }
-                                ui.painter().rect_stroke(
-                                    sw_rect,
-                                    egui::CornerRadius::same(3),
-                                    egui::Stroke::new(1.0, t.border),
-                                    egui::StrokeKind::Middle,
-                                );
-                                if sw_resp.clicked() {
-                                    clicked_thumb = Some(row.channel);
-                                }
-                                // Name + opacity bar.
-                                ui.vertical(|ui| {
-                                    ui.label(
-                                        egui::RichText::new(&row.slot_name)
-                                            .color(t.text)
-                                            .size(11.5),
-                                    );
-                                    let (bar_rect, _) = ui.allocate_exact_size(
-                                        egui::vec2(ui.available_width(), 5.0),
-                                        egui::Sense::hover(),
-                                    );
-                                    let fill_rect = egui::Rect::from_min_max(
-                                        bar_rect.left_top(),
-                                        egui::pos2(
-                                            bar_rect.left() + bar_rect.width() * row.opacity,
-                                            bar_rect.bottom(),
-                                        ),
-                                    );
-                                    ui.painter().rect_filled(
-                                        bar_rect,
-                                        egui::CornerRadius::same(1),
-                                        t.panel2,
-                                    );
-                                    ui.painter().rect_filled(
-                                        fill_rect,
-                                        egui::CornerRadius::same(1),
-                                        row.chip_color,
-                                    );
-                                });
-                                ui.label(
-                                    egui::RichText::new(format!(
-                                        "{}%",
-                                        (row.opacity * 100.0) as i32
-                                    ))
-                                    .color(t.muted)
-                                    .size(10.0)
-                                    .monospace(),
-                                );
-                                if row.slot_id.is_some() {
-                                    let unbind_resp = crate::ui::widgets::icon_button(
-                                        ui,
-                                        crate::ui::icons::Icon::X,
-                                        18.0,
-                                        "Unbind slot",
-                                    );
-                                    if unbind_resp.clicked() {
-                                        clicked_unbind = Some(row.channel);
-                                    }
-                                }
-                            });
-                        })
-                        .response
-                        .interact(egui::Sense::click());
-                    if row_resp.clicked() {
-                        new_active = Some(row.channel);
-                    }
-                }
-
-                // ---- Inline slot picker grid ----
-                // Renders below the rows when a row's slot thumbnail
-                // was clicked. Keeps everything in-flow rather than
-                // floating a `Window` over the inspector.
-                if let Some(channel) = picker_open_for {
-                    ui.add_space(8.0);
-                    egui::Frame::new()
-                        .fill(t.panel2)
-                        .stroke(egui::Stroke::new(1.0, t.border))
-                        .corner_radius(egui::CornerRadius::same(5))
-                        .inner_margin(egui::Margin::same(8))
-                        .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                ui.label(
-                                    egui::RichText::new(format!(
-                                        "Pick a slot for channel {}",
-                                        match channel {
-                                            0 => 'R',
-                                            1 => 'G',
-                                            2 => 'B',
-                                            _ => 'A',
-                                        }
-                                    ))
-                                    .color(t.text)
-                                    .size(11.0),
-                                );
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| {
-                                        if crate::ui::widgets::icon_button(
-                                            ui,
-                                            crate::ui::icons::Icon::X,
-                                            18.0,
-                                            "Close",
-                                        )
-                                        .clicked()
-                                        {
-                                            clicked_thumb = Some(channel); // toggles closed below
-                                        }
-                                    },
-                                );
-                            });
-                            ui.add_space(4.0);
-                            if self.slot_registry.is_empty() {
-                                ui.label(
-                                    egui::RichText::new(
-                                        "No slots found under tools/textures/.\n\
-                                         Run scripts/fetch-textures.sh.",
-                                    )
-                                    .color(t.muted)
-                                    .size(11.0),
-                                );
-                            } else {
-                                let slot_ids: Vec<u8> =
-                                    self.slot_registry.iter().map(|s| s.id).collect();
-                                egui::Grid::new("splat_slot_picker")
-                                    .num_columns(3)
-                                    .spacing([6.0, 6.0])
-                                    .show(ui, |ui| {
-                                        for (i, slot_id) in slot_ids.iter().enumerate() {
-                                            let handle = self.slot_thumbnail(&ctx, *slot_id);
-                                            let slot_name = self
-                                                .slot_registry
-                                                .iter()
-                                                .find(|s| s.id == *slot_id)
-                                                .map(|s| s.name.clone())
-                                                .unwrap_or_default();
-                                            ui.vertical(|ui| {
-                                                let (thumb_rect, thumb_resp) = ui
-                                                    .allocate_exact_size(
-                                                        egui::vec2(64.0, 64.0),
-                                                        egui::Sense::click(),
-                                                    );
-                                                if let Some(h) = &handle {
-                                                    egui::Image::new((h.id(), thumb_rect.size()))
-                                                        .corner_radius(4.0)
-                                                        .paint_at(ui, thumb_rect);
-                                                } else {
-                                                    ui.painter().rect_filled(
-                                                        thumb_rect,
-                                                        egui::CornerRadius::same(4),
-                                                        t.bg,
-                                                    );
-                                                }
-                                                ui.painter().rect_stroke(
-                                                    thumb_rect,
-                                                    egui::CornerRadius::same(4),
-                                                    egui::Stroke::new(1.0, t.border),
-                                                    egui::StrokeKind::Middle,
-                                                );
-                                                ui.label(
-                                                    egui::RichText::new(format!(
-                                                        "{:02} · {}",
-                                                        slot_id, slot_name
-                                                    ))
-                                                    .color(t.muted)
-                                                    .size(9.5),
-                                                );
-                                                if thumb_resp.clicked() {
-                                                    self.bind_slot_to_channel(channel, *slot_id);
-                                                    self.splat_picker_open_for = None;
-                                                }
-                                            });
-                                            if (i + 1) % 3 == 0 {
-                                                ui.end_row();
-                                            }
-                                        }
-                                    });
-                            }
-                        });
-                }
-            },
-        );
-        if let Some(c) = new_active {
-            self.splat_brush_state.active_channel = c;
-        }
-        if let Some(c) = clicked_thumb {
-            // Toggle: clicking the open channel's thumbnail closes the
-            // picker; clicking any other channel opens for that channel.
-            self.splat_picker_open_for = if self.splat_picker_open_for == Some(c) {
-                None
-            } else {
-                Some(c)
-            };
-        }
-        if let Some(c) = clicked_unbind {
-            self.unbind_channel(c);
-        }
-
-        // ---- BRUSH section ----
-        let brushes: Vec<(String, String)> = self
-            .splat_brushes
-            .iter()
-            .map(|b| (b.id().to_string(), b.label().to_string()))
-            .collect();
-        crate::ui::widgets::section(
-            ui,
-            "Brush",
-            false,
-            |_ui| {},
-            |ui| {
-                ui.horizontal(|ui| {
-                    for (id, label) in &brushes {
-                        let selected = id.as_str() == self.splat_brush_state.brush_id.as_str();
-                        if ui.add(egui::Button::selectable(selected, label)).clicked() {
-                            self.splat_brush_state.brush_id = id.clone();
-                            info!(brush = %id, "splat brush activated");
-                        }
-                    }
-                });
-                ui.add_space(8.0);
-                let r_label = format!("{:.0} elmos", self.splat_brush_state.radius);
-                crate::ui::widgets::ramp_slider_labelled(
-                    ui,
-                    "Radius",
-                    &mut self.splat_brush_state.radius,
-                    8.0..=512.0,
-                    t.accent,
-                    r_label,
-                );
-                ui.add_space(6.0);
-                let strength_label = format!("{:.2}", self.splat_brush_state.strength);
-                crate::ui::widgets::ramp_slider_labelled(
-                    ui,
-                    "Strength",
-                    &mut self.splat_brush_state.strength,
-                    0.0..=1.0,
-                    t.accent,
-                    strength_label,
-                );
-                ui.add_space(6.0);
-                let space_label = format!("{}%", (self.splat_brush_state.spacing * 100.0) as i32);
-                crate::ui::widgets::ramp_slider_labelled(
-                    ui,
-                    "Spacing",
-                    &mut self.splat_brush_state.spacing,
-                    0.0..=1.0,
-                    t.muted,
-                    space_label,
-                );
-            },
-        );
-
-        // ---- PER-LAYER TUNING ----
-        let active = self.splat_brush_state.active_channel.min(3);
-        let scale_was = self.splat_config.tex_scales[active];
-        let mult_was = self.splat_config.tex_mults[active];
-        crate::ui::widgets::section(
-            ui,
-            "Per-layer tuning",
-            false,
-            |ui| {
-                ui.label(
-                    egui::RichText::new(format!(
-                        "channel {}",
-                        match active {
-                            0 => 'R',
-                            1 => 'G',
-                            2 => 'B',
-                            _ => 'A',
-                        }
-                    ))
-                    .color(t.muted)
-                    .size(11.0),
-                );
-            },
-            |ui| {
-                let scale_label = format!("{:.4}", self.splat_config.tex_scales[active]);
-                let scale_resp = crate::ui::widgets::ramp_slider_labelled(
-                    ui,
-                    "tex_scale",
-                    &mut self.splat_config.tex_scales[active],
-                    0.0015..=0.05,
-                    t.accent,
-                    scale_label,
-                );
-                scale_resp.on_hover_text(
-                    "BAR convention. Real maps use 0.0015–0.008; default 0.02 is the\n\
-                     engine-historical value but visually coarse.",
-                );
-                ui.add_space(6.0);
-                let mult_label = format!("{:.2}", self.splat_config.tex_mults[active]);
-                crate::ui::widgets::ramp_slider_labelled(
-                    ui,
-                    "tex_mult",
-                    &mut self.splat_config.tex_mults[active],
-                    0.0..=4.0,
-                    t.accent,
-                    mult_label,
-                );
-            },
-        );
-        if (scale_was - self.splat_config.tex_scales[active]).abs() > f32::EPSILON
-            || (mult_was - self.splat_config.tex_mults[active]).abs() > f32::EPSILON
-        {
-            self.mark_dirty();
-        }
-
-        // ---- GLOBAL ----
-        let mut global_changed = false;
-        let was_alpha = self.splat_config.diffuse_in_alpha;
-        crate::ui::widgets::section(
-            ui,
-            "Global",
-            false,
-            |_ui| {},
-            |ui| {
-                let resp = crate::ui::widgets::pill_toggle(
-                    ui,
-                    "Diffuse in α",
-                    &mut self.splat_config.diffuse_in_alpha,
-                );
-                resp.on_hover_text(
-                    "Splat-detail-normal alpha channel carries a high-pass\n\
-                     diffuse offset. Baseline off — ADR-034 enables once stable.",
-                );
-                if was_alpha != self.splat_config.diffuse_in_alpha {
-                    global_changed = true;
-                }
-            },
-        );
-        if global_changed {
-            self.mark_dirty();
-        }
     }
 
     /// F5 metal-spots inspector (C4 / Sprint 11). Operates directly
@@ -8675,7 +8043,6 @@ impl App {
                 && self.brush_id.is_some()
                 && self.heightmap.is_some();
             let start_pos_active = matches!(self.tool, Tool::StartPositions);
-            let splat_active = matches!(self.tool, Tool::SplatPaint) && self.heightmap.is_some();
             let metal_active = matches!(self.tool, Tool::MetalSpots);
             let geo_active = matches!(self.tool, Tool::GeoFeatures);
             let feature_active = matches!(self.tool, Tool::Feature);
@@ -8683,7 +8050,6 @@ impl App {
             let water_active = matches!(self.tool, Tool::Water) && self.heightmap.is_some();
             let central_interactive = brush_active
                 || start_pos_active
-                || splat_active
                 || metal_active
                 || geo_active
                 || water_active;
@@ -8767,21 +8133,10 @@ impl App {
                 self.end_stroke();
             }
 
-            // D5: splat-paint pointer dispatch. Mirrors the heightmap
-            // brush pattern — LMB drag stamps; RMB orbits (no splat
-            // erase on RMB per the pitfall list). Erase mode is the
-            // "Erase" brush button in the BRUSH section. No undo
-            // integration this sprint (4 MB distribution > the 100 MB
-            // undo cap; deferred).
-            if splat_active
-                && !consumed_click
-                && !cursor_in_gizmo
-                && (response.dragged_by(egui::PointerButton::Primary)
-                    || response.clicked_by(egui::PointerButton::Primary))
-                && let Some(cursor) = ctx.pointer_interact_pos()
-            {
-                self.apply_splat_brush_at(cursor, rect);
-            }
+            // D10 / Sprint 17 (ADR-041): `Tool::SplatPaint` retired.
+            // The dispatch site here used to fan LMB into
+            // `apply_splat_brush_at`; layered painting via
+            // `Tool::PaintLayer` (Sprint 16) supersedes it.
 
             // C9 / Sprint 14 — Tool::Water flood-carve dispatch.
             // LMB stamps Lower (carves the heightmap below Y=0);
@@ -9674,6 +9029,39 @@ impl eframe::App for App {
             self.dismiss_intro();
         }
 
+        // D10 / Sprint 17 (ADR-041) — one-time migration toast for
+        // pre-Sprint-14 projects whose layer stack got seeded from
+        // the legacy `splat_config`. Persists across reopens via
+        // `Project.migration_toast_dismissed`.
+        if self.pending_migration_toast {
+            let mut still_open = true;
+            egui::Window::new("Splat layers migrated")
+                .id(egui::Id::new("sprint17_migration_toast"))
+                .open(&mut still_open)
+                .resizable(false)
+                .collapsible(false)
+                .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 60.0))
+                .show(ctx, |ui| {
+                    ui.set_max_width(420.0);
+                    ui.label(
+                        "Your project's splat layers were migrated to the new Layers panel.\n\
+                         The old painting wasn't carried over — re-paint into the layer masks.\n\
+                         (One-time prompt; dismissing stores the preference per project.)",
+                    );
+                    ui.add_space(6.0);
+                    if ui.button("Got it").clicked() {
+                        self.pending_migration_toast = false;
+                        self.migration_toast_dismissed = true;
+                        self.mark_dirty();
+                    }
+                });
+            if !still_open {
+                self.pending_migration_toast = false;
+                self.migration_toast_dismissed = true;
+                self.mark_dirty();
+            }
+        }
+
         // B8 Next-steps hint: shown after the wizard's Create, hidden
         // for projects that the user previously dismissed (per-project
         // flag in the `.barmeproj`). Skipped while either wizard or
@@ -9757,6 +9145,8 @@ mod tests {
             mapinfo_overrides: std::collections::HashMap::new(),
             show_next_steps: false,
             next_steps_dismissed: false,
+            migration_toast_dismissed: false,
+            pending_migration_toast: false,
             dirty: false,
             last_non_none_symmetry: SymmetryAxis::Horizontal,
             grid_overlay_on: false,
@@ -9780,9 +9170,7 @@ mod tests {
             splat_config: SplatConfig::default(),
             dnts_diffuse_in_alpha: false,
             splat_distribution: None,
-            splat_brush_state: SplatBrushState::default(),
             splat_brushes: SplatBrushRegistry::default(),
-            splat_picker_open_for: None,
             slot_registry: Vec::new(),
             slot_thumbnails: std::collections::HashMap::new(),
             metal_state: MetalState::default(),
@@ -9821,12 +9209,13 @@ mod tests {
         // C6 (Sprint 12) added Tool::Feature → 8 variants.
         // C9 (Sprint 14) added Tool::Water → 9 variants.
         // D9 (Sprint 16) added Tool::PaintLayer → 10 variants.
+        // D10 (Sprint 17 / ADR-041) retired Tool::SplatPaint → 9 variants.
         // A change here is intentional but should bump ADR-030 /
-        // ADR-035 / ADR-042 / ADR-040 + the phase-3-plan entry for B1.
+        // ADR-035 / ADR-041 / ADR-042 + the phase-3-plan entry for B1.
         assert_eq!(
             Tool::ALL.len(),
-            10,
-            "Tool::ALL size changed — update ADR-030 / ADR-035 / ADR-042 / ADR-040 + plan"
+            9,
+            "Tool::ALL size changed — update ADR-030 / ADR-035 / ADR-041 / ADR-042 + plan"
         );
     }
 
@@ -9877,7 +9266,8 @@ mod tests {
         assert_eq!(Tool::Select.accel(), "Q");
         assert_eq!(Tool::Sculpt.accel(), "B");
         assert_eq!(Tool::StartPositions.accel(), "S");
-        assert_eq!(Tool::SplatPaint.accel(), "T");
+        // D10 / Sprint 17 (ADR-041): `T` is freed by the retirement
+        // of `Tool::SplatPaint`. No tool currently binds it.
         assert_eq!(Tool::MetalSpots.accel(), "M");
         assert_eq!(Tool::GeoFeatures.accel(), "V");
         assert_eq!(Tool::Feature.accel(), "F");
@@ -10337,15 +9727,9 @@ mod tests {
     //                that names every feature in the library; scatter
     //                hashes deterministically.
 
-    #[test]
-    fn splat_brush_state_default_is_paint_radius_48() {
-        let s = SplatBrushState::default();
-        assert_eq!(s.active_channel, 0);
-        assert_eq!(s.brush_id, "paint");
-        assert!((s.radius - 48.0).abs() < f32::EPSILON);
-        assert!((0.0..=1.0).contains(&s.strength));
-        assert!((0.0..=1.0).contains(&s.spacing));
-    }
+    // D10 / Sprint 17 (ADR-041) — `SplatBrushState` retired with
+    // `inspector_splat`; the `splat_brush_state_default_is_paint_
+    // radius_48` test went with it.
 
     #[test]
     fn fresh_app_has_engine_default_splat_config() {
@@ -10547,36 +9931,12 @@ mod tests {
         }
     }
 
-    #[test]
-    fn bind_slot_to_channel_marks_project_dirty() {
-        let mut app = make_test_app();
-        assert!(!app.dirty);
-        app.splat_config.channels[1] = None;
-        // Direct mutation without `bind_slot_to_channel` to avoid the
-        // GPU upload path (no render_state in a test). The dirty flag
-        // is what we're pinning here.
-        app.splat_config.channels[1] = Some(3);
-        app.mark_dirty();
-        assert!(app.dirty);
-    }
-
-    #[test]
-    fn unbind_channel_clears_slot_and_dirties() {
-        let mut app = make_test_app();
-        app.splat_config.channels[2] = Some(7);
-        app.dirty = false;
-        app.unbind_channel(2);
-        assert!(app.splat_config.channels[2].is_none());
-        assert!(app.dirty);
-    }
-
-    #[test]
-    fn unbind_unbound_channel_is_noop() {
-        let mut app = make_test_app();
-        app.dirty = false;
-        app.unbind_channel(0);
-        assert!(!app.dirty);
-    }
+    // D10 / Sprint 17 (ADR-041) — the legacy
+    // `bind_slot_to_channel` / `unbind_channel` helpers retired with
+    // `inspector_splat`. Layers panel "Change slot…" + DNTS-channel
+    // chip + slot-picker popup replace them; covered indirectly by
+    // the `ProjectDiff::SetLayerProperty` round-trip tests in
+    // barme-core.
 
     #[test]
     fn validation_summary_warns_when_slot_bound_without_specular() {
@@ -10681,42 +10041,10 @@ mod tests {
         assert_eq!(su.ground_diffuse, base.ground_diffuse);
     }
 
-    #[test]
-    fn apply_splat_brush_at_short_circuits_without_render_state() {
-        // No `render_state` (test apps have none) → method must
-        // gracefully no-op rather than panic. Pins the test-time
-        // behaviour so a future contributor doesn't add a
-        // `.expect("render_state")` that breaks the test fixture.
-        let mut app = make_test_app();
-        // Plant a heightmap so we pass the "heightmap is_some" guard.
-        let dims = app.map_size.heightmap_dims();
-        let data = vec![0u16; (dims.0 as usize) * (dims.1 as usize)];
-        let hm = Heightmap::new(dims.0, dims.1, data).expect("build flat hm");
-        app.heightmap = Some(HeightmapState {
-            path: std::path::PathBuf::from("<fixture>"),
-            data: hm,
-            dims,
-            min: 0,
-            max: 0,
-            validated_against: Some(app.map_size),
-        });
-        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(100.0, 100.0));
-        let cursor = egui::pos2(50.0, 50.0);
-        app.apply_splat_brush_at(cursor, rect);
-        // No render_state → no GPU upload, no allocation.
-        assert!(app.splat_distribution.is_none());
-    }
-
-    #[test]
-    fn splat_brush_state_active_channel_indexes_splat_channel() {
-        // The inspector indexes `SplatChannel::{R,G,B,A}` by
-        // `active_channel as usize`; pin the mapping here so a
-        // future renumber surfaces a test failure.
-        assert_eq!(SplatChannel::R.index(), 0);
-        assert_eq!(SplatChannel::G.index(), 1);
-        assert_eq!(SplatChannel::B.index(), 2);
-        assert_eq!(SplatChannel::A.index(), 3);
-    }
+    // D10 / Sprint 17 (ADR-041) — `apply_splat_brush_at` +
+    // `SplatBrushState` retired alongside `inspector_splat`. The
+    // `SplatChannel::{R,G,B,A}.index()` pin moves to barme-core
+    // (`splat.rs::tests`).
 
     #[test]
     fn snapshot_project_carries_splat_config() {
