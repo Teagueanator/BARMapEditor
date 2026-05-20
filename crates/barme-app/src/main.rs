@@ -289,6 +289,29 @@ struct App {
     /// so a single brush stroke only triggers a tile-scoped GPU upload
     /// next frame, not a full mask re-push.
     composite_layer_last_version: std::collections::HashMap<(String, usize), u64>,
+    /// D9 / Sprint 16 (ADR-040): the layer id paint strokes currently
+    /// target. `None` until the user enters [`Tool::PaintLayer`] for
+    /// the first time, then defaults to the top-of-stack visible
+    /// layer. Persists across tool switches so re-entering paint
+    /// mode resumes on the same layer.
+    paint_active_layer_id: Option<String>,
+    /// D9 / Sprint 16 (ADR-040): top-down 2D paint viewport pan / zoom.
+    /// Pan: world-elmo offset from the central viewport's centre;
+    /// zoom: RT-pixels per logical screen pixel (default = fit map).
+    paint_view_state: PaintViewState,
+    /// D9 / Sprint 16: per-session mask brush settings — radius /
+    /// strength / spacing sliders + active brush id + the mask-only
+    /// preview toggle.
+    paint_brush_state: PaintBrushState,
+    /// D9 / Sprint 16: mask brush registry (`mask-reveal` / `mask-hide`
+    /// / `mask-smooth` / `mask-fill`). Looked up by id at stamp time.
+    mask_brushes: barme_core::MaskBrushRegistry,
+    /// D9 / Sprint 16 (ADR-040): the previous frame's cursor position
+    /// in world-elmo space, used to interpolate stamps along a fast
+    /// drag (PITFALL §3 — fast drags must not leave gaps). Cleared
+    /// on `drag_stopped` so a fresh LMB press doesn't carry a stale
+    /// `prev` from the prior stroke.
+    paint_last_drag_pos: Option<glam::Vec2>,
     /// D5 / Sprint 9: persisted per-channel slot bindings, scales,
     /// mults, and the ADR-034 placeholder toggle. Round-trips through
     /// `Project.splat_config` on save / open. Replaces the Phase-7
@@ -534,6 +557,73 @@ impl Default for SplatBrushState {
             radius: 48.0,
             strength: 0.65,
             spacing: 0.30,
+        }
+    }
+}
+
+/// D9 / Sprint 16 (ADR-040): per-session view state for the top-
+/// down 2D paint viewport. Pan in world-elmo space; zoom = RT
+/// pixels per logical screen pixel. Default (zoom = 0.0) is the
+/// "fit map to viewport" auto-zoom — the viewport solves for the
+/// per-axis zoom on each frame so the map fills the available
+/// rect with 1:1 aspect (letterboxed bands on the short axis).
+#[derive(Debug, Clone, Copy)]
+struct PaintViewState {
+    /// World-elmo offset from the map centre.
+    pan_elmos: glam::Vec2,
+    /// Manual zoom factor in screen-px per RT-px. `0.0` = use
+    /// auto-fit; >0 = explicit zoom. Bounded `[0.25, 16.0]` on user
+    /// input. Double-click resets to `0.0` (auto-fit).
+    zoom: f32,
+}
+
+impl Default for PaintViewState {
+    fn default() -> Self {
+        Self {
+            pan_elmos: glam::Vec2::ZERO,
+            zoom: 0.0,
+        }
+    }
+}
+
+/// D9 / Sprint 16 (ADR-040): per-session mask brush controls.
+/// Mirrors [`SplatBrushState`] but addresses layer masks rather
+/// than the splat distribution. None of these belong on the
+/// project — they're tool preferences.
+#[derive(Debug, Clone)]
+struct PaintBrushState {
+    /// `mask-reveal` / `mask-hide` / `mask-smooth` / `mask-fill`.
+    /// Resolved against `App::mask_brushes` at stamp time.
+    brush_id: String,
+    /// Radius in elmos. Mask is 1 px = 1 elmo, so this maps
+    /// directly to pixel radius.
+    radius: f32,
+    /// Strength 0..=1.
+    strength: f32,
+    /// Stamp spacing along a drag, in radii. `0.5` = one stamp per
+    /// half-radius of pointer motion (Sprint 9 default — avoids
+    /// gaps on fast drags while keeping per-frame stamp count
+    /// bounded).
+    spacing: f32,
+    /// Show only the active layer's mask in the 2D viewport
+    /// (grayscale; red overlay where mask = 0). Useful for
+    /// scrubbing a mask without the diffuse composite interfering
+    /// visually.
+    mask_only_preview: bool,
+    /// `mask-fill` target visibility: when `true`, fill paints
+    /// 255; when `false`, fill paints 0.
+    fill_target_visible: bool,
+}
+
+impl Default for PaintBrushState {
+    fn default() -> Self {
+        Self {
+            brush_id: "mask-reveal".to_string(),
+            radius: 64.0,
+            strength: 0.5,
+            spacing: 0.5,
+            mask_only_preview: false,
+            fill_target_visible: true,
         }
     }
 }
@@ -810,6 +900,14 @@ enum Tool {
     /// floods (calls `Brush::Lower` with strength derived from
     /// `water_carve_depth`), RMB raises terrain back. Keyboard `W`.
     Water,
+    /// D9 / Sprint 16 (ADR-040) — layered texture painting. LMB
+    /// stamps the active mask brush (`mask-reveal` / `mask-hide` /
+    /// `mask-smooth` / `mask-fill`) into the active layer's mask;
+    /// the central viewport switches to a top-down 2D orthographic
+    /// view of the GPU composite RT. Keyboard `L`. Inspector shows
+    /// a minimal active-layer chip strip + brush controls until
+    /// Sprint 17 lands the full Photoshop-style Layers panel.
+    PaintLayer,
     /// Math-function terrain generator (F14 / ADR-020). No central-rect
     /// editing; the formula is committed via Apply in the Inspector.
     Procgen,
@@ -886,7 +984,7 @@ impl Tool {
     /// by the tool strip *and* the unit tests so adding a variant in
     /// one place doesn't drift from the other. The exhaustive `match`
     /// dispatches in the Inspector enforce the rest of the invariant.
-    const ALL: [Tool; 9] = [
+    const ALL: [Tool; 10] = [
         Tool::Select,
         Tool::Sculpt,
         Tool::StartPositions,
@@ -895,6 +993,7 @@ impl Tool {
         Tool::GeoFeatures,
         Tool::Feature,
         Tool::Water,
+        Tool::PaintLayer,
         Tool::Procgen,
     ];
 
@@ -913,6 +1012,7 @@ impl Tool {
             Tool::GeoFeatures => "♨",
             Tool::Feature => "🌲",
             Tool::Water => "🌊",
+            Tool::PaintLayer => "🖌",
             Tool::Procgen => "ƒ",
         }
     }
@@ -929,6 +1029,7 @@ impl Tool {
             Tool::GeoFeatures => Icon::Geo,
             Tool::Feature => Icon::Tree,
             Tool::Water => Icon::Water,
+            Tool::PaintLayer => Icon::Brush,
             Tool::Procgen => Icon::Procgen,
         }
     }
@@ -946,6 +1047,7 @@ impl Tool {
             Tool::GeoFeatures => "V",
             Tool::Feature => "F",
             Tool::Water => "W",
+            Tool::PaintLayer => "L",
             Tool::Procgen => "G",
         }
     }
@@ -961,6 +1063,7 @@ impl Tool {
             Tool::GeoFeatures => "Geo vents",
             Tool::Feature => "Features",
             Tool::Water => "Water / Lava",
+            Tool::PaintLayer => "Paint layer",
             Tool::Procgen => "Procgen",
         }
     }
@@ -1069,6 +1172,11 @@ impl App {
             // open.
             layer_stack: LayerStack::from_biome("", MapSize::square(16)),
             composite_layer_last_version: std::collections::HashMap::new(),
+            paint_active_layer_id: None,
+            paint_view_state: PaintViewState::default(),
+            paint_brush_state: PaintBrushState::default(),
+            mask_brushes: barme_core::MaskBrushRegistry::default_set(),
+            paint_last_drag_pos: None,
             splat_config: SplatConfig::default(),
             splat_distribution: None,
             splat_brush_state: SplatBrushState::default(),
@@ -1206,6 +1314,12 @@ impl App {
         // biome's source to the composite slot array next.
         self.composite_layer_last_version.clear();
         self.reupload_layer_stack_diffuses();
+        // D9 / Sprint 16 (ADR-040): reset paint viewport state. The
+        // active layer id resets to None so the next Tool::PaintLayer
+        // entry picks the default (topmost visible) layer; the
+        // view's pan/zoom resets to auto-fit.
+        self.paint_active_layer_id = None;
+        self.paint_view_state = PaintViewState::default();
         // GPU side resets via the next-frame TerrainCallback (uniforms
         // re-write to defaults; distribution texture is left holding
         // the prior session's pixels — irrelevant since active_mask = 0
@@ -2168,6 +2282,185 @@ impl App {
         self.splat_config.channels[channel] = None;
         self.mark_dirty();
         info!(channel, "splat slot unbound");
+    }
+
+    /// D9 / Sprint 16 (ADR-040) — apply the active mask brush at the
+    /// given cursor position (in mask-elmo coords). Returns the brush
+    /// dispatch's [`DirtyRect`] for the per-frame `sync_composite_
+    /// mask_tiles` to pick up next frame. No-op when no active layer
+    /// is selected / the layer doesn't exist / the brush id resolves
+    /// to nothing.
+    fn apply_mask_brush_at_elmos(
+        &mut self,
+        world_x: f32,
+        world_z: f32,
+    ) -> Option<barme_core::DirtyRect> {
+        let layer_id = self.paint_active_layer_id.clone()?;
+        let brush_id = self.paint_brush_state.brush_id.clone();
+        let brush = self.mask_brushes.get(&brush_id)?;
+        let stamp = barme_core::MaskStamp {
+            world_x,
+            world_z,
+            radius: self.paint_brush_state.radius,
+            strength: self.paint_brush_state.strength,
+            target_visible: self.paint_brush_state.fill_target_visible,
+        };
+        let rect = self.layer_stack.apply_brush(&layer_id, brush, stamp)?;
+        self.dirty = true;
+        Some(rect)
+    }
+
+    /// D9 / Sprint 16 (ADR-040) — interpolate stamps along the drag
+    /// segment between `from` and `to` so a fast drag (delta >
+    /// spacing × radius) doesn't leave gaps in the stroke. Mirrors
+    /// the heightmap brush's drag-interp pattern (PITFALL §3 in the
+    /// Sprint-16 prompt).
+    fn apply_mask_brush_along_drag(&mut self, from: glam::Vec2, to: glam::Vec2) {
+        let radius = self.paint_brush_state.radius.max(1.0);
+        let spacing_elmos = (self.paint_brush_state.spacing.max(0.05) * radius).max(1.0);
+        let delta = to - from;
+        let dist = delta.length();
+        if dist <= spacing_elmos {
+            // One stamp at `to` covers it.
+            self.apply_mask_brush_at_elmos(to.x, to.y);
+            return;
+        }
+        let steps = (dist / spacing_elmos).ceil() as u32;
+        for i in 1..=steps {
+            let t = (i as f32) / (steps as f32);
+            let p = from + delta * t;
+            self.apply_mask_brush_at_elmos(p.x, p.y);
+        }
+    }
+
+    /// D9 / Sprint 16 (ADR-040) — central viewport for `Tool::Paint
+    /// Layer`. Renders the 2D composite preview, handles brush
+    /// dispatch + drag interpolation, mutates `paint_view_state` for
+    /// pan / zoom, and toggles the mask-only preview from the chip.
+    fn central_paint_layer(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
+        let t = crate::ui::theme::Tokens::DARK;
+        let (extent_x, extent_z) = self.map_size.elmo_extents();
+        let extent = (extent_x as f32, extent_z as f32);
+
+        // Default active layer: topmost visible layer if no selection
+        // has stuck. Top-of-stack = last in the bottom-first vec.
+        if self.paint_active_layer_id.is_none()
+            && let Some(top) = self.layer_stack.layers.iter().rev().find(|l| l.visible)
+        {
+            self.paint_active_layer_id = Some(top.id.clone());
+        }
+
+        // Composite RT egui texture id — request a re-allocation each
+        // frame at the clamped dims; the function is idempotent when
+        // the size hasn't changed.
+        let composite_id = if let Some(rs) = self.render_state.as_ref() {
+            let (cw, ch) = self.composite_rt_dims();
+            render::ensure_composite_rt(rs, (cw, ch))
+        } else {
+            None
+        };
+        // Push mask tile uploads if the active brush bumped versions.
+        // The frame's pipeline pass samples whatever's on the GPU now,
+        // so this needs to land BEFORE the egui paint that uses the RT.
+        self.sync_composite_mask_tiles();
+
+        let cursor_world = ui.ctx().pointer_interact_pos().and_then(|p| {
+            // Cheap world-elmo conversion via the same math the
+            // paint_view uses internally — we need it ahead of the
+            // `paint_view` call so the status strip + brush dispatch
+            // agree on the cursor coord.
+            if !rect.contains(p) {
+                return None;
+            }
+            let auto_fit = (((rect.size().x - 32.0) / extent.0.max(1.0))
+                .min((rect.size().y - 32.0) / extent.1.max(1.0)))
+            .max(1e-4);
+            let zoom = if self.paint_view_state.zoom > 0.0 {
+                self.paint_view_state
+                    .zoom
+                    .clamp(auto_fit * 0.25, auto_fit * 16.0)
+            } else {
+                auto_fit
+            };
+            let map_centre_screen = rect.center()
+                + egui::vec2(
+                    self.paint_view_state.pan_elmos.x * zoom,
+                    self.paint_view_state.pan_elmos.y * zoom,
+                );
+            let map_size_screen = egui::vec2(extent.0 * zoom, extent.1 * zoom);
+            let map_origin = map_centre_screen - map_size_screen * 0.5;
+            let rel = p - map_origin;
+            let ex = rel.x / zoom;
+            let ez = rel.y / zoom;
+            if ex < 0.0 || ex >= extent.0 || ez < 0.0 || ez >= extent.1 {
+                None
+            } else {
+                Some(glam::Vec2::new(ex, ez))
+            }
+        });
+
+        // Mask value at cursor for the status strip.
+        let mask_value_at_cursor = match (&self.paint_active_layer_id, cursor_world) {
+            (Some(id), Some(p)) => self
+                .layer_stack
+                .layer_by_id(id)
+                .map(|l| l.mask.sample(p.x.round() as u32, p.y.round() as u32)),
+            _ => None,
+        };
+        let active_layer_name = self
+            .paint_active_layer_id
+            .as_ref()
+            .and_then(|id| self.layer_stack.layer_by_id(id))
+            .map(|l| l.name.clone());
+
+        let mask_preview_on = self.paint_brush_state.mask_only_preview;
+        let radius = self.paint_brush_state.radius;
+        let out = crate::ui::paint_view::paint_view(
+            ui,
+            rect,
+            crate::ui::paint_view::PaintViewInput {
+                composite_rt_id: composite_id,
+                world_extent_elmos: extent,
+                view_state: &mut self.paint_view_state,
+                brush_radius_elmos: radius,
+                mask_only_preview: mask_preview_on,
+                background: t.bg,
+                mask_value_at_cursor,
+                active_layer_name,
+                cursor_elmos: cursor_world,
+            },
+        );
+
+        if out.toggled_mask_preview {
+            self.paint_brush_state.mask_only_preview = !self.paint_brush_state.mask_only_preview;
+        }
+
+        // Brush dispatch: LMB drag stamps. Use the cursor world-coord
+        // we computed above (same math as `paint_view`) for the
+        // dispatch site; track the previous stamp so fast drags get
+        // interpolated stamps along the delta.
+        if let Some(now) = cursor_world {
+            if out.response.drag_started_by(egui::PointerButton::Primary)
+                || out.response.clicked_by(egui::PointerButton::Primary)
+            {
+                self.apply_mask_brush_at_elmos(now.x, now.y);
+                tracing::debug!(
+                    layer = self.paint_active_layer_id.as_deref().unwrap_or("<none>"),
+                    brush = %self.paint_brush_state.brush_id,
+                    world_x = now.x,
+                    world_z = now.y,
+                    "mask brush stamp"
+                );
+            } else if out.response.dragged_by(egui::PointerButton::Primary)
+                && let Some(prev) = self.paint_last_drag_pos
+            {
+                self.apply_mask_brush_along_drag(prev, now);
+            }
+            self.paint_last_drag_pos = Some(now);
+        }
+        if out.response.drag_stopped_by(egui::PointerButton::Primary) {
+            self.paint_last_drag_pos = None;
+        }
     }
 
     /// Apply one splat brush stamp at the cursor position. Mirrors
@@ -3632,6 +3925,12 @@ impl App {
                 // slot diffuse to the composite slot array.
                 self.composite_layer_last_version.clear();
                 self.reupload_layer_stack_diffuses();
+                // D9 / Sprint 16 (ADR-040): paint viewport resets too
+                // — the open project may have a different stack, so
+                // the prior session's active layer id may no longer
+                // exist.
+                self.paint_active_layer_id = None;
+                self.paint_view_state = PaintViewState::default();
 
                 // C4/C5 (Sprint 11): metal-spot + geo-vent persistence.
                 // The Project model owns the sources; the inspector
@@ -4311,7 +4610,7 @@ impl App {
         if ctx.wants_keyboard_input() {
             return;
         }
-        let (q, b, s, t_key, m_key, v_key, f_key, w_key, g, help, esc) = ctx.input(|i| {
+        let (q, b, s, t_key, m_key, v_key, f_key, w_key, l_key, g, help, esc) = ctx.input(|i| {
             let shift = i.modifiers.shift;
             (
                 i.key_pressed(egui::Key::Q),
@@ -4322,6 +4621,7 @@ impl App {
                 i.key_pressed(egui::Key::V),
                 i.key_pressed(egui::Key::F),
                 i.key_pressed(egui::Key::W),
+                i.key_pressed(egui::Key::L),
                 i.key_pressed(egui::Key::G),
                 // `?` is shift+/ on US layouts. Egui exposes the slash
                 // key; we gate on shift so plain `/` doesn't open help.
@@ -4355,6 +4655,10 @@ impl App {
         if w_key {
             // Sprint 14 / C9: W = "Water / Lava".
             self.set_tool(Tool::Water);
+        }
+        if l_key {
+            // Sprint 16 / D9: L = "Paint layer".
+            self.set_tool(Tool::PaintLayer);
         }
         if g {
             self.set_tool(Tool::Procgen);
@@ -5039,6 +5343,7 @@ impl App {
                             Tool::GeoFeatures => self.inspector_geo(ui),
                             Tool::Feature => self.inspector_feature(ui),
                             Tool::Water => self.inspector_water(ui),
+                            Tool::PaintLayer => self.inspector_paint_layer(ui),
                             Tool::Procgen => self.inspector_procgen(ctx, ui, action),
                         }
                     });
@@ -6210,6 +6515,128 @@ impl App {
     /// Lower / Smooth) styled with a coloured swatch ring per mode,
     /// ramp sliders for radius and strength, and a behaviour chip row
     /// (Continuous active; Pressure and Lock-Z placeholder-disabled).
+    /// D9 / Sprint 16 (ADR-040) — minimal paint-layer inspector. A
+    /// vertical strip of layer chips (top-of-stack first, Photoshop
+    /// convention) above a BRUSH section that mirrors the Sprint-9
+    /// splat inspector's controls. Sprint 17 replaces the strip with
+    /// the full Layers panel; the brush controls survive as-is.
+    fn inspector_paint_layer(&mut self, ui: &mut egui::Ui) {
+        let t = crate::ui::theme::Tokens::DARK;
+
+        // ---- ACTIVE LAYER strip ----
+        crate::ui::widgets::section(
+            ui,
+            "Active layer",
+            false,
+            |_ui| {},
+            |ui| {
+                if self.layer_stack.layers.is_empty() {
+                    ui.label(
+                        egui::RichText::new("No layers in the stack. Sprint 17 adds the Layers panel.")
+                            .small()
+                            .weak(),
+                    );
+                    return;
+                }
+                // Render top-of-stack first to match Photoshop UX
+                // even though the data is bottom-first.
+                let active = self.paint_active_layer_id.clone();
+                let mut new_active: Option<String> = None;
+                for layer in self.layer_stack.layers.iter().rev() {
+                    let is_active = active.as_ref() == Some(&layer.id);
+                    let bg = if is_active { t.accent } else { t.panel };
+                    let fg = if is_active { t.bg } else { t.text };
+                    let label = if layer.visible {
+                        layer.name.clone()
+                    } else {
+                        format!("(hidden) {}", layer.name)
+                    };
+                    let (chip_rect, chip_resp) =
+                        ui.allocate_exact_size(egui::vec2(ui.available_width(), 28.0), egui::Sense::click());
+                    let painter = ui.painter_at(chip_rect);
+                    painter.rect_filled(chip_rect, 4.0, bg);
+                    painter.text(
+                        chip_rect.left_center() + egui::vec2(10.0, 0.0),
+                        egui::Align2::LEFT_CENTER,
+                        &label,
+                        egui::FontId::proportional(12.0),
+                        fg,
+                    );
+                    if chip_resp.clicked() {
+                        new_active = Some(layer.id.clone());
+                    }
+                    ui.add_space(2.0);
+                }
+                if let Some(id) = new_active {
+                    self.paint_active_layer_id = Some(id);
+                }
+            },
+        );
+
+        // ---- BRUSH section ----
+        crate::ui::widgets::section(
+            ui,
+            "Brush",
+            false,
+            |_ui| {},
+            |ui| {
+                let brushes: [(&str, &str, egui::Color32); 4] = [
+                    ("mask-reveal", "Reveal", t.green),
+                    ("mask-hide", "Hide", t.red),
+                    ("mask-smooth", "Smooth", t.accent),
+                    ("mask-fill", "Fill", t.amber),
+                ];
+                let mut new_brush_id: Option<String> = None;
+                ui.columns(4, |cols| {
+                    for (i, (id, label, color)) in brushes.iter().enumerate() {
+                        let active = self.paint_brush_state.brush_id == *id;
+                        let resp = Self::brush_card(&mut cols[i], label, *color, active);
+                        if resp.clicked() {
+                            new_brush_id = Some((*id).to_string());
+                        }
+                    }
+                });
+                if let Some(id) = new_brush_id {
+                    self.paint_brush_state.brush_id = id;
+                }
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Radius").color(t.muted).size(11.0));
+                    ui.add(
+                        egui::Slider::new(&mut self.paint_brush_state.radius, 8.0..=512.0)
+                            .suffix(" e"),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Strength").color(t.muted).size(11.0));
+                    ui.add(egui::Slider::new(
+                        &mut self.paint_brush_state.strength,
+                        0.0..=1.0,
+                    ));
+                });
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Spacing").color(t.muted).size(11.0));
+                    ui.add(egui::Slider::new(
+                        &mut self.paint_brush_state.spacing,
+                        0.05..=2.0,
+                    ));
+                });
+                if self.paint_brush_state.brush_id == "mask-fill" {
+                    ui.add_space(4.0);
+                    ui.checkbox(
+                        &mut self.paint_brush_state.fill_target_visible,
+                        "Fill makes layer visible (else hide)",
+                    );
+                }
+                ui.add_space(4.0);
+                ui.checkbox(
+                    &mut self.paint_brush_state.mask_only_preview,
+                    "Mask-only preview",
+                );
+            },
+        );
+    }
+
     fn inspector_sculpt(&mut self, ui: &mut egui::Ui) {
         let t = crate::ui::theme::Tokens::DARK;
         // BRUSH section: 4-card picker.
@@ -7445,6 +7872,15 @@ impl App {
             let (rect, response) =
                 ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
 
+            // D9 / Sprint 16 (ADR-040) — `Tool::PaintLayer` swaps the
+            // central viewport for the 2D paint view. Pointer dispatch
+            // happens entirely inside `central_paint_layer`; the 3D
+            // path below is skipped for this tool.
+            if matches!(self.tool, Tool::PaintLayer) {
+                self.central_paint_layer(ui, rect);
+                return;
+            }
+
             let brush_active = matches!(self.tool, Tool::Sculpt)
                 && self.brush_id.is_some()
                 && self.heightmap.is_some();
@@ -8502,6 +8938,11 @@ mod tests {
             // specific stack shape.
             layer_stack: LayerStack::default(),
             composite_layer_last_version: std::collections::HashMap::new(),
+            paint_active_layer_id: None,
+            paint_view_state: PaintViewState::default(),
+            paint_brush_state: PaintBrushState::default(),
+            mask_brushes: barme_core::MaskBrushRegistry::default_set(),
+            paint_last_drag_pos: None,
             splat_config: SplatConfig::default(),
             splat_distribution: None,
             splat_brush_state: SplatBrushState::default(),
@@ -8544,12 +8985,13 @@ mod tests {
         }
         // C6 (Sprint 12) added Tool::Feature → 8 variants.
         // C9 (Sprint 14) added Tool::Water → 9 variants.
+        // D9 (Sprint 16) added Tool::PaintLayer → 10 variants.
         // A change here is intentional but should bump ADR-030 /
-        // ADR-035 / ADR-042 + the phase-3-plan entry for B1.
+        // ADR-035 / ADR-042 / ADR-040 + the phase-3-plan entry for B1.
         assert_eq!(
             Tool::ALL.len(),
-            9,
-            "Tool::ALL size changed — update ADR-030 / ADR-035 / ADR-042 + plan"
+            10,
+            "Tool::ALL size changed — update ADR-030 / ADR-035 / ADR-042 / ADR-040 + plan"
         );
     }
 

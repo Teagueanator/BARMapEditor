@@ -11,6 +11,7 @@ pub mod markers;
 pub mod minimap;
 pub mod next_steps;
 pub mod overlay;
+pub mod paint_view;
 pub mod theme;
 pub mod viewport_chrome;
 pub mod widgets;
