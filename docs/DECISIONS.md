@@ -3987,6 +3987,222 @@ unused at runtime. ADR-043 repurposes the binding as the
   flag stays plumbed and the WGSL implements the `splat_detail_normal
   .a` path; runtime activation waits on the high-pass DNTS bake.
 
+## ADR-044 — Water polish: BumpWater port + reflection / refraction (Sprint 26 / R3)
+
+**Status:** ADOPTED 2026-05-21. Amends ADR-042 (Sprint 14 / C9, water +
+lava as a map property) by replacing its renderer MVP — a flat alpha-
+blended quad at `Y = 0` — with the renderer-parity arc's R3 sprint,
+which lands a port of `BumpWaterFS.glsl` to the editor's wgpu pipeline.
+Closes the polish deferral the ADR-042 STATUS UPDATE flagged: "Polished
+water (fresnel, foam, caustics, lava emission, perlin wave motion) is
+the renderer-parity arc's job."
+
+**ADR numbering correction.** The Sprint 26 prompt called this ADR-039
+("the polish ships as ADR-039 (next number after Sprint 25's
+ADR-038)"). Inspection of `docs/DECISIONS.md` shows ADR-039 was already
+taken by Sprint 16's GPU layered composite + tiled-COW mask storage,
+and ADR-043 by Sprint 25's terrain shader parity. The next free slot
+is **ADR-044**, and we ship under that number with a kickoff-log note
+explaining the divergence (CLAUDE.md house rule #1 — surface spec
+contradictions, don't silently work around them).
+
+**Context.** Sprint 14 / C9 / ADR-042 shipped a water authoring flow
+end-to-end: `WaterMode` preset enum, sparse `Project.water_overrides`,
+Tool::Water inspector with five sections, lava-atmosphere offer, and
+emission into `mapinfo.water`. The renderer cut was deliberately
+minimal — one tinted quad with depth-test on, depth-write off,
+premultiplied alpha — so the data path could land without blocking on
+shader work. Sprint 26 closes the renderer gap.
+
+The Sprint-25 / R1 / ADR-043 terrain shader (`SMFFragProg.glsl` port)
+is the foundation: it already produces the realistic ground colour the
+water shader needs to refract through. The remaining gap is the water
+shader itself, which in the engine reads from a 350-line GLSL file
+covering normal mapping, perlin waves, screen-space refraction, planar
+reflections, foam, caustics, fresnel composite, and lava emission.
+
+**Decision.** Eight tightly-coupled changes:
+
+1. **Planar reflection pass.** Fixed `REFLECTION_RT_SIZE = 1024²`
+   colour + depth RT allocated once at install time. A second terrain
+   pipeline `pipeline_reflection` (front-face cull to compensate for
+   the mirrored-Y winding flip) renders the terrain into the
+   reflection RT with `OrbitCamera::view_proj_matrix_reflected_y0` —
+   eye and target Y negated, up vector flipped. Gated on
+   `App.water_reflections` (default ON; per-session preference, not
+   persisted) AND `water.is_some()` so the cost is zero when water is
+   off or the user disables reflections on iGPU.
+
+2. **Refraction copy + render-pass split.** Sample-from-and-write-to
+   of the same texture is UB on Vulkan / D3D12. The engine's
+   `BumpWater.cpp` does a framebuffer copy before the water pass;
+   we do the same via `encoder.copy_texture_to_texture(offscreen.color
+   → refraction_copy)`. The single offscreen render pass that shipped
+   in Sprint 14 splits into: Pass 1 (terrain) → COPY → Pass 2 (water +
+   lines + markers with LoadOp::Load on colour and depth). The water
+   shader's binding 1 reads from `refraction_copy`; perturbed
+   screen-space UV gives the under-water distortion.
+
+3. **WGSL fbm surface normal.** The engine samples a 512² normal map
+   (`waterbump.png`) four times at progressively offset UVs combined
+   with amplitudes `1, a, a², a³, a⁴` — morally fbm. We synthesise
+   the same field in WGSL via 4-octave gradient noise (Quilez 2D hash,
+   quintic-smoothed bilerp, 3.0-lacunarity). Tradeoff: we ship no
+   binary asset (the engine's `waterbump.png` is GPL-2.0 inherited
+   from springcontent), and the noise is deterministic across
+   backends (Vulkan / Metal / D3D12 all produce identical pixels per
+   `naga::front::wgsl` validation). Sprint 27 may revisit if visual
+   parity demands the real texture.
+
+4. **Fresnel composite.** Schlick's approximation:
+   `fresnel = min + max × pow(1 - cos(view, normal), power)`. World-
+   space camera eye threaded through `WaterU.eye` (added in commit 4).
+   `dot` clamped to `[0, 1]` to dodge backface NaN (PITFALL #6 from
+   the prompt). `polish_c.x/y/z` carry the three knobs; engine
+   defaults 0.2 / 0.8 / 4.0 (FINDINGS §1.5).
+
+5. **Foam (refraction-brightness proxy).** The engine's foam reads a
+   precomputed coastmap (`BumpWaterCoastBlur*.glsl` produces a
+   per-pixel distance-to-shore texture). The editor doesn't run that
+   bake yet — explicitly Sprint 27 / R4 candidate. As a proxy we use
+   the brightness of the refraction sample: bright refraction ≈
+   shallow terrain ≈ near shoreline → foam. Imperfect but visually
+   plausible at editor camera distances. The smoothstep band width
+   comes from `polish_b.w = foam_height`.
+
+6. **Caustics.** Procedural two-axis sine pattern warped by
+   `surface_normal.xz`, animated by `polish_a.z = time_s`. Modulated
+   by the same refraction-luma proxy so caustics only shimmer in
+   shallow water (matches engine's `if (waterdepth > 0)` at
+   `BumpWaterFS.glsl:325`).
+
+7. **Lava emission glow.** When `water_mode ∈ {Lava, Magma}`,
+   `polish_c.w = 1.0` gates a self-illumination branch:
+   `emission_color × strength × (1 + caust · 0.5) × daylight`.
+   `daylight` is hardcoded `0.5` until Sprint 28 wires
+   `dot(sun_dir, world_up)`. Gating via multiply, not a divergent
+   `if`, so the shader stays uniform across preset switches.
+
+8. **Inspector polish section.** Collapsible "Polish" added to
+   `inspector_water` below "Flood": reflections toggle + fresnel
+   triple + reflection distortion + perlin start freq + lacunarity.
+   Each control carries an `on_hover_text(HelpId::*)` per Sprint 19
+   convention. Seven new HelpId variants.
+
+**Alternatives considered.**
+
+- **Vendor `waterbump.png` + `caustics/*.jpg` from the springcontent
+  base.** Rejected — both are GPL-2.0 inherited; the editor's binary
+  distribution would inherit the licence with material downstream
+  implications. Procedural synthesis matches the engine's visual
+  contract well enough at editor camera distances.
+
+- **Two separate uniform buffers vs. ping-pong RTs for refraction.**
+  The two-RT pingpong would mean rendering terrain to RT_A, water
+  reading RT_A and writing RT_B, then blitting RT_B → RT_A for the
+  next frame. Rejected — adds a per-frame allocator + blit; the
+  texture-copy approach is the BAR engine's well-trodden shortcut
+  and costs one full-RT memcpy on the GPU (~0.1 ms at 2048²) which
+  is acceptable.
+
+- **Render the reflection at the same resolution as the main RT.**
+  Rejected — doubles the terrain-pass cost. Half-res (1024²) keeps
+  the doubled-terrain cost bounded on Vega 8 iGPU (~1 ms reflection
+  + ~3 ms main = under 16 ms frame target with headroom). The water
+  shader perturbs the reflection UV anyway; minor pixel loss is
+  invisible.
+
+- **Sky cubemap reflections (water reflects the sky).** Deferred to
+  Sprint 35 (emission + sky-reflect + parallax) — needs a skybox
+  cubemap which the renderer doesn't bind yet.
+
+- **Coastmap bake (proper shoreline foam).** Deferred — needs a
+  pre-process pass equivalent to `BumpWaterCoastBlurFS` running at
+  project load / heightmap edit. Adds CPU cost during sculpt; we
+  ship the brightness-proxy foam now and revisit if the visual
+  divergence is rejected.
+
+- **Promote `wind_speed`, `wave_offset_factor`, `caustics_resolution`,
+  `caustics_strength`, `wave_foam_distortion` to `WaterBlock`.**
+  FINDINGS §1.5 lists them as engine-read Lua keys, but the editor's
+  `WaterBlock` doesn't carry them yet. Promoting requires touching
+  `barme-core::mapinfo_schema`, `barme-pipeline::mapinfo` emit, the
+  F9 form (Sprint 18), and a fresh round of preset tuning. Sprint 26
+  ships them as compile-time constants in `water_draw_for_frame`;
+  the schema lift is a Sprint 27 / R4 backlog item documented here.
+
+**Consequences.**
+
+- The 3D preview's water surface now reproduces BAR's `BumpWaterFS`
+  for the fields the editor's `WaterBlock` carries today (fresnel,
+  perlin, surface tint, alpha, reflection-distortion). Wave shape,
+  caustic brightness, and shore-foam are visually close but not
+  pixel-perfect against the engine's preset-tied bake (Sprint 36
+  parity validation will quantify the ΔE).
+
+- The water shader's bind group expands from 1 binding (uniform) to
+  5 (uniform + refraction tex/sampler + reflection tex/sampler).
+  Bind group rebuilds on offscreen RT resize via the new
+  `RenderResources::rebind_water`.
+
+- `WaterU` grows from 96 to 192 bytes. The size + round-trip tests
+  pin the layout; future polish parameters can extend the four
+  `polish_*` vec4s without re-spinning the test scaffolding.
+
+- The reflection pass adds ~1 ms terrain-pass cost on Vega 8 iGPU
+  (half-res mitigation). The `App.water_reflections` toggle lets
+  the user disable for low-end hardware; the inspector surfaces it
+  with the disable-cost callout.
+
+- 1 new naga validation test (`water_wgsl_parses_and_validates`)
+  catches WGSL syntax / binding-layout drift at `cargo test` time
+  — parallels Sprint 25's `terrain_wgsl_parses_and_validates`.
+
+- 2 new camera-math tests pin `view_proj_matrix_reflected_y0`'s
+  geometric contract (eye/target/up flip; above-Y reflected projects
+  equivalently to below-Y normal).
+
+**Pitfalls (operational notes for follow-up sprints).**
+
+- The reflection pipeline uses `Face::Front` cull, NOT `Face::Back`.
+  The mirrored-Y view flips winding; pairing `FrontFace::Cw` with
+  `Face::Front` keeps the same visible-from-above triangles after
+  the mirror. Sprint 27+ work that touches the terrain pipeline must
+  apply changes to both `pipeline` and `pipeline_reflection`.
+
+- Two uniform buffers, not one. `queue.write_buffer` collapses to the
+  latest value before any encoder command runs; writing
+  `mirrored_view_proj` then `main_view_proj` to one buffer would
+  race the reflection pass. The split is intentional and load-bearing.
+
+- The foam proxy will fail on very dark diffuse surfaces (e.g. a
+  black-tinted ocean). Sprint 27 / R4 should ship the coastmap bake
+  to fix this — drop a `bool has_coastmap` flag in the WaterU and
+  branch the foam path.
+
+- The lava-emission daylight factor is hardcoded `0.5`. When Sprint
+  28 lands atmosphere + sun direction, replace the constant with
+  `dot(normalize(sun_dir.xyz), vec3<f32>(0, 1, 0))` and the visual
+  ramps from "max brightness at night" to "dimmed under direct sun"
+  automatically.
+
+- Shadows (Sprint 30) MUST inhibit the lava-emission branch under
+  cast shadows. Today's code is shadow-free; the branch is
+  `lit = false` semantically — add a shadow sample multiplier next
+  to the daylight factor when the shadow map lands.
+
+- The procedural caustics ship at a fixed two-octave sine pattern.
+  Sprint 35 (parallax + emission + sky-reflect) may revisit if the
+  visual is rejected; the engine's 32-image cycle is a strict
+  improvement but needs ~6 MB of vendored caustics jpgs.
+
+**Reference.** Engine shader:
+`/home/teague/code/RecoilEngine/cont/base/springcontent/shaders/GLSL/BumpWaterFS.glsl`.
+Engine state: `rts/Rendering/Env/BumpWater.cpp`. Schema reference:
+`docs/research/source-audit-2026-05-18/FINDINGS.md` §1.5. Research:
+`devlog/research-water-lava/`. Sprint devlog:
+`devlog/sprint-26-water-polish/`.
+
 ## ADR template
 
 ```
