@@ -161,6 +161,15 @@ pub const COMPOSITE_RT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8U
 /// 0..=1 alpha.
 pub const COMPOSITE_MASK_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R8Unorm;
 
+// ─── Sprint 26 / R3 / ADR-044 — water polish constants ──────────────
+
+/// Side of the planar reflection render target (Sprint 26 / R3). Half-res
+/// against a 2048 main RT keeps the doubled-terrain cost bounded on iGPU
+/// (Vega 8 budget ~3 ms terrain pass; half-res reflection ≈ 1 ms). The
+/// water shader samples this via screen-space UV with perturbation, so
+/// minor pixel loss is invisible under the refractionDistortion blur.
+pub const REFLECTION_RT_SIZE: u32 = 1024;
+
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
 struct Uniforms {
@@ -491,6 +500,47 @@ impl OffscreenTarget {
     }
 }
 
+/// GPU state for the Sprint-26 planar reflection pass (R3 / ADR-044).
+/// A fixed [`REFLECTION_RT_SIZE`]² colour + depth target the terrain
+/// pipeline (via a Front-face-culled variant) renders into using a
+/// camera mirrored through `y = 0`. The water shader samples the
+/// colour view at screen-space UV (perturbed by surface normal x
+/// `reflection_distortion`) to produce the in-water mirror image of
+/// the terrain above.
+///
+/// The RT is allocated once at install time (size is fixed; no resize
+/// logic). Format matches [`OFFSCREEN_COLOR_FORMAT`] so the rendered
+/// terrain reads identically out of either RT.
+pub struct ReflectionTarget {
+    /// Kept alive for the view.
+    #[allow(dead_code)]
+    color: wgpu::Texture,
+    color_view: wgpu::TextureView,
+    /// Kept alive for the view.
+    #[allow(dead_code)]
+    depth: wgpu::Texture,
+    depth_view: wgpu::TextureView,
+    /// Sampler the water shader binds to read this target. Linear
+    /// filter + ClampToEdge — the reflection is sampled by screen-space
+    /// UV; out-of-rect UVs come from perturbation overflow and the
+    /// edge clamp produces a stable fallback colour (no garbage from
+    /// uninitialised neighbours). Wired into the water bind group by
+    /// commit 2 (refraction + reflection sampling); allocated here in
+    /// commit 1 so the RT and its sampler land together.
+    #[allow(dead_code)]
+    pub sampler: wgpu::Sampler,
+}
+
+impl ReflectionTarget {
+    pub fn color_view(&self) -> &wgpu::TextureView {
+        &self.color_view
+    }
+
+    pub fn depth_view(&self) -> &wgpu::TextureView {
+        &self.depth_view
+    }
+}
+
 /// Allocate the colour + depth textures for an offscreen target at the
 /// given physical pixel size. Kept private; callers go through
 /// [`ensure_offscreen`].
@@ -550,6 +600,60 @@ pub fn resolve_offscreen_size(requested: (u32, u32)) -> Option<(u32, u32)> {
         return None;
     }
     Some((w.min(OFFSCREEN_CLAMP), h.min(OFFSCREEN_CLAMP)))
+}
+
+/// Allocate the Sprint-26 reflection target. Fixed-size
+/// [`REFLECTION_RT_SIZE`]² colour + depth pair. Sprint 26 / R3 /
+/// ADR-044.
+fn install_reflection_target(device: &wgpu::Device) -> ReflectionTarget {
+    let size = REFLECTION_RT_SIZE;
+    let color = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("reflection.color"),
+        size: wgpu::Extent3d {
+            width: size,
+            height: size,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: OFFSCREEN_COLOR_FORMAT,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    let color_view = color.create_view(&wgpu::TextureViewDescriptor::default());
+    let depth = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("reflection.depth"),
+        size: wgpu::Extent3d {
+            width: size,
+            height: size,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: OFFSCREEN_DEPTH_FORMAT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    let depth_view = depth.create_view(&wgpu::TextureViewDescriptor::default());
+    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("reflection.samp"),
+        address_mode_u: wgpu::AddressMode::ClampToEdge,
+        address_mode_v: wgpu::AddressMode::ClampToEdge,
+        address_mode_w: wgpu::AddressMode::ClampToEdge,
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        mipmap_filter: wgpu::FilterMode::Linear,
+        ..Default::default()
+    });
+    ReflectionTarget {
+        color,
+        color_view,
+        depth,
+        depth_view,
+        sampler,
+    }
 }
 
 /// GPU state for the Sprint-13 marker pipeline (ADR-037). One bind
@@ -734,6 +838,31 @@ pub struct RenderResources {
     /// Sprint-14 water plane pipeline (C9 / ADR-042). Drawn between
     /// terrain and lines in `TerrainCallback::prepare`.
     water: WaterResources,
+    /// Sprint 26 / R3 / ADR-044 — planar reflection target. Fixed
+    /// [`REFLECTION_RT_SIZE`]² colour + depth. The reflection pass
+    /// renders terrain into this with a mirrored view-proj just before
+    /// the main offscreen pass when `App.water_reflections` is on.
+    /// Sampled by the water shader (commit 2 wires the binding).
+    pub reflection: ReflectionTarget,
+    /// Sprint 26 / R3 — second terrain pipeline used by the reflection
+    /// pass. Identical to `pipeline` except for `cull_mode =
+    /// Some(Face::Front)`, which compensates for the winding flip
+    /// produced by the mirrored-Y view matrix in
+    /// [`OrbitCamera::view_proj_matrix_reflected_y0`].
+    pipeline_reflection: wgpu::RenderPipeline,
+    /// Sprint 26 / R3 — reflection-pass uniform buffer. Same
+    /// `Uniforms` shape as `uniform_buf`; carries the mirrored
+    /// view-proj. Separate buffer because `queue.write_buffer` writes
+    /// COMMIT before any encoder commands run within a submit, so two
+    /// writes to one buffer collapse to the second value (the main
+    /// pass would see the mirrored matrix instead).
+    reflection_uniform_buf: wgpu::Buffer,
+    /// Sprint 26 / R3 — reflection-pass bind group. Parallel to
+    /// `bind_group` but binds `reflection_uniform_buf` at binding 0;
+    /// every other binding (heightmap, splat, composite, base normal,
+    /// specular) shares with the main bind group. Rebuilt by
+    /// [`Self::rebind`] alongside the main one.
+    reflection_bind_group: wgpu::BindGroup,
 }
 
 impl RenderResources {
@@ -783,6 +912,18 @@ impl RenderResources {
             device,
             &self.bind_group_layout,
             &self.uniform_buf,
+            &heightmap_view,
+            &self.splat,
+            &composite_view,
+            &self.composite.mask_samp,
+        );
+        // Sprint 26 / R3 / ADR-044 — reflection bind group binds the
+        // SAME views/samplers at every slot, with only the uniform
+        // buffer swapped for the mirrored-view one.
+        self.reflection_bind_group = make_bind_group(
+            device,
+            &self.bind_group_layout,
+            &self.reflection_uniform_buf,
             &heightmap_view,
             &self.splat,
             &composite_view,
@@ -2044,6 +2185,65 @@ pub fn install(render_state: &egui_wgpu::RenderState) {
     let line = install_line_resources(device, &marker.uniform_buf);
     let water = install_water_resources(device);
 
+    // ─── Sprint 26 / R3 / ADR-044 — reflection pass resources ──────
+    let reflection = install_reflection_target(device);
+    let reflection_uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("terrain.reflection.uniforms"),
+        size: std::mem::size_of::<Uniforms>() as u64,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let reflection_bind_group = make_bind_group(
+        device,
+        &bgl,
+        &reflection_uniform_buf,
+        &dummy_view,
+        &splat,
+        &dummy_composite_view,
+        &composite.mask_samp,
+    );
+    let pipeline_reflection = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("terrain.pipeline.reflection"),
+        layout: Some(&pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_main"),
+            compilation_options: Default::default(),
+            buffers: &[],
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            front_face: wgpu::FrontFace::Cw,
+            // Flip cull direction — the mirrored-Y view in
+            // `view_proj_matrix_reflected_y0` inverts winding from the
+            // pipeline's perspective. Pairing `FrontFace::Cw` with
+            // `Face::Front` here keeps the same visible-from-above
+            // triangles after the mirror.
+            cull_mode: Some(wgpu::Face::Front),
+            ..Default::default()
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: OFFSCREEN_DEPTH_FORMAT,
+            depth_write_enabled: true,
+            depth_compare: wgpu::CompareFunction::Less,
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        }),
+        multisample: wgpu::MultisampleState::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_main"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: OFFSCREEN_COLOR_FORMAT,
+                blend: Some(wgpu::BlendState::REPLACE),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        multiview: None,
+        cache: None,
+    });
+
     render_state
         .renderer
         .write()
@@ -2063,6 +2263,10 @@ pub fn install(render_state: &egui_wgpu::RenderState) {
             marker,
             line,
             water,
+            reflection,
+            pipeline_reflection,
+            reflection_uniform_buf,
+            reflection_bind_group,
         });
 }
 
@@ -2311,6 +2515,27 @@ impl OrbitCamera {
         let (near, far) = self.near_far();
         let proj = Mat4::perspective_lh(self.fov_y, aspect, near, far);
         proj * self.view_matrix()
+    }
+
+    /// Sprint 26 / R3 / ADR-044 — view-projection matrix for the planar
+    /// reflection pass. Mirrors eye + target through `y = 0` and flips
+    /// the up vector. The up-flip preserves geometry winding from the
+    /// mirrored viewpoint (otherwise the reflection-pass terrain would
+    /// render inside-out and back-face culling would discard it).
+    ///
+    /// Reflection-pass terrain must use `cull_mode = Some(Face::Front)`
+    /// to compose with the flipped winding — the main terrain pipeline
+    /// stays at `Face::Back`. See `pipeline_reflection` in
+    /// [`install_terrain_reflection_pipeline`].
+    pub fn view_proj_matrix_reflected_y0(&self, aspect: f32) -> Mat4 {
+        let eye = self.eye();
+        let mirrored_eye = Vec3::new(eye.x, -eye.y, eye.z);
+        let mirrored_target = Vec3::new(self.target.x, -self.target.y, self.target.z);
+        let mirrored_up = Vec3::new(0.0, -1.0, 0.0);
+        let view = Mat4::look_at_lh(mirrored_eye, mirrored_target, mirrored_up);
+        let (near, far) = self.near_far();
+        let proj = Mat4::perspective_lh(self.fov_y, aspect, near, far);
+        proj * view
     }
 }
 
@@ -3215,6 +3440,17 @@ pub struct WaterDraw {
 
 pub struct TerrainCallback {
     pub view_proj: [[f32; 4]; 4],
+    /// Sprint 26 / R3 / ADR-044 — mirrored-Y view-projection used by
+    /// the planar reflection pass. Populated by
+    /// [`OrbitCamera::view_proj_matrix_reflected_y0`]; ignored when
+    /// `reflections_enabled == false`.
+    pub reflection_view_proj: [[f32; 4]; 4],
+    /// Sprint 26 / R3 — when `true`, `prepare()` encodes the reflection
+    /// pass into [`ReflectionTarget`] before the main offscreen pass.
+    /// Driven by `App.water_reflections` (default ON); the inspector
+    /// surfaces a "View > Reflections" toggle so users on iGPUs can
+    /// disable the doubled-terrain cost.
+    pub reflections_enabled: bool,
     pub max_height: f32,
     /// Sprint-14 follow-up: world Y at raw heightmap value 0. Negative
     /// values let the heightmap dip below BAR's water plane at Y = 0.
@@ -3269,11 +3505,16 @@ impl TerrainCallback {
         line_vertices: Vec<LineVertex>,
         water: Option<WaterDraw>,
         composite: Option<CompositeU>,
+        reflections_enabled: bool,
     ) -> Self {
         let aspect = (rect.width() / rect.height()).max(0.0001);
         let eye = camera.eye();
         Self {
             view_proj: camera.view_proj_matrix(aspect).to_cols_array_2d(),
+            reflection_view_proj: camera
+                .view_proj_matrix_reflected_y0(aspect)
+                .to_cols_array_2d(),
+            reflections_enabled,
             max_height,
             min_height,
             world_extent_x,
@@ -3432,6 +3673,65 @@ impl egui_wgpu::CallbackTrait for TerrainCallback {
         };
         if res.heightmap.is_none() {
             return Vec::new();
+        }
+
+        // Sprint 26 / R3 / ADR-044 — planar reflection pass. Renders
+        // the terrain into `res.reflection` with a mirrored-Y view-proj
+        // and Face::Front cull. Runs BEFORE the main offscreen pass so
+        // the water shader (commit 2 wires the binding) can sample it
+        // without read-from-write-to UB. Skipped when reflections are
+        // disabled (App.water_reflections=false; iGPU fallback) OR
+        // when no water plane is in the frame (no consumer).
+        if self.reflections_enabled && self.water.is_some() {
+            // Reflection-pass terrain uniforms — same shape, mirrored
+            // view-proj.
+            queue.write_buffer(
+                &res.reflection_uniform_buf,
+                0,
+                bytemuck::bytes_of(&Uniforms {
+                    view_proj: self.reflection_view_proj,
+                    params: [
+                        self.max_height.max(1.0),
+                        ELMOS_PER_PIXEL,
+                        self.world_extent_x.max(1.0),
+                        self.world_extent_z.max(1.0),
+                    ],
+                    params2: [
+                        self.min_height,
+                        if use_composite_rt { 1.0 } else { 0.0 },
+                        0.0,
+                        0.0,
+                    ],
+                }),
+            );
+            let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("reflection.terrain"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: res.reflection.color_view(),
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(OFFSCREEN_CLEAR_COLOR),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: res.reflection.depth_view(),
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            rpass.set_pipeline(&res.pipeline_reflection);
+            rpass.set_bind_group(0, &res.reflection_bind_group, &[]);
+            rpass.set_index_buffer(grid.index_buf.slice(..), wgpu::IndexFormat::Uint32);
+            rpass.draw_indexed(0..grid.index_count, 0, 0..1);
+            drop(rpass);
+            trace!("reflection pass encoded");
         }
 
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -3851,6 +4151,74 @@ mod tests {
         let c = at_distance(100.0);
         let (near, far) = c.near_far();
         assert!(far >= near * 100.0 - 1.0, "far / near ratio too tight");
+    }
+
+    /// Sprint 26 / R3 / ADR-044 — the mirrored view-proj must place
+    /// the camera below `y = 0` (negative eye Y) and look "up" through
+    /// the water plane so the reflected geometry projects correctly.
+    /// Pins the mirror semantics so a later refactor can't flip the Y
+    /// sign in only one of `eye` / `target` / `up`.
+    #[test]
+    fn view_proj_matrix_reflected_y0_mirrors_eye_and_target() {
+        let mut c = OrbitCamera::framing(8192.0, 8192.0);
+        c.target = Vec3::new(4096.0, 100.0, 4096.0);
+        c.pitch = std::f32::consts::FRAC_PI_4;
+        let eye = c.eye();
+        // Eye must originally be above the water plane for the test to
+        // be meaningful — `framing()` + the default 45° pitch puts it
+        // well above Y = 0.
+        assert!(eye.y > 0.0, "test precondition: eye must start above 0");
+
+        let aspect = 16.0 / 9.0;
+        let mirrored_view = Mat4::look_at_lh(
+            Vec3::new(eye.x, -eye.y, eye.z),
+            Vec3::new(c.target.x, -c.target.y, c.target.z),
+            Vec3::new(0.0, -1.0, 0.0),
+        );
+        let (near, far) = c.near_far();
+        let mirrored_proj = Mat4::perspective_lh(c.fov_y, aspect, near, far);
+        let expected = mirrored_proj * mirrored_view;
+        let actual = c.view_proj_matrix_reflected_y0(aspect);
+        for (col, (a, e)) in actual
+            .to_cols_array()
+            .iter()
+            .zip(expected.to_cols_array().iter())
+            .enumerate()
+        {
+            assert!(
+                (a - e).abs() < 1e-4,
+                "col {col}: actual = {a}, expected = {e}"
+            );
+        }
+    }
+
+    /// A point above the water (positive Y) projected by the mirrored
+    /// view-proj should land where its reflection across `y = 0` would
+    /// project under the normal view-proj. This is the geometric
+    /// contract that makes the reflection RT samplable by screen-space
+    /// UV in the water shader.
+    #[test]
+    fn view_proj_matrix_reflected_y0_swaps_above_and_below_y0() {
+        let c = OrbitCamera::framing(8192.0, 8192.0);
+        let aspect = 16.0 / 9.0;
+        let above = glam::Vec4::new(4096.0, 200.0, 4096.0, 1.0);
+        let below = glam::Vec4::new(4096.0, -200.0, 4096.0, 1.0);
+        // Reflected camera looking at point ABOVE Y=0 should match
+        // normal camera looking at point BELOW Y=0 (the reflection of
+        // the above point through the water plane).
+        let r_above = c.view_proj_matrix_reflected_y0(aspect) * above;
+        let n_below = c.view_proj_matrix(aspect) * below;
+        for (i, (r, n)) in r_above
+            .to_array()
+            .iter()
+            .zip(n_below.to_array().iter())
+            .enumerate()
+        {
+            assert!(
+                (r - n).abs() < 1e-1,
+                "component {i}: reflected_above = {r}, normal_below = {n}"
+            );
+        }
     }
 
     #[test]

@@ -536,6 +536,14 @@ struct App {
     /// don't have to ship in lockstep.
     #[allow(dead_code)]
     water_carve_depth: f32,
+    /// Sprint 26 / R3 / ADR-044 — planar reflection toggle. When `true`
+    /// (default), the renderer encodes a second terrain pass into the
+    /// reflection RT before the main offscreen pass; the water shader
+    /// samples it for the in-water mirror image of the terrain above.
+    /// Per-session preference (NOT persisted to `.barmeproj`) — users
+    /// on iGPUs can disable to recover ~3 ms terrain-pass cost via the
+    /// inspector's Polish section / `View > Reflections` chord.
+    water_reflections: bool,
 }
 
 /// View-state for the F7 feature picker + placed-list inspector.
@@ -1441,6 +1449,11 @@ impl App {
             // generic flooded basin. Lives on App not Project (per-
             // session tool preference, same status as brush_radius).
             water_carve_depth: -80.0,
+            // Sprint 26 / R3 — reflections ON by default. Vega 8 budget
+            // analysis: terrain pass ~3 ms, reflection at 1024² ≈ 1 ms;
+            // 16 ms frame target leaves headroom. Inspector lets the
+            // user disable on lower-end hardware.
+            water_reflections: true,
         };
         // D9 / Sprint 16 — push the default biome stack's source
         // diffuse to the composite slot array so the first central()
@@ -10437,6 +10450,7 @@ impl App {
                     line_vertices,
                     water,
                     composite_uniforms,
+                    self.water_reflections,
                 );
                 ui.painter()
                     .add(egui_wgpu::Callback::new_paint_callback(rect, cb));
@@ -11235,6 +11249,7 @@ mod tests {
             tidal_strength: None,
             lava_atmosphere: false,
             water_carve_depth: -80.0,
+            water_reflections: true,
         }
     }
 
