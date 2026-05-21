@@ -2367,7 +2367,6 @@ pub fn ensure_composite_rt(
 ) -> Option<egui::TextureId> {
     let size = resolve_composite_rt_size(requested)?;
     let device = render_state.device.clone();
-    let queue = render_state.queue.clone();
     let mut renderer = render_state.renderer.write();
 
     let (needs_realloc, old_id) = {
@@ -2424,9 +2423,15 @@ pub fn ensure_composite_rt(
         "composite RT (re)allocated"
     );
 
-    // Allocate the new 16-layer mask array at the matching dims. Init
-    // every layer to zero so the shader produces the mid-grey
-    // background until the paint dispatcher uploads real mask bytes.
+    // Allocate the new 16-layer mask array at the matching dims.
+    // wgpu zero-initialises textures on first use (its safe-by-default
+    // policy — uninitialised reads are not undefined behaviour),
+    // so the shader sees all-zero masks until the paint dispatcher
+    // writes real bytes via `write_composite_layer_mask_tiles`. The
+    // pre-Sprint-23 manual row-by-row zero-fill loop (16 layers ×
+    // 4096 rows = 65,536 `queue.write_texture` calls) was redundant
+    // and saturated wgpu's staging arena on Vega 8 iGPU — root cause
+    // of the 16-SMU PaintLayer-entry OOM (Sprint 23 / T1 / H1+H4).
     let mask_tex = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("composite.mask_array"),
         size: wgpu::Extent3d {
@@ -2446,31 +2451,6 @@ pub fn ensure_composite_rt(
         dimension: Some(wgpu::TextureViewDimension::D2Array),
         ..Default::default()
     });
-    // Zero-fill row by row to avoid a huge upfront allocation.
-    let zero_row = vec![0u8; size.0 as usize];
-    for layer in 0..COMPOSITE_MAX_LAYERS {
-        for y in 0..size.1 {
-            queue.write_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture: &mask_tex,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d { x: 0, y, z: layer },
-                    aspect: wgpu::TextureAspect::All,
-                },
-                &zero_row,
-                wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(size.0),
-                    rows_per_image: Some(1),
-                },
-                wgpu::Extent3d {
-                    width: size.0,
-                    height: 1,
-                    depth_or_array_layers: 1,
-                },
-            );
-        }
-    }
 
     // Drop the borrow chain so we can take `&mut res` again to swap
     // the new resources in.
