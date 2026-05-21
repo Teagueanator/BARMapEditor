@@ -40,9 +40,18 @@ use crate::{
 
 /// Coarse-grained stage of the build pipeline. Returned via
 /// [`BuildEvent::Stage`] so the UI can render "Building: <stage>".
+///
+/// `RenderDiffuse` and `InstallToBar` are emitted by the editor's
+/// worker around `BuildPlan::execute` (the diffuse bake lives in
+/// `barme-app`; the install step is a local file copy past the
+/// pipeline's `.sd7` output). Everything else is emitted by
+/// [`execute_stages`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum BuildStage {
+    /// Worker-emitted: layered diffuse bake (CPU-heavy, ~1.5 s on
+    /// 16-SMU) → texture BMP fed to PyMapConv.
+    RenderDiffuse,
     PrepareStaging,
     RenderMinimap,
     InvokePyMapConv,
@@ -52,6 +61,9 @@ pub enum BuildStage {
     EmitStartboxesLua,
     EmitFeaturePlacerLua,
     PackageSd7,
+    /// Worker-emitted: copy the produced `.sd7` into BAR's user maps
+    /// directory.
+    InstallToBar,
     Done,
 }
 
@@ -59,6 +71,7 @@ impl BuildStage {
     /// Human-readable label for the progress overlay + status strip.
     pub fn label(&self) -> &'static str {
         match self {
+            BuildStage::RenderDiffuse => "Baking diffuse texture",
             BuildStage::PrepareStaging => "Preparing staging directory",
             BuildStage::RenderMinimap => "Rendering minimap",
             BuildStage::InvokePyMapConv => "Compiling SMF + SMT (PyMapConv)",
@@ -68,6 +81,7 @@ impl BuildStage {
             BuildStage::EmitStartboxesLua => "Emitting start boxes",
             BuildStage::EmitFeaturePlacerLua => "Emitting feature placer",
             BuildStage::PackageSd7 => "Packaging non-solid .sd7",
+            BuildStage::InstallToBar => "Installing into BAR maps dir",
             BuildStage::Done => "Done",
         }
     }
@@ -79,15 +93,17 @@ impl BuildStage {
     /// wants a sense of "10 % vs 80 %".
     pub fn cumulative_fraction(&self) -> f32 {
         match self {
-            BuildStage::PrepareStaging => 0.02,
-            BuildStage::RenderMinimap => 0.12,
-            BuildStage::InvokePyMapConv => 0.75,
+            BuildStage::RenderDiffuse => 0.06,
+            BuildStage::PrepareStaging => 0.08,
+            BuildStage::RenderMinimap => 0.18,
+            BuildStage::InvokePyMapConv => 0.78,
             BuildStage::StageSplatAssets => 0.92,
             BuildStage::EmitMapInfoLua => 0.93,
             BuildStage::EmitMetalLayoutLua => 0.94,
             BuildStage::EmitStartboxesLua => 0.95,
             BuildStage::EmitFeaturePlacerLua => 0.96,
-            BuildStage::PackageSd7 => 1.0,
+            BuildStage::PackageSd7 => 0.98,
+            BuildStage::InstallToBar => 1.0,
             BuildStage::Done => 1.0,
         }
     }
@@ -647,6 +663,7 @@ mod tests {
     #[test]
     fn cumulative_fractions_are_monotone() {
         let order = [
+            BuildStage::RenderDiffuse,
             BuildStage::PrepareStaging,
             BuildStage::RenderMinimap,
             BuildStage::InvokePyMapConv,
@@ -656,6 +673,7 @@ mod tests {
             BuildStage::EmitStartboxesLua,
             BuildStage::EmitFeaturePlacerLua,
             BuildStage::PackageSd7,
+            BuildStage::InstallToBar,
             BuildStage::Done,
         ];
         let mut last = 0.0_f32;
@@ -817,12 +835,14 @@ mod tests {
     #[test]
     fn stage_labels_fit_overlay_width() {
         let stages = [
+            BuildStage::RenderDiffuse,
             BuildStage::PrepareStaging,
             BuildStage::RenderMinimap,
             BuildStage::InvokePyMapConv,
             BuildStage::StageSplatAssets,
             BuildStage::EmitMapInfoLua,
             BuildStage::PackageSd7,
+            BuildStage::InstallToBar,
             BuildStage::Done,
         ];
         for s in &stages {

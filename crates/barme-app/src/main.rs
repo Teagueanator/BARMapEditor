@@ -1,9 +1,11 @@
+mod build_runner;
 mod config;
 mod launcher;
 mod render;
 mod ui;
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::Result;
 use barme_core::{
@@ -122,6 +124,19 @@ struct App {
     min_height: f32,
     current_project_path: Option<PathBuf>,
     last_install: Option<Result<PathBuf, String>>,
+    /// Sprint 20 — worker-thread build pipeline state. Drives the
+    /// progress overlay, status-strip "Building…" chip, and log panel.
+    /// `BuildState::Idle` until the user clicks Build; then transitions
+    /// `Running → Done | Failed | Cancelled`. Each non-`Idle` variant
+    /// owns its log ring buffer so the panel survives until the user
+    /// dismisses it (returns to `Idle` on dismiss or on the next
+    /// successful build).
+    build_state: build_runner::BuildState,
+    /// Sprint 20 — is the build log panel window open this frame?
+    /// Toggled by the status strip's click affordance, the progress
+    /// overlay's "View log…" button, and the top-bar Build > Show log
+    /// menu item. Auto-set when the build transitions to Failed.
+    build_log_open: bool,
     brushes: BrushRegistry,
     brush_id: Option<String>,
     brush_radius: f32,
@@ -1259,6 +1274,8 @@ impl App {
             min_height: 0.0,
             current_project_path: None,
             last_install: None,
+            build_state: build_runner::BuildState::Idle,
+            build_log_open: false,
             brushes: BrushRegistry::default_set(),
             brush_id: None, // Off
             brush_radius: 256.0,
@@ -4782,7 +4799,28 @@ impl App {
     /// Compile the current project to a `.sd7` and copy it into BAR's
     /// user maps directory. v0 UX: heightmap must be loaded, texture is a
     /// synthesised flat grey (Stage 1 will replace with real DNTS).
+    ///
+    /// Sprint 20: start a worker-thread build. Snapshots every input
+    /// the worker needs (project clone, heightmap PNG written to a
+    /// temp dir, splat + layer resolver bindings, owned slot
+    /// resolver), then spawns a thread that drives
+    /// `BuildPlan::execute` and `install_sd7`. The UI thread keeps
+    /// polling `BuildState` each frame via
+    /// [`App::poll_build_state`].
     fn build_and_install(&mut self) {
+        use std::collections::VecDeque;
+        use std::sync::Mutex;
+        use std::sync::atomic::AtomicBool;
+        use std::sync::mpsc;
+
+        // Bail if a build is already running — the top-bar gate
+        // disables the button but the keyboard shortcut path can
+        // still slip through. Idempotent.
+        if self.build_state.is_running() {
+            warn!("build & install already running; ignoring duplicate request");
+            return;
+        }
+
         self.last_install = None;
         self.last_error = None;
         let Some(hm) = self.heightmap.as_ref() else {
@@ -4792,28 +4830,30 @@ impl App {
         };
         // The CPU-side heightmap is authoritative (may include unsaved
         // brush edits). Serialize to a temp PNG so the pipeline gets the
-        // current state, not a stale on-disk snapshot.
-        let tmp = match tempfile::tempdir() {
+        // current state, not a stale on-disk snapshot. The TempDir is
+        // moved into the worker so it auto-cleans only after the
+        // build finishes.
+        let workdir = match tempfile::tempdir() {
             Ok(t) => t,
             Err(e) => {
                 let msg = format!("tempdir: {e:#}");
                 error!("build & install tempdir failed: {msg}");
-                self.last_install = Some(Err(msg));
+                self.last_error = Some(msg);
                 return;
             }
         };
-        let hm_path = tmp.path().join("heightmap.png");
+        let hm_path = workdir.path().join("heightmap.png");
         if let Err(e) = hm.data.save_png(&hm_path) {
             let msg = format!("write heightmap: {e:#}");
             error!("build & install snapshot failed: {msg}");
-            self.last_install = Some(Err(msg));
+            self.last_error = Some(msg);
             return;
         }
         let Some(dst_dir) = launcher::bar_maps_dir() else {
             let msg =
                 "could not locate BAR maps dir on this platform — pick one manually (Stage 1)";
             warn!("{msg}");
-            self.last_install = Some(Err(msg.into()));
+            self.last_error = Some(msg.into());
             return;
         };
         let repo_root = repo_root();
@@ -4822,19 +4862,12 @@ impl App {
             Err(e) => {
                 let msg = format!("{e:#}");
                 error!("pymapconv unavailable: {msg}");
-                self.last_install = Some(Err(msg));
+                self.last_error = Some(msg);
                 return;
             }
         };
         let project = self.snapshot_project_for_build();
-        // D6 (Sprint 12): resolve each bound splat channel to its slot
-        // directory inside `tools/textures/` so the pipeline can call
-        // `bake_dnts` per active channel. Unbound channels stay None;
-        // the splat pipeline skips them.
         let splat_inputs = self.resolve_splat_bake_inputs(&project);
-        // D10 / Sprint 17 (ADR-041) — also resolve the layer-driven
-        // splat inputs. When the project has any DNTS-bound layers,
-        // the pipeline uses this in place of the legacy splat path.
         let layer_inputs = self.resolve_layer_splat_bake_inputs(&project);
         info!(
             name = %project.name,
@@ -4843,43 +4876,159 @@ impl App {
             max_height = self.height_scale,
             heightmap = %hm_path.display(),
             dst = %dst_dir.display(),
-            "build & install requested"
+            "build & install requested (worker thread)"
         );
-        // D8 / Sprint 15: hand a SlotResolver to the launcher so the
-        // layer bake can resolve slot ids → `diffuse.png` paths. The
-        // resolver borrows the App's `slot_registry` which is built
-        // once at startup; it lives for the duration of this call.
-        // D10 / Sprint 17 (ADR-041): attach the project root so the
-        // layer bake can resolve relative `LayerSource::Imported`
-        // paths against the project-local `textures/` sidecar.
-        let project_root = self.current_project_path.as_ref().and_then(|p| p.parent());
-        let layer_resolver = AppSlotResolver::with_project_root(&self.slot_registry, project_root);
-        match launcher::build_and_install(
-            &driver,
-            &project,
-            &hm_path,
-            None,
+        // Owned slot resolver — clone the registry so the worker
+        // thread doesn't borrow the App's slot_registry slice. ~16
+        // entries × 2 fields each = trivial allocation cost.
+        let owned_slots: Vec<build_runner::OwnedSlotEntry> = self
+            .slot_registry
+            .iter()
+            .map(|s| build_runner::OwnedSlotEntry {
+                id: s.id,
+                dir: s.dir.clone(),
+            })
+            .collect();
+        let project_root_owned = self
+            .current_project_path
+            .as_ref()
+            .and_then(|p| p.parent().map(Path::to_path_buf));
+        let owned_resolver = build_runner::OwnedSlotResolver::new(owned_slots, project_root_owned);
+        let project_name = project.name.clone();
+
+        let inputs = build_runner::WorkerInputs {
+            driver,
+            project,
+            heightmap_png: hm_path,
+            heightmap: hm.data.clone(),
             splat_inputs,
-            Some(layer_inputs),
-            &layer_resolver,
-            self.current_project_path.as_deref(),
-            &dst_dir,
-        ) {
-            Ok(installed) => {
-                let bytes = std::fs::metadata(&installed).map(|m| m.len()).unwrap_or(0);
-                info!(
-                    path = %installed.display(),
-                    bytes,
-                    "build & install ok"
-                );
-                self.last_install = Some(Ok(installed));
+            layer_inputs: Some(layer_inputs),
+            slot_resolver: Box::new(owned_resolver),
+            project_path: self.current_project_path.clone(),
+            work_dir: workdir,
+            dst_dir,
+            project_name: project_name.clone(),
+        };
+
+        let (tx, rx) = mpsc::channel::<barme_pipeline::BuildEvent>();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let log = Arc::new(Mutex::new(VecDeque::with_capacity(
+            build_runner::LOG_RING_CAP,
+        )));
+
+        let cancel_for_worker = cancel.clone();
+        let thread = std::thread::Builder::new()
+            .name(format!("barme-build:{project_name}"))
+            .spawn(move || {
+                let sink = build_runner::ChannelSink::new(tx);
+                build_runner::run_worker_build(inputs, &sink, &cancel_for_worker)
+            })
+            .map_err(|e| format!("spawn build thread: {e}"));
+        let thread = match thread {
+            Ok(h) => h,
+            Err(msg) => {
+                error!("{msg}");
+                self.last_error = Some(msg);
+                return;
             }
-            Err(e) => {
-                let msg = format!("{e:#}");
-                error!(error = %msg, "build & install failed");
-                self.last_install = Some(Err(msg));
+        };
+
+        self.build_state = build_runner::BuildState::Running {
+            project_name,
+            started_at: std::time::Instant::now(),
+            current_stage: barme_pipeline::BuildStage::RenderDiffuse,
+            latest_progress: 0.0,
+            events: rx,
+            log,
+            cancel,
+            thread: Some(thread),
+        };
+    }
+
+    /// Sprint 20: poll the worker thread + drain its event channel
+    /// once per UI frame. Transitions Running → Done | Failed |
+    /// Cancelled when the join handle is ready.
+    fn poll_build_state(&mut self, ctx: &egui::Context) {
+        let (transition, repaint_soon) = match &mut self.build_state {
+            build_runner::BuildState::Running {
+                events,
+                log,
+                current_stage,
+                latest_progress,
+                thread,
+                started_at,
+                ..
+            } => {
+                let log_arc: Arc<_> = log.clone();
+                let closed =
+                    build_runner::drain_events(events, log, current_stage, latest_progress)
+                        .is_err();
+                // Drive a repaint while running so the spinner + elapsed
+                // readout stays fresh even when the worker is silent.
+                ctx.request_repaint_after(std::time::Duration::from_millis(100));
+                if closed {
+                    // Worker dropped the sender → join the thread.
+                    let handle = thread.take();
+                    let result = handle.and_then(|h| h.join().ok());
+                    let duration = started_at.elapsed();
+                    let next = match result {
+                        Some(Ok(installed)) => {
+                            info!(
+                                installed = %installed.display(),
+                                elapsed_ms = duration.as_millis() as u64,
+                                "build & install ok (worker)"
+                            );
+                            self.last_install = Some(Ok(installed.clone()));
+                            build_runner::BuildState::Done {
+                                sd7_path: installed,
+                                duration,
+                                log: log_arc,
+                            }
+                        }
+                        Some(Err(msg)) => {
+                            error!(error = %msg, "build & install failed (worker)");
+                            let cancelled = msg.starts_with("Cancelled");
+                            self.last_install = Some(Err(msg.clone()));
+                            if cancelled {
+                                build_runner::BuildState::Cancelled {
+                                    duration,
+                                    log: log_arc,
+                                }
+                            } else {
+                                build_runner::BuildState::Failed {
+                                    error: msg,
+                                    duration,
+                                    log: log_arc,
+                                }
+                            }
+                        }
+                        None => {
+                            let msg = "worker thread panicked (no result)".to_string();
+                            error!("{msg}");
+                            self.last_install = Some(Err(msg.clone()));
+                            build_runner::BuildState::Failed {
+                                error: msg,
+                                duration,
+                                log: log_arc,
+                            }
+                        }
+                    };
+                    (Some(next), false)
+                } else {
+                    (None, true)
+                }
             }
+            _ => (None, false),
+        };
+        if let Some(next) = transition {
+            // Auto-open the log panel on failure so the user sees the
+            // tail of stderr without an extra click.
+            if matches!(next, build_runner::BuildState::Failed { .. }) {
+                self.build_log_open = true;
+            }
+            self.build_state = next;
         }
+        let _ = repaint_soon;
     }
 
     fn open_from(&mut self, path: PathBuf) {
@@ -9974,6 +10123,11 @@ impl eframe::App for App {
 
         let mut action: Option<FileAction> = None;
 
+        // Sprint 20: poll the worker thread + drain its event channel
+        // BEFORE rendering panels so the status strip + progress
+        // overlay see this frame's stage / log updates immediately.
+        self.poll_build_state(ctx);
+
         // egui panel add-order rule: top → bottom → left → right →
         // CentralPanel LAST. Reversing this means CentralPanel eats the
         // rect later panels were supposed to claim.
@@ -10204,6 +10358,8 @@ mod tests {
             min_height: 0.0,
             current_project_path: None,
             last_install: None,
+            build_state: build_runner::BuildState::Idle,
+            build_log_open: false,
             brushes: BrushRegistry::default_set(),
             brush_id: None,
             brush_radius: 256.0,
