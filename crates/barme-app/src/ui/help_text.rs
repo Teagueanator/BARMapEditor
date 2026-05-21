@@ -62,6 +62,11 @@ pub enum HelpId {
     HeaderHeightmapDims,
     HeaderHeightmapSample,
     HeaderHeightScale,
+    /// Sprint 27 / U5 — `min_height` (Sea-floor / Y at raw 0) elevated
+    /// from the Water inspector's duplicate "Heightmap range" section
+    /// into the persistent header so flooding decisions can be made
+    /// from any tool.
+    HeaderMinHeight,
 
     // Per-inspector sticky chips (sprint-19 addition).
     InspectorSymmetryChip,
@@ -212,6 +217,7 @@ impl HelpId {
         HelpId::HeaderHeightmapDims,
         HelpId::HeaderHeightmapSample,
         HelpId::HeaderHeightScale,
+        HelpId::HeaderMinHeight,
         HelpId::InspectorSymmetryChip,
         HelpId::InspectorMapSizeChip,
         // select
@@ -394,6 +400,9 @@ pub fn help(id: HelpId) -> &'static str {
         }
         HelpId::HeaderHeightScale => {
             "World Y at raw heightmap value 65535. BAR maps cap practical height around 4096 elmos; taller values give more headroom but exaggerate slopes."
+        }
+        HelpId::HeaderMinHeight => {
+            "World Y at raw heightmap value 0. Set negative so basins fill with water — BAR's water plane is fixed at Y = 0."
         }
 
         // Per-inspector chips.

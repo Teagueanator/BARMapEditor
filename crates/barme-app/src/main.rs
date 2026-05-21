@@ -7587,6 +7587,8 @@ impl App {
             .map(|h| format!("min {} · max {}", h.min, h.max))
             .unwrap_or_else(|| "—".to_string());
         let height_scale = &mut self.height_scale;
+        let min_height_before = self.min_height;
+        let mut min_height_edit = self.min_height;
         crate::ui::widgets::section(
             ui,
             "Heightmap",
@@ -7627,6 +7629,21 @@ impl App {
                             );
                             ui.end_row();
                         }
+                        // Sprint 27 / U5 — `min_height` lifted from the
+                        // Water inspector's duplicate "Heightmap range"
+                        // section so flood decisions read from one
+                        // canonical place.
+                        ui.label(egui::RichText::new("Min height").color(t.muted).size(11.0));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.add(
+                                egui::DragValue::new(&mut min_height_edit)
+                                    .range(-2048.0..=0.0)
+                                    .speed(1.0)
+                                    .suffix(" elmos"),
+                            )
+                            .on_hover_text(help(HelpId::HeaderMinHeight));
+                        });
+                        ui.end_row();
                         ui.label(egui::RichText::new("Max height").color(t.muted).size(11.0));
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             ui.add(
@@ -7641,6 +7658,10 @@ impl App {
                     });
             },
         );
+        if (min_height_edit - min_height_before).abs() > 1e-3 {
+            self.min_height = min_height_edit;
+            self.mark_dirty();
+        }
     }
 
     /// Sprint 19 / U1 — sticky chip row rendered at the top of every
@@ -8613,69 +8634,12 @@ impl App {
         // a "Revert" button so the user can undo from the same card.
         self.inspector_water_atmosphere_offer(ui);
 
-        // ── HEIGHTMAP RANGE ──────────────────────────────
-        // Sprint 19 — surface min / max height edits inside the Water
-        // tool so the user can fix "water spawned in the wrong place"
-        // without scrolling back to the persistent header. BAR's water
-        // plane is fixed at Y=0 (`Ground.h::GetWaterPlaneLevel` is
-        // `consteval`); the user adjusts the heightmap range to slide
-        // terrain above / below it.
-        crate::ui::widgets::section_with_hover(
-            ui,
-            "Heightmap range",
-            false,
-            "Duplicates the Project header sliders, surfaced here because flooding decisions live with the water tool. Floor and ceiling map raw heightmap u16 values to world Y.",
-            |_ui| {},
-            |ui| {
-                ui.label(
-                    egui::RichText::new(
-                        "Water plane is fixed at Y = 0. Lower the floor below 0 \
-                         so basins fill with water; raise the ceiling above 0 \
-                         so mountains stand clear of it.",
-                    )
-                    .color(t.dim)
-                    .size(10.0),
-                );
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("Floor (min)").color(t.muted).size(11.0));
-                    let before = self.min_height;
-                    let mut current = self.min_height;
-                    ui.add(
-                        egui::DragValue::new(&mut current)
-                            .range(-2048.0..=0.0)
-                            .speed(1.0)
-                            .suffix(" elmos"),
-                    )
-                    .on_hover_text(help(HelpId::WaterFloorMin));
-                    if (current - before).abs() > 1e-3 {
-                        self.min_height = current;
-                        self.mark_dirty();
-                    }
-                });
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new("Ceiling (max)")
-                            .color(t.muted)
-                            .size(11.0),
-                    );
-                    let before = self.height_scale;
-                    let mut current = self.height_scale;
-                    ui.add(
-                        egui::DragValue::new(&mut current)
-                            .range(1.0..=4096.0)
-                            .speed(1.0)
-                            .suffix(" elmos"),
-                    )
-                    .on_hover_text(help(HelpId::WaterCeilingMax));
-                    if (current - before).abs() > 1e-3 {
-                        self.height_scale = current;
-                        self.mark_dirty();
-                    }
-                });
-            },
-        );
+        // Sprint 27 / U5 — the duplicate "Heightmap range" section was
+        // removed; `min_height` + `height_scale` now live in the
+        // persistent Inspector header (one canonical edit path). The
+        // FLOOD section below still surfaces `min_height` as
+        // "Sea-floor depth" because that field is the load-bearing
+        // input to the Water-tool flood gesture.
 
         // ── BEHAVIOUR ────────────────────────────────────
         // Damage / void_water / tidal_strength. Tidal lives at
