@@ -28,6 +28,7 @@ use tracing::info;
 pub mod build;
 pub mod dnts;
 pub mod featureplacer;
+pub mod lint;
 pub mod lua_ast;
 pub mod mapinfo;
 pub mod metal_layout;
@@ -39,6 +40,7 @@ pub mod startboxes;
 
 pub use build::{BuildEvent, BuildEventSink, BuildPlan, BuildStage, LogStream, NEVER_CANCEL};
 pub use dnts::{BakeOptions, DntsBakeError, bake_dnts};
+pub use lint::{LintFix, LintIssue, LintRule, LintSeverity, StockManifest, lint, lint_with};
 pub use minimap::{
     MINIMAP_DIM, MinimapError, copy_minimap_override, render_minimap, stage_minimap,
 };
