@@ -3469,6 +3469,21 @@ impl App {
                         "mask stroke committed to undo history",
                     );
                 }
+                // Sprint 23 (T1 / ADR-041 amendment) — `trace!` RSS
+                // at stroke boundaries per the sprint standing
+                // constraints. Linux-only via `barme_core::rss`;
+                // no-op elsewhere. Keeps a per-stroke trail for the
+                // 16-SMU OOM investigation in case future regressions
+                // surface.
+                if let Some(snap) = barme_core::rss::current("paint-stroke-end") {
+                    tracing::trace!(
+                        target: "barme::rss",
+                        rss_mb = snap.rss_mb(),
+                        vm_peak_mb = snap.vm_peak_mb(),
+                        layer_id = %layer_id,
+                        "RSS snapshot after paint stroke",
+                    );
+                }
             }
         }
     }

@@ -606,11 +606,51 @@ Implements SRS F1–F12. Ships a Windows `.exe` and a Linux AppImage.
       polish sprints (19 / 20 / 22) now complete; Sprint 21's
       lint registry (C8) feeds the help-center wiring. Out of
       scope for Sprint 22: 16-SMU OOM root-cause + orphan-
-      texture GC + legacy `SplatConfig` retire (Sprint 23
-      cleanup); animated tour callouts (text-only ships);
+      texture GC + legacy `SplatConfig` retire (now landed in
+      Sprint 23 — see STATUS UPDATE below);
+      animated tour callouts (text-only ships);
       runtime article loading (recompile-only for now);
       i18n / localisation; interactive sandbox tutorials;
       toast queue / proper modals (Sprint 31).
+- [x] **STATUS UPDATE 2026-05-21 (Sprint 23 / T1, ADR-041 amendment).**
+      Closes the three Sprint-17 followups carried since Sprint 17 /
+      D10. **5 commits on `main`** so a bisect can attribute any
+      regression to its triggering change:
+      (1) investigation — RSS harness (`barme_core::rss`,
+      `procfs`-backed, Linux-gated) + CPU layer-stack budget
+      regression tests + characterisation of the pre-fix cold-sync
+      contract;
+      (2) H1+H4 mitigation — delete the 65 536-call row-by-row
+      zero-fill loop in `render::ensure_composite_rt` (wgpu
+      zero-initialises textures by default; the loop was wasted
+      staging arena work);
+      (3) H2 mitigation — `TileGrid::filled` seeds
+      `current_version` / `tile_versions` at 0 when `fill == 0`
+      (matches the GPU's zero-init default; `dirty_tiles_since(0)`
+      returns empty on uniform-zero masks);
+      (4) orphan-texture GC — new
+      `barme_core::layers::garbage_collect_textures(project, root)`
+      with `GcReport`; wired through `File > Garbage collect orphan
+      textures` menu + auto-run after every successful save (silent
+      when empty; `last_error` toast otherwise);
+      (5) legacy `SplatConfig` retirement —
+      `crates/barme-core/src/splat.rs::SplatConfig`,
+      `Project.splat_config`, `LayerStack::migrate_from_splat_config`
+      all deleted; legacy `.barmeproj` loads now flow through a new
+      `barme_core::layers::legacy_splat_config_to_layers(value:
+      toml::Value, size)` function that parses the on-disk
+      `[splat_config]` table directly without a typed struct.
+      `Project::after_load_migrate` takes the raw TOML text +
+      returns `bool` so `App::open_from` can fire a one-time
+      terminal banner. `SCHEMA_V` not bumped (serde's
+      default-when-missing handles the field's absence).
+      Tests: barme-core 274 → 277 (net delta covers the 3 deleted
+      `SplatConfig` tests + the 4 new `legacy_splat_config_to_layers`
+      and migration tests + the 6 GC tests + the 3 RSS / 4 cold-sync
+      contract pins); barme-app 331 (unchanged top-line; one
+      timing-sensitive `procgen` thumbnail test is flaky under load
+      but pre-existing). Sprint 24 = multithreading (rayon procgen
+      + parallel DNTS bake).
 - [ ] Beherith (or active mapper) reviews `.sd7` byte-for-byte against PyMapConv
       reference output on three test maps
 - [ ] Listed on `beyondallreason.info/guide/mapmaking-resources` as beta

@@ -3681,6 +3681,83 @@ than one. Sprint 17 finishes the feature.
   BAR; the legacy 4-channel inspector is gone; stock textures are
   one click away (no upload required).
 
+**Amendment 2026-05-21 (Sprint 23 / T1) — three followups closed:**
+
+1. **16-SMU `Tool::PaintLayer` entry OOM (root cause).** Two
+   contributors confirmed by `barme_core::rss` profile data:
+   - (H1+H4) `render::ensure_composite_rt` zero-filled the
+     16-layer mask array via a 65 536-call row-by-row
+     `queue.write_texture` loop. wgpu zero-init defaults handle
+     the case without any explicit writes; the loop was wasted
+     staging-arena work that ballooned on iGPU shared memory.
+     Fix: delete the loop.
+   - (H2) `TileGrid::filled` unconditionally seeded
+     `current_version = 1`, causing the first
+     `App::sync_composite_mask_tiles` to upload every tile of
+     every layer (~256 MB on a 4-layer 16-SMU project). Fix:
+     seed the version at 0 when `fill == 0` so the CPU matches
+     the GPU's zero-init default.
+   - H3 (per-layer PNG decode on PaintLayer entry) refuted — the
+     decode lives on project open / wizard / migration paths,
+     not on tool entry.
+   - Combined: entry-frame mask transfer drops 256 MB → 64 MB.
+     Pinned by Linux-only `procfs`-backed RSS harness +
+     CPU-side budget tests in `barme_core::layers::tests`.
+     `trace!(target: "barme::rss", …)` snapshots fire at paint-
+     stroke boundaries for ongoing observability.
+
+2. **Orphan imported-texture GC.** New `barme_core::layers::
+   garbage_collect_textures(project, project_root) ->
+   io::Result<GcReport>` walks `<root>/textures/{*.png,
+   *.meta.toml}`, computes the in-use UUID set from
+   `LayerSource::imported_uuid()` (new accessor) across every
+   layer, and unlinks orphans. `GcReport` carries
+   `orphans_removed: Vec<PathBuf>` + `orphans_removed_bytes: u64`
+   + `orphans_in_use_count: usize` + `errors: Vec<(PathBuf,
+   io::Error)>`. Wiring:
+   - Auto-runs after every successful save via `App::save_to`
+     (silent when the report is empty; surfaces freed-MB total
+     on `last_error` otherwise).
+   - Manual `File > Garbage collect orphan textures` menu item
+     (also surfaces "no orphans found" so the user knows the
+     click did something).
+   - Deliberately **does NOT** run on `ProjectDiff::RemoveLayer`
+     — the 100 MB undo ring may still hold a snapshot of the
+     removed layer with its source path, and Ctrl+Z within the
+     undo window expects the file to be on disk. ADR-033
+     eviction-driven GC is a follow-up.
+
+3. **Legacy `SplatConfig` retired at runtime.** The struct
+   itself (`crates/barme-core/src/splat.rs::SplatConfig`),
+   `Project.splat_config` field, `LayerStack::migrate_from_
+   splat_config` all deleted. Legacy `.barmeproj` loads now
+   flow through `barme_core::layers::legacy_splat_config_to_
+   layers(value: &toml::Value, size: MapSize) -> LayerStack`,
+   which reads the on-disk `[splat_config]` block as a
+   `toml::Value` and rebuilds the layer stack without a typed
+   struct. `Project::after_load_migrate` takes the raw TOML
+   text and returns `bool` (true when the migration fired),
+   so `App::open_from` can surface a one-time terminal banner.
+   `Project::load_from_file_reporting_migration` is the new
+   raw-aware loader; `load_from_file` keeps its single-return
+   shape and runs the migration with a `NullSlotResolver`.
+   `SCHEMA_V` not bumped — serde's default-when-missing handles
+   the field's absence on load (ADR-041 Commit 6 already
+   shipped `#[serde(skip_serializing)]`). Compatibility verified
+   against v=0 / v=1 / v=2 fixtures. The legacy splat pipeline
+   path (`stage_splat_assets` / `compute_active_channels` /
+   `populate_resources`) now derives its data from
+   `project.layers.dnts_layers()` + `project.dnts_diffuse_in_alpha`
+   instead of the deleted `splat_config`; the smoke binary's
+   `layer_inputs = None` codepath continues to work because
+   `Project::new` seeds a default biome layer that isn't
+   DNTS-bound, leaving `compute_active_channels` returning
+   `[false; 4]` and the legacy path a clean no-op.
+
+After this sprint, the painter is **production-ready for 16-SMU
+mappers** with no known memory leaks and a stable disk footprint.
+Sprint 24 = multithreading (rayon procgen + parallel DNTS bake).
+
 Critical files:
 - NEW `crates/barme-app/src/ui/layers_panel.rs`
 - `crates/barme-app/src/ui/widgets.rs` — `slot_picker_grid` +

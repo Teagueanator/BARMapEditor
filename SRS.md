@@ -805,6 +805,25 @@ A single-window, single-executable desktop app that produces a *playable* BAR ma
     Copy-on-first-write within a stroke bounds a single `UndoEntry` at
     `bbox.w × bbox.h × 2 bytes` (≤ ~2 MB at 16 SMU, ≤ ~9 MB at 32
     SMU), independent of stamp count.
+  - **STATUS UPDATE 2026-05-21 (Sprint 23 / T1, ADR-041 amendment):**
+    16-SMU `Tool::PaintLayer` entry transient brought back inside
+    budget on Vega-8-class iGPU shared-memory hosts. Two root causes
+    were profile-confirmed: (H1+H4) `ensure_composite_rt` zero-filled
+    the 16-layer mask array via 65 536 single-row `queue.write_texture`
+    calls that saturated wgpu's staging arena — wgpu zero-inits
+    textures by default so the loop was redundant from day one; the
+    fix deletes the loop. (H2) `TileGrid::filled` unconditionally
+    seeded `current_version = 1`, so the first cold sync uploaded
+    every tile of every layer (~256 MB of useless GPU writes on a
+    4-layer 16-SMU project where the GPU's zero-default already
+    matched the CPU side). The fix seeds the version at 0 when
+    `fill == 0`. Combined: entry-frame mask transfer drops 256 MB
+    → 64 MB; the staging-buffer ballooning is gone. Pinned by a
+    Linux-only `barme_core::rss` harness (`procfs`-backed) and CPU
+    layer-stack budget tests. RSS snapshots at paint-stroke
+    boundaries surface via `trace!(target: "barme::rss", …)`.
+    H3 (per-layer PNG decode on PaintLayer entry) refuted — that
+    work lives on the project-load path, not on tool entry.
 - **NFR-Portability:** Single static binary on Windows x86_64 and Linux x86_64; AppImage for Linux. No system-wide install required.
 - **NFR-Toolchain:** Bundle PyMapConv + Compressonator under a `tools/` subdirectory of the executable.
   Also requires the host system to provide a 7-Zip binary (`7z` / `7zz` / `7za`) — declared in install docs, not bundled.
