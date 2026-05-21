@@ -727,16 +727,76 @@ pub(super) fn check_metal_value_range(info: &MapInfo, out: &mut Vec<LintIssue>) 
     }
 }
 
-// ─── Info-tier stubs (commit 4 fills these in) ───
+// ─── Info-tier rules ───
 
-pub(super) fn check_gravity_drift(_info: &MapInfo, _out: &mut Vec<LintIssue>) {}
-pub(super) fn check_extractor_radius_drift(
-    _project: &Project,
-    _info: &MapInfo,
-    _out: &mut Vec<LintIssue>,
-) {
+/// BAR convention: gravity = 130. Fires when gravity is set but
+/// outside `100..=160` — unusual but valid (light-gravity sandbox
+/// maps exist).
+pub(super) fn check_gravity_drift(info: &MapInfo, out: &mut Vec<LintIssue>) {
+    let Some(g) = info.gravity else {
+        return;
+    };
+    if !(100.0..=160.0).contains(&g) {
+        out.push(issue(
+            LintRule::GravityNotOneThirty,
+            format!(
+                "`gravity = {g}` is outside BAR's typical 100..=160 range. \
+                 BAR convention is 130. Unusual values are valid for \
+                 sandbox maps but worth flagging."
+            ),
+            Some("gravity"),
+            Some(LintFix::MapInfoPatch(MapInfoPatch::Gravity(Some(130.0)))),
+        ));
+    }
 }
-pub(super) fn check_void_ground_alpha_min(_info: &MapInfo, _out: &mut Vec<LintIssue>) {}
+
+/// BAR convention: extractorRadius = 80. Fires when the project's
+/// radius drifts from 80 but isn't the broken 500 (covered by
+/// [`check_extractor_radius_five_hundred`]). Info-tier; the user
+/// may have a sound reason.
+pub(super) fn check_extractor_radius_drift(
+    project: &Project,
+    _info: &MapInfo,
+    out: &mut Vec<LintIssue>,
+) {
+    let r = project.extractor_radius;
+    // The Warning-tier rule handles 500. Skip that bucket here.
+    if (r - 500.0).abs() < 0.5 {
+        return;
+    }
+    if (r - 80.0).abs() > 0.5 {
+        out.push(issue(
+            LintRule::ExtractorRadiusDriftFromEighty,
+            format!(
+                "`extractorRadius = {r}` differs from BAR's 80. Not broken \
+                 (the 500 engine default would be), but mex placement \
+                 hover-snap will feel different to players."
+            ),
+            Some("extractorRadius"),
+            Some(LintFix::MapInfoPatch(MapInfoPatch::ExtractorRadius(Some(
+                80.0,
+            )))),
+        ));
+    }
+}
+
+/// PITFALL §20. When `voidGround = true` the user may want to tune
+/// `voidAlphaMin` (engine default 0.9). Info-tier: surfaces the
+/// knob so the user notices it exists.
+pub(super) fn check_void_ground_alpha_min(info: &MapInfo, out: &mut Vec<LintIssue>) {
+    if info.void_ground && (info.void_alpha_min - 0.9).abs() < f32::EPSILON {
+        out.push(issue(
+            LintRule::VoidGroundWithoutVoidAlphaMinTuning,
+            "`voidGround = true` with `voidAlphaMin` at the engine default \
+             (0.9). The threshold controls how aggressively voidGround \
+             discards diffuse-alpha fragments — tune it if you authored a \
+             custom diffuse with deliberate fade margins."
+                .to_string(),
+            Some("voidAlphaMin"),
+            None,
+        ));
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -1509,6 +1569,96 @@ mod tests {
         let p = fixture_project();
         // Default 1.0 — BAR median.
         assert!(!fired(&lint(&p), LintRule::MetalValueOutOfBARRange));
+    }
+
+    // ─────── Info-tier rules ───────
+
+    // ─── GravityNotOneThirty ───
+
+    #[test]
+    fn gravity_drift_fires_below_range() {
+        let p = fixture_project();
+        let mut info: MapInfo = (&p).into();
+        info.gravity = Some(50.0);
+        let issues = super::super::lint_with(&p, &info, &StockManifest::default());
+        assert!(fired(&issues, LintRule::GravityNotOneThirty));
+    }
+
+    #[test]
+    fn gravity_drift_fires_above_range() {
+        let p = fixture_project();
+        let mut info: MapInfo = (&p).into();
+        info.gravity = Some(250.0);
+        let issues = super::super::lint_with(&p, &info, &StockManifest::default());
+        assert!(fired(&issues, LintRule::GravityNotOneThirty));
+    }
+
+    #[test]
+    fn gravity_at_one_thirty_silent() {
+        let p = fixture_project();
+        // bar_default ships gravity = 130.
+        assert!(!fired(&lint(&p), LintRule::GravityNotOneThirty));
+    }
+
+    // ─── ExtractorRadiusDriftFromEighty ───
+
+    #[test]
+    fn extractor_radius_drift_fires_at_fifty() {
+        let mut p = fixture_project();
+        p.extractor_radius = 50.0;
+        assert!(fired(&lint(&p), LintRule::ExtractorRadiusDriftFromEighty));
+    }
+
+    #[test]
+    fn extractor_radius_drift_silent_at_five_hundred() {
+        // The Warning-tier rule covers 500; the info-tier drift rule
+        // skips it so a single problem produces a single chip.
+        let mut p = fixture_project();
+        p.extractor_radius = 500.0;
+        assert!(!fired(&lint(&p), LintRule::ExtractorRadiusDriftFromEighty));
+    }
+
+    #[test]
+    fn extractor_radius_drift_silent_at_bar_eighty() {
+        let p = fixture_project();
+        assert!(!fired(&lint(&p), LintRule::ExtractorRadiusDriftFromEighty));
+    }
+
+    // ─── VoidGroundWithoutVoidAlphaMinTuning ───
+
+    #[test]
+    fn void_ground_alpha_min_fires_when_void_ground_on_at_default() {
+        let p = fixture_project();
+        let mut info: MapInfo = (&p).into();
+        info.void_ground = true;
+        // void_alpha_min stays at engine default 0.9.
+        let issues = super::super::lint_with(&p, &info, &StockManifest::default());
+        assert!(fired(
+            &issues,
+            LintRule::VoidGroundWithoutVoidAlphaMinTuning
+        ));
+    }
+
+    #[test]
+    fn void_ground_alpha_min_silent_when_void_ground_off() {
+        let p = fixture_project();
+        assert!(!fired(
+            &lint(&p),
+            LintRule::VoidGroundWithoutVoidAlphaMinTuning
+        ));
+    }
+
+    #[test]
+    fn void_ground_alpha_min_silent_when_tuned() {
+        let p = fixture_project();
+        let mut info: MapInfo = (&p).into();
+        info.void_ground = true;
+        info.void_alpha_min = 0.5; // tuned away from default
+        let issues = super::super::lint_with(&p, &info, &StockManifest::default());
+        assert!(!fired(
+            &issues,
+            LintRule::VoidGroundWithoutVoidAlphaMinTuning
+        ));
     }
 
     /// Aggregate warning-tier severity check: a wizard-style fixture
