@@ -13,10 +13,13 @@
 //! resources resolve correctly without flag rewriting.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Output};
+use std::process::{Command, ExitStatus};
+use std::sync::atomic::AtomicBool;
 
 use barme_core::Project;
 use tracing::{debug, error, info, warn};
+
+use crate::build::{LogStream, NEVER_CANCEL, invoke_with_streaming};
 
 /// Relative path from the repo root to the vendored PyMapConv binary
 /// (fetched by `scripts/fetch-pymapconv.sh`; see ADR-011).
@@ -128,6 +131,12 @@ pub enum PyMapConvError {
         "CompressonatorCLI symlink missing at {0}; run scripts/fetch-compressonator.sh from the repo root"
     )]
     CompressonatorMissing(PathBuf),
+
+    /// Sprint 20: the caller's cancel flag flipped while waiting on
+    /// the child. The child was killed (best-effort) before the
+    /// error was raised.
+    #[error("pymapconv invocation cancelled")]
+    Cancelled,
 }
 
 impl PyMapConvDriver {
@@ -173,7 +182,30 @@ impl PyMapConvDriver {
     /// called. On success the returned `.smf` and `.smt` paths are
     /// guaranteed to exist; on failure the typed error carries the captured
     /// stdout/stderr so the UI can surface PyMapConv's own diagnostics.
+    ///
+    /// **Sprint 20:** thin wrapper over [`Self::compile_streaming`] with
+    /// a no-op line callback and the [`NEVER_CANCEL`] sentinel. Callers
+    /// that want live progress (the editor's build log panel) call
+    /// [`Self::compile_streaming`] directly.
     pub fn compile(&self, inputs: CompileInputs<'_>) -> Result<CompileOutputs, PyMapConvError> {
+        self.compile_streaming(inputs, |_, _| {}, &NEVER_CANCEL)
+    }
+
+    /// Streaming variant of [`Self::compile`]: `on_line` fires for every
+    /// `\n`-separated chunk PyMapConv writes to stdout / stderr while
+    /// the compile is running. `cancel.load(Relaxed)` is polled
+    /// between subprocess waits — when set, the child is killed
+    /// (best-effort) and the function returns a typed
+    /// [`PyMapConvError::Cancelled`].
+    pub fn compile_streaming<F>(
+        &self,
+        inputs: CompileInputs<'_>,
+        on_line: F,
+        cancel: &AtomicBool,
+    ) -> Result<CompileOutputs, PyMapConvError>
+    where
+        F: Fn(&str, LogStream) + Sync,
+    {
         let CompileInputs {
             project,
             heightmap_png,
@@ -264,17 +296,21 @@ impl PyMapConvDriver {
         );
         debug!(?cmd, "full pymapconv command");
 
-        let Output {
+        let streamed = invoke_with_streaming(&mut cmd, on_line, cancel).map_err(|source| {
+            if source.kind() == std::io::ErrorKind::Interrupted {
+                PyMapConvError::Cancelled
+            } else {
+                PyMapConvError::Spawn {
+                    binary: self.binary.clone(),
+                    source,
+                }
+            }
+        })?;
+        let crate::build::StreamedOutput {
             status,
             stdout,
             stderr,
-        } = cmd.output().map_err(|source| PyMapConvError::Spawn {
-            binary: self.binary.clone(),
-            source,
-        })?;
-
-        let stdout = String::from_utf8_lossy(&stdout).into_owned();
-        let stderr = String::from_utf8_lossy(&stderr).into_owned();
+        } = streamed;
 
         // Upstream quirk: pymapconv exits with status 1 on Linux even after
         // a successful compile (the bundled Qt event loop closes

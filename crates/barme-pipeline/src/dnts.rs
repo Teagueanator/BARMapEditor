@@ -35,6 +35,8 @@ use image::{Rgba, RgbaImage};
 use sha2::{Digest, Sha256};
 use tracing::{debug, info, trace, warn};
 
+use crate::build::{LogStream, NEVER_CANCEL, invoke_with_streaming};
+
 /// Per-slot bake configuration. Stable byte encoding via
 /// [`BakeOptions::to_cache_bytes`] backs the sha256 cache key.
 ///
@@ -460,24 +462,29 @@ fn invoke_compressonator(
         .arg(out_dds);
 
     debug!(?cmd, "dnts: invoking CompressonatorCLI");
-    let output = cmd
-        .output()
-        .map_err(|source| DntsBakeError::SpawnCompressonator {
-            bin: bin.to_path_buf(),
-            source,
-        })?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    // Compressonator emits useful warnings on stderr (e.g. NPOT
-    // dimensions). Stream both at trace so they're available under
-    // `RUST_LOG=barme_pipeline::dnts=trace` but don't pollute info-level.
-    if !stdout.is_empty() {
-        trace!(target: "barme_pipeline::dnts", "compressonator stdout:\n{stdout}");
-    }
-    if !stderr.is_empty() {
-        trace!(target: "barme_pipeline::dnts", "compressonator stderr:\n{stderr}");
-    }
+    // Sprint 20: route Compressonator through the streaming primitive
+    // even though we don't surface its lines to the editor's build
+    // log panel yet. The per-line callback fires `trace!` so
+    // `RUST_LOG=barme_pipeline::dnts=trace` reveals progress, and
+    // the post-exit captured aggregates keep the success-or-fail
+    // contract unchanged.
+    let output = invoke_with_streaming(
+        &mut cmd,
+        |line, stream| match stream {
+            LogStream::Stdout => {
+                trace!(target: "barme_pipeline::dnts", "compressonator stdout: {line}")
+            }
+            LogStream::Stderr => {
+                trace!(target: "barme_pipeline::dnts", "compressonator stderr: {line}")
+            }
+            _ => {}
+        },
+        &NEVER_CANCEL,
+    )
+    .map_err(|source| DntsBakeError::SpawnCompressonator {
+        bin: bin.to_path_buf(),
+        source,
+    })?;
 
     // Trust artifact presence as the success contract (mirrors the
     // PyMapConv driver). Compressonator generally exits 0 on success,
@@ -489,8 +496,8 @@ fn invoke_compressonator(
             status: output.status.code(),
             input: in_png.to_path_buf(),
             output: out_dds.to_path_buf(),
-            stdout,
-            stderr,
+            stdout: output.stdout,
+            stderr: output.stderr,
         });
     }
     if !present {

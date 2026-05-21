@@ -21,8 +21,12 @@
 //!    integration tests). Passes a no-op `()` sink and the
 //!    [`NEVER_CANCEL`] sentinel.
 
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use barme_core::{Heightmap, Project, SlotResolver};
 use tracing::{info, warn};
@@ -121,7 +125,12 @@ pub enum BuildEvent {
 /// Trait the staged driver writes events to. The synchronous
 /// `build_sd7` path passes `&()` (no-op); the worker thread path
 /// passes a closure that forwards on an `mpsc::Sender`.
-pub trait BuildEventSink {
+///
+/// `Sync` is required so the staged driver can capture
+/// `&dyn BuildEventSink` inside a closure handed to
+/// [`invoke_with_streaming`] (whose `on_line` callback fires from
+/// reader threads and therefore needs to be `Sync`).
+pub trait BuildEventSink: Sync {
     fn emit(&self, event: BuildEvent);
 }
 
@@ -129,7 +138,7 @@ impl BuildEventSink for () {
     fn emit(&self, _: BuildEvent) {}
 }
 
-impl<F: Fn(BuildEvent)> BuildEventSink for F {
+impl<F: Fn(BuildEvent) + Sync> BuildEventSink for F {
     fn emit(&self, e: BuildEvent) {
         (self)(e)
     }
@@ -139,6 +148,125 @@ impl<F: Fn(BuildEvent)> BuildEventSink for F {
 /// this so the staged helper can call `cancel.load(...)` without a
 /// `None` check.
 pub static NEVER_CANCEL: AtomicBool = AtomicBool::new(false);
+
+/// Poll interval for the cancel flag while a child subprocess is
+/// running. 50 ms is short enough that Cancel feels instant in the UI
+/// and long enough that the worker thread isn't busy-spinning.
+const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Returned by [`invoke_with_streaming`]. Carries the captured streams
+/// so callers (PyMapConv driver, Compressonator) can still apply their
+/// post-exit success heuristics (e.g. PyMapConv's "exit 1 on success"
+/// quirk) against the full buffered output, not just the per-line
+/// callback's side effects.
+#[derive(Debug)]
+pub struct StreamedOutput {
+    pub status: ExitStatus,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+/// Run `cmd`, attaching `Stdio::piped()` to stdout + stderr, and
+/// stream each line through `on_line` as it arrives. The full output
+/// of both streams is also accumulated in [`StreamedOutput`] for
+/// callers that still need the captured-after-exit shape.
+///
+/// `cancel.load(Relaxed)` is checked while waiting on the child;
+/// when set, the child is killed (best-effort — see PITFALL #6 in
+/// the sprint prompt; on Linux this only signals the direct child,
+/// any subprocess group it spawned dies in ~5 s on its own).
+///
+/// `on_line` runs from one of two reader threads; the bound is
+/// `Fn(&str, LogStream) + Sync` so closures that share state via
+/// `&Mutex<...>` work without extra annotations.
+///
+/// Behaviour on cancellation: returns
+/// `Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"))`.
+/// Callers map that to their own typed-error cancellation variant.
+pub fn invoke_with_streaming<F>(
+    cmd: &mut Command,
+    on_line: F,
+    cancel: &AtomicBool,
+) -> Result<StreamedOutput, std::io::Error>
+where
+    F: Fn(&str, LogStream) + Sync,
+{
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd.spawn()?;
+    let stdout = child.stdout.take().expect("piped stdout missing");
+    let stderr = child.stderr.take().expect("piped stderr missing");
+
+    let stdout_buf: Mutex<String> = Mutex::new(String::new());
+    let stderr_buf: Mutex<String> = Mutex::new(String::new());
+
+    let on_line_ref = &on_line;
+    let stdout_buf_ref = &stdout_buf;
+    let stderr_buf_ref = &stderr_buf;
+
+    let status = std::thread::scope(|s| -> Result<ExitStatus, std::io::Error> {
+        let stdout_handle = s.spawn(move || {
+            let reader = BufReader::new(stdout);
+            for line in reader.lines().map_while(Result::ok) {
+                on_line_ref(&line, LogStream::Stdout);
+                if let Ok(mut buf) = stdout_buf_ref.lock() {
+                    buf.push_str(&line);
+                    buf.push('\n');
+                }
+            }
+        });
+        let stderr_handle = s.spawn(move || {
+            let reader = BufReader::new(stderr);
+            for line in reader.lines().map_while(Result::ok) {
+                on_line_ref(&line, LogStream::Stderr);
+                if let Ok(mut buf) = stderr_buf_ref.lock() {
+                    buf.push_str(&line);
+                    buf.push('\n');
+                }
+            }
+        });
+
+        let final_status = wait_with_cancel(&mut child, cancel)?;
+        // Wait for both reader threads to finish draining their
+        // pipes before we report success. The child has exited (or
+        // been killed) by this point, so the pipes will EOF and the
+        // readers will exit on their own.
+        let _ = stdout_handle.join();
+        let _ = stderr_handle.join();
+        Ok(final_status)
+    })?;
+
+    let stdout_str = stdout_buf.into_inner().unwrap_or_default();
+    let stderr_str = stderr_buf.into_inner().unwrap_or_default();
+    Ok(StreamedOutput {
+        status,
+        stdout: stdout_str,
+        stderr: stderr_str,
+    })
+}
+
+/// Poll the cancel flag while waiting on the child. When the flag
+/// flips, kill the child + wait for its exit so we don't leak a
+/// zombie. Returns the final `ExitStatus` from `child.wait()` even
+/// after a kill (the killed status carries the signal info).
+fn wait_with_cancel(child: &mut Child, cancel: &AtomicBool) -> Result<ExitStatus, std::io::Error> {
+    loop {
+        match child.try_wait()? {
+            Some(status) => return Ok(status),
+            None => {
+                if cancel.load(Ordering::Relaxed) {
+                    warn!("invoke_with_streaming: cancel flag set; killing child");
+                    let _ = child.kill();
+                    let status = child.wait();
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        format!("cancelled (post-kill status: {:?})", status.as_ref().ok()),
+                    ));
+                }
+                std::thread::sleep(CANCEL_POLL_INTERVAL);
+            }
+        }
+    }
+}
 
 /// One-shot snapshot of every input the staged pipeline needs. Owned
 /// so it can cross the `thread::spawn` boundary at the editor side
@@ -264,25 +392,34 @@ pub fn execute_stages(
     check_cancel(cancel, &BuildStage::InvokePyMapConv)?;
     emit_stage(events, BuildStage::InvokePyMapConv);
     info!(name = %project.name, "execute_stages: compiling SMF/SMT");
-    let outputs = driver.compile(CompileInputs {
-        project,
-        heightmap_png,
-        texture_bmp,
-        metalmap_png: metalmap_path.as_deref(),
-        minimap_png: minimap_path.as_deref(),
-        out_dir: &compile_out,
-    })?;
-    // Replay PyMapConv's captured stdout/stderr as Log events. Chunk
-    // 2 of Sprint 20 swaps the captured-after-exit pair for a
-    // streaming variant; until then we surface the full output once
-    // post-compile so the user can scroll through PyMapConv's "All
-    // Done!" + Compressonator chatter.
-    for line in outputs.stdout.lines() {
-        emit_log_line(events, line, LogStream::Stdout);
-    }
-    for line in outputs.stderr.lines() {
-        emit_log_line(events, line, LogStream::Stderr);
-    }
+    let on_pymapconv_line = |line: &str, stream: LogStream| {
+        events.emit(BuildEvent::Log {
+            line: line.to_string(),
+            stream,
+        });
+    };
+    let outputs = driver
+        .compile_streaming(
+            CompileInputs {
+                project,
+                heightmap_png,
+                texture_bmp,
+                metalmap_png: metalmap_path.as_deref(),
+                minimap_png: minimap_path.as_deref(),
+                out_dir: &compile_out,
+            },
+            on_pymapconv_line,
+            cancel,
+        )
+        .map_err(|e| match e {
+            crate::PyMapConvError::Cancelled => BuildError::Cancelled(BuildStage::InvokePyMapConv),
+            other => other.into(),
+        })?;
+    // PyMapConv captured stdout/stderr is already available as a
+    // post-exit aggregate in `outputs` (the streaming wrapper
+    // accumulated it). The per-line callback above has already
+    // surfaced each line live; nothing to replay here.
+    let _ = (&outputs.stdout, &outputs.stderr);
 
     // ─── Stage 4: splat assets ────────────────────────────────────
     check_cancel(cancel, &BuildStage::StageSplatAssets)?;
@@ -488,14 +625,6 @@ fn emit_info(events: &dyn BuildEventSink, line: String) {
     });
 }
 
-/// Emit a single subprocess log line.
-fn emit_log_line(events: &dyn BuildEventSink, line: &str, stream: LogStream) {
-    events.emit(BuildEvent::Log {
-        line: line.to_string(),
-        stream,
-    });
-}
-
 /// Bail with [`BuildError::Cancelled`] when the cancel flag is set.
 /// Called between stages; mid-stage cancellation is the streaming
 /// wrappers' job (Chunk 2 of Sprint 20).
@@ -597,6 +726,89 @@ mod tests {
         });
         ().emit(BuildEvent::Progress(0.5));
         // No panic, no observable state. The test passes by reaching here.
+    }
+
+    /// Sprint 20 / chunk 2 — `invoke_with_streaming` fires the
+    /// per-line callback once per `\n`-separated chunk, in order,
+    /// from BOTH streams.
+    #[test]
+    fn invoke_with_streaming_collects_lines_in_order() {
+        let captured: Mutex<Vec<(String, LogStream)>> = Mutex::new(Vec::new());
+        let cancel = AtomicBool::new(false);
+        let mut cmd = std::process::Command::new("sh");
+        cmd.arg("-c").arg(
+            "printf 'line1\\nline2\\nline3\\n'; \
+             printf 'err1\\nerr2\\n' 1>&2",
+        );
+        let out = invoke_with_streaming(
+            &mut cmd,
+            |line, stream| {
+                captured.lock().unwrap().push((line.to_string(), stream));
+            },
+            &cancel,
+        )
+        .expect("subprocess should succeed");
+        assert!(out.status.success(), "sh -c exit 0");
+        // Captured strings are line-by-line; order within a single
+        // stream is deterministic, but stdout vs stderr can interleave
+        // — assert the per-stream sequences instead of exact ordering.
+        let lines = captured.lock().unwrap();
+        let stdout: Vec<&str> = lines
+            .iter()
+            .filter(|(_, s)| *s == LogStream::Stdout)
+            .map(|(l, _)| l.as_str())
+            .collect();
+        let stderr: Vec<&str> = lines
+            .iter()
+            .filter(|(_, s)| *s == LogStream::Stderr)
+            .map(|(l, _)| l.as_str())
+            .collect();
+        assert_eq!(stdout, vec!["line1", "line2", "line3"]);
+        assert_eq!(stderr, vec!["err1", "err2"]);
+        // Captured-after-exit shape is preserved for callers (e.g.
+        // PyMapConv) that still post-process the full stream.
+        assert!(out.stdout.contains("line1\n"));
+        assert!(out.stderr.contains("err2\n"));
+    }
+
+    /// Sprint 20 / chunk 2 — cancelling mid-process kills the child
+    /// and returns an `Interrupted` error within the poll window.
+    /// Test command sleeps for a long time; cancel fires after a
+    /// short delay; we assert the call returns quickly.
+    #[test]
+    fn invoke_with_streaming_cancels_long_running_child() {
+        use std::sync::Arc;
+        use std::thread;
+        use std::time::Instant;
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_setter = cancel.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(120));
+            cancel_setter.store(true, Ordering::Relaxed);
+        });
+
+        // Bypass the shell so kill() reaches the leaf process directly.
+        // Wrapping in `sh -c` leaves the sleep as a grandchild that
+        // inherits stdout — our reader thread would block on the
+        // open pipe until the orphan finished. Sprint 20 documents
+        // this as a known limitation (Child::kill is best-effort;
+        // PyMapConv's Compressonator grandchildren die in ~5 s on
+        // their own).
+        let mut cmd = std::process::Command::new("sleep");
+        cmd.arg("30");
+        let started = Instant::now();
+        let result = invoke_with_streaming(&mut cmd, |_, _| {}, &cancel);
+        let elapsed = started.elapsed();
+        // Should return within ~CANCEL_POLL_INTERVAL after the flag
+        // fires (~120 ms + a few × 50 ms poll cycles). Generous bound
+        // so a slow CI host doesn't flake.
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "cancel did not interrupt long-running child within 2s (took {elapsed:?})"
+        );
+        let err = result.expect_err("cancelled run should return Err");
+        assert_eq!(err.kind(), std::io::ErrorKind::Interrupted);
     }
 
     /// Stage labels are short enough to fit in the progress overlay's
