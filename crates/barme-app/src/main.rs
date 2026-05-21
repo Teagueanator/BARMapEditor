@@ -986,8 +986,12 @@ fn load_slot_thumbnail_rgba(slot: &SlotMeta) -> Option<image::RgbaImage> {
 
 /// Load a slot's `diffuse.png` at full resolution + resize to
 /// `SLOT_DIFFUSE_DIM` if needed (per FINDINGS H2 — starter pack ships
-/// 1024² so the happy path skips the resize). Returns the RGBA8 bytes
-/// ready for `render::upload_diffuse_layer`.
+/// 1024² so the happy path skips the resize). Returns the RGBA8 bytes;
+/// see `crates/barme-app/src/render.rs` for the matching GPU upload
+/// helpers (`upload_slot_normal_layer`, `upload_base_normal`,
+/// `upload_specular`) — Sprint 25 / ADR-038 renamed the slot uploader
+/// from the retired `upload_diffuse_layer` to reflect the binding's
+/// new role.
 fn load_slot_full_rgba(slot: &SlotMeta) -> Option<image::RgbaImage> {
     use crate::render::SLOT_DIFFUSE_DIM;
     let diffuse = slot.dir.join("diffuse.png");
@@ -2411,6 +2415,13 @@ impl App {
                 active_mask |= 1 << ch;
             }
         }
+        // Sprint 25 / R1 / ADR-038 — `flags.w` is the texture-presence
+        // bitfield. Sprint 25 ships the WGSL transcription with the
+        // base-normal / specular / DNTS-slot-normals bindings; until a
+        // future sprint wires real upload paths from the layer stack +
+        // the parity-fixture loader, the bits stay at 0 so the shader
+        // takes the fallback paths (vertex normal, global specular,
+        // skip DNTS normal blend).
         SplatUniforms {
             tex_scales,
             tex_mults,
@@ -2423,6 +2434,10 @@ impl App {
             sun_dir: base.sun_dir,
             ground_ambient: base.ground_ambient,
             ground_diffuse: base.ground_diffuse,
+            ground_specular: base.ground_specular,
+            // Camera eye lands at prepare() time via TerrainCallback —
+            // see `render::TerrainCallback::prepare`.
+            camera_pos: base.camera_pos,
         }
     }
 
