@@ -8325,12 +8325,17 @@ impl App {
                 ];
                 let mut new_brush_id: Option<String> = None;
                 ui.columns(4, |cols| {
-                    for (i, (id, label, color, help_id)) in brushes.iter().enumerate() {
-                        let active = self.paint_brush_state.brush_id == *id;
-                        let resp = Self::brush_card(&mut cols[i], label, *color, active)
-                            .on_hover_text(help(*help_id));
-                        if resp.clicked() {
-                            new_brush_id = Some((*id).to_string());
+                    for (i, &(id, label, color, help_id)) in brushes.iter().enumerate() {
+                        let active = self.paint_brush_state.brush_id == id;
+                        let card = crate::ui::widgets::BrushCard {
+                            label,
+                            icon: None,
+                            ring_color: color,
+                            active,
+                            hover_help: help_id,
+                        };
+                        if crate::ui::widgets::brush_card(&mut cols[i], card).clicked() {
+                            new_brush_id = Some(id.to_string());
                         }
                     }
                 });
@@ -8385,22 +8390,12 @@ impl App {
         let t = crate::ui::theme::Tokens::DARK;
         self.inspector_sticky_chips(ui);
         // BRUSH section: 4-card picker.
-        let brushes_info: Vec<(Option<String>, &str, egui::Color32, HelpId)> = vec![
+        let brushes_info: [(Option<&str>, &str, egui::Color32, HelpId); 4] = [
             (None, "Off", t.muted, HelpId::SculptBrushOff),
+            (Some("raise"), "Raise", t.green, HelpId::SculptBrushRaise),
+            (Some("lower"), "Lower", t.red, HelpId::SculptBrushLower),
             (
-                Some("raise".to_string()),
-                "Raise",
-                t.green,
-                HelpId::SculptBrushRaise,
-            ),
-            (
-                Some("lower".to_string()),
-                "Lower",
-                t.red,
-                HelpId::SculptBrushLower,
-            ),
-            (
-                Some("smooth".to_string()),
+                Some("smooth"),
                 "Smooth",
                 t.accent,
                 HelpId::SculptBrushSmooth,
@@ -8415,12 +8410,17 @@ impl App {
             |_ui| {},
             |ui| {
                 ui.columns(4, |cols| {
-                    for (i, (id, label, color, help_id)) in brushes_info.iter().enumerate() {
-                        let active = self.brush_id == *id;
-                        let resp = Self::brush_card(&mut cols[i], label, *color, active)
-                            .on_hover_text(help(*help_id));
-                        if resp.clicked() {
-                            new_brush = Some(id.clone());
+                    for (i, &(id, label, color, help_id)) in brushes_info.iter().enumerate() {
+                        let active = self.brush_id.as_deref() == id;
+                        let card = crate::ui::widgets::BrushCard {
+                            label,
+                            icon: None,
+                            ring_color: color,
+                            active,
+                            hover_help: help_id,
+                        };
+                        if crate::ui::widgets::brush_card(&mut cols[i], card).clicked() {
+                            new_brush = Some(id.map(str::to_string));
                         }
                     }
                 });
@@ -9234,53 +9234,6 @@ impl App {
             self.min_height = target;
             self.mark_dirty();
         }
-    }
-
-    /// Single 4-card BrushPicker tile. Pure renderer; returns the
-    /// click response.
-    fn brush_card(
-        ui: &mut egui::Ui,
-        label: &str,
-        color: egui::Color32,
-        active: bool,
-    ) -> egui::Response {
-        let t = crate::ui::theme::Tokens::DARK;
-        let (rect, response) =
-            ui.allocate_exact_size(egui::vec2(ui.available_width(), 42.0), egui::Sense::click());
-        let painter = ui.painter();
-        let bg = if active { t.hover } else { t.bg };
-        let stroke = egui::Stroke::new(1.0, if active { t.border_hi } else { t.border });
-        painter.rect_filled(rect, egui::CornerRadius::same(4), bg);
-        painter.rect_stroke(
-            rect,
-            egui::CornerRadius::same(4),
-            stroke,
-            egui::StrokeKind::Middle,
-        );
-        // Swatch ring.
-        let cx = rect.center().x;
-        let swatch_y = rect.top() + 14.0;
-        let r = 7.0;
-        let fill = if label == "Off" {
-            egui::Color32::TRANSPARENT
-        } else {
-            egui::Color32::from_rgba_premultiplied(color.r() / 5, color.g() / 5, color.b() / 5, 80)
-        };
-        painter.circle(
-            egui::pos2(cx, swatch_y),
-            r,
-            fill,
-            egui::Stroke::new(1.5, color),
-        );
-        // Label.
-        painter.text(
-            egui::pos2(cx, rect.bottom() - 12.0),
-            egui::Align2::CENTER_CENTER,
-            label,
-            egui::FontId::proportional(11.0),
-            if active { t.text } else { t.muted },
-        );
-        response
     }
 
     /// F8 Inspector tree (ADR-032 / B6). One collapsing header per

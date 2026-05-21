@@ -15,6 +15,7 @@ use eframe::egui::{
     self, Color32, CornerRadius, Pos2, Rect, Response, Sense, Stroke, StrokeKind, Ui, Vec2,
 };
 
+use crate::ui::help_text::{HelpId, help};
 use crate::ui::icons::{self, Icon};
 use crate::ui::theme::{ChipTone, Tokens};
 
@@ -527,6 +528,85 @@ pub fn icon_button(ui: &mut Ui, icon: Icon, size: f32, tooltip: &str) -> Respons
     let icon_rect = rect.shrink(inset);
     icons::paint_icon(painter, icon_rect, icon, color, 1.5);
     response.on_hover_text(tooltip)
+}
+
+/// Sprint 27 / U5 — descriptor for [`brush_card`]. The struct exists
+/// so the call-site reads top-down (`label … active … hover_help`)
+/// instead of guessing positional arguments.
+///
+/// `icon` is `Option<Icon>` for future Stage-2 polish (an icon centred
+/// in the ring). For Sprint 27 callers pass `None`, preserving the
+/// translucent-fill swatch the legacy `App::brush_card` produced.
+pub struct BrushCard<'a> {
+    pub label: &'a str,
+    pub icon: Option<Icon>,
+    pub ring_color: Color32,
+    pub active: bool,
+    pub hover_help: HelpId,
+}
+
+/// Sprint 27 / U5 — the brush-selector card lifted from
+/// `App::brush_card`. Sculpt's `Off / Raise / Lower / Smooth` strip
+/// and PaintLayer's `Reveal / Hide / Smooth / Fill` strip now share
+/// this widget, so a change to the ring + label layout reaches both
+/// tools.
+///
+/// Visual contract:
+/// - Allocates the column's full width and 42 px tall.
+/// - Active state lifts the background to `t.hover` and the border to
+///   `t.border_hi`; inactive uses `t.bg` / `t.border`.
+/// - Ring (~14 px diameter) sits 14 px down from the top, stroked in
+///   `card.ring_color`. A translucent fill of the same tone fills the
+///   ring when the label is anything other than "Off" — the "Off"
+///   variant intentionally reads as empty.
+/// - Optional icon (`card.icon`) paints inside the ring instead of
+///   the translucent fill.
+/// - Label sits at the bottom, in `t.text` when active and `t.muted`
+///   otherwise.
+///
+/// Tooltip is sourced from `card.hover_help` so the help_text.rs
+/// catalogue stays the single source of truth.
+pub fn brush_card(ui: &mut Ui, card: BrushCard<'_>) -> Response {
+    let t = Tokens::DARK;
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 42.0), Sense::click());
+    let painter = ui.painter();
+    let bg = if card.active { t.hover } else { t.bg };
+    let stroke = Stroke::new(1.0, if card.active { t.border_hi } else { t.border });
+    painter.rect_filled(rect, CornerRadius::same(4), bg);
+    painter.rect_stroke(rect, CornerRadius::same(4), stroke, StrokeKind::Middle);
+    let cx = rect.center().x;
+    let swatch_y = rect.top() + 14.0;
+    let r = 7.0;
+    let is_off = card.label == "Off";
+    let fill = if is_off || card.icon.is_some() {
+        Color32::TRANSPARENT
+    } else {
+        Color32::from_rgba_premultiplied(
+            card.ring_color.r() / 5,
+            card.ring_color.g() / 5,
+            card.ring_color.b() / 5,
+            80,
+        )
+    };
+    painter.circle(
+        Pos2::new(cx, swatch_y),
+        r,
+        fill,
+        Stroke::new(1.5, card.ring_color),
+    );
+    if let Some(icon) = card.icon {
+        let icon_rect = Rect::from_center_size(Pos2::new(cx, swatch_y), egui::vec2(10.0, 10.0));
+        icons::paint_icon(painter, icon_rect, icon, card.ring_color, 1.5);
+    }
+    painter.text(
+        Pos2::new(cx, rect.bottom() - 12.0),
+        egui::Align2::CENTER_CENTER,
+        card.label,
+        egui::FontId::proportional(11.0),
+        if card.active { t.text } else { t.muted },
+    );
+    response.on_hover_text(help(card.hover_help))
 }
 
 #[cfg(test)]
