@@ -150,17 +150,27 @@ impl TileGrid {
         let tiles_x = width.div_ceil(TILE_DIM);
         let tiles_y = height.div_ceil(TILE_DIM);
         let tile_count = (tiles_x as usize) * (tiles_y as usize);
+        // Sprint 23 (T1 / H2): the initial version depends on `fill`.
+        // wgpu zero-initialises every texture on allocation, so when
+        // the CPU mask is also uniform-zero the GPU side already
+        // matches — no cold-sync upload required. For non-zero fills
+        // (the bottom-base layer convention is `fill = 255`) the
+        // GPU's zero default does NOT match, so every tile must
+        // upload on the first sync.
+        //
+        // Pre-Sprint-23 this was unconditionally `1`, which fanned
+        // 1024 × layer_count cold-sync uploads on 16-SMU projects
+        // (~256 MB transferred per entry on a 4-layer stack —
+        // dominant contributor to the PaintLayer-entry OOM).
+        let initial_version: u64 = if fill == 0 { 0 } else { 1 };
         Self {
             width,
             height,
             tiles_x,
             tiles_y,
             tiles: vec![Tile::Uniform(fill); tile_count],
-            // Start at version 1 so a caller passing `since = 0` gets
-            // every tile back (matches the "GPU has never uploaded
-            // anything from this layer" cold-start case).
-            current_version: 1,
-            tile_versions: vec![1; tile_count],
+            current_version: initial_version,
+            tile_versions: vec![initial_version; tile_count],
         }
     }
 
@@ -1026,12 +1036,21 @@ mod tests {
 
     #[test]
     fn dirty_tiles_since_returns_only_changed() {
-        let mut m = LayerMask::filled(two_smu(), 0);
+        // Sprint 23 (H2): a freshly-filled uniform-zero mask reports
+        // NO dirty tiles on cold sync — wgpu zero-initialises the
+        // GPU mask array on allocation so the CPU and GPU sides
+        // already match. Use `fill=255` here to keep exercising the
+        // "cold-start returns every tile" half of the contract (the
+        // bottom-base layer convention is `fill=255` and DOES need
+        // the upload).
+        let mut m = LayerMask::filled(two_smu(), 255);
         let v0 = m.version();
-        // Initially every tile has version 1 > 0; the cold-start case
-        // gets the whole grid back.
         let all = m.dirty_tiles_since(0);
-        assert_eq!(all.len(), 16); // 4×4 grid
+        assert_eq!(
+            all.len(),
+            16,
+            "non-zero-fill cold-sync uploads every tile (4×4 grid)",
+        );
         // After a snapshot, no tiles are dirty until we write.
         assert!(m.dirty_tiles_since(v0).is_empty());
         // Stamp tile (0, 0).
@@ -1059,6 +1078,37 @@ mod tests {
                 tile_y: 3
             }
         );
+    }
+
+    /// Sprint 23 (H2) — pin the post-fix contract: a freshly-filled
+    /// uniform-zero mask returns ZERO dirty tiles on cold sync. The
+    /// wgpu mask array zero-initialises on allocation; uploading
+    /// the CPU's matching zero bytes is wasted bandwidth and the
+    /// root cause of the 16-SMU PaintLayer-entry mask transfer.
+    #[test]
+    fn dirty_tiles_since_zero_fill_returns_empty_on_cold_sync() {
+        let m = LayerMask::filled(two_smu(), 0);
+        assert!(
+            m.dirty_tiles_since(0).is_empty(),
+            "uniform-zero mask must report ZERO dirty tiles on cold sync"
+        );
+        // Version is also 0 (no writes happened).
+        assert_eq!(m.version(), 0);
+    }
+
+    /// Sprint 23 (H2) — pin the non-zero-fill cold-sync contract:
+    /// `fill=255` (the bottom-base biome layer) reports every tile
+    /// dirty on cold sync so the GPU side receives the non-zero
+    /// uniform bytes.
+    #[test]
+    fn dirty_tiles_since_nonzero_fill_returns_all_tiles_on_cold_sync() {
+        let m = LayerMask::filled(two_smu(), 255);
+        assert_eq!(
+            m.dirty_tiles_since(0).len(),
+            16,
+            "uniform-255 cold-sync must upload every tile"
+        );
+        assert_eq!(m.version(), 1);
     }
 
     #[test]

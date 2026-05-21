@@ -1360,36 +1360,34 @@ mod tests {
         );
     }
 
-    /// Sprint 23 investigation — characterisation of the cold-sync
-    /// dirty-tile count on a freshly-`filled` mask. **Pre-H2-fix**
-    /// the count equals every tile in the grid regardless of fill
-    /// (because [`mask::TileGrid::filled`] starts `current_version`
-    /// at 1 and seeds every per-tile version at 1; queries at
-    /// `since=0` therefore return everything). The H2 mitigation
-    /// commit flips the contract so `fill=0` returns empty (matches
-    /// wgpu's zero-init default).
-    ///
-    /// Kept in the investigation commit as a baseline; the H2-fix
-    /// commit promotes this into an assertion that `fill=0` returns
-    /// EMPTY (saves ~64 MB of useless cold-sync transfer per child
-    /// layer on 16-SMU projects).
+    /// Sprint 23 (H2 mitigation) — pin the post-fix cold-sync
+    /// contract end-to-end for a realistic 16-SMU 4-layer stack.
+    /// The bottom-base layer (`fill=255`) reports every tile dirty
+    /// (its non-zero uniform must reach the GPU); the three child
+    /// layers (`fill=0`) report ZERO dirty tiles (wgpu's zero-init
+    /// default already matches). For 16 SMU that's
+    /// `1 × 1024 = 1024` cold-sync tile uploads instead of the
+    /// pre-fix `4 × 1024 = 4096` (~64 MB instead of ~256 MB
+    /// transferred per entry frame).
     #[test]
-    fn freshly_filled_mask_cold_sync_returns_every_tile_pre_h2_fix() {
-        let m = LayerMask::filled(MapSize::square(2), 0);
-        let dirty = m.dirty_tiles_since(0);
-        // Pre-fix contract: 2 SMU = 1024² → 4×4 tile grid = 16
-        // tiles, ALL dirty regardless of fill.
+    fn realistic_four_layer_stack_cold_sync_uploads_only_non_zero_base() {
+        let size = MapSize::square(16);
+        let base = TextureLayer::new(LayerSource::Slot { id: 0 }, size, 255);
+        let dirty_base = base.mask.dirty_tiles_since(0).len();
+        // 16 SMU = 8192² → 32×32 tile grid = 1024 tiles.
         assert_eq!(
-            dirty.len(),
-            16,
-            "pre-H2-fix: every tile is reported dirty on cold sync"
+            dirty_base, 1024,
+            "fill=255 bottom-base must cold-upload every tile",
         );
-        let m255 = LayerMask::filled(MapSize::square(2), 255);
-        assert_eq!(
-            m255.dirty_tiles_since(0).len(),
-            16,
-            "pre-H2-fix: fill=255 also reports every tile dirty"
-        );
+        for slot_id in 1..=3u8 {
+            let child = TextureLayer::new(LayerSource::Slot { id: slot_id }, size, 0);
+            let dirty_child = child.mask.dirty_tiles_since(0).len();
+            assert_eq!(
+                dirty_child, 0,
+                "fill=0 child layer at slot {slot_id} must skip cold sync \
+                 (wgpu zero-init default already matches)",
+            );
+        }
     }
 
     /// The harness itself: snapshot RSS before and after building a
