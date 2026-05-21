@@ -293,41 +293,439 @@ pub(super) fn check_heightmap_dims(project: &Project, out: &mut Vec<LintIssue>) 
     }
 }
 
-// ─── Warning rules (commit 3 fills these in) ───
+// ─── Warning rules ───
 
-pub(super) fn check_lighting_sun_dir_missing(_info: &MapInfo, _out: &mut Vec<LintIssue>) {}
-pub(super) fn check_atmosphere_sky_dir_present(_project: &Project, _out: &mut Vec<LintIssue>) {}
-pub(super) fn check_gui_minimap_rotation(_project: &Project, _out: &mut Vec<LintIssue>) {}
+/// PITFALL §11 / FINDINGS §1.4. Fires when `lighting.sun_dir`'s xyz
+/// is the zero vector — a degenerate direction the engine treats as
+/// "no sun" (everything renders dark / unlit). The schema's
+/// `bar_default` ships `[0.3, 1.0, -0.2, 1.0]`; this lint catches a
+/// user resetting the field to all zeros through F9.
+pub(super) fn check_lighting_sun_dir_missing(info: &MapInfo, out: &mut Vec<LintIssue>) {
+    let [x, y, z, _w] = info.lighting.sun_dir;
+    if x.abs() < f32::EPSILON && y.abs() < f32::EPSILON && z.abs() < f32::EPSILON {
+        out.push(issue(
+            LintRule::LightingSunDirMissing,
+            "`lighting.sunDir` xyz is the zero vector — terrain will \
+             render unlit. Set a real direction (BAR convention: \
+             ~[0.3, 1.0, -0.2, 1.0])."
+                .to_string(),
+            Some("lighting.sunDir"),
+            Some(LintFix::MapInfoPatch(MapInfoPatch::LightingSunDir([
+                0.3, 1.0, -0.2, 1.0,
+            ]))),
+        ));
+    }
+}
+
+/// PITFALL §12 / FINDINGS §1.3. `atmosphere.skyDir` is deprecated.
+/// The emitter never writes it (always emits `skyAxisAngle`). This
+/// lint guards against user-imported state where `mapinfo_overrides`
+/// carries the deprecated key.
+pub(super) fn check_atmosphere_sky_dir_present(project: &Project, out: &mut Vec<LintIssue>) {
+    if project
+        .mapinfo_overrides
+        .keys()
+        .any(|k| k == "atmosphere.skyDir" || k == "atmosphere.sky_dir")
+    {
+        out.push(issue(
+            LintRule::AtmosphereSkyDirPresent,
+            "`atmosphere.skyDir` is deprecated (engine logs `L_DEPRECATED`). \
+             Use `atmosphere.skyAxisAngle` (float4: axis xyz + radians) \
+             instead. Drop the override; the emitter writes the modern key."
+                .to_string(),
+            Some("atmosphere.skyAxisAngle"),
+            None,
+        ));
+    }
+}
+
+/// PITFALL §19 / FINDINGS §1.11. `gui.minimapRotation` is unused.
+/// Same pattern as [`check_atmosphere_sky_dir_present`] — fires on
+/// `mapinfo_overrides` containing the dead key.
+pub(super) fn check_gui_minimap_rotation(project: &Project, out: &mut Vec<LintIssue>) {
+    if project
+        .mapinfo_overrides
+        .keys()
+        .any(|k| k == "gui.minimapRotation" || k == "gui.minimap_rotation")
+    {
+        out.push(issue(
+            LintRule::GuiMinimapRotationPresent,
+            "`gui.minimapRotation` is not consumed by current Recoil \
+             (`MapInfo.cpp:119-124`). Drop the override; the field is dead."
+                .to_string(),
+            Some("gui.minimapRotation"),
+            None,
+        ));
+    }
+}
+
+/// PITFALL §6. `extractorRadius = 500` (the engine default) breaks
+/// BAR's mex snap. BAR uses 80.
 pub(super) fn check_extractor_radius_five_hundred(
-    _project: &Project,
+    project: &Project,
     _info: &MapInfo,
-    _out: &mut Vec<LintIssue>,
+    out: &mut Vec<LintIssue>,
 ) {
+    if (project.extractor_radius - 500.0).abs() < 0.5 {
+        out.push(issue(
+            LintRule::ExtractorRadiusFiveHundred,
+            "`extractorRadius = 500` is the engine default but breaks BAR's \
+             mex-snap UI. Set it to 80 (BAR convention)."
+                .to_string(),
+            Some("extractorRadius"),
+            Some(LintFix::MapInfoPatch(MapInfoPatch::ExtractorRadius(Some(
+                80.0,
+            )))),
+        ));
+    }
 }
+
+/// PITFALL §6. `tidalStrength > 0` without a `water.surfaceColor`
+/// means tidal generators visually clip into invisible water. Fires
+/// when tidal is on but the emitted water block has no surface
+/// colour.
 pub(super) fn check_tidal_without_surface(
-    _project: &Project,
-    _info: &MapInfo,
-    _out: &mut Vec<LintIssue>,
+    project: &Project,
+    info: &MapInfo,
+    out: &mut Vec<LintIssue>,
 ) {
+    let tidal = project.tidal_strength.unwrap_or(0.0);
+    if tidal <= 0.0 {
+        return;
+    }
+    let has_surface = info.water.as_ref().and_then(|w| w.surface_color).is_some();
+    if !has_surface {
+        out.push(issue(
+            LintRule::TidalStrengthWithoutWaterSurfaceColor,
+            format!(
+                "`tidalStrength = {tidal}` but no `water.surfaceColor` is \
+                 set. Tidal generators will visually clip into invisible \
+                 water. Pick a water preset (Ocean / Tropical / …) so the \
+                 surface renders."
+            ),
+            Some("water.surfaceColor"),
+            None,
+        ));
+    }
 }
-pub(super) fn check_terrain_below_without_water(_project: &Project, _out: &mut Vec<LintIssue>) {}
-pub(super) fn check_water_without_terrain_below(_project: &Project, _out: &mut Vec<LintIssue>) {}
-pub(super) fn check_teams_less_than_sixteen(_project: &Project, _out: &mut Vec<LintIssue>) {}
-pub(super) fn check_startboxes_missing(_project: &Project, _out: &mut Vec<LintIssue>) {}
+
+/// PITFALL §6 — `min_height < 0` with no water preset = engine
+/// renders its default blue ocean (silent surprise). Migrated from
+/// `App::validation_summary`'s WARN tier (Sprint 14 / C9).
+pub(super) fn check_terrain_below_without_water(project: &Project, out: &mut Vec<LintIssue>) {
+    use barme_core::WaterMode;
+    if project.min_height < 0.0 && project.water_mode == WaterMode::None {
+        out.push(issue(
+            LintRule::TerrainBelowZeroWithoutWater,
+            format!(
+                "Terrain dips below Y = 0 (min_height = {:.1}) but no water \
+                 preset is selected. The engine will render its default blue \
+                 ocean — pick a preset in the Water tool to make it explicit.",
+                project.min_height
+            ),
+            Some("water"),
+            None,
+        ));
+    }
+}
+
+/// Sprint 14 / C9 inverse — `water_mode != None` with
+/// `min_height >= 0` = no water visible without `forceRendering`.
+/// Migrated from `App::validation_summary`.
+pub(super) fn check_water_without_terrain_below(project: &Project, out: &mut Vec<LintIssue>) {
+    use barme_core::WaterMode;
+    if project.water_mode != WaterMode::None && project.min_height >= 0.0 {
+        out.push(issue(
+            LintRule::WaterModeSetWithoutTerrainBelowZero,
+            format!(
+                "Water preset `{:?}` is set but terrain doesn't dip below \
+                 Y = 0 (min_height = {:.1}) — water won't be visible. Either \
+                 carve a basin with the Water tool's flood brush or set \
+                 `forceRendering = true`.",
+                project.water_mode, project.min_height
+            ),
+            Some("water"),
+            None,
+        ));
+    }
+}
+
+/// PITFALL §6. Large maps (≥4 ally groups) should surface ≥16
+/// teams so BAR's lobby can match expected slot counts. Fires when
+/// the project has ≥4 ally groups but total team positions < 16.
+pub(super) fn check_teams_less_than_sixteen(project: &Project, out: &mut Vec<LintIssue>) {
+    let ally_count = project.ally_groups.len();
+    let total: usize = project
+        .ally_groups
+        .iter()
+        .map(|g| g.start_positions.len())
+        .sum();
+    if ally_count >= 4 && total < 16 {
+        out.push(issue(
+            LintRule::TeamsLessThanSixteenOnLargeMap,
+            format!(
+                "{ally_count} ally groups but only {total} team positions. \
+                 Large-map BAR lobbies expect ≥16 slots — add more start \
+                 positions per group."
+            ),
+            Some("teams"),
+            None,
+        ));
+    }
+}
+
+/// PITFALL §26. Multi-ally-group projects (>2 groups) without any
+/// `box_polygon` set emit no `map_startboxes.lua`, which falls back
+/// to BAR's auto-N/S split — fine for 1v1 but jarring for 3+ team
+/// maps where players expect explicit corner/sector boxes.
+pub(super) fn check_startboxes_missing(project: &Project, out: &mut Vec<LintIssue>) {
+    if project.ally_groups.len() <= 2 {
+        return;
+    }
+    let any_box = project.ally_groups.iter().any(|g| g.box_polygon.is_some());
+    if !any_box {
+        out.push(issue(
+            LintRule::StartboxesLuaMissingWhenMultiTeam,
+            format!(
+                "{} ally groups but no start-box polygons authored. BAR will \
+                 fall back to its auto-N/S split, which doesn't fit FFA / \
+                 multi-corner layouts. Author a polygon per ally group in \
+                 the F8 tool.",
+                project.ally_groups.len()
+            ),
+            Some("ally_groups"),
+            None,
+        ));
+    }
+}
+
+/// PITFALL §6. DNTS layers active without `resources.detailTex` —
+/// the base detail texture — render visibly flat. Fires when DNTS
+/// is on and `info.resources.detail_tex.is_none()`.
 pub(super) fn check_resources_detail_tex_dnts(
-    _project: &Project,
-    _info: &MapInfo,
-    _out: &mut Vec<LintIssue>,
+    project: &Project,
+    info: &MapInfo,
+    out: &mut Vec<LintIssue>,
 ) {
+    let dnts_active = !info.resources.splat_detail_normal_tex.is_empty()
+        || project.layers.dnts_layers().iter().any(|l| l.is_some());
+    if dnts_active && info.resources.detail_tex.is_none() {
+        out.push(issue(
+            LintRule::ResourcesDetailTexMissingOnDntsMap,
+            "DNTS layers active but `resources.detailTex` is unset. The base \
+             detail texture is what the splat normals modulate; without it \
+             the terrain looks visibly flat under close-camera. The engine \
+             falls back to `resources.lua` `graphics.maps.detailtex` → \
+             `detailtex2.bmp` — ship a real one for parity."
+                .to_string(),
+            Some("resources.detailTex"),
+            None,
+        ));
+    }
 }
-pub(super) fn check_geo_in_metal_layout(_project: &Project, _out: &mut Vec<LintIssue>) {}
-pub(super) fn check_metalmap_nonzero(_project: &Project, _out: &mut Vec<LintIssue>) {}
-pub(super) fn check_sun_dir_w_large(_info: &MapInfo, _out: &mut Vec<LintIssue>) {}
-pub(super) fn check_splat_detail_normal_legacy(_info: &MapInfo, _out: &mut Vec<LintIssue>) {}
-pub(super) fn check_dnts_below_zero(_project: &Project, _out: &mut Vec<LintIssue>) {}
-pub(super) fn check_start_position_shape(_project: &Project, _out: &mut Vec<LintIssue>) {}
-pub(super) fn check_lua_gaia_team_missing(_project: &Project, _out: &mut Vec<LintIssue>) {}
-pub(super) fn check_metal_value_range(_info: &MapInfo, _out: &mut Vec<LintIssue>) {}
+
+/// PITFALL §14 / FINDINGS §5. Future-import guard: BAR has no
+/// gadget reading `map_metal_layout.geos[]` — geo vents go through
+/// the Springboard featureplacer trio. Fires when
+/// `mapinfo_overrides` carries any dotted key under
+/// `map_metal_layout.geos`.
+pub(super) fn check_geo_in_metal_layout(project: &Project, out: &mut Vec<LintIssue>) {
+    if project
+        .mapinfo_overrides
+        .keys()
+        .any(|k| k.starts_with("map_metal_layout.geos") || k.starts_with("metal_layout.geos"))
+    {
+        out.push(issue(
+            LintRule::GeoInMetalLayoutGeosArray,
+            "Project carries a `map_metal_layout.geos[]` override (Zero-K \
+             convention). BAR derives geo vents from features with \
+             `geoThermal = true` — the array is silently ignored. Migrate \
+             the entries to `Project.geo_vents` via the V (geovent) tool."
+                .to_string(),
+            Some("metal_layout.geos"),
+            None,
+        ));
+    }
+}
+
+/// PITFALL §13 / FINDINGS §5. `map_metal_spot_placer.lua` bails if
+/// any SMF metalmap pixel is non-zero. The pipeline ships an
+/// all-zero PNG when `metal_spots` is non-empty; this lint guards
+/// the future-import path where a user-supplied metalmap could
+/// shadow the zero-bytes contract.
+pub(super) fn check_metalmap_nonzero(project: &Project, out: &mut Vec<LintIssue>) {
+    if project.metal_spots.is_empty() {
+        return;
+    }
+    let custom_metalmap = project
+        .mapinfo_overrides
+        .get("smf.metalmapTex")
+        .or_else(|| project.mapinfo_overrides.get("smf.metalmap_tex"));
+    if let Some(v) = custom_metalmap {
+        let path = match v {
+            toml::Value::String(s) => s.as_str(),
+            _ => "<unknown>",
+        };
+        if !path.trim().is_empty() {
+            out.push(issue(
+                LintRule::SmfMetalmapNonZeroWithLuaSpots,
+                format!(
+                    "Project has {} Lua metal spot(s) AND a custom \
+                     `smf.metalmapTex` override (`{path}`). BAR's \
+                     `map_metal_spot_placer.lua` bails when ANY SMF \
+                     metalmap pixel is non-zero. Drop the override or \
+                     ensure the texture is all-black.",
+                    project.metal_spots.len()
+                ),
+                Some("smf.metalmapTex"),
+                None,
+            ));
+        }
+    }
+}
+
+/// PITFALL §18 / FINDINGS §1.4 / NEW-6. `lighting.sun_dir.w` is
+/// an intensity scalar with engine default `1.0`. Fires when w > 100
+/// (the older `1e9` sunStartDistance leakage would land here).
+pub(super) fn check_sun_dir_w_large(info: &MapInfo, out: &mut Vec<LintIssue>) {
+    let w = info.lighting.sun_dir[3];
+    if w > 100.0 {
+        out.push(issue(
+            LintRule::SunDirWIsLarge,
+            format!(
+                "`lighting.sunDir.w` = {w} (engine default 1.0). Older \
+                 research mis-attributed this as `sunStartDistance` (1e9), \
+                 which over-saturates sunlight on load. Set w to ~1.0."
+            ),
+            Some("lighting.sunDir"),
+            Some(LintFix::MapInfoPatch(MapInfoPatch::LightingSunDir([
+                info.lighting.sun_dir[0],
+                info.lighting.sun_dir[1],
+                info.lighting.sun_dir[2],
+                1.0,
+            ]))),
+        ));
+    }
+}
+
+/// PITFALL §15 / FINDINGS §1.8. The legacy
+/// `splatDetailNormalDiffuseAlpha` top-level key is shadowed by the
+/// subtable's `alpha` field. The emitter writes the subtable form;
+/// this lint guards user-imported state with the legacy key.
+pub(super) fn check_splat_detail_normal_legacy(info: &MapInfo, out: &mut Vec<LintIssue>) {
+    if info.resources.splat_detail_normal_diffuse_alpha.is_some() {
+        out.push(issue(
+            LintRule::SplatDetailNormalTexLegacyForm,
+            "`resources.splatDetailNormalDiffuseAlpha` is the legacy form \
+             (engine prefers the subtable's `alpha` companion). Mixing the \
+             two silently shadows the subtable. Drop the legacy key — the \
+             emitter writes the modern form."
+                .to_string(),
+            Some("resources.splatDetailNormalTex"),
+            None,
+        ));
+    }
+}
+
+/// PITFALL §8. DNTS layers + `min_height < 0` triggers the LOS
+/// animated-snow bug (Beherith forum t=35202). Migrated from
+/// `App::validation_summary`'s WARN tier (Sprint 14 / C9).
+pub(super) fn check_dnts_below_zero(project: &Project, out: &mut Vec<LintIssue>) {
+    let dnts_active = project.layers.dnts_layers().iter().any(|l| l.is_some());
+    if dnts_active && project.min_height < 0.0 {
+        out.push(issue(
+            LintRule::DntsOnMapWithMinHeightBelowZero,
+            format!(
+                "DNTS layers active on a map with `min_height = {:.1}` < 0. \
+                 Any LOS-touching Lua widget will trigger TV-snow artefacts \
+                 (Beherith forum t=35202). Raise min_height above 0 OR \
+                 retire the DNTS layers.",
+                project.min_height
+            ),
+            None,
+            None,
+        ));
+    }
+}
+
+/// PITFALL §23 — featureplacer rotation is an unquoted integer.
+/// The editor's `FeatureInstance.rot_heading: u16` is always an
+/// integer, so this rule cannot fire from editor-created state. It
+/// guards a future F13 import path where `mapinfo_overrides`
+/// carries `featureplacer.quoted_rot = true` (indicating the
+/// imported `set.lua` had string-quoted rotations that the parser
+/// preserved verbatim).
+pub(super) fn check_start_position_shape(project: &Project, out: &mut Vec<LintIssue>) {
+    let flagged = project
+        .mapinfo_overrides
+        .get("featureplacer.quoted_rot")
+        .map(|v| matches!(v, toml::Value::Boolean(true)))
+        .unwrap_or(false);
+    if flagged {
+        out.push(issue(
+            LintRule::StartPositionShapeWrong,
+            "Featureplacer rotations are quoted strings (PyMapConv `-k` \
+             format leaked in via import). The `FP_featureplacer.lua` \
+             gadget calls `Spring.CreateFeature(..., fDef.rot)` which \
+             expects an unquoted integer. Re-emit via the editor to fix."
+                .to_string(),
+            Some("featureplacer.rot"),
+            None,
+        ));
+    }
+}
+
+/// PITFALL §25. Every multiplayer map with a `LuaGaia/Gadgets/`
+/// gadget needs the bootstrap pair. The pipeline always stages it;
+/// this rule guards a future import path where the user
+/// deliberately opted out (e.g. for diagnostics) via
+/// `mapinfo_overrides["build.luagaia_bootstrap"] = false`.
+pub(super) fn check_lua_gaia_team_missing(project: &Project, out: &mut Vec<LintIssue>) {
+    let multi_player = project.ally_groups.len() >= 2;
+    if !multi_player {
+        return;
+    }
+    let opted_out = project
+        .mapinfo_overrides
+        .get("build.luagaia_bootstrap")
+        .map(|v| matches!(v, toml::Value::Boolean(false)))
+        .unwrap_or(false);
+    if opted_out {
+        out.push(issue(
+            LintRule::LuaGaiaTeamMissing,
+            "Project has ≥2 ally groups (multiplayer) and \
+             `build.luagaia_bootstrap = false`. Without \
+             `LuaGaia/main.lua` + `LuaGaia/draw.lua`, the engine never \
+             scans `LuaGaia/Gadgets/` and the Springboard featureplacer \
+             never runs — geo vents and features fail to spawn."
+                .to_string(),
+            None,
+            None,
+        ));
+    }
+}
+
+/// PITFALL §22. `mapinfo.maxMetal` outside `0.5..=5.0` scales every
+/// metal spot's F4-displayed income atypically vs published BAR
+/// maps (jade_empress 0.99 — starwatcher 4.11).
+pub(super) fn check_metal_value_range(info: &MapInfo, out: &mut Vec<LintIssue>) {
+    let Some(mm) = info.max_metal else {
+        return;
+    };
+    if !(0.5..=5.0).contains(&mm) {
+        out.push(issue(
+            LintRule::MetalValueOutOfBARRange,
+            format!(
+                "`maxMetal = {mm}` is outside BAR's 0.5..=5.0 range. Every \
+                 spot's F4 income scales linearly — values too low make \
+                 mexes display ~0.1 m/s; values too high stack hot. \
+                 Published BAR maps cluster 0.93..=4.11."
+            ),
+            Some("maxMetal"),
+            Some(LintFix::MapInfoPatch(MapInfoPatch::MaxMetal(Some(1.0)))),
+        ));
+    }
+}
 
 // ─── Info-tier stubs (commit 4 fills these in) ───
 
@@ -657,5 +1055,477 @@ mod tests {
                 "{rule:?} should fire; issues:\n{issues:#?}"
             );
         }
+    }
+
+    // ─────── Warning rules ───────
+
+    // ─── LightingSunDirMissing ───
+
+    #[test]
+    fn lighting_sun_dir_fires_on_zero_xyz() {
+        let p = fixture_project();
+        let mut info: MapInfo = (&p).into();
+        info.lighting.sun_dir = [0.0, 0.0, 0.0, 1.0];
+        let issues = super::super::lint_with(&p, &info, &StockManifest::default());
+        assert!(fired(&issues, LintRule::LightingSunDirMissing));
+    }
+
+    #[test]
+    fn lighting_sun_dir_silent_with_non_zero_direction() {
+        let p = fixture_project();
+        assert!(!fired(&lint(&p), LintRule::LightingSunDirMissing));
+    }
+
+    // ─── AtmosphereSkyDirPresent ───
+
+    #[test]
+    fn atmosphere_sky_dir_fires_when_override_present() {
+        let mut p = fixture_project();
+        p.mapinfo_overrides.insert(
+            "atmosphere.skyDir".into(),
+            toml::Value::String("legacy".into()),
+        );
+        assert!(fired(&lint(&p), LintRule::AtmosphereSkyDirPresent));
+    }
+
+    #[test]
+    fn atmosphere_sky_dir_silent_without_override() {
+        let p = fixture_project();
+        assert!(!fired(&lint(&p), LintRule::AtmosphereSkyDirPresent));
+    }
+
+    // ─── GuiMinimapRotationPresent ───
+
+    #[test]
+    fn gui_minimap_rotation_fires_when_override_present() {
+        let mut p = fixture_project();
+        p.mapinfo_overrides
+            .insert("gui.minimapRotation".into(), toml::Value::Float(1.57));
+        assert!(fired(&lint(&p), LintRule::GuiMinimapRotationPresent));
+    }
+
+    #[test]
+    fn gui_minimap_rotation_silent_without_override() {
+        let p = fixture_project();
+        assert!(!fired(&lint(&p), LintRule::GuiMinimapRotationPresent));
+    }
+
+    // ─── ExtractorRadiusFiveHundred ───
+
+    #[test]
+    fn extractor_radius_five_hundred_fires() {
+        let mut p = fixture_project();
+        p.extractor_radius = 500.0;
+        assert!(fired(&lint(&p), LintRule::ExtractorRadiusFiveHundred));
+    }
+
+    #[test]
+    fn extractor_radius_silent_at_bar_eighty() {
+        let p = fixture_project();
+        assert!(!fired(&lint(&p), LintRule::ExtractorRadiusFiveHundred));
+    }
+
+    // ─── TidalStrengthWithoutWaterSurfaceColor ───
+
+    #[test]
+    fn tidal_without_surface_color_fires() {
+        let mut p = fixture_project();
+        p.tidal_strength = Some(10.0);
+        // water_mode stays None so info.water = None → no surface_color.
+        assert!(fired(
+            &lint(&p),
+            LintRule::TidalStrengthWithoutWaterSurfaceColor
+        ));
+    }
+
+    #[test]
+    fn tidal_with_surface_color_silent() {
+        let mut p = fixture_project();
+        p.tidal_strength = Some(10.0);
+        p.water_mode = WaterMode::Ocean; // ships a surface_color from the preset
+        assert!(!fired(
+            &lint(&p),
+            LintRule::TidalStrengthWithoutWaterSurfaceColor
+        ));
+    }
+
+    #[test]
+    fn tidal_zero_silent_even_without_water() {
+        let p = fixture_project(); // tidal_strength = None
+        assert!(!fired(
+            &lint(&p),
+            LintRule::TidalStrengthWithoutWaterSurfaceColor
+        ));
+    }
+
+    // ─── TerrainBelowZeroWithoutWater ───
+
+    #[test]
+    fn terrain_below_zero_without_water_fires() {
+        let mut p = fixture_project();
+        p.min_height = -50.0;
+        // water_mode stays None.
+        assert!(fired(&lint(&p), LintRule::TerrainBelowZeroWithoutWater));
+    }
+
+    #[test]
+    fn terrain_below_zero_with_water_silent() {
+        let mut p = fixture_project();
+        p.min_height = -50.0;
+        p.water_mode = WaterMode::Ocean;
+        assert!(!fired(&lint(&p), LintRule::TerrainBelowZeroWithoutWater));
+    }
+
+    // ─── WaterModeSetWithoutTerrainBelowZero ───
+
+    #[test]
+    fn water_mode_without_terrain_below_fires() {
+        let mut p = fixture_project();
+        p.water_mode = WaterMode::Ocean;
+        // min_height stays 0.0
+        assert!(fired(
+            &lint(&p),
+            LintRule::WaterModeSetWithoutTerrainBelowZero
+        ));
+    }
+
+    #[test]
+    fn water_mode_with_terrain_below_silent() {
+        let mut p = fixture_project();
+        p.water_mode = WaterMode::Ocean;
+        p.min_height = -50.0;
+        assert!(!fired(
+            &lint(&p),
+            LintRule::WaterModeSetWithoutTerrainBelowZero
+        ));
+    }
+
+    // ─── TeamsLessThanSixteenOnLargeMap ───
+
+    #[test]
+    fn teams_less_than_sixteen_fires_with_four_groups_few_positions() {
+        let mut p = fixture_project();
+        // Add 3 more ally groups (total 4) with 2 positions each.
+        for id in 1..4 {
+            let mut g = AllyGroup::new(id);
+            g.start_positions.push(StartPosition {
+                x_elmo: id as i32 * 100,
+                z_elmo: 100,
+            });
+            g.start_positions.push(StartPosition {
+                x_elmo: id as i32 * 100,
+                z_elmo: 200,
+            });
+            p.ally_groups.push(g);
+        }
+        // 4 groups × 2 positions + first group's 1 = 9 total → < 16.
+        assert!(fired(&lint(&p), LintRule::TeamsLessThanSixteenOnLargeMap));
+    }
+
+    #[test]
+    fn teams_less_than_sixteen_silent_with_two_groups() {
+        let mut p = fixture_project();
+        let mut g = AllyGroup::new(1);
+        g.start_positions.push(StartPosition {
+            x_elmo: 200,
+            z_elmo: 200,
+        });
+        p.ally_groups.push(g);
+        // Only 2 groups → rule doesn't fire even with few positions.
+        assert!(!fired(&lint(&p), LintRule::TeamsLessThanSixteenOnLargeMap));
+    }
+
+    // ─── StartboxesLuaMissingWhenMultiTeam ───
+
+    #[test]
+    fn startboxes_missing_fires_with_three_groups_no_boxes() {
+        let mut p = fixture_project();
+        for id in 1..3 {
+            let mut g = AllyGroup::new(id);
+            g.start_positions.push(StartPosition {
+                x_elmo: id as i32 * 200,
+                z_elmo: 200,
+            });
+            p.ally_groups.push(g);
+        }
+        assert!(fired(
+            &lint(&p),
+            LintRule::StartboxesLuaMissingWhenMultiTeam
+        ));
+    }
+
+    #[test]
+    fn startboxes_missing_silent_when_any_group_has_polygon() {
+        let mut p = fixture_project();
+        for id in 1..3 {
+            let mut g = AllyGroup::new(id);
+            g.start_positions.push(StartPosition {
+                x_elmo: id as i32 * 200,
+                z_elmo: 200,
+            });
+            if id == 1 {
+                g.box_polygon = Some(vec![(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)]);
+            }
+            p.ally_groups.push(g);
+        }
+        assert!(!fired(
+            &lint(&p),
+            LintRule::StartboxesLuaMissingWhenMultiTeam
+        ));
+    }
+
+    #[test]
+    fn startboxes_missing_silent_with_two_groups() {
+        let mut p = fixture_project();
+        let mut g = AllyGroup::new(1);
+        g.start_positions.push(StartPosition {
+            x_elmo: 200,
+            z_elmo: 200,
+        });
+        p.ally_groups.push(g);
+        // 2 groups → rule doesn't fire even with no boxes (1v1 fallback OK).
+        assert!(!fired(
+            &lint(&p),
+            LintRule::StartboxesLuaMissingWhenMultiTeam
+        ));
+    }
+
+    // ─── ResourcesDetailTexMissingOnDntsMap ───
+
+    #[test]
+    fn resources_detail_tex_missing_on_dnts_fires() {
+        let p = fixture_project();
+        let mut info: MapInfo = (&p).into();
+        info.resources.splat_detail_normal_tex = vec!["a.dds".into()];
+        info.resources.detail_tex = None;
+        let issues = super::super::lint_with(&p, &info, &StockManifest::default());
+        assert!(fired(&issues, LintRule::ResourcesDetailTexMissingOnDntsMap));
+    }
+
+    #[test]
+    fn resources_detail_tex_silent_when_set() {
+        let p = fixture_project();
+        let mut info: MapInfo = (&p).into();
+        info.resources.splat_detail_normal_tex = vec!["a.dds".into()];
+        info.resources.detail_tex = Some("detail.dds".into());
+        let issues = super::super::lint_with(&p, &info, &StockManifest::default());
+        assert!(!fired(
+            &issues,
+            LintRule::ResourcesDetailTexMissingOnDntsMap
+        ));
+    }
+
+    #[test]
+    fn resources_detail_tex_silent_without_dnts() {
+        let p = fixture_project();
+        assert!(!fired(
+            &lint(&p),
+            LintRule::ResourcesDetailTexMissingOnDntsMap
+        ));
+    }
+
+    // ─── GeoInMetalLayoutGeosArray ───
+
+    #[test]
+    fn geo_in_metal_layout_fires_when_override_present() {
+        let mut p = fixture_project();
+        p.mapinfo_overrides.insert(
+            "map_metal_layout.geos.0.x".into(),
+            toml::Value::Integer(4096),
+        );
+        assert!(fired(&lint(&p), LintRule::GeoInMetalLayoutGeosArray));
+    }
+
+    #[test]
+    fn geo_in_metal_layout_silent_without_override() {
+        let p = fixture_project();
+        assert!(!fired(&lint(&p), LintRule::GeoInMetalLayoutGeosArray));
+    }
+
+    // ─── SmfMetalmapNonZeroWithLuaSpots ───
+
+    #[test]
+    fn metalmap_nonzero_fires_with_spots_and_custom_metalmap() {
+        let mut p = fixture_project();
+        p.metal_spots.push(barme_core::MetalSpot::new(100, 100));
+        p.mapinfo_overrides.insert(
+            "smf.metalmapTex".into(),
+            toml::Value::String("maps/custom_metal.png".into()),
+        );
+        assert!(fired(&lint(&p), LintRule::SmfMetalmapNonZeroWithLuaSpots));
+    }
+
+    #[test]
+    fn metalmap_nonzero_silent_without_custom_override() {
+        let mut p = fixture_project();
+        p.metal_spots.push(barme_core::MetalSpot::new(100, 100));
+        assert!(!fired(&lint(&p), LintRule::SmfMetalmapNonZeroWithLuaSpots));
+    }
+
+    #[test]
+    fn metalmap_nonzero_silent_without_spots() {
+        let mut p = fixture_project();
+        p.mapinfo_overrides.insert(
+            "smf.metalmapTex".into(),
+            toml::Value::String("maps/custom_metal.png".into()),
+        );
+        // No metal spots → rule doesn't fire (engine metalmap is the source).
+        assert!(!fired(&lint(&p), LintRule::SmfMetalmapNonZeroWithLuaSpots));
+    }
+
+    // ─── SunDirWIsLarge ───
+
+    #[test]
+    fn sun_dir_w_large_fires_at_1e9() {
+        let p = fixture_project();
+        let mut info: MapInfo = (&p).into();
+        info.lighting.sun_dir = [0.3, 1.0, -0.2, 1.0e9];
+        let issues = super::super::lint_with(&p, &info, &StockManifest::default());
+        assert!(fired(&issues, LintRule::SunDirWIsLarge));
+    }
+
+    #[test]
+    fn sun_dir_w_small_silent() {
+        let p = fixture_project();
+        assert!(!fired(&lint(&p), LintRule::SunDirWIsLarge));
+    }
+
+    // ─── SplatDetailNormalTexLegacyForm ───
+
+    #[test]
+    fn splat_detail_normal_legacy_fires() {
+        let p = fixture_project();
+        let mut info: MapInfo = (&p).into();
+        info.resources.splat_detail_normal_diffuse_alpha = Some(1);
+        let issues = super::super::lint_with(&p, &info, &StockManifest::default());
+        assert!(fired(&issues, LintRule::SplatDetailNormalTexLegacyForm));
+    }
+
+    #[test]
+    fn splat_detail_normal_legacy_silent_without_field() {
+        let p = fixture_project();
+        assert!(!fired(&lint(&p), LintRule::SplatDetailNormalTexLegacyForm));
+    }
+
+    // ─── DntsOnMapWithMinHeightBelowZero ───
+    //
+    // Note: fires when `Project.layers` has any DNTS-bound layer
+    // AND `min_height < 0`. Synthesizing DNTS-bound layers from
+    // outside `barme-core` would require crossing the layer API
+    // surface; covered indirectly by the silent path below and by
+    // the existing `validation_summary` tests in `barme-app`.
+
+    #[test]
+    fn dnts_on_map_silent_with_no_layers_below_zero() {
+        let mut p = fixture_project();
+        p.min_height = -50.0;
+        // No DNTS layers seeded → rule silent.
+        assert!(!fired(&lint(&p), LintRule::DntsOnMapWithMinHeightBelowZero));
+    }
+
+    // ─── StartPositionShapeWrong ───
+
+    #[test]
+    fn start_position_shape_fires_when_override_flagged() {
+        let mut p = fixture_project();
+        p.mapinfo_overrides.insert(
+            "featureplacer.quoted_rot".into(),
+            toml::Value::Boolean(true),
+        );
+        assert!(fired(&lint(&p), LintRule::StartPositionShapeWrong));
+    }
+
+    #[test]
+    fn start_position_shape_silent_by_default() {
+        let p = fixture_project();
+        assert!(!fired(&lint(&p), LintRule::StartPositionShapeWrong));
+    }
+
+    // ─── LuaGaiaTeamMissing ───
+
+    #[test]
+    fn lua_gaia_team_missing_fires_when_bootstrap_opted_out() {
+        let mut p = fixture_project();
+        // Second ally group → multiplayer.
+        let mut g = AllyGroup::new(1);
+        g.start_positions.push(StartPosition {
+            x_elmo: 800,
+            z_elmo: 800,
+        });
+        p.ally_groups.push(g);
+        p.mapinfo_overrides.insert(
+            "build.luagaia_bootstrap".into(),
+            toml::Value::Boolean(false),
+        );
+        assert!(fired(&lint(&p), LintRule::LuaGaiaTeamMissing));
+    }
+
+    #[test]
+    fn lua_gaia_team_silent_for_single_ally_group() {
+        let mut p = fixture_project();
+        p.mapinfo_overrides.insert(
+            "build.luagaia_bootstrap".into(),
+            toml::Value::Boolean(false),
+        );
+        // Only one ally group from fixture_project — not multiplayer.
+        assert!(!fired(&lint(&p), LintRule::LuaGaiaTeamMissing));
+    }
+
+    #[test]
+    fn lua_gaia_team_silent_when_bootstrap_present() {
+        let mut p = fixture_project();
+        let mut g = AllyGroup::new(1);
+        g.start_positions.push(StartPosition {
+            x_elmo: 800,
+            z_elmo: 800,
+        });
+        p.ally_groups.push(g);
+        // No opt-out override → bootstrap stages by default; lint silent.
+        assert!(!fired(&lint(&p), LintRule::LuaGaiaTeamMissing));
+    }
+
+    // ─── MetalValueOutOfBARRange ───
+
+    #[test]
+    fn metal_value_below_range_fires() {
+        let p = fixture_project();
+        let mut info: MapInfo = (&p).into();
+        info.max_metal = Some(0.02);
+        let issues = super::super::lint_with(&p, &info, &StockManifest::default());
+        assert!(fired(&issues, LintRule::MetalValueOutOfBARRange));
+    }
+
+    #[test]
+    fn metal_value_above_range_fires() {
+        let p = fixture_project();
+        let mut info: MapInfo = (&p).into();
+        info.max_metal = Some(10.0);
+        let issues = super::super::lint_with(&p, &info, &StockManifest::default());
+        assert!(fired(&issues, LintRule::MetalValueOutOfBARRange));
+    }
+
+    #[test]
+    fn metal_value_in_bar_range_silent() {
+        let p = fixture_project();
+        // Default 1.0 — BAR median.
+        assert!(!fired(&lint(&p), LintRule::MetalValueOutOfBARRange));
+    }
+
+    /// Aggregate warning-tier severity check: a wizard-style fixture
+    /// produces ≤ 2 warnings (the Sprint 21 exit criterion).
+    #[test]
+    fn wizard_style_fixture_emits_at_most_two_warnings() {
+        let p = fixture_project();
+        let issues = lint(&p);
+        let warnings: Vec<&LintIssue> = issues
+            .iter()
+            .filter(|i| i.severity == LintSeverity::Warning)
+            .collect();
+        assert!(
+            warnings.len() <= 2,
+            "wizard-style fixture produced {} warnings (cap is 2): {:#?}",
+            warnings.len(),
+            warnings
+        );
     }
 }
