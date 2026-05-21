@@ -312,9 +312,39 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         + vec3<f32>(foam_factor);
     let composite_with_reflection = mix(below, refl_color, fresnel * refl_enabled);
 
+    // ─── LAVA EMISSION (Sprint 26 / R3 commit 5) ───────────────────
+    //
+    // When the preset is Lava or Magma, the surface self-illuminates
+    // with `surface_color × emission_strength × (1 + caust · 0.5)`.
+    // The caustic modulation gives the lava its characteristic
+    // pulsating glow. Sprint 28 (atmosphere) will replace the
+    // hardcoded `0.5` daylight factor with `dot(sun_dir, world_up)`
+    // so the lava ramps to max brightness at night and dims under
+    // direct sun. Sprint 30 (shadows) inhibits this branch under
+    // cast shadows.
+    //
+    // `polish_c.w` gates the branch — 1.0 for Lava/Magma, 0.0
+    // otherwise. Keeping it as a multiply (not a divergent `if`)
+    // means the shader stays uniform across preset switches — no
+    // recompile cost when the user clicks between Ocean and Lava.
+    let lava_emission_flag = u.polish_c.w;
+    let daylight = 0.5; // Sprint 28: dot(sun_dir, world_up).
+    let emission_strength = 0.8;
+    // Take the un-premultiplied surface tint as the emission colour
+    // (`surf_premul / surf_alpha`) so emission strength is independent
+    // of the user's `surface_alpha` slider. Guard against div-by-zero.
+    let emission_color = surf_premul / max(surf_alpha, 1e-3);
+    let lava_glow = emission_color
+        * (1.0 + caust * 0.5)
+        * emission_strength
+        * daylight
+        * lava_emission_flag;
+
+    let final_rgb = composite_with_reflection + lava_glow;
+
     // Pre-multiplied output. The pipeline's blend state multiplies
     // by alpha; we return RGB pre-multiplied by `alpha_scale × surf_alpha`
     // so the blend equation reduces to `dst + src - src·dst·α`.
     let out_alpha = surf_alpha * alpha_scale;
-    return vec4<f32>(composite_with_reflection * alpha_scale, out_alpha);
+    return vec4<f32>(final_rgb * alpha_scale, out_alpha);
 }
