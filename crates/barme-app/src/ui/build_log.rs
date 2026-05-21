@@ -28,6 +28,10 @@ use crate::ui::theme::Tokens;
 pub struct LogPanelClicks {
     pub clear: bool,
     pub save_as: Option<PathBuf>,
+    /// Sprint 22 / U2 — `[What does this mean?]` button on the
+    /// Failed-state header. Set when the user clicks; the App
+    /// routes to `HelpArticleId::BuildPipeline`.
+    pub open_build_help: bool,
 }
 
 /// Render the build log panel. Caller passes a mutable `bool` that
@@ -51,7 +55,7 @@ pub fn render(ctx: &egui::Context, open: &mut bool, state: &BuildState) -> LogPa
         .default_height(360.0)
         .show(ctx, |ui| {
             // ─── Header — current state summary ─────────────────────
-            render_header(ui, state, &t);
+            render_header(ui, state, &t, &mut clicks);
             ui.separator();
 
             // ─── Body — scrollable monospace lines ──────────────────
@@ -112,7 +116,7 @@ pub fn render(ctx: &egui::Context, open: &mut bool, state: &BuildState) -> LogPa
 }
 
 /// One-line header describing the current build state.
-fn render_header(ui: &mut egui::Ui, state: &BuildState, t: &Tokens) {
+fn render_header(ui: &mut egui::Ui, state: &BuildState, t: &Tokens, clicks: &mut LogPanelClicks) {
     match state {
         BuildState::Idle => {
             ui.label(egui::RichText::new("Idle").color(t.muted).size(12.0));
@@ -155,11 +159,32 @@ fn render_header(ui: &mut egui::Ui, state: &BuildState, t: &Tokens) {
         BuildState::Failed {
             error, duration, ..
         } => {
-            ui.label(
-                egui::RichText::new(format!("✗ Failed after {}s: {error}", duration.as_secs()))
+            // Sprint 22 / U2: failure header carries a "What does
+            // this mean?" button that opens the BuildPipeline help
+            // article. Common failures + their resolutions are
+            // documented there.
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "✗ Failed after {}s: {error}",
+                        duration.as_secs()
+                    ))
                     .color(egui::Color32::from_rgb(220, 110, 90))
                     .size(12.0),
-            );
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .small_button("What does this mean?")
+                        .on_hover_text(
+                            "Open the Build pipeline article in the help center —\n\
+                             documents common PyMapConv failures and their fixes.",
+                        )
+                        .clicked()
+                    {
+                        clicks.open_build_help = true;
+                    }
+                });
+            });
         }
         BuildState::Cancelled { duration, .. } => {
             ui.label(

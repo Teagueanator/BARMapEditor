@@ -32,7 +32,18 @@ use barme_pipeline::{LintFix, LintIssue, LintRule, LintSeverity};
 use eframe::egui;
 use tracing::trace;
 
+use crate::ui::help_center::HelpArticleId;
 use crate::ui::theme::{ChipTone, Tokens};
+
+/// Sprint 22 / U2 — outcome from one lint-panel frame. `fix`
+/// carries the user's Fix click; `open_help` carries a click on a
+/// rule row's `[Help…]` button. Both can be Some on the same
+/// frame if the user mass-clicks.
+#[derive(Debug, Default)]
+pub struct LintPanelOutcome {
+    pub fix: Option<MapInfoPatch>,
+    pub open_help: Option<HelpArticleId>,
+}
 
 /// Severity-tinted palette used both here and in the build log.
 /// Centralised so a change here propagates everywhere visually.
@@ -56,15 +67,16 @@ fn severity_label(severity: LintSeverity) -> &'static str {
 /// drives visibility — the panel sets it to `false` when the user
 /// closes the window.
 ///
-/// Returns `Some(MapInfoPatch)` when the user clicks a Fix button.
-/// The App dispatches the patch via `apply_mapinfo_patch` and pushes
-/// the inverse as a `ProjectDiff::EditMapInfo` undo entry.
+/// Sprint 22 / U2: returns a [`LintPanelOutcome`] carrying both a
+/// Fix click (which dispatches via `apply_mapinfo_patch` + an
+/// `EditMapInfo` undo entry) and a Help click (which opens the
+/// help center on the corresponding pitfall article).
 pub fn render(
     ctx: &egui::Context,
     open: &mut bool,
     issues: &[LintIssue],
     previously_open: &mut bool,
-) -> Option<MapInfoPatch> {
+) -> LintPanelOutcome {
     if *open && !*previously_open {
         trace!(target: "barme::lint_panel", "lint_panel opened");
     } else if !*open && *previously_open {
@@ -73,12 +85,12 @@ pub fn render(
     *previously_open = *open;
 
     if !*open {
-        return None;
+        return LintPanelOutcome::default();
     }
 
     let t = Tokens::DARK;
     let mut local_open = true;
-    let mut fix_to_apply: Option<MapInfoPatch> = None;
+    let mut outcome = LintPanelOutcome::default();
     egui::Window::new("Project lint")
         .open(&mut local_open)
         .collapsible(false)
@@ -86,15 +98,15 @@ pub fn render(
         .default_width(520.0)
         .default_height(420.0)
         .show(ctx, |ui| {
-            fix_to_apply = render_body(ui, issues, t);
+            outcome = render_body(ui, issues, t);
         });
     if !local_open {
         *open = false;
     }
-    fix_to_apply
+    outcome
 }
 
-fn render_body(ui: &mut egui::Ui, issues: &[LintIssue], t: Tokens) -> Option<MapInfoPatch> {
+fn render_body(ui: &mut egui::Ui, issues: &[LintIssue], t: Tokens) -> LintPanelOutcome {
     let errors = issues
         .iter()
         .filter(|i| i.severity == LintSeverity::Error)
@@ -135,7 +147,7 @@ fn render_body(ui: &mut egui::Ui, issues: &[LintIssue], t: Tokens) -> Option<Map
     });
     ui.separator();
 
-    let mut fix: Option<MapInfoPatch> = None;
+    let mut outcome = LintPanelOutcome::default();
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| {
@@ -158,8 +170,12 @@ fn render_body(ui: &mut egui::Ui, issues: &[LintIssue], t: Tokens) -> Option<Map
                     );
                     ui.separator();
                     for issue in group {
-                        if let Some(patch) = render_issue_row(ui, issue, t) {
-                            fix = Some(patch);
+                        let row = render_issue_row(ui, issue, t);
+                        if row.fix.is_some() {
+                            outcome.fix = row.fix;
+                        }
+                        if row.open_help.is_some() {
+                            outcome.open_help = row.open_help;
                         }
                     }
                 }
@@ -177,11 +193,11 @@ fn render_body(ui: &mut egui::Ui, issues: &[LintIssue], t: Tokens) -> Option<Map
             }
         });
 
-    fix
+    outcome
 }
 
-fn render_issue_row(ui: &mut egui::Ui, issue: &LintIssue, t: Tokens) -> Option<MapInfoPatch> {
-    let mut fix: Option<MapInfoPatch> = None;
+fn render_issue_row(ui: &mut egui::Ui, issue: &LintIssue, t: Tokens) -> LintPanelOutcome {
+    let mut row_outcome = LintPanelOutcome::default();
     ui.horizontal(|ui| {
         let (dot_rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 18.0), egui::Sense::hover());
         let center = egui::pos2(dot_rect.left() + 5.0, dot_rect.center().y);
@@ -225,15 +241,31 @@ fn render_issue_row(ui: &mut egui::Ui, issue: &LintIssue, t: Tokens) -> Option<M
                             ))
                             .clicked()
                         {
-                            fix = Some(patch.clone());
+                            row_outcome.fix = Some(patch.clone());
                         }
                     });
                 }
+                // Sprint 22 / U2 — `[Help…]` button routes to the
+                // help center on the issue's PITFALLS.md anchor.
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let anchor_str = issue.rule.pitfall_anchor();
+                    let anchor_n: u8 = anchor_str.parse().unwrap_or(0);
+                    if ui
+                        .small_button("Help…")
+                        .on_hover_text(format!(
+                            "Open the help center article for PITFALL §{anchor_str}."
+                        ))
+                        .clicked()
+                    {
+                        row_outcome.open_help =
+                            Some(HelpArticleId::from_pitfall_anchor(anchor_n));
+                    }
+                });
             });
         });
     });
     ui.separator();
-    fix
+    row_outcome
 }
 
 /// Live issue count from a registry-backed `Vec<LintIssue>`. Used by
@@ -363,26 +395,27 @@ mod tests {
         let mut prev = false;
         let issues = vec![issue(LintRule::ModtypeNotThree, Some("modtype"))];
         let _ = ctx.run(Default::default(), |ctx| {
-            let _fix = render(ctx, &mut open, &issues, &mut prev);
+            let _outcome = render(ctx, &mut open, &issues, &mut prev);
         });
         assert!(prev, "previously_open should mirror open after render");
         assert!(open, "lint panel should stay open when no close fired");
     }
 
-    /// When `open = false`, `render` early-returns and never produces
-    /// a fix.
+    /// When `open = false`, `render` early-returns and never
+    /// produces an outcome.
     #[test]
     fn render_no_op_when_closed() {
         let ctx = egui::Context::default();
         let mut open = false;
         let mut prev = true;
         let issues: Vec<LintIssue> = vec![];
-        let mut fix_seen = None;
+        let mut outcome_seen = LintPanelOutcome::default();
         let _ = ctx.run(Default::default(), |ctx| {
-            fix_seen = render(ctx, &mut open, &issues, &mut prev);
+            outcome_seen = render(ctx, &mut open, &issues, &mut prev);
         });
         assert!(!prev);
-        assert!(fix_seen.is_none());
+        assert!(outcome_seen.fix.is_none());
+        assert!(outcome_seen.open_help.is_none());
     }
 
     /// Panel renders an "all clear" footer when the issue list is
@@ -394,8 +427,8 @@ mod tests {
         let mut prev = true;
         let issues: Vec<LintIssue> = vec![];
         let _ = ctx.run(Default::default(), |ctx| {
-            let _fix = render(ctx, &mut open, &issues, &mut prev);
+            let _outcome = render(ctx, &mut open, &issues, &mut prev);
         });
-        // No panic, no fix returned.
+        // No panic.
     }
 }

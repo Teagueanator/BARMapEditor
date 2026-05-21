@@ -199,6 +199,18 @@ pub fn render(app: &mut App, ui: &mut egui::Ui) {
                         .small()
                         .weak(),
                 );
+                // Sprint 22 / U2 — link to the help-center article
+                // so users new to the layered painter have a one-
+                // click path to the data-model + bake explanation.
+                if ui
+                    .small_button("How layers work")
+                    .on_hover_text(
+                        "Open the Layered painter reference article in the help center.",
+                    )
+                    .clicked()
+                {
+                    actions.borrow_mut().push(LayerAction::OpenHelpHowLayersWork);
+                }
                 return;
             }
 
@@ -330,6 +342,9 @@ enum LayerAction {
     AddLayerFromImport,
     DuplicateActive,
     SetDntsDiffuseInAlpha(bool),
+    /// Sprint 22 / U2 — empty-state help link. Opens the help
+    /// center on the layered-painter reference article.
+    OpenHelpHowLayersWork,
 }
 
 fn apply_actions(app: &mut App, actions: Vec<LayerAction>) {
@@ -537,6 +552,10 @@ fn apply_actions(app: &mut App, actions: Vec<LayerAction>) {
                     app.dnts_diffuse_in_alpha = v;
                     app.mark_dirty();
                 }
+            }
+            LayerAction::OpenHelpHowLayersWork => {
+                app.help_center
+                    .open_at(crate::ui::help_center::HelpArticleId::LayeredPainter);
             }
         }
     }

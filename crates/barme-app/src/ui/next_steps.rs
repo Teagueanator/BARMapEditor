@@ -13,6 +13,10 @@ pub enum NextStepsAction {
     /// `Project.next_steps_dismissed = true` so save/load keeps the
     /// hint hidden for this project specifically.
     Dismiss,
+    /// Sprint 22 / U2 — User clicked `[Start the tour]`. Caller
+    /// resets `EditorConfig.tour_completed_for` and starts the
+    /// guided tour. The Window itself does not auto-close.
+    StartTour,
 }
 
 /// Three task-oriented bullets the wizard's freshly-seeded demo
@@ -37,6 +41,7 @@ pub fn render_next_steps_hint(ctx: &egui::Context, open: &mut bool) -> Option<Ne
     }
     let mut local_open = true;
     let mut dismissed = false;
+    let mut start_tour = false;
     egui::Window::new("Next steps")
         .open(&mut local_open)
         .collapsible(false)
@@ -52,19 +57,38 @@ pub fn render_next_steps_hint(ctx: &egui::Context, open: &mut bool) -> Option<Ne
                 ui.label(format!("• {bullet}"));
             }
             ui.add_space(8.0);
-            if ui
-                .button("Got it")
-                .on_hover_text(
-                    "Dismiss this hint for the current project. Save/load preserves the dismissal.",
-                )
-                .clicked()
-            {
-                dismissed = true;
-            }
+            ui.horizontal(|ui| {
+                if ui
+                    .button("Got it")
+                    .on_hover_text(
+                        "Dismiss this hint for the current project. Save/load preserves the dismissal.",
+                    )
+                    .clicked()
+                {
+                    dismissed = true;
+                }
+                ui.add_space(8.0);
+                // Sprint 22 / U2: explicit tour entry point.
+                if ui
+                    .button("Start the tour")
+                    .on_hover_text(
+                        "Run the 7-step guided walkthrough. Re-runnable any time \
+                         from Help > Start guided tour.",
+                    )
+                    .clicked()
+                {
+                    start_tour = true;
+                }
+            });
         });
     if !local_open {
         // The user clicked the Window's X.
         dismissed = true;
+    }
+    if start_tour {
+        // Start tour does NOT dismiss the hint — user might want
+        // the bullets in front of them while the tour runs.
+        return Some(NextStepsAction::StartTour);
     }
     if dismissed {
         *open = false;
@@ -100,10 +124,9 @@ mod tests {
     }
 
     #[test]
-    fn action_is_dismiss_only() {
-        // Single-variant enum, pinned so a future addition doesn't
-        // silently change the caller contract.
-        let act = NextStepsAction::Dismiss;
-        assert_eq!(act, NextStepsAction::Dismiss);
+    fn dismiss_and_start_tour_are_distinct_actions() {
+        // Sprint 22 / U2 added StartTour. Pin both so a future
+        // change is intentional.
+        assert_ne!(NextStepsAction::Dismiss, NextStepsAction::StartTour);
     }
 }

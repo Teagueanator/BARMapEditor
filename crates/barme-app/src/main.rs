@@ -5089,6 +5089,12 @@ impl App {
                 }
             }
         }
+        // Sprint 22 / U2 — Build-log "What does this mean?" button
+        // on the Failed-state header.
+        if clicks.open_build_help {
+            self.help_center
+                .open_at(crate::ui::help_center::HelpArticleId::BuildPipeline);
+        }
     }
 
     /// Sprint 20 / chunk 8 — apply the save-before-build modal's
@@ -6629,6 +6635,55 @@ impl App {
                 .clicked()
             {
                 self.build_log_open = true;
+                ui.close();
+            }
+        });
+
+        // Sprint 22 / U2 — Help menu. The principal entry for the
+        // tour re-trigger + tool-intro reset + help-center jumps.
+        ui.menu_button("Help", |ui| {
+            if ui
+                .button("Open help center")
+                .on_hover_text("Re-openable help center. Articles per tool, per pitfall, plus Getting started + What's new.")
+                .clicked()
+            {
+                self.help_center
+                    .open_at(crate::ui::help_center::HelpArticleId::GettingStarted);
+                ui.close();
+            }
+            if ui
+                .button("Start guided tour")
+                .on_hover_text("Walk through the 7-step tour again. Resets the per-version completion flag.")
+                .clicked()
+            {
+                self.editor_config.reset_tour_completion();
+                self.tour.start();
+                ui.close();
+            }
+            if ui
+                .button("Reset tool intros")
+                .on_hover_text("Clear the 'Don't show again' set so every tool re-pops its intro on next entry.")
+                .clicked()
+            {
+                self.editor_config.reset_tool_intros();
+                self.editor_config.save();
+                ui.close();
+            }
+            ui.separator();
+            if ui
+                .button("Cheat sheet (?)")
+                .on_hover_text("Compact keyboard reference. Also opens via the ? chord.")
+                .clicked()
+            {
+                self.show_cheat_sheet = true;
+                ui.close();
+            }
+            if ui
+                .button("Command palette (Ctrl+K)")
+                .on_hover_text("Fuzzy-search every tool, preset, menu item, and shortcut.")
+                .clicked()
+            {
+                self.command_palette.show();
                 ui.close();
             }
         });
@@ -10785,17 +10840,23 @@ impl eframe::App for App {
         // `App::lint_summary`. A Fix click returns a `MapInfoPatch`
         // which we dispatch through the F9 form's undo path so
         // Ctrl-Z restores the prior value.
-        let fix_patch = crate::ui::lint_panel::render(
+        // Sprint 22 / U2 extends the outcome with a per-row
+        // `[Help…]` click that opens the help center on the
+        // PITFALL anchor.
+        let lint_outcome = crate::ui::lint_panel::render(
             ctx,
             &mut self.lint_panel_open,
             &self.lint_summary,
             &mut self.lint_panel_was_open,
         );
-        if let Some(patch) = fix_patch {
+        if let Some(patch) = lint_outcome.fix {
             let from = self.snapshot_mapinfo_patch_inverse(&patch);
             self.apply_mapinfo_patch(patch.clone());
             self.history
                 .push_project_diff(ProjectDiff::EditMapInfo { from, to: patch });
+        }
+        if let Some(article) = lint_outcome.open_help {
+            self.help_center.open_at(article);
         }
 
         // First-launch hint (B3). Renders ONLY after the wizard closes
@@ -10908,13 +10969,17 @@ impl eframe::App for App {
         // flag in the `.barmeproj`). Skipped while either wizard or
         // intro is up — three stacked floating windows would be
         // chaos.
-        if self.show_next_steps
-            && !self.wizard_open
-            && !self.show_intro
-            && let Some(crate::ui::next_steps::NextStepsAction::Dismiss) =
-                crate::ui::next_steps::render_next_steps_hint(ctx, &mut self.show_next_steps)
-        {
-            self.dismiss_next_steps();
+        if self.show_next_steps && !self.wizard_open && !self.show_intro {
+            match crate::ui::next_steps::render_next_steps_hint(ctx, &mut self.show_next_steps) {
+                Some(crate::ui::next_steps::NextStepsAction::Dismiss) => {
+                    self.dismiss_next_steps();
+                }
+                Some(crate::ui::next_steps::NextStepsAction::StartTour) => {
+                    self.editor_config.reset_tour_completion();
+                    self.tour.start();
+                }
+                None => {}
+            }
         }
 
         // Wizard renders on top, after all other panels. Drains to
