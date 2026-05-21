@@ -3713,6 +3713,27 @@ mod tests {
         assert_eq!(SLOT_NORMAL_FORMAT, wgpu::TextureFormat::Rgba8Unorm);
     }
 
+    /// Sprint 25 / R1 / ADR-038 — parse + validate `terrain.wgsl` at
+    /// `cargo test` time using wgpu's re-exported naga. wgpu only
+    /// compiles the WGSL at GPU `create_shader_module` time, which we
+    /// can't reach in headless CI; this test catches WGSL syntax /
+    /// type / binding-layout drift before the user runs the app.
+    #[test]
+    fn terrain_wgsl_parses_and_validates() {
+        use wgpu::naga::front::wgsl;
+        use wgpu::naga::valid::{Capabilities, ValidationFlags, Validator};
+
+        let src = include_str!("terrain.wgsl");
+        let module = match wgsl::parse_str(src) {
+            Ok(m) => m,
+            Err(e) => panic!("terrain.wgsl parse failed:\n{}", e.emit_to_string(src)),
+        };
+        let mut validator = Validator::new(ValidationFlags::all(), Capabilities::all());
+        if let Err(e) = validator.validate(&module) {
+            panic!("terrain.wgsl validate failed:\n{e:?}");
+        }
+    }
+
     // ---- Phase 1 (Sprint 13 / ADR-037): offscreen RT size resolution ----
 
     #[test]

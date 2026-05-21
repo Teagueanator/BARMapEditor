@@ -1,26 +1,48 @@
-// Stage 1 terrain shader (ADR-017 vertex; ADR-036 fragment).
+// Stage 1 terrain shader.
+//
+// Sprint 25 / R1 / ADR-038 — UNIFIED port of Recoil's
+// `cont/base/springcontent/shaders/GLSL/SMFFragProg.glsl`
+// (`SMF_DETAIL_NORMAL_TEXTURE_SPLATTING` branch). Each fragment-stage
+// section cites the GLSL source line so a reviewer can read the WGSL
+// alongside the engine source. The transcription follows
+// FINDINGS §7.1–§7.6 (source-audit 2026-05-18) which corrects five
+// pre-existing claims about the splat composite math.
 //
 // Vertex stage samples the heightmap as a storage texture (r16uint) so
 // brush edits become texture writes, not full-mesh re-uploads. A 4-tap
 // finite difference of neighbouring heights yields a per-vertex normal
-// in world space — interpolated into the fragment stage as the "base
-// normal" (the engine uses a baked SMT normal texture sampled per
-// fragment; the editor has no SMT bake at preview time).
+// in world space — kept as a fallback for the fragment stage's base
+// normal when no `normalsTex` is bound (the engine's base normal is
+// sampled per-fragment from a baked R+A texture; the editor doesn't
+// run that bake at preview time so the vertex normal carries the real
+// signal until a future sprint plumbs the heightmap → R+A bake).
 //
-// Fragment stage composites four diffuse layers from a `texture_2d_array`
-// by the per-channel `splatCofac = textureSample(splatDistr, uv) *
-// texMults` weights — directly translated from
-// `RecoilEngine/cont/base/springcontent/shaders/GLSL/SMFFragProg.glsl`
-// lines 174-198 (the SMF_DETAIL_NORMAL_TEXTURE_SPLATTING branch) with
-// the diffuse-only simplification documented in ADR-036. When the
-// cofactor sum is zero (no slots painted, or all weights ramp to 0),
-// the fragment falls back to a heightmap-driven biome gradient so
-// unpainted maps still look like terrain.
+// Fragment stage:
+//   1. Sample base normal from `normals_tex.ra` (FINDINGS §7.5). The
+//      `has_base_normal_tex` bit (flags.w & 1) picks between sampled
+//      and vertex normal — both are uniform per-frame so the branch
+//      is uniform control flow.
+//   2. Build TBN per-fragment via cross(normal, vec3(-1, 0, 0))
+//      (FINDINGS §7.4 — NOT static `T=+X, B=+Z`).
+//   3. Sample the 4 DNTS slot normals with PER-CHANNEL UV multipliers
+//      `worldPos.xz * tex_scales.{r,g,b,a}` (FINDINGS §7.3).
+//   4. splatCofac = textureSample(distr, uv) × tex_mults × active_mask
+//      (FINDINGS §7.3); blend strength = min(1, dot(cofac, 1)).
+//   5. splat_detail_normal = sum of (decoded × cofac) per channel;
+//      `.y = max(.y, 0.01)` per `SMFFragProg.glsl:189`.
+//   6. Final normal = normalize(mix(base_normal, normalize(stnMatrix
+//      × splat_detail_normal.xyz), blend_strength))
+//      (`SMFFragProg.glsl:328`).
+//   7. Lambert + Blinn-Phong using the final normal, with per-fragment
+//      specular exponent `specularCol.a × 16.0` (FINDINGS §7.6).
+//   8. fragColor = (diffuseCol + detailCol) × shadeInt + specularInt
+//      (`SMFFragProg.glsl:381 + 422`).
 //
-// Per FINDINGS §7 (source-audit 2026-05-18), the constant is
-// SMF_INTENSITY_MULT (with T); we pre-apply it CPU-side on the
-// ambient colour to keep the shader clean.
-
+// Per FINDINGS §7.1, `SMF_INTENSITY_MULT = 210/255` is pre-applied to
+// `ground_ambient` + `ground_diffuse` CPU-side so the WGSL stays free
+// of the multiply. The engine multiplies once per-fragment inside
+// `GetShadeInt`; we hoist.
+//
 // ADR-008 governs world-space conventions: Y-up left-handed,
 // +X east, +Z south, 8 elmos per heightmap pixel.
 
@@ -45,25 +67,41 @@ struct Uniforms {
     params2: vec4<f32>,
 };
 
-// Per-channel splat tuning + lighting state (ADR-036).
+// Per-channel splat tuning + lighting state (ADR-036 / ADR-038).
 //
 // `tex_scales` maps directly to mapinfo `splats.texScales` — each
-// channel scales `worldPos.xz` to produce the per-layer detail UV.
-// `tex_mults` maps to `splats.texMults` — per-channel weight multiplier
-// applied to the splat distribution sample.
+// channel scales `worldPos.xz` to produce the per-layer detail UV
+// (FINDINGS §7.3).
+// `tex_mults` maps to `splats.texMults` — per-channel weight
+// multiplier applied to the splat distribution sample.
 //
 // `flags.x = active_slot_mask` (bit i set = layer i is bound to a
 // real slot). Unbound layers contribute zero so a fresh project with
 // no slots assigned still renders the fallback gradient.
 //
-// `flags.y = diffuse_in_alpha` (0 / 1) — ADR-034 placeholder. Plumbed
-// but UNUSED in this sprint: the high-pass diffuse-offset workflow
-// from `splatDetailNormalDiffuseAlpha = 1` requires the DNTS-encoded
-// alpha bake which D5 deliberately keeps off (ADR-025 baseline).
+// `flags.y = diffuse_in_alpha` (0 / 1). When set, the engine's
+// `SMF_DETAIL_NORMAL_DIFFUSE_ALPHA` path adds
+// `clamp(splat_detail_normal.a, -1, 1)` to the diffuse colour
+// (`SMFFragProg.glsl:192 + 323`); we implement the same.
 //
+// `flags.z = buildable_overlay_on` — when 1, fragments where the
+// world-normal Y slope drops below cos(10°) get mixed with a red
+// "too steep" overlay.
+//
+// `flags.w = tex_present_bits` (Sprint 25 / R1 / ADR-038):
+//   bit 0 = base-normal texture bound (sample normals_tex.ra);
+//   bit 1 = specular texture bound (per-fragment exponent);
+//   bit 2 = DNTS slot-normal array populated (do the §7.3 blend).
 // `sun_dir` is the world-space *to-sun* direction (normalized).
-// `ground_ambient` already has `SMF_INTENSITY_MULT = 210/255`
-// pre-multiplied CPU-side (FINDINGS §7.1).
+// `ground_ambient` / `ground_diffuse` are pre-multiplied by
+// `SMF_INTENSITY_MULT = 210/255` CPU-side (FINDINGS §7.1).
+// `ground_specular.xyz` is the fallback specular colour;
+// `ground_specular.w` is the global exponent used when no specular
+// texture is bound (FINDINGS §7.6).
+// `camera_pos.xyz` is the world-space eye for the Blinn-Phong
+// half-vector (the engine computes this in
+// `SMFVertProg.glsl:34-41`; we move it to the fragment stage because
+// the vertex shader doesn't carry it).
 struct SplatU {
     tex_scales: vec4<f32>,
     tex_mults:  vec4<f32>,
@@ -71,21 +109,35 @@ struct SplatU {
     sun_dir:    vec4<f32>,
     ground_ambient: vec4<f32>,
     ground_diffuse: vec4<f32>,
+    ground_specular: vec4<f32>,
+    camera_pos: vec4<f32>,
 };
 
-@group(0) @binding(0) var<uniform> u: Uniforms;
-@group(0) @binding(1) var heightmap: texture_2d<u32>;
-@group(0) @binding(2) var<uniform> sp: SplatU;
-@group(0) @binding(3) var splat_distr: texture_2d<f32>;
-@group(0) @binding(4) var splat_distr_samp: sampler;
-@group(0) @binding(5) var slot_diffuse: texture_2d_array<f32>;
-@group(0) @binding(6) var slot_diffuse_samp: sampler;
+@group(0) @binding(0)  var<uniform> u: Uniforms;
+@group(0) @binding(1)  var heightmap: texture_2d<u32>;
+@group(0) @binding(2)  var<uniform> sp: SplatU;
+@group(0) @binding(3)  var splat_distr: texture_2d<f32>;
+@group(0) @binding(4)  var splat_distr_samp: sampler;
+// Sprint 25 / R1 / ADR-038 — slot-normal array. Was the Sprint-9
+// 4-layer slot diffuse array; Sprint 17 retired the diffuse role
+// (composite RT takes over) and Sprint 25 repurposes the binding
+// as DNTS normals (engine `splatDetailNormalTex1..4`).
+@group(0) @binding(5)  var slot_normals: texture_2d_array<f32>;
+@group(0) @binding(6)  var slot_normals_samp: sampler;
 // Sprint 16 / D9 / ADR-039 — layered composite RT bound as the
 // diffuse base when `u.params2.y > 0.5`. Cap dims 4096²; the shader
 // bilinearly upsamples to the terrain's per-fragment sample
 // coordinate. CPU bake stays authoritative for the .sd7 export.
-@group(0) @binding(7) var composite_rt: texture_2d<f32>;
-@group(0) @binding(8) var composite_samp: sampler;
+@group(0) @binding(7)  var composite_rt: texture_2d<f32>;
+@group(0) @binding(8)  var composite_samp: sampler;
+// Sprint 25 / R1 / ADR-038 — base normal map (engine `normalsTex`).
+// FINDINGS §7.5 — only R + A channels read; ny = sqrt(1 - nx² - nz²).
+@group(0) @binding(9)  var normals_tex: texture_2d<f32>;
+@group(0) @binding(10) var normals_samp: sampler;
+// Sprint 25 / R1 / ADR-038 — specular map (engine `specularTex`).
+// FINDINGS §7.6 — `specular_exp = sample.a × 16.0` per fragment.
+@group(0) @binding(11) var specular_tex: texture_2d<f32>;
+@group(0) @binding(12) var specular_samp: sampler;
 
 struct VsOut {
     @builtin(position) clip_pos: vec4<f32>,
@@ -123,9 +175,11 @@ fn vs_main(@builtin(vertex_index) vid: u32) -> VsOut {
     );
 
     // 4-tap finite difference for the per-vertex normal. Engine path
-    // samples a baked SMT normal texture per-fragment; we approximate
-    // by hand because the editor doesn't run the normal bake at
-    // preview time.
+    // samples a baked SMT normal texture per-fragment; until the
+    // editor bakes that texture, the vertex normal carries the real
+    // signal and the fragment stage's `has_base_normal_tex` flag
+    // stays at 0 so the sampled `normals_tex` (1×1 "up" fallback)
+    // is ignored.
     let h_l = sample_y(px - 1, pz, dims, min_h, max_h);
     let h_r = sample_y(px + 1, pz, dims, min_h, max_h);
     let h_u = sample_y(px, pz - 1, dims, min_h, max_h);
@@ -153,7 +207,8 @@ fn vs_main(@builtin(vertex_index) vid: u32) -> VsOut {
 
 // Heightmap → biome gradient. Mirrors `crates/barme-app/src/ui/minimap.rs`
 // `biome_ramp` so the central viewport and the mini-map agree on the
-// fallback colour family.
+// fallback colour family. Used as the diffuse base when no composite
+// RT is bound (i.e. the project's layer stack is empty).
 fn biome_ramp(t: f32) -> vec3<f32> {
     let tc = clamp(t, 0.0, 1.0);
     if (tc < 0.30) { return vec3<f32>(0.157, 0.235, 0.337); }
@@ -168,93 +223,186 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let max_h = u.params.x;
     let min_h = u.params2.x;
 
-    // splatCofac = per-pixel distribution × per-channel weight scale
-    // (FINDINGS §7.3). The active_slot_mask zeroes layers the user
-    // hasn't bound so a fresh project doesn't sample a stale layer.
+    // ─── 1. Texture-presence bits (FINDINGS §7.2) ────────────────
+    // Engine's `SMF_DETAIL_NORMAL_TEXTURE_SPLATTING` gate is
+    // `splatDistrTex && HaveSplatNormalTexture()` per
+    // `SMFRenderState.cpp:114` — NOT AND-ed with specularTex.
+    let tex_bits = sp.flags.w;
+    let has_base_normal = f32(tex_bits & 1u);
+    let has_specular   = f32((tex_bits >> 1u) & 1u);
+    let has_dnts_norm  = f32((tex_bits >> 2u) & 1u);
+
+    // ─── 2. Base normal (FINDINGS §7.5) ──────────────────────────
+    // `vec3 normal = GetFragmentNormal(normTexCoords);` —
+    // SMFFragProg.glsl:269 / function defined at lines 146-150.
+    // `normal.xz = texture2D(normalsTex, uv).ra; normal.y = sqrt(1
+    // - dot(normal.xz, normal.xz));`. Per pitfall #10 we sample
+    // unconditionally and blend with the uniform-controlled
+    // `has_base_normal` factor; the 1×1 fallback decodes to
+    // (0, 1, 0) so the mix is a no-op when nothing is bound.
+    let n_raw = textureSample(normals_tex, normals_samp, in.uv_norm);
+    let n_x = n_raw.r * 2.0 - 1.0;
+    let n_z = n_raw.a * 2.0 - 1.0;
+    let n_y = sqrt(max(0.0, 1.0 - n_x * n_x - n_z * n_z));
+    let sampled_normal = vec3<f32>(n_x, n_y, n_z);
+    // Fall back to the vertex normal when no real base-normal texture
+    // is bound (the editor's pre-bake state). `normalize` guards
+    // against denormal sums from the interpolator.
+    let vertex_normal = normalize(in.world_normal);
+    var normal = normalize(mix(vertex_normal, sampled_normal, has_base_normal));
+
+    // ─── 3. Per-fragment TBN (FINDINGS §7.4 / SMFFragProg.glsl:276-278)
+    // The engine uses the per-fragment NORMAL to build a stable TBN —
+    // NOT a static `T=+X, B=+Z` basis. `tTangent = normalize(cross(
+    // normal, vec3(-1, 0, 0)))`, `sTangent = cross(normal, tTangent)`.
+    // The columns are (sTangent, tTangent, normal). Normal maps "swim"
+    // on sloped surfaces if you skip this rebuild.
+    let t_tangent = normalize(cross(normal, vec3<f32>(-1.0, 0.0, 0.0)));
+    let s_tangent = cross(normal, t_tangent);
+    let stn = mat3x3<f32>(s_tangent, t_tangent, normal);
+
+    // ─── 4. DNTS composite (FINDINGS §7.3 / SMFFragProg.glsl:174-198)
+    // `splatCofac = texture2D(splatDistrTex, uv) * splatTexMults`,
+    // then per-channel layer UVs `worldPos.xzxz * texScales.rrgg`
+    // and `worldPos.xzxz * texScales.bbaa`. The full vec4 sample is
+    // signed-decoded `(* 2 - 1)`, then multiplied by the per-channel
+    // cofactor. The `active_slot_mask` gates unbound layers so a
+    // fresh project doesn't sample a stale slot.
     let dist = textureSample(splat_distr, splat_distr_samp, in.uv_norm);
     let mask = sp.flags.x;
-    // `active` is a reserved keyword in WGSL since wgpu 27; using
-    // `active_mask` keeps the same semantics (per-channel 1.0/0.0
-    // gate from active_slot_mask) without tripping the parser.
     let active_mask = vec4<f32>(
         f32((mask >> 0u) & 1u),
         f32((mask >> 1u) & 1u),
         f32((mask >> 2u) & 1u),
         f32((mask >> 3u) & 1u),
     );
-    let splat_cofac = dist * sp.tex_mults * active_mask;
-    // Saturated sum used as the diffuse-blend strength (mirrors the
-    // engine's `splatDetailStrength.x = min(1.0, dot(splatCofac,
-    // vec4(1.0)))` from SMFFragProg.glsl:180).
-    let detail_strength = min(1.0, dot(splat_cofac, vec4<f32>(1.0)));
+    let cofac = dist * sp.tex_mults * active_mask;
+    let blend_strength = clamp(dot(cofac, vec4<f32>(1.0, 1.0, 1.0, 1.0)), 0.0, 1.0);
 
-    // Per-channel diffuse sample. Each layer uses an independent UV
-    // stream `worldPos.xz * tex_scales[i]` — straight from
-    // SMFFragProg.glsl:175-176. The texture array binds all four
-    // slots so reassigning a slot is a single `queue.write_texture`
-    // into the affected layer (ADR-036).
+    // Per-channel UV streams. Each layer scales worldPos.xz by its
+    // own `tex_scales[i]` — SMFFragProg.glsl:175-176 packs them into
+    // two vec4s via the `.xzxz * .rrgg` / `.bbaa` swizzles; we
+    // unroll into four vec2s for clarity.
     let uv0 = in.world_pos.xz * sp.tex_scales.x;
     let uv1 = in.world_pos.xz * sp.tex_scales.y;
     let uv2 = in.world_pos.xz * sp.tex_scales.z;
     let uv3 = in.world_pos.xz * sp.tex_scales.w;
-    let d0 = textureSample(slot_diffuse, slot_diffuse_samp, uv0, 0).rgb;
-    let d1 = textureSample(slot_diffuse, slot_diffuse_samp, uv1, 1).rgb;
-    let d2 = textureSample(slot_diffuse, slot_diffuse_samp, uv2, 2).rgb;
-    let d3 = textureSample(slot_diffuse, slot_diffuse_samp, uv3, 3).rgb;
-    let splat_rgb =
-          d0 * splat_cofac.x
-        + d1 * splat_cofac.y
-        + d2 * splat_cofac.z
-        + d3 * splat_cofac.w;
+    let s0 = textureSample(slot_normals, slot_normals_samp, uv0, 0);
+    let s1 = textureSample(slot_normals, slot_normals_samp, uv1, 1);
+    let s2 = textureSample(slot_normals, slot_normals_samp, uv2, 2);
+    let s3 = textureSample(slot_normals, slot_normals_samp, uv3, 3);
+    let d0 = s0 * 2.0 - 1.0;
+    let d1 = s1 * 2.0 - 1.0;
+    let d2 = s2 * 2.0 - 1.0;
+    let d3 = s3 * 2.0 - 1.0;
 
-    // Fallback gradient — keep unpainted regions readable rather than
-    // black-on-painted. `detail_strength` mixes between gradient and
-    // splat composite. When fully painted (strength = 1), the gradient
-    // disappears.
+    // splatDetailNormal aggregates the decoded layers, weighted by
+    // the channel cofactor (SMFFragProg.glsl:183-186). The result is
+    // intentionally NOT normalised — the engine waits until the TBN
+    // rotates it into world space.
+    var splat_detail_normal =
+          d0 * cofac.r
+        + d1 * cofac.g
+        + d2 * cofac.b
+        + d3 * cofac.a;
+    // SMFFragProg.glsl:189 — clamp .y to a minimum so the y=0 case
+    // (all cofacs zero) doesn't produce a degenerate normal.
+    splat_detail_normal.y = max(splat_detail_normal.y, 0.01);
+
+    // SMFFragProg.glsl:192 — when SMF_DETAIL_NORMAL_DIFFUSE_ALPHA is
+    // set, the splat-detail strength's `.y` is the clamped alpha of
+    // the summed DNTS sample (used as the diffuse-add value at
+    // SMFFragProg.glsl:323).
+    let detail_strength_y = clamp(splat_detail_normal.a, -1.0, 1.0)
+        * f32(sp.flags.y);
+
+    // ─── 5. Final normal (SMFFragProg.glsl:328) ──────────────────
+    // `normal = normalize(mix(normal, normalize(stnMatrix *
+    // splatDetailNormal.xyz), splatDetailStrength.x));`
+    // Gated on `has_dnts_norm`: when no DNTS array is bound the
+    // sampled detail is identically zero (the 1×1 fallback decodes
+    // to (0, 0, 1, 0) so cofac × decoded = 0 for any cofac) and
+    // mixing has no effect — but we still mask the mix factor to
+    // zero so the math is explicit.
+    let dnts_blend = blend_strength * has_dnts_norm;
+    let stn_detail = normalize(stn * splat_detail_normal.xyz);
+    normal = normalize(mix(normal, stn_detail, dnts_blend));
+
+    // ─── 6. Diffuse base ─────────────────────────────────────────
+    // Sprint 16 / D9 / ADR-039 — when the project has a non-empty
+    // layer stack the composite RT is bound; otherwise fall back to
+    // the height-keyed biome ramp. The Sprint-9 4-layer slot-diffuse
+    // path is retired (the binding now carries DNTS normals).
     //
-    // `t` normalises world Y to [0, 1] across the full `[min_h, max_h]`
-    // range so that submerged terrain (`y < 0`) still gets a distinct
-    // ramp colour. Pre-fix the gradient clamped at 0, collapsing all
-    // underwater terrain to the lowest band; that was uninformative
-    // once Sprint 14's water tool let users carve below sea level.
+    // Sample both unconditionally + uniform-select (pitfall #10) so
+    // WGSL pedants don't flag `textureSample` inside non-uniform
+    // control flow. `u.params2.y` is uniform per frame, so this is
+    // already uniform control flow at the spec level — hoisting is
+    // just defensive.
     let range = max(max_h - min_h, 1.0);
-    let t = clamp((in.world_pos.y - min_h) / range, 0.0, 1.0);
-    let fallback = biome_ramp(t);
-    let splat_base = mix(fallback, splat_rgb, detail_strength);
+    let height_t = clamp((in.world_pos.y - min_h) / range, 0.0, 1.0);
+    let fallback_rgb = biome_ramp(height_t);
+    let composite_rgb = textureSample(composite_rt, composite_samp, in.uv_norm).rgb;
+    let use_composite = step(0.5, u.params2.y);
+    let diffuse_rgb = mix(fallback_rgb, composite_rgb, use_composite);
+    // SMFFragProg.glsl:323 — detailCol is `vec4(splatDetailStrength.y)`,
+    // a single greyscale value added to the diffuse colour.
+    let detail_rgb = vec3<f32>(detail_strength_y);
 
-    // Sprint 16 / D9 / ADR-039 — diffuse-source switch. When the
-    // project carries a non-empty layer stack the App sets
-    // `params2.y = 1.0`; the terrain shader samples the composite
-    // RT instead of the biome ramp + splat blend. The Sprint-9 DNTS
-    // detail (splat_cofac) is intentionally NOT layered on top here
-    // — Sprint 17 lands the DNTS hybrid emission; until then, the
-    // composite RT IS the entire diffuse for layered projects.
-    var base_rgb = splat_base;
-    if (u.params2.y > 0.5) {
-        let uv = in.uv_norm;
-        base_rgb = textureSample(composite_rt, composite_samp, uv).rgb;
-    }
+    // ─── 7. Lighting (SMFFragProg.glsl:333-334, 412-422) ─────────
+    // Lambert + Blinn-Phong, with the per-fragment specular exponent
+    // = `specularCol.a * 16.0` (FINDINGS §7.6). The engine multiplies
+    // ambient + diffuse by `SMF_INTENSITY_MULT = 210/255` inside
+    // GetShadeInt; we pre-applied that CPU-side per FINDINGS §7.1
+    // so the fragment stage doesn't repeat the dim.
+    let sun = normalize(sp.sun_dir.xyz);
+    let cos_diffuse = clamp(dot(sun, normal), 0.0, 1.0);
+    // View direction toward the camera, in world space. Falling back
+    // to the world's +Y axis when the eye sits exactly on the
+    // fragment (degenerate, but safer than a NaN normalize).
+    let to_eye = sp.camera_pos.xyz - in.world_pos;
+    let view_dir = select(
+        vec3<f32>(0.0, 1.0, 0.0),
+        normalize(to_eye),
+        dot(to_eye, to_eye) > 1e-6,
+    );
+    let half_dir = normalize(sun + view_dir);
+    let cos_specular = clamp(dot(half_dir, normal), 0.001, 1.0);
 
-    // Lambert + ambient lighting (FINDINGS §7 simplified path — no
-    // shadows, no specular). The ambient was pre-multiplied by
-    // SMF_INTENSITY_MULT CPU-side so the shader stays clean.
-    let n = normalize(in.world_normal);
-    let l = normalize(sp.sun_dir.xyz);
-    let n_dot_l = clamp(dot(n, l), 0.0, 1.0);
-    var lit = base_rgb * (sp.ground_ambient.rgb + sp.ground_diffuse.rgb * n_dot_l);
+    // Specular colour + exponent. SMFFragProg.glsl:404-416 — when the
+    // map ships a specularTex, the colour comes from the sample and
+    // the exponent is `sample.a × 16.0`. Without a specularTex the
+    // engine falls back to `vec4(groundSpecularColor, 1.0)` and the
+    // global `groundSpecularExponent` uniform — we stash both in
+    // `sp.ground_specular` (`.xyz` = colour, `.w` = exponent).
+    let spec_sample = textureSample(specular_tex, specular_samp, in.uv_norm);
+    let spec_col = mix(sp.ground_specular.xyz, spec_sample.rgb, has_specular);
+    let spec_exp = mix(sp.ground_specular.w, spec_sample.a * 16.0, has_specular);
+    let spec_pow = pow(cos_specular, max(spec_exp, 1.0));
+    let specular_int = spec_col * spec_pow;
+
+    // SMFFragProg.glsl:205-206 — shadeInt.rgb = groundAmbientColor +
+    // groundDiffuseColor * cosAngleDiffuse * shadowCoeff. Shadows
+    // are deferred to Sprint 30; treat shadowCoeff = 1.0 here.
+    let shade_int = sp.ground_ambient.rgb
+        + sp.ground_diffuse.rgb * cos_diffuse;
+
+    // ─── 8. Final compose (SMFFragProg.glsl:381 + 422) ───────────
+    // `fragColor.rgb = (diffuseCol.rgb + detailCol.rgb) * shadeInt.rgb;`
+    // `fragColor.rgb += specularInt;`
+    var lit = (diffuse_rgb + detail_rgb) * shade_int + specular_int;
 
     // Buildable-area overlay (Sprint 11 hotfix follow-up). When
     // `flags.z == 1`, mix red into the composite where the surface is
     // too steep for a factory. BAR's `armlab.lua` / `corlab.lua` set
     // `maxslope = 15`; the engine divides by 1.5 in `movedefs.lua:551`
-    // so the effective cap is ~10°. `cos(10°) ≈ 0.9848`. The world
-    // normal here is vertex-derived (the wgpu pipeline writes per-vertex
-    // normals from the heightmap gradient) so the predicate matches
-    // the actual ground tangent the engine would compute.
+    // so the effective cap is ~10°. `cos(10°) ≈ 0.9848`. We compare
+    // against the BASE world normal (pre-DNTS) so the overlay tracks
+    // engine-side gameplay slope, not per-fragment detail.
     let buildable_on = sp.flags.z;
     if (buildable_on == 1u) {
         let cos_max_slope = 0.9848;
-        if (n.y < cos_max_slope) {
+        if (vertex_normal.y < cos_max_slope) {
             let too_steep = vec3<f32>(0.95, 0.20, 0.20);
             lit = mix(lit, too_steep, 0.55);
         }
