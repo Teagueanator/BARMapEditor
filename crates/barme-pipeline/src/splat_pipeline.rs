@@ -52,14 +52,32 @@
 //!   byte-for-byte (no nearest-neighbour resampling).
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Instant;
 
 use barme_core::layers::LayerMask;
 use barme_core::{Project, SPLAT_DIM, SplatDistribution};
 use image::{Rgba, RgbaImage};
+use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use sha2::{Digest, Sha256};
 use tracing::{debug, info, trace, warn};
 
 use crate::dnts::{BakeOptions, DntsBakeError, bake_dnts};
+
+/// Sprint 24 (T2): cap concurrent CompressonatorCLI subprocesses to
+/// keep a 4-core dev box responsive even with 16 DNTS slots. Per
+/// `docs/research/multithreading/PROPOSAL.md` §3 — beyond this point
+/// the marginal subprocess saturates disk I/O for negligible
+/// wall-time gain.
+const DNTS_BAKE_THREAD_CAP: usize = 4;
+
+/// No-op progress callback for callers that don't care about per-slot
+/// completion progress (unit tests, the smoke binary). The
+/// [`stage_splat_assets_from_layers`] signature is generic over
+/// `Fn(usize, usize) + Sync` so a closure or this helper both fit.
+pub fn no_op_progress() -> impl Fn(usize, usize) + Sync {
+    |_, _| {}
+}
 
 /// Per-channel resolved slot directory. The app's `SlotMeta` registry
 /// translates `Project.splat_config.channels[i]: Option<u8>` to a
@@ -612,6 +630,7 @@ pub fn stage_splat_assets_from_layers(
     inputs: &LayerSplatBakeInputs,
     work_dir: &Path,
     bake_opts: BakeOptions,
+    on_progress: impl Fn(usize, usize) + Sync,
 ) -> Result<(StagedSplatAssets, Vec<LintWarning>), SplatPipelineError> {
     let mut out = StagedSplatAssets::default();
     let mut warnings = Vec::new();
@@ -645,7 +664,10 @@ pub fn stage_splat_assets_from_layers(
     )?;
     out.splat_distr_png = Some(png_path);
 
-    // 2. Per-bound-channel DDS bake (skip imported layers).
+    // 2. Collect the per-channel bake tasks + the imported-layer
+    //    lint warnings up front so the parallel bake closure has a
+    //    flat task list and the warning emission stays sequential.
+    let mut tasks: Vec<(usize, PathBuf, String)> = Vec::new();
     for ch in 0..4 {
         let Some(slot_dir) = inputs.channel_slot_dirs[ch].as_ref() else {
             if inputs.channel_imported[ch] {
@@ -667,22 +689,76 @@ pub fn stage_splat_assets_from_layers(
             .unwrap_or("slot")
             .to_string();
         let filename = format!("{slot_name}_dnts.dds");
-        let disk_path = splat_dir.join(&filename);
+        tasks.push((ch, slot_dir.clone(), filename));
+    }
+    let total = tasks.len();
+
+    // 3. Parallel DNTS bake across active channels — Sprint 24 (T2).
+    //    Cache is content-addressed and atomic-renamed
+    //    (`dnts::bake_dnts_in_env`), so two channels resolving the
+    //    same `cache_key` (same slot + same opts) are safe. We cap at
+    //    `min(num_cpus, 4)` via a SCOPED rayon pool so we don't
+    //    pollute the global pool with subprocess concurrency limits.
+    //    The progress callback fires per-bake **completion** (not
+    //    start) so the overlay reflects work done, and the counter is
+    //    a coarse `AtomicUsize` — never in the hot path.
+    let bake_start = Instant::now();
+    let completed = AtomicUsize::new(0);
+    let bake_one = |task: &(usize, PathBuf, String)| -> Result<StagedDds, SplatPipelineError> {
+        let (ch, slot_dir, filename) = task;
+        let disk_path = splat_dir.join(filename);
         info!(
             channel = ch,
-            slot = %slot_name,
+            slot = %slot_dir.display(),
             out = %disk_path.display(),
             "splat_pipeline (layers): baking DNTS for channel"
         );
         bake_dnts(slot_dir, &disk_path, bake_opts)?;
-        out.per_slot_dds.push(StagedDds {
-            channel: ch,
+        let done = completed.fetch_add(1, Ordering::SeqCst) + 1;
+        on_progress(done, total);
+        Ok(StagedDds {
+            channel: *ch,
             disk_path,
-            filename,
-        });
-    }
+            filename: filename.clone(),
+        })
+    };
 
-    // 3. Specular fallback — same shape as the legacy path.
+    let mut baked: Vec<StagedDds> = if total <= 1 {
+        // One bake (or zero) — skip the scoped-pool ceremony.
+        tasks.iter().map(&bake_one).collect::<Result<Vec<_>, _>>()?
+    } else {
+        let cap = rayon::current_num_threads().clamp(1, DNTS_BAKE_THREAD_CAP);
+        let scoped_result: Result<
+            Result<Vec<StagedDds>, SplatPipelineError>,
+            rayon::ThreadPoolBuildError,
+        > = rayon::ThreadPoolBuilder::new()
+            .num_threads(cap)
+            .build_scoped(
+                |thread| thread.run(),
+                |pool| pool.install(|| tasks.par_iter().map(&bake_one).collect()),
+            );
+        scoped_result.map_err(|e| SplatPipelineError::Io {
+            path: splat_dir.clone(),
+            source: std::io::Error::other(format!("rayon scoped pool init failed: {e}")),
+        })??
+    };
+    // Per-channel order isn't preserved by the parallel collect (rayon's
+    // worker scheduling is order-insensitive on completion). Sort so the
+    // post-bake state matches the pre-Sprint-24 serial order — the
+    // `populate_resources_from_layers` consumer indexes by `dds.channel`
+    // so order doesn't affect correctness, but a stable order keeps
+    // logs and snapshot tests reproducible.
+    baked.sort_by_key(|d| d.channel);
+    let bake_elapsed_ms = bake_start.elapsed().as_secs_f64() * 1000.0;
+    info!(
+        target: "barme_pipeline::splat_pipeline",
+        slots_baked = baked.len(),
+        elapsed_ms = bake_elapsed_ms,
+        "splat_pipeline (layers): parallel DNTS bake complete"
+    );
+    out.per_slot_dds = baked;
+
+    // 4. Specular fallback — same shape as the legacy path.
     let any_active = !out.per_slot_dds.is_empty();
     if any_active {
         // Reuse the legacy ensure_specular_dds helper by building a
@@ -1088,8 +1164,13 @@ mod tests {
             channel_imported: [true, false, false, false],
         };
         let tmp = tempfile::tempdir().unwrap();
-        let result =
-            stage_splat_assets_from_layers(&p, &inputs, tmp.path(), BakeOptions::default());
+        let result = stage_splat_assets_from_layers(
+            &p,
+            &inputs,
+            tmp.path(),
+            BakeOptions::default(),
+            no_op_progress(),
+        );
         // No slot dir on the bound channel → ensure_specular_dds is
         // skipped (the function only runs when there's an active DDS,
         // and the imported branch produced none). Build succeeds.
@@ -1117,6 +1198,202 @@ mod tests {
         // Every pixel = (255, 0, 0, 0).
         for px in img.pixels() {
             assert_eq!(px.0, [255, 0, 0, 0]);
+        }
+    }
+
+    // ─── Sprint 24 (T2) — parallel DNTS bake regression ──────────────
+
+    /// Locate the vendored Compressonator binary (same shape as
+    /// `dnts::tests::locate_compressonator`). Returns None when the
+    /// fetch script hasn't been run **or** when the binary is empty
+    /// (PITFALL #29 — a corrupted vendored binary should surface as a
+    /// clean skip, not an ENOEXEC panic). Tests using it `eprintln!`
+    /// + skip when None.
+    fn locate_compressonator_for_test() -> Option<(PathBuf, PathBuf)> {
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let dir = manifest
+            .parent()? // crates/
+            .parent()? // repo root
+            .join("tools")
+            .join("compressonator");
+        let bin = dir.join("compressonatorcli-bin");
+        let metadata = std::fs::metadata(&bin).ok()?;
+        if metadata.len() == 0 {
+            return None;
+        }
+        Some((bin, dir))
+    }
+
+    /// Build the textures subtree: four slot directories with one
+    /// distinct synthetic `normal.png` each. The caller is responsible
+    /// for placing a `compressonator/` sibling at `<root>/compressonator/`
+    /// (typically a symlink to the vendored binary). Two parallel
+    /// callers MUST NOT share `root` — each test owns its own
+    /// `tools/` dir to keep the cache hashes isolated.
+    fn build_synth_textures_tree(root: &Path) -> [PathBuf; 4] {
+        let textures_dir = root.join("textures");
+        let mut out: [PathBuf; 4] = Default::default();
+        for (ch, slot_path) in out.iter_mut().enumerate() {
+            let slot = textures_dir.join(format!("0{ch}-synth-slot"));
+            std::fs::create_dir_all(&slot).unwrap();
+            // Distinct normal-byte fill per channel → distinct cache
+            // key, so the four parallel bakes don't dedupe via cache.
+            let mut img = RgbaImage::new(8, 8);
+            let r = 100u8 + ch as u8 * 20;
+            for px in img.pixels_mut() {
+                *px = Rgba([r, 128, 255, 0xFF]);
+            }
+            img.save(slot.join("normal.png")).unwrap();
+            *slot_path = slot;
+        }
+        out
+    }
+
+    /// Sprint 24 (T2): parallel bake of 4 distinct DNTS-bound layers
+    /// completes in wall-time bounded by `< 1.5 × max(per-slot bake)`.
+    /// Compressonator subprocess timing is variable, so this is a
+    /// soft assertion + diagnostic eprintln rather than a hard fail —
+    /// matches the sprint prompt's "soft assertion + log is fine."
+    #[test]
+    fn parallel_bake_wall_time_under_15x_single_slot() {
+        use barme_core::{LayerMask, MapSize};
+        let Some((bin, _dir)) = locate_compressonator_for_test() else {
+            eprintln!(
+                "skipping parallel_bake_wall_time_under_15x_single_slot: \
+                       compressonatorcli-bin not vendored"
+            );
+            return;
+        };
+        let _ = bin; // used only as the gating check
+
+        let tmp = tempfile::tempdir().unwrap();
+        let tools = tmp.path().join("tools");
+        std::fs::create_dir_all(&tools).unwrap();
+        // Bake env discovery wants `compressonator/` and `textures/`
+        // as siblings under `tools/`. We symlink the vendored
+        // Compressonator dir into place (so the bake actually invokes
+        // the real binary) and build the synthetic textures subtree
+        // separately so we don't end up writing through the symlink.
+        let real_compressonator = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.join("tools").join("compressonator"))
+            .unwrap();
+        std::os::unix::fs::symlink(&real_compressonator, tools.join("compressonator")).unwrap();
+        let slots = build_synth_textures_tree(&tools);
+
+        // Time the single-slot bake first (cache miss → real
+        // Compressonator invocation), then time the parallel 4-slot
+        // bake from a fresh cache.
+        let single_proj = Project::new("single-bench", 4);
+        let single_inputs = LayerSplatBakeInputs {
+            channel_slot_dirs: [Some(slots[0].clone()), None, None, None],
+            channel_masks: [
+                Some(LayerMask::filled(MapSize::square(2), 200)),
+                None,
+                None,
+                None,
+            ],
+            channel_tex_scales: [0.02; 4],
+            channel_tex_mults: [1.0; 4],
+            channel_layer_names: [Some("single".into()), None, None, None],
+            channel_imported: [false; 4],
+        };
+        let single_work = tmp.path().join("work-single");
+        std::fs::create_dir_all(&single_work).unwrap();
+        let t0 = std::time::Instant::now();
+        stage_splat_assets_from_layers(
+            &single_proj,
+            &single_inputs,
+            &single_work,
+            BakeOptions::default(),
+            no_op_progress(),
+        )
+        .expect("single-slot bake should succeed");
+        let single_elapsed = t0.elapsed();
+
+        // Fresh cache for the parallel run — the single-slot cache
+        // entry is now warm but the other 3 channels' cache_keys
+        // differ (distinct normal bytes per slot), so the parallel
+        // bake spawns 3 fresh Compressonator subprocesses + 1 cache
+        // hit. Clear the cache entirely to force 4 fresh bakes.
+        let cache_dir = tools.join("textures-cache");
+        if cache_dir.is_dir() {
+            std::fs::remove_dir_all(&cache_dir).unwrap();
+        }
+
+        let parallel_proj = Project::new("parallel-bench", 4);
+        let parallel_inputs = LayerSplatBakeInputs {
+            channel_slot_dirs: [
+                Some(slots[0].clone()),
+                Some(slots[1].clone()),
+                Some(slots[2].clone()),
+                Some(slots[3].clone()),
+            ],
+            channel_masks: [
+                Some(LayerMask::filled(MapSize::square(2), 100)),
+                Some(LayerMask::filled(MapSize::square(2), 100)),
+                Some(LayerMask::filled(MapSize::square(2), 100)),
+                Some(LayerMask::filled(MapSize::square(2), 100)),
+            ],
+            channel_tex_scales: [0.02; 4],
+            channel_tex_mults: [1.0; 4],
+            channel_layer_names: [
+                Some("a".into()),
+                Some("b".into()),
+                Some("c".into()),
+                Some("d".into()),
+            ],
+            channel_imported: [false; 4],
+        };
+        let parallel_work = tmp.path().join("work-parallel");
+        std::fs::create_dir_all(&parallel_work).unwrap();
+        let completed_progress = std::sync::atomic::AtomicUsize::new(0);
+        let progress = |done: usize, total: usize| {
+            completed_progress.fetch_add(1, Ordering::SeqCst);
+            assert!(
+                done >= 1 && done <= total,
+                "progress: done={done}, total={total}"
+            );
+            assert_eq!(total, 4, "expected total=4, got {total}");
+        };
+        let t0 = std::time::Instant::now();
+        let (staged, warnings) = stage_splat_assets_from_layers(
+            &parallel_proj,
+            &parallel_inputs,
+            &parallel_work,
+            BakeOptions::default(),
+            progress,
+        )
+        .expect("parallel bake should succeed");
+        let parallel_elapsed = t0.elapsed();
+
+        assert_eq!(warnings.len(), 0, "no imported-layer lint expected");
+        assert_eq!(staged.per_slot_dds.len(), 4, "all 4 channels baked");
+        assert_eq!(
+            completed_progress.load(Ordering::SeqCst),
+            4,
+            "progress callback fires once per completed bake"
+        );
+
+        // Wall-time soft assertion: parallel ≤ 1.5 × single-slot.
+        // CompressonatorCLI subprocess startup dominates (~hundreds of
+        // ms) at this synthetic size, so 4 concurrent bakes hit
+        // process-spawn serialisation on slow disks. The 1.5× bound
+        // is the sprint prompt's target.
+        let single_ms = single_elapsed.as_secs_f64() * 1000.0;
+        let parallel_ms = parallel_elapsed.as_secs_f64() * 1000.0;
+        eprintln!(
+            "DNTS bake: single = {single_ms:.0} ms; parallel(4) = {parallel_ms:.0} ms; \
+             ratio = {:.2}× (target < 1.5×)",
+            parallel_ms / single_ms.max(1.0)
+        );
+        if parallel_ms > 1.5 * single_ms {
+            eprintln!(
+                "WARN: parallel bake exceeded 1.5× single-slot — check disk \
+                 contention or Compressonator process-spawn overhead. Soft \
+                 assertion; not failing the test."
+            );
         }
     }
 }

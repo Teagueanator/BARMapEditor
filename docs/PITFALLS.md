@@ -612,3 +612,46 @@ the project side. Pinned by the C9 inspector emission tests in
 `barme-core::mapinfo_schema::tests` (which would catch a regression
 on the data side) plus the shader uniform pin in `render.rs::tests`
 (which catches a layout drift).
+
+### 29. Test fixtures that symlink into `tools/` can corrupt the vendored binaries
+
+Found Sprint 24 / T2: a parallel-DNTS-bake test built a synthetic
+tools layout under a `tempdir`, then symlinked the vendored
+`tools/compressonator/` dir into it so `discover()` would find the
+real Compressonator binary. A helper inside the test then ran
+`std::fs::write(<path>.join("compressonatorcli-bin"), b"")`
+on what it thought was a temp directory — but because that path
+was a symlink to the real `tools/compressonator/`, the empty
+write **overwrote the vendored ELF**. Subsequent invocations got
+`ENOEXEC` ("Exec format error") because the binary was 0 bytes,
+and `./scripts/fetch-compressonator.sh` is idempotent on
+directory presence so it didn't auto-restore.
+
+The damage was invisible until the next test run; `git status`
+doesn't track it (the tools/ tree is gitignored), and the failure
+mode is "every DNTS bake panics" — not localised to the offending
+test.
+
+**Rule:** Test helpers that build synthetic on-disk layouts MUST
+either:
+1. Write **only** under `tempfile::TempDir`-owned paths (never
+   into a symlink that resolves outside the tempdir), OR
+2. Construct fake compressonator stubs by writing to fresh
+   subdirs under the tempdir and then **symlinking from inside
+   the test code** so the symlink direction is `tempdir →
+   real_tools/`, not the other way round — and never write a
+   path that begins with the tempdir but might resolve through
+   a symlink back out.
+
+Mitigation in code: `crates/barme-pipeline/src/splat_pipeline.rs`'s
+`build_synth_textures_tree` now writes **only** `textures/<slot>/`
+entries; the caller is responsible for the `compressonator/`
+symlink, and the helper never touches that path. The parallel-bake
+test's locate helper also rejects empty binaries (`metadata().len() == 0`)
+so a future corrupted-binary state surfaces as a clean skip
+instead of an ENOEXEC panic.
+
+If the vendored binary IS corrupted, recover with
+`rm -rf tools/compressonator && ./scripts/fetch-compressonator.sh`
+(the fetch script's idempotency check is directory-presence only,
+so the rm is needed to force re-download).

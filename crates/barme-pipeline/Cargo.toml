@@ -21,9 +21,12 @@ toml.workspace = true
 # scoped rayon pool. See `crates/barme-pipeline/src/splat_pipeline.rs`
 # and `docs/research/multithreading/PROPOSAL.md` §3.
 rayon.workspace = true
+# Sprint 24 (T2): atomic tempfile+rename in the DNTS bake cache so two
+# parallel bakes on the same content-addressed cache key never leave a
+# half-written `.dds` behind. See `crates/barme-pipeline/src/dnts.rs`.
+tempfile.workspace = true
 
 [dev-dependencies]
-tempfile.workspace = true
 tracing-subscriber = { workspace = true }
 which.workspace = true
 anyhow.workspace = true

@@ -452,7 +452,24 @@ pub fn execute_stages(
     };
     let (splat_staged, _lints) = if use_layers {
         let li = layer_inputs.expect("guarded by use_layers");
-        splat_pipeline::stage_splat_assets_from_layers(project, li, work_dir, bake_opts)?
+        // Sprint 24 (T2): per-slot completion progress events drive the
+        // build overlay's progress bar through the splat stage. Each
+        // completion increments `done` and emits a 0.0..=1.0 fraction.
+        // Rayon doesn't guarantee completion order so the fractions
+        // can arrive (3/8, 1/8, 4/8, 2/8, …) — the overlay reads only
+        // `done / total`, so unordered events render correctly.
+        let on_progress = |done: usize, total: usize| {
+            if total > 0 {
+                events.emit(BuildEvent::Progress(done as f32 / total as f32));
+            }
+        };
+        splat_pipeline::stage_splat_assets_from_layers(
+            project,
+            li,
+            work_dir,
+            bake_opts,
+            on_progress,
+        )?
     } else {
         (
             splat_pipeline::stage_splat_assets(project, &splat_inputs, work_dir, bake_opts)?,

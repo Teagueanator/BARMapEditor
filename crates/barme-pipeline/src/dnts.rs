@@ -33,6 +33,7 @@ use std::process::Command;
 
 use image::{Rgba, RgbaImage};
 use sha2::{Digest, Sha256};
+use tempfile::Builder as TempBuilder;
 use tracing::{debug, info, trace, warn};
 
 use crate::build::{LogStream, NEVER_CANCEL, invoke_with_streaming};
@@ -227,27 +228,79 @@ fn bake_dnts_in_env(
         flip_green_channel(&mut composed);
     }
 
-    let staging = env.cache_dir.join(format!("{key}.png"));
-    ensure_parent_dir(&staging)?;
-    composed
-        .save(&staging)
+    // Sprint 24 (T2): tempfile + atomic-rename for the cache write.
+    // Two parallel `bake_dnts` calls on the same `(slot_dir, opts)`
+    // produce the same `cache_key` → same `cache_path`. Without
+    // atomicity both Compressonators would write the same target
+    // concurrently and a torn `cache_path` could be observed by the
+    // subsequent `copy_file`. Each thread now writes to a unique
+    // sibling path under `cache_dir` and `.persist()`s it (fs::rename
+    // → atomic on POSIX; MoveFileExW with REPLACE_EXISTING on
+    // Windows). Output is byte-identical for the same input, so
+    // last-writer-wins is safe; `cache_path` is always a complete BC3.
+    //
+    // We use `NamedTempFile::into_temp_path()` for BOTH paths so the
+    // tempfile's open file descriptor is dropped before Compressonator
+    // (the staging PNG) or the `image` crate (the staging PNG write)
+    // tries to truncate-open the same path. Holding the FD open while
+    // a sibling tool truncates the file is fine on POSIX, but on
+    // Windows it manifests as an `ERROR_SHARING_VIOLATION` — and
+    // Compressonator's `-o` flag on the .dds.tmp likewise needs the
+    // tempfile FD released before it'll overwrite cleanly.
+    ensure_parent_dir(&cache_path)?;
+    let staging_png_path = TempBuilder::new()
+        .prefix(&format!("{key}.png-"))
+        .suffix(".png")
+        .tempfile_in(&env.cache_dir)
         .map_err(|source| DntsBakeError::Io {
-            path: staging.clone(),
+            path: env.cache_dir.clone(),
+            source,
+        })?
+        .into_temp_path();
+    composed
+        .save(&staging_png_path)
+        .map_err(|source| DntsBakeError::Io {
+            path: staging_png_path.to_path_buf(),
             source: std::io::Error::other(source),
         })?;
+
+    // The output path's extension must end in `.dds` — Compressonator
+    // dispatches the encoder by extension (a `.tmp` suffix produces
+    // `Error: Destination file type "TMP" is not supported`). So the
+    // tempfile suffix is `.dds`; the random middle keeps two parallel
+    // bakes on the same cache key from colliding. The unlink-before-
+    // invoke step below is required because Compressonator refuses to
+    // overwrite an existing output, and `tempfile_in` pre-creates a
+    // zero-byte placeholder. `TempPath` still owns cleanup-on-drop;
+    // `.persist()` later succeeds because rename is path-based.
+    let tmp_dds_path = TempBuilder::new()
+        .prefix(&format!("{key}.dds-"))
+        .suffix(".dds")
+        .tempfile_in(&env.cache_dir)
+        .map_err(|source| DntsBakeError::Io {
+            path: env.cache_dir.clone(),
+            source,
+        })?
+        .into_temp_path();
+    let _ = std::fs::remove_file(&tmp_dds_path);
 
     invoke_compressonator(
         &env.compressonator_bin,
         &env.compressonator_dir,
-        &staging,
-        &cache_path,
+        &staging_png_path,
+        &tmp_dds_path,
     )?;
 
-    // Best-effort cleanup of the staging PNG — failure here doesn't break the
-    // bake, just leaves a stray file in the cache dir.
-    if let Err(e) = std::fs::remove_file(&staging) {
-        warn!(?staging, %e, "dnts: could not remove staging png");
-    }
+    // Atomic publish into the cache. `persist` consumes the TempPath
+    // and renames it into place — last writer wins, but the file at
+    // `cache_path` is always a complete BC3 DDS.
+    tmp_dds_path
+        .persist(&cache_path)
+        .map_err(|e| DntsBakeError::Io {
+            path: cache_path.clone(),
+            source: e.error,
+        })?;
+    // staging_png_path drops here → tempfile crate auto-deletes the PNG.
 
     ensure_parent_dir(out_dds)?;
     copy_file(&cache_path, out_dds)?;
@@ -630,6 +683,11 @@ mod tests {
         // CARGO_MANIFEST_DIR points at crates/barme-pipeline; the
         // vendored binary lives at
         // <repo>/tools/compressonator/compressonatorcli-bin.
+        //
+        // PITFALL #29 — a 0-byte file at the expected path means a
+        // prior test corrupted the vendored binary (or the fetch
+        // script left a stub). Treat that as "not vendored" so the
+        // tests skip cleanly instead of panicking on ENOEXEC.
         let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let dir = manifest
             .parent()? // crates/
@@ -637,7 +695,11 @@ mod tests {
             .join("tools")
             .join("compressonator");
         let bin = dir.join("compressonatorcli-bin");
-        bin.exists().then_some((bin, dir))
+        let metadata = std::fs::metadata(&bin).ok()?;
+        if metadata.len() == 0 {
+            return None;
+        }
+        Some((bin, dir))
     }
 
     /// Build a synthetic slot directory inside `root`.
