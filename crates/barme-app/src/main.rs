@@ -1707,9 +1707,12 @@ impl App {
                         .unwrap_or_else(|| "(none)".into()),
                     path.display()
                 );
-                self.current_project_path = Some(path);
+                self.current_project_path = Some(path.clone());
                 self.last_error = None;
                 self.dirty = false;
+                // Sprint 20 / chunk 7 — record in recent projects.
+                self.editor_config.push_recent(path);
+                self.editor_config.save();
             }
             Err(e) => {
                 error!(path = %path.display(), error = %format!("{e:#}"), "project save failed");
@@ -5217,10 +5220,24 @@ impl App {
                             Some(format!("heightmap not found: {}", hm_path.display()));
                     }
                 }
+                // Sprint 20 / chunk 7 — record in recent projects. The
+                // path is whatever the user picked; `current_project_path`
+                // already holds it from earlier in this match arm.
+                if let Some(saved) = self.current_project_path.clone() {
+                    self.editor_config.push_recent(saved);
+                    self.editor_config.save();
+                }
             }
             Err(e) => {
                 error!(path = %path.display(), error = %format!("{e:#}"), "project open failed");
                 self.last_error = Some(format!("open: {e:#}"));
+                // Sprint 20 / chunk 7 — silently drop missing entries
+                // from recent projects so the submenu stays cleanly
+                // navigable. PITFALL #8 in the sprint prompt: never
+                // pop a dialog per missing entry; the single
+                // `last_error` toast above carries the news.
+                self.editor_config.remove_recent(&path);
+                self.editor_config.save();
             }
         }
     }
@@ -5791,6 +5808,10 @@ enum FileAction {
     Save,
     SaveAs,
     Open,
+    /// Sprint 20: open a specific `.barmeproj` path (no file dialog).
+    /// Used by the File > Recent projects submenu + the empty-state
+    /// CTA's recent-projects row.
+    OpenPath(PathBuf),
     BuildAndInstall,
     ApplyProcGen,
     Undo,
@@ -6202,6 +6223,52 @@ impl App {
                 *action = Some(FileAction::Open);
                 ui.close();
             }
+            // Sprint 20 / chunk 7 — recent projects submenu. Listed
+            // most-recent-first; hover shows the full path. The list
+            // is empty until the user has saved or opened at least
+            // one project (whose paths are pushed by
+            // `App::save_to` / `App::open_from`).
+            let recent_count = self.editor_config.recent_projects.len();
+            ui.menu_button(format!("Recent projects ({recent_count})"), |ui| {
+                if self.editor_config.recent_projects.is_empty() {
+                    ui.label(
+                        egui::RichText::new("(no recent projects)")
+                            .weak()
+                            .italics(),
+                    );
+                } else {
+                    // Snapshot to avoid `borrow self while inside the
+                    // closure that may mutate it`. Each entry below
+                    // routes through `open_from` so the recent list +
+                    // missing-file pruning stay consistent.
+                    let recents: Vec<PathBuf> =
+                        self.editor_config.recent_projects.iter().cloned().collect();
+                    for p in &recents {
+                        let label = p
+                            .file_name()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or_else(|| p.to_str().unwrap_or("?"));
+                        let hover = p.display().to_string();
+                        if ui.button(label).on_hover_text(hover).clicked() {
+                            // Schedule the open; drain_action +
+                            // open_from will handle missing-file pruning.
+                            *action = Some(FileAction::OpenPath(p.clone()));
+                            ui.close();
+                            break;
+                        }
+                    }
+                    ui.separator();
+                    if ui
+                        .button("Clear recent projects")
+                        .on_hover_text("Drop every entry from this list.")
+                        .clicked()
+                    {
+                        self.editor_config.clear_recent();
+                        self.editor_config.save();
+                        ui.close();
+                    }
+                }
+            });
             if ui
                 .button("Save project")
                 .on_hover_text("Save to the current .barmeproj path. [Shortcut: Ctrl+S]")
@@ -10141,7 +10208,9 @@ impl App {
 
             // Empty-state CTA when no heightmap is loaded.
             if self.heightmap.is_none() {
-                match crate::ui::viewport_chrome::empty_state_cta(ui, rect) {
+                let recents: Vec<PathBuf> =
+                    self.editor_config.recent_projects.iter().cloned().collect();
+                match crate::ui::viewport_chrome::empty_state_cta(ui, rect, &recents) {
                     crate::ui::viewport_chrome::EmptyStateClick::Create => {
                         self.wizard = WizardState::default_for_new_project();
                         self.wizard_open = true;
@@ -10150,6 +10219,9 @@ impl App {
                         if let Some(p) = pick_open_path() {
                             self.open_from(p);
                         }
+                    }
+                    crate::ui::viewport_chrome::EmptyStateClick::OpenRecent(p) => {
+                        self.open_from(p);
                     }
                     crate::ui::viewport_chrome::EmptyStateClick::None => {}
                 }
@@ -10195,6 +10267,7 @@ impl App {
                     self.open_from(p);
                 }
             }
+            Some(FileAction::OpenPath(p)) => self.open_from(p),
             Some(FileAction::BuildAndInstall) => self.build_and_install(),
             Some(FileAction::ApplyProcGen) => self.apply_procgen(),
             Some(FileAction::Undo) => self.undo_one(),

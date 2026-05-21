@@ -314,10 +314,25 @@ fn vp_toggle_btn(ui: &mut Ui, icon: Icon, on: bool, tooltip: &str) -> bool {
 }
 
 /// Empty-state CTA card — centred inside the viewport when no
-/// heightmap is loaded. Returns `true` when "Create map" is clicked.
-pub fn empty_state_cta(ui: &mut Ui, rect: Rect) -> EmptyStateClick {
+/// heightmap is loaded. Returns an [`EmptyStateClick`] tagged with
+/// the action the user requested this frame (Create / Open /
+/// OpenRecent(path) / None).
+///
+/// `recents` is the slice of recent project paths from the editor
+/// config, most-recent-first. Only the first 5 are surfaced as
+/// clickable rows beneath the action buttons; the full list lives in
+/// the File > Recent projects submenu.
+pub fn empty_state_cta(ui: &mut Ui, rect: Rect, recents: &[std::path::PathBuf]) -> EmptyStateClick {
     let t = Tokens::DARK;
-    let card_size = egui::vec2(340.0, 180.0);
+    // Stretch the card vertically to fit the recent-projects list
+    // when present. Each row is ~22 px tall; cap at 5 rows.
+    let recent_rows = recents.len().min(5);
+    let recent_block_h = if recent_rows == 0 {
+        0.0
+    } else {
+        18.0 + (recent_rows as f32) * 22.0 + 6.0
+    };
+    let card_size = egui::vec2(360.0, 180.0 + recent_block_h);
     let card_rect = Rect::from_center_size(rect.center(), card_size);
     let painter = ui.painter();
     painter.rect_filled(
@@ -364,7 +379,7 @@ pub fn empty_state_cta(ui: &mut Ui, rect: Rect) -> EmptyStateClick {
     let mut click = EmptyStateClick::None;
     let btn_w = 110.0;
     let btn_h = 32.0;
-    let btn_y = card_rect.bottom() - 22.0;
+    let btn_y = card_rect.top() + 158.0;
     let create_rect = Rect::from_center_size(
         Pos2::new(card_rect.center().x - 60.0, btn_y),
         egui::vec2(btn_w, btn_h),
@@ -402,6 +417,66 @@ pub fn empty_state_cta(ui: &mut Ui, rect: Rect) -> EmptyStateClick {
         click = EmptyStateClick::Create;
     } else if open_resp.clicked() {
         click = EmptyStateClick::Open;
+    }
+
+    // Sprint 20 / chunk 7 — recent projects block. Renders below the
+    // CTA buttons. Each row carries the filename in foreground text
+    // + the parent dir in muted (truncated to fit); hover shows the
+    // full path. Click → loads via `open_from`.
+    if recent_rows > 0 {
+        let painter = ui.painter();
+        painter.text(
+            Pos2::new(card_rect.left() + 18.0, btn_y + 28.0),
+            Align2::LEFT_TOP,
+            "Recent projects",
+            FontId::proportional(11.5),
+            t.muted,
+        );
+        for (i, p) in recents.iter().take(recent_rows).enumerate() {
+            let row_top = btn_y + 48.0 + (i as f32) * 22.0;
+            let row_rect = Rect::from_min_size(
+                Pos2::new(card_rect.left() + 14.0, row_top),
+                egui::vec2(card_size.x - 28.0, 20.0),
+            );
+            let id = ui.id().with(("empty_recent", i));
+            let resp = ui.interact(row_rect, id, Sense::click());
+            let painter = ui.painter();
+            if resp.hovered() {
+                painter.rect_filled(row_rect, CornerRadius::same(4), t.hover);
+            }
+            let label = p
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or_else(|| p.to_str().unwrap_or("?"));
+            painter.text(
+                Pos2::new(row_rect.left() + 6.0, row_rect.center().y),
+                Align2::LEFT_CENTER,
+                label,
+                FontId::proportional(12.0),
+                t.text,
+            );
+            // Parent dir, right-aligned, muted.
+            if let Some(parent) = p.parent() {
+                let parent_str = parent.to_string_lossy().into_owned();
+                let trimmed = if parent_str.len() > 32 {
+                    format!("…{}", &parent_str[parent_str.len() - 30..])
+                } else {
+                    parent_str
+                };
+                painter.text(
+                    Pos2::new(row_rect.right() - 6.0, row_rect.center().y),
+                    Align2::RIGHT_CENTER,
+                    trimmed,
+                    FontId::proportional(10.5),
+                    t.muted,
+                );
+            }
+            let hover = p.display().to_string();
+            let resp = resp.on_hover_text(hover);
+            if resp.clicked() {
+                click = EmptyStateClick::OpenRecent(p.clone());
+            }
+        }
     }
     click
 }
@@ -459,11 +534,14 @@ pub fn hint_card(ui: &mut Ui, rect: Rect, show: &mut bool) {
 }
 
 /// Empty-state CTA click outcome.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EmptyStateClick {
     None,
     Create,
     Open,
+    /// Sprint 20 / chunk 7 — user clicked a row in the "Recent
+    /// projects" list. Caller routes through `App::open_from`.
+    OpenRecent(std::path::PathBuf),
 }
 
 #[cfg(test)]

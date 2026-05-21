@@ -9,6 +9,7 @@
 //! replays the intro once by appending a new version string to
 //! [`EditorConfig::seen_intro_versions`].
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -19,6 +20,10 @@ use tracing::{info, warn};
 /// distinct value seen.
 pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Hard cap on the recent-projects list. The submenu only renders the
+/// first 10 entries anyway; nothing keeps a longer list around.
+pub const RECENT_PROJECTS_CAP: usize = 10;
+
 /// Schema for `barme-editor.toml`. Forward-compat: every field has
 /// `#[serde(default)]` so older configs load cleanly, and unknown TOML
 /// keys are ignored (default `toml` behaviour).
@@ -28,6 +33,13 @@ pub struct EditorConfig {
     /// Appending a new value replays the hint once.
     #[serde(default)]
     pub seen_intro_versions: Vec<String>,
+
+    /// Sprint 20: most-recently-opened or saved project files. Capped at
+    /// [`RECENT_PROJECTS_CAP`]. Front = most recent. Persists across
+    /// editor restarts; missing files drop silently at next open
+    /// (`App::open_from` → [`EditorConfig::remove_recent`]).
+    #[serde(default)]
+    pub recent_projects: VecDeque<PathBuf>,
 }
 
 impl EditorConfig {
@@ -119,6 +131,33 @@ impl EditorConfig {
     /// as seen.
     pub fn mark_intro_seen_for_current_version(&mut self) {
         self.mark_intro_seen_for(CURRENT_VERSION);
+    }
+
+    /// Sprint 20: record an opened-or-saved `.barmeproj`. The path is
+    /// promoted to the front of the list; any duplicate further back
+    /// is removed; the list is truncated to [`RECENT_PROJECTS_CAP`].
+    /// Idempotent if `path` is already at the front.
+    pub fn push_recent(&mut self, path: PathBuf) {
+        // Dedupe by exact path; preserves the user's mental model of
+        // "this is the same project I just had open."
+        self.recent_projects.retain(|p| p != &path);
+        self.recent_projects.push_front(path);
+        while self.recent_projects.len() > RECENT_PROJECTS_CAP {
+            self.recent_projects.pop_back();
+        }
+    }
+
+    /// Sprint 20: drop `path` from the list (e.g. open failed because
+    /// the file no longer exists). Silent — Sprint 31's toast queue
+    /// can promote the dropped-entry notification later.
+    pub fn remove_recent(&mut self, path: &Path) {
+        self.recent_projects.retain(|p| p != path);
+    }
+
+    /// Sprint 20: drop every entry. Wired to the File > Recent
+    /// projects > Clear menu item.
+    pub fn clear_recent(&mut self) {
+        self.recent_projects.clear();
     }
 }
 
@@ -239,5 +278,91 @@ mod tests {
     fn current_version_const_matches_cargo_pkg_version() {
         // Belt-and-braces — a future env macro change would flip this.
         assert_eq!(CURRENT_VERSION, env!("CARGO_PKG_VERSION"));
+    }
+
+    // ─── Sprint 20 / chunk 7 ─────────────────────────────────────────
+
+    #[test]
+    fn push_recent_promotes_to_front_and_dedupes() {
+        let mut cfg = EditorConfig::default();
+        cfg.push_recent(PathBuf::from("/a.barmeproj"));
+        cfg.push_recent(PathBuf::from("/b.barmeproj"));
+        cfg.push_recent(PathBuf::from("/c.barmeproj"));
+        // b is promoted, ahead of c, behind itself; dedupe drops the
+        // older b position.
+        cfg.push_recent(PathBuf::from("/b.barmeproj"));
+        assert_eq!(
+            cfg.recent_projects.iter().collect::<Vec<_>>(),
+            vec![
+                &PathBuf::from("/b.barmeproj"),
+                &PathBuf::from("/c.barmeproj"),
+                &PathBuf::from("/a.barmeproj"),
+            ]
+        );
+    }
+
+    #[test]
+    fn push_recent_truncates_at_cap() {
+        let mut cfg = EditorConfig::default();
+        for i in 0..RECENT_PROJECTS_CAP + 5 {
+            cfg.push_recent(PathBuf::from(format!("/{i}.barmeproj")));
+        }
+        assert_eq!(cfg.recent_projects.len(), RECENT_PROJECTS_CAP);
+        // The most-recent (i=14) sits at the front.
+        let front = cfg.recent_projects.front().unwrap();
+        assert_eq!(
+            front,
+            &PathBuf::from(format!("/{}.barmeproj", RECENT_PROJECTS_CAP + 4))
+        );
+        // The oldest survivor is i=5 (5..14 = 10 entries).
+        let back = cfg.recent_projects.back().unwrap();
+        assert_eq!(back, &PathBuf::from("/5.barmeproj"));
+    }
+
+    #[test]
+    fn remove_recent_drops_only_matching_path() {
+        let mut cfg = EditorConfig::default();
+        cfg.push_recent(PathBuf::from("/a.barmeproj"));
+        cfg.push_recent(PathBuf::from("/b.barmeproj"));
+        cfg.push_recent(PathBuf::from("/c.barmeproj"));
+        cfg.remove_recent(Path::new("/b.barmeproj"));
+        assert_eq!(cfg.recent_projects.len(), 2);
+        assert!(cfg.recent_projects.contains(&PathBuf::from("/a.barmeproj")));
+        assert!(cfg.recent_projects.contains(&PathBuf::from("/c.barmeproj")));
+        assert!(!cfg.recent_projects.contains(&PathBuf::from("/b.barmeproj")));
+    }
+
+    #[test]
+    fn clear_recent_empties_the_list() {
+        let mut cfg = EditorConfig::default();
+        cfg.push_recent(PathBuf::from("/a.barmeproj"));
+        cfg.push_recent(PathBuf::from("/b.barmeproj"));
+        cfg.clear_recent();
+        assert!(cfg.recent_projects.is_empty());
+    }
+
+    #[test]
+    fn recent_projects_round_trip_through_disk() {
+        let mut cfg = EditorConfig::default();
+        cfg.push_recent(PathBuf::from("/a.barmeproj"));
+        cfg.push_recent(PathBuf::from("/b.barmeproj"));
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("recent.toml");
+        cfg.save_to(&path).expect("save");
+        let loaded = EditorConfig::load_from(&path).expect("load");
+        assert_eq!(loaded.recent_projects, cfg.recent_projects);
+    }
+
+    #[test]
+    fn recent_projects_loads_from_older_config_via_serde_default() {
+        // A config file written before Sprint 20 has only the
+        // `seen_intro_versions` field; recent_projects must default
+        // cleanly.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("legacy.toml");
+        std::fs::write(&path, "seen_intro_versions = [\"0.0.1\"]\n").unwrap();
+        let loaded = EditorConfig::load_from(&path).expect("load");
+        assert!(loaded.recent_projects.is_empty());
+        assert_eq!(loaded.seen_intro_versions, vec!["0.0.1"]);
     }
 }
