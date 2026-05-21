@@ -15,7 +15,7 @@ use eframe::egui::{
     self, Align2, Color32, CornerRadius, FontId, Pos2, Rect, Sense, Stroke, StrokeKind, Ui,
 };
 
-use barme_core::{AllyGroup, Heightmap, SplatDistribution};
+use barme_core::{AllyGroup, Heightmap, SplatDistribution, SymmetryAxis};
 
 use crate::render::OrbitCamera;
 use crate::ui::icons::{self, Icon};
@@ -60,6 +60,7 @@ pub fn paint_minimap(
     features: &[MinimapFeature],
     extents: (f32, f32),
     camera: &OrbitCamera,
+    symmetry: SymmetryAxis,
 ) -> Rect {
     let t = Tokens::DARK;
     let panel_rect = Rect::from_min_size(
@@ -123,17 +124,18 @@ pub fn paint_minimap(
         paint_splat_overlay(painter, body_rect, d);
     }
 
-    // Symmetry guide line — caller has already decided whether to
-    // pass a visible symmetry; we draw an unconditional vertical
-    // bisector because the mockup shows one for every state. Cheap
-    // and informative even with sym=None.
-    painter.line_segment(
-        [
-            Pos2::new(body_rect.center().x, body_rect.top()),
-            Pos2::new(body_rect.center().x, body_rect.bottom()),
-        ],
-        Stroke::new(1.0, Color32::from_rgba_premultiplied(255, 255, 255, 90)),
-    );
+    // Sprint 19 / U1 — symmetry guide. Reads the project's active
+    // `SymmetryAxis` and draws the corresponding axes / spokes on
+    // the minimap body.
+    //
+    // History: the original mockup-era implementation drew an
+    // unconditional vertical bisector because the static mockup
+    // shows one for every state. That was visually misleading once
+    // the symmetry system grew Quad / Diagonal / Rotational modes —
+    // the minimap promised vertical mirroring even when the actual
+    // axis was diagonal. The new implementation derives the lines
+    // from `Project.symmetry` and the centre point of the body rect.
+    paint_minimap_symmetry(painter, body_rect, symmetry);
 
     // Metal spots (under pins).
     for (x, z, val) in metal_spots {
@@ -264,6 +266,56 @@ pub fn paint_minimap(
     let _ = ui.interact(body_rect, ui.id().with("minimap_body"), Sense::click());
 
     panel_rect
+}
+
+/// Sprint 19 / U1 — return the screen-space line segments the
+/// minimap should draw for the active symmetry mode. Mirror modes
+/// return one or two full-body crosshairs; diagonal modes return
+/// a corner-to-corner cross; rotational modes return `fold` spokes
+/// originating at the centre.
+///
+/// Returning `Vec<(Pos2, Pos2)>` rather than painting directly keeps
+/// the geometry unit-testable without an `egui::Painter`.
+pub fn minimap_symmetry_segments(body: Rect, symmetry: SymmetryAxis) -> Vec<(Pos2, Pos2)> {
+    let c = body.center();
+    match symmetry {
+        SymmetryAxis::None => Vec::new(),
+        SymmetryAxis::Horizontal => {
+            vec![(Pos2::new(body.left(), c.y), Pos2::new(body.right(), c.y))]
+        }
+        SymmetryAxis::Vertical => vec![(Pos2::new(c.x, body.top()), Pos2::new(c.x, body.bottom()))],
+        SymmetryAxis::Quad => vec![
+            (Pos2::new(body.left(), c.y), Pos2::new(body.right(), c.y)),
+            (Pos2::new(c.x, body.top()), Pos2::new(c.x, body.bottom())),
+        ],
+        SymmetryAxis::DiagonalMain => vec![(body.left_top(), body.right_bottom())],
+        SymmetryAxis::DiagonalAnti => vec![(body.left_bottom(), body.right_top())],
+        SymmetryAxis::Rotational { fold } => {
+            if fold < 2 {
+                Vec::new()
+            } else {
+                let r = (body.width().min(body.height())) * 0.5;
+                let n = fold as u32;
+                let mut out = Vec::with_capacity(n as usize);
+                for k in 0..n {
+                    let theta = (k as f32) * std::f32::consts::TAU / (n as f32);
+                    let (s, co) = theta.sin_cos();
+                    out.push((c, Pos2::new(c.x + r * co, c.y + r * s)));
+                }
+                out
+            }
+        }
+    }
+}
+
+/// Paint the symmetry guide lines for `symmetry` inside `body`. Pure
+/// renderer — geometry comes from [`minimap_symmetry_segments`].
+fn paint_minimap_symmetry(painter: &egui::Painter, body: Rect, symmetry: SymmetryAxis) {
+    let segs = minimap_symmetry_segments(body, symmetry);
+    let stroke = Stroke::new(1.0, Color32::from_rgba_premultiplied(255, 255, 255, 90));
+    for (a, b) in segs {
+        painter.line_segment([a, b], stroke);
+    }
 }
 
 /// Project a world-space (x, z) onto the mini-map body rect.
@@ -520,5 +572,76 @@ mod tests {
         // 50 %-green pixel: alpha ≈ (128/255) * 128 = 64.
         let m = overlay_mix([0, 128, 0, 0]).unwrap();
         assert!(m.3 >= 60 && m.3 <= 70, "got alpha {}", m.3);
+    }
+
+    // ---------------------- minimap_symmetry_segments (Sprint 19 / U1) ----------------------
+
+    fn unit_body() -> Rect {
+        Rect::from_min_size(Pos2::new(0.0, 0.0), egui::vec2(100.0, 100.0))
+    }
+
+    #[test]
+    fn minimap_symmetry_segments_none_returns_empty() {
+        assert!(minimap_symmetry_segments(unit_body(), SymmetryAxis::None).is_empty());
+    }
+
+    #[test]
+    fn minimap_symmetry_segments_horizontal_runs_left_to_right_through_centre() {
+        let segs = minimap_symmetry_segments(unit_body(), SymmetryAxis::Horizontal);
+        assert_eq!(segs.len(), 1);
+        let (a, b) = segs[0];
+        assert!((a.x - 0.0).abs() < 1e-3 && (b.x - 100.0).abs() < 1e-3);
+        assert!((a.y - 50.0).abs() < 1e-3 && (b.y - 50.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn minimap_symmetry_segments_vertical_runs_top_to_bottom_through_centre() {
+        let segs = minimap_symmetry_segments(unit_body(), SymmetryAxis::Vertical);
+        assert_eq!(segs.len(), 1);
+        let (a, b) = segs[0];
+        assert!((a.x - 50.0).abs() < 1e-3 && (b.x - 50.0).abs() < 1e-3);
+        assert!((a.y - 0.0).abs() < 1e-3 && (b.y - 100.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn minimap_symmetry_segments_quad_returns_both_mirror_axes() {
+        assert_eq!(
+            minimap_symmetry_segments(unit_body(), SymmetryAxis::Quad).len(),
+            2
+        );
+    }
+
+    #[test]
+    fn minimap_symmetry_segments_diagonal_main_runs_corner_to_corner() {
+        let segs = minimap_symmetry_segments(unit_body(), SymmetryAxis::DiagonalMain);
+        assert_eq!(segs.len(), 1);
+        let (a, b) = segs[0];
+        assert_eq!(a, Pos2::new(0.0, 0.0));
+        assert_eq!(b, Pos2::new(100.0, 100.0));
+    }
+
+    #[test]
+    fn minimap_symmetry_segments_diagonal_anti_runs_opposite_corners() {
+        let segs = minimap_symmetry_segments(unit_body(), SymmetryAxis::DiagonalAnti);
+        assert_eq!(segs.len(), 1);
+        let (a, b) = segs[0];
+        assert_eq!(a, Pos2::new(0.0, 100.0));
+        assert_eq!(b, Pos2::new(100.0, 0.0));
+    }
+
+    #[test]
+    fn minimap_symmetry_segments_rotational_returns_fold_spokes() {
+        for &fold in &[2u8, 3, 4, 6, 8, 12] {
+            let segs = minimap_symmetry_segments(unit_body(), SymmetryAxis::Rotational { fold });
+            assert_eq!(segs.len(), fold as usize, "fold={fold}");
+        }
+    }
+
+    #[test]
+    fn minimap_symmetry_segments_rotational_fold_lt_2_returns_empty() {
+        for fold in [0u8, 1] {
+            let segs = minimap_symmetry_segments(unit_body(), SymmetryAxis::Rotational { fold });
+            assert!(segs.is_empty(), "fold={fold} should be empty");
+        }
     }
 }

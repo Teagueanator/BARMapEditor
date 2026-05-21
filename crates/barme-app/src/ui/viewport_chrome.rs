@@ -10,6 +10,7 @@ use eframe::egui::{
 };
 
 use crate::render::{OrbitCamera, screen_to_world_y0};
+use crate::ui::help_text::{HelpId, help};
 use crate::ui::icons::{self, Icon};
 use crate::ui::theme::Tokens;
 
@@ -265,15 +266,21 @@ pub fn viewport_options_toolbar(
         .inner_margin(egui::Margin::same(3))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
-                if vp_toggle_btn(ui, Icon::Grid, *grid, "Coordinate grid (G)") {
+                // Sprint 19 / U1 — the legacy `(G)` / `(L)` / `(W)` chord
+                // hints in these tooltips were false promises. Those
+                // letters are bound to tool accelerators in
+                // `handle_keyboard` (Procgen / PaintLayer / Water), not
+                // to viewport toggles. Strip the chord; keep the
+                // descriptive text.
+                if vp_toggle_btn(ui, Icon::Grid, *grid, help(HelpId::ViewportGrid)) {
                     *grid = !*grid;
                     changed = true;
                 }
-                if vp_toggle_btn(ui, Icon::Light, *lighting, "Lighting (L)") {
+                if vp_toggle_btn(ui, Icon::Light, *lighting, help(HelpId::ViewportLighting)) {
                     *lighting = !*lighting;
                     changed = true;
                 }
-                if vp_toggle_btn(ui, Icon::Wire, *wireframe, "Wireframe (W)") {
+                if vp_toggle_btn(ui, Icon::Wire, *wireframe, help(HelpId::ViewportWireframe)) {
                     *wireframe = !*wireframe;
                     changed = true;
                 }
@@ -282,12 +289,7 @@ pub fn viewport_options_toolbar(
                 // for a factory (slope > 10° per the BAR research:
                 // `armlab.lua` / `corlab.lua` set `maxslope = 15`, the
                 // engine divides by 1.5 → effective 10° cap).
-                if vp_toggle_btn(
-                    ui,
-                    Icon::Build,
-                    *buildable,
-                    "Buildable area for factories (red = too steep, >10° slope)",
-                ) {
+                if vp_toggle_btn(ui, Icon::Build, *buildable, help(HelpId::ViewportBuildable)) {
                     *buildable = !*buildable;
                     changed = true;
                 }

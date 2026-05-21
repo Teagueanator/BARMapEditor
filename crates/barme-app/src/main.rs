@@ -9771,6 +9771,7 @@ impl App {
                 &features_mini,
                 extents,
                 &self.camera,
+                self.symmetry,
             );
 
             // Floating viewport-options toolbar. Allocate a Ui placed

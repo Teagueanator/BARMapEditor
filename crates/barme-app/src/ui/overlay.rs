@@ -317,14 +317,30 @@ pub fn dash_subsegments(a: egui::Pos2, b: egui::Pos2) -> Vec<(egui::Pos2, egui::
 
 /// Colour of the brush ring keyed by the brush's stable id. Raise =
 /// green, Lower = red, Smooth = blue per the UX research digest
-/// (`docs/research/ui/claude-research-findings.md` §5). Unknown ids
-/// fall back to light grey rather than panicking, so a future brush
-/// id can ship before its colour mapping does.
+/// (`docs/research/ui/claude-research-findings.md` §5). Sprint 19 /
+/// U1 extended the mapping to cover the four mask-paint brushes from
+/// D9 / Sprint 16: mask-reveal / mask-hide / mask-smooth / mask-fill.
+/// Each mask brush ring colour matches the brush card colour in the
+/// Paint-layer inspector (visual rhyme) and is sourced from
+/// [`crate::ui::theme::Tokens::DARK`] semantic names so dark-theme
+/// edits propagate without re-tuning RGB.
+///
+/// Unknown ids fall back to light grey rather than panicking, so a
+/// future brush id can ship before its colour mapping does.
 pub fn brush_ring_color(brush_id: &str) -> egui::Color32 {
+    let t = crate::ui::theme::Tokens::DARK;
     match brush_id {
         "raise" => egui::Color32::from_rgb(80, 200, 100),
         "lower" => egui::Color32::from_rgb(220, 90, 90),
         "smooth" => egui::Color32::from_rgb(100, 160, 230),
+        // Sprint 19 / U1 — mask-paint brushes (Sprint 16 / D9). Pair
+        // each ring colour with its inspector_paint_layer brush card
+        // so a quick glance at the canvas confirms which brush is
+        // active without checking the Inspector.
+        "mask-reveal" => t.green,
+        "mask-hide" => t.red,
+        "mask-smooth" => t.accent,
+        "mask-fill" => t.amber,
         _ => egui::Color32::LIGHT_GRAY,
     }
 }
@@ -893,6 +909,59 @@ mod tests {
     fn brush_ring_color_unknown_id_returns_neutral_fallback() {
         let unknown = brush_ring_color("nonsense_brush_id");
         assert_eq!(unknown, egui::Color32::LIGHT_GRAY);
+    }
+
+    /// Sprint 19 / U1 — every mask brush returns a non-fallback colour
+    /// pulled from the theme tokens. Used to be `LIGHT_GRAY` (the
+    /// fallback path) — that gave users no semantic colour feedback
+    /// when painting layers.
+    #[test]
+    fn brush_ring_color_mask_brushes_use_theme_tokens() {
+        let t = crate::ui::theme::Tokens::DARK;
+        assert_eq!(brush_ring_color("mask-reveal"), t.green);
+        assert_eq!(brush_ring_color("mask-hide"), t.red);
+        assert_eq!(brush_ring_color("mask-smooth"), t.accent);
+        assert_eq!(brush_ring_color("mask-fill"), t.amber);
+    }
+
+    /// All four mask brush ids return distinct colours from each
+    /// other AND from the three sculpt brushes — the user must be
+    /// able to tell at a glance which brush is active.
+    #[test]
+    fn brush_ring_color_mask_brushes_distinct_from_sculpt() {
+        let mask = [
+            brush_ring_color("mask-reveal"),
+            brush_ring_color("mask-hide"),
+            brush_ring_color("mask-smooth"),
+            brush_ring_color("mask-fill"),
+        ];
+        let sculpt = [
+            brush_ring_color("raise"),
+            brush_ring_color("lower"),
+            brush_ring_color("smooth"),
+        ];
+        // No mask colour matches another mask colour.
+        for (i, a) in mask.iter().enumerate() {
+            for (j, b) in mask.iter().enumerate() {
+                if i != j {
+                    assert_ne!(a, b, "mask brush colours collided at indices {i} and {j}",);
+                }
+            }
+        }
+        // No mask colour matches the LIGHT_GRAY fallback.
+        for c in &mask {
+            assert_ne!(
+                c,
+                &egui::Color32::LIGHT_GRAY,
+                "mask brush colour fell back to the unknown-id grey",
+            );
+        }
+        // No mask colour collides with a sculpt colour.
+        for m in &mask {
+            for s in &sculpt {
+                assert_ne!(m, s, "mask brush colour collided with sculpt colour");
+            }
+        }
     }
 
     // ------------------- BrushCursor sanity -------------------
