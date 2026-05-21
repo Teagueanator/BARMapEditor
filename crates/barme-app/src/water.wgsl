@@ -95,13 +95,125 @@ fn clip_to_screen_uv(clip_pos: vec4<f32>) -> vec2<f32> {
     return vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
 }
 
+// ─── Sprint 26 / R3 / ADR-044 — procedural surface normal ─────
+//
+// BAR's `BumpWaterFS.glsl::GetNormal` samples `normalmap` four times
+// at progressively offset UVs and combines them with amplitudes
+// `1, a, a², a³, a⁴` (a = `PerlinAmp`). That's morally fbm against a
+// noise texture; we replace it with WGSL gradient noise so we avoid
+// the GPL-2.0 asset vendoring discussion (the engine's waterbump.png
+// is GPL inherited from the springcontent base; we'd inherit the
+// licence into the editor's binary distribution). The visual contract
+// is identical — a tilable animated normal map driven by the same
+// `perlinStartFreq` / `Lacunarity` / `Amplitude` parameters.
+
+/// Cheap deterministic 2D hash. Source: Quilez's "Inigo's hash" at
+/// `https://www.shadertoy.com/view/4djSRW` — chosen for tight WGSL
+/// portability (no out-of-spec ints, no bitwise tricks that vary by
+/// backend).
+fn hash22(p: vec2<f32>) -> vec2<f32> {
+    let q = vec2<f32>(
+        dot(p, vec2<f32>(127.1, 311.7)),
+        dot(p, vec2<f32>(269.5, 183.3)),
+    );
+    return fract(sin(q) * 43758.5453) * 2.0 - 1.0;
+}
+
+/// 2D gradient (Perlin-style) noise. Returns `-1..1`. Standard
+/// quintic-smoothed bilerp of the four corner gradients.
+fn gradient_noise(p: vec2<f32>) -> f32 {
+    let pi = floor(p);
+    let pf = fract(p);
+    // Quintic falloff `6t⁵ − 15t⁴ + 10t³`. Smoother first + second
+    // derivatives than the simpler `3t² − 2t³` cubic — important for
+    // taking the normal as a finite difference of noise samples.
+    let w = pf * pf * pf * (pf * (pf * 6.0 - 15.0) + 10.0);
+    let g00 = hash22(pi + vec2<f32>(0.0, 0.0));
+    let g10 = hash22(pi + vec2<f32>(1.0, 0.0));
+    let g01 = hash22(pi + vec2<f32>(0.0, 1.0));
+    let g11 = hash22(pi + vec2<f32>(1.0, 1.0));
+    let d00 = dot(g00, pf - vec2<f32>(0.0, 0.0));
+    let d10 = dot(g10, pf - vec2<f32>(1.0, 0.0));
+    let d01 = dot(g01, pf - vec2<f32>(0.0, 1.0));
+    let d11 = dot(g11, pf - vec2<f32>(1.0, 1.0));
+    let x0 = mix(d00, d10, w.x);
+    let x1 = mix(d01, d11, w.x);
+    return mix(x0, x1, w.y);
+}
+
+/// 4-octave fbm — mirrors the engine shader's four normalmap taps with
+/// progressive lacunarity. `amp_decay` halves the contribution per
+/// octave (engine uses `a, a², a³, a⁴` with `a = polish_d.w`; we follow
+/// the same geometric falloff).
+fn fbm4(p: vec2<f32>, start_freq: f32, amp: f32) -> f32 {
+    // Engine `PerlinLacunarity` default is 3.0 (FINDINGS §1.5).
+    let l = 3.0;
+    var v = 0.0;
+    var f = start_freq;
+    var a = amp;
+    v += gradient_noise(p * f) * a;
+    f = f * l;
+    a = a * amp;
+    v += gradient_noise(p * f) * a;
+    f = f * l;
+    a = a * amp;
+    v += gradient_noise(p * f) * a;
+    f = f * l;
+    a = a * amp;
+    v += gradient_noise(p * f) * a;
+    return v;
+}
+
+/// Reconstruct a world-space surface normal from the fbm field via a
+/// 4-tap finite difference. World XZ → noise field → height; partial
+/// derivatives give the tangent plane, cross-product the normal.
+/// `time_s` shifts the field over time to give the surface its
+/// animated chop. `wind` xy drives the per-axis flow direction.
+fn fbm_surface_normal(
+    world_xz: vec2<f32>,
+    time_s: f32,
+    wind: vec2<f32>,
+    normal_scale: f32,
+    start_freq: f32,
+    amp: f32,
+) -> vec3<f32> {
+    // Convert world-space XZ to a noise-space coordinate. `normal_scale`
+    // controls one fbm "tile" per `1/normal_scale` elmos.
+    let base = world_xz * normal_scale + wind * time_s;
+    // 4-tap finite difference; the offset matches the engine's
+    // `WaveFoamDistortion` magnitude class. Larger eps → smoother
+    // normals (loses detail); smaller → noisier (precision-limited).
+    let eps = 0.5;
+    let n_c = fbm4(base, start_freq, amp);
+    let n_x = fbm4(base + vec2<f32>(eps, 0.0), start_freq, amp);
+    let n_z = fbm4(base + vec2<f32>(0.0, eps), start_freq, amp);
+    let dx = (n_x - n_c) / eps;
+    let dz = (n_z - n_c) / eps;
+    // Normal from height field: `(-dx, 1, -dz)` then normalize. Y
+    // dominates so the normal stays close to vertical (the surface
+    // isn't a wall; it's a gently rippling plane).
+    return normalize(vec3<f32>(-dx, 1.0, -dz));
+}
+
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    // For Sprint 26 / commit 2, `surface_normal` is a fixed up-vector;
-    // commit 3 swaps it for a Perlin-driven animated normal. The
-    // refraction / reflection sampling structure stays — only the
-    // perturbation source changes.
-    let surface_normal = vec3<f32>(0.0, 1.0, 0.0);
+    // Sprint 26 / R3 / commit 3 — fbm-driven surface normal. Replaces
+    // the commit-2 placeholder `vec3(0, 1, 0)`. The refraction +
+    // reflection UV perturbation, fresnel angle (commit 4), and
+    // shorewave foam tap (commit 4) all read from this single normal,
+    // so the visual coherence holds across the per-effect work.
+    let wind = vec2<f32>(u.polish_b.x, u.polish_b.y);
+    let normal_scale = u.polish_b.z;
+    let perlin_start = u.polish_d.z;
+    let perlin_amp = u.polish_d.w;
+    let surface_normal = fbm_surface_normal(
+        in.world_pos.xz,
+        u.polish_a.z,
+        wind,
+        normal_scale,
+        perlin_start,
+        perlin_amp,
+    );
 
     // Screen-space UV for the refraction sampler. Perturbed by the
     // surface normal projected onto the screen (engine
