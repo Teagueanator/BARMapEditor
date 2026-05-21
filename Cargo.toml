@@ -56,6 +56,9 @@ directories = "6"
 # Scratch dirs (build_and_install uses a per-call tempdir)
 tempfile = "3"
 
+# Sprint 20: disk-free-space probe for the PrepareStaging warning.
+fs2 = "0.4"
+
 # Workspace-internal
 barme-core = { path = "crates/barme-core" }
 barme-pipeline = { path = "crates/barme-pipeline" }

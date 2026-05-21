@@ -227,6 +227,40 @@ pub fn run_worker_build(
         line: "▸ Baking diffuse texture".into(),
         stream: LogStream::Info,
     });
+    // Sprint 20 / chunk 8 — disk-space sanity check. Warn-level
+    // when the build temp dir's filesystem has <2 GB free; not a
+    // gate (the user might know better — a 4-SMU map fits in
+    // <500 MB). Failure to probe is silent: fs2 returns 0 on
+    // unsupported targets and a Result on others.
+    const MIN_FREE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+    match fs2::available_space(&work) {
+        Ok(free) if free < MIN_FREE_BYTES => {
+            let msg = format!(
+                "low disk: {} MB free at {} (recommended ≥ 2 GB; build may fail if PyMapConv \
+                 needs more)",
+                free / (1024 * 1024),
+                work.display(),
+            );
+            warn!("{msg}");
+            sink.emit(BuildEvent::Log {
+                line: msg,
+                stream: LogStream::Warn,
+            });
+        }
+        Ok(free) => {
+            sink.emit(BuildEvent::Log {
+                line: format!(
+                    "disk: {} MB free at {}",
+                    free / (1024 * 1024),
+                    work.display()
+                ),
+                stream: LogStream::Info,
+            });
+        }
+        Err(e) => {
+            warn!(?e, ?work, "fs2::available_space failed");
+        }
+    }
     let texture_bmp = bake_texture_bmp(&project, &heightmap_png, &work, &*slot_resolver)
         .map_err(|e| format!("diffuse bake: {e}"))?;
     sink.emit(BuildEvent::Log {

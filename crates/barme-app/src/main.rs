@@ -137,6 +137,11 @@ struct App {
     /// overlay's "View log…" button, and the top-bar Build > Show log
     /// menu item. Auto-set when the build transitions to Failed.
     build_log_open: bool,
+    /// Sprint 20 / chunk 8 — is the save-before-build confirmation
+    /// modal open this frame? Set when the user requests a build with
+    /// unsaved changes; cleared by the modal's three button outcomes
+    /// (Save & build / Build without saving / Cancel).
+    save_before_build_open: bool,
     brushes: BrushRegistry,
     brush_id: Option<String>,
     brush_radius: f32,
@@ -1276,6 +1281,7 @@ impl App {
             last_install: None,
             build_state: build_runner::BuildState::Idle,
             build_log_open: false,
+            save_before_build_open: false,
             brushes: BrushRegistry::default_set(),
             brush_id: None, // Off
             brush_radius: 256.0,
@@ -4974,6 +4980,37 @@ impl App {
                     error!("{msg}");
                     self.last_error = Some(msg);
                 }
+            }
+        }
+    }
+
+    /// Sprint 20 / chunk 8 — apply the save-before-build modal's
+    /// choice. SaveAndBuild → save first then start the build;
+    /// BuildWithoutSaving → start the build directly; Cancel → no-op;
+    /// Dismissed → modal stayed open or wasn't shown.
+    fn apply_save_before_build_choice(
+        &mut self,
+        choice: crate::ui::save_before_build::SaveBeforeBuildChoice,
+    ) {
+        use crate::ui::save_before_build::SaveBeforeBuildChoice;
+        match choice {
+            SaveBeforeBuildChoice::Dismissed | SaveBeforeBuildChoice::Cancel => {}
+            SaveBeforeBuildChoice::SaveAndBuild => {
+                if let Some(path) = self.current_project_path.clone() {
+                    self.save_to(path);
+                    self.build_and_install();
+                } else {
+                    // No on-disk path yet — fall back to Save As… via
+                    // the dialog. If the user cancels the dialog, no
+                    // build runs.
+                    if let Some(p) = pick_save_path(&self.project_name) {
+                        self.save_to(p);
+                        self.build_and_install();
+                    }
+                }
+            }
+            SaveBeforeBuildChoice::BuildWithoutSaving => {
+                self.build_and_install();
             }
         }
     }
@@ -10268,7 +10305,18 @@ impl App {
                 }
             }
             Some(FileAction::OpenPath(p)) => self.open_from(p),
-            Some(FileAction::BuildAndInstall) => self.build_and_install(),
+            Some(FileAction::BuildAndInstall) => {
+                // Sprint 20 / chunk 8 — dirty-state gate. If the
+                // project has unsaved changes, open the confirmation
+                // modal instead of starting the build immediately.
+                // The modal's three outcomes funnel back through
+                // `apply_save_before_build_choice`.
+                if self.dirty && self.current_project_path.is_some() {
+                    self.save_before_build_open = true;
+                } else {
+                    self.build_and_install();
+                }
+            }
             Some(FileAction::ApplyProcGen) => self.apply_procgen(),
             Some(FileAction::Undo) => self.undo_one(),
             Some(FileAction::Redo) => self.redo_one(),
@@ -10311,6 +10359,13 @@ impl eframe::App for App {
         let log_clicks =
             crate::ui::build_log::render(ctx, &mut self.build_log_open, &self.build_state);
         self.apply_build_log_clicks(log_clicks);
+
+        // Sprint 20 / chunk 8 — save-before-build modal. Apply the
+        // user's choice immediately so a Save & build chain runs on
+        // the same frame.
+        let save_choice =
+            crate::ui::save_before_build::render(ctx, &mut self.save_before_build_open);
+        self.apply_save_before_build_choice(save_choice);
 
         self.drain_action(action);
         self.symmetry_popover(ctx);
@@ -10534,6 +10589,7 @@ mod tests {
             last_install: None,
             build_state: build_runner::BuildState::Idle,
             build_log_open: false,
+            save_before_build_open: false,
             brushes: BrushRegistry::default_set(),
             brush_id: None,
             brush_radius: 256.0,
