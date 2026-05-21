@@ -7648,37 +7648,36 @@ impl App {
     /// the active symmetry mode (which drives the tool's strokes) plus
     /// the map size (in SMU). Each chip carries its own hover-text via
     /// [`crate::ui::help_text`].
+    ///
+    /// Sprint 27 / U5 — thin wrapper over
+    /// [`crate::ui::widgets::sticky_chip_strip`]. The wrapper exists so
+    /// every `inspector_*` keeps its one-line call site; the chip
+    /// layout / divider / padding all live in widgets.rs.
     fn inspector_sticky_chips(&self, ui: &mut egui::Ui) {
-        use crate::ui::help_text::{HelpId, help};
-        use crate::ui::theme::{ChipTone, Tokens};
-        let t = Tokens::DARK;
-        let sym_label = self.symmetry.label();
+        use crate::ui::help_text::HelpId;
+        use crate::ui::theme::ChipTone;
+        use crate::ui::widgets::{ChipDesc, sticky_chip_strip};
         let sym_tone = match self.symmetry {
             SymmetryAxis::None => ChipTone::Neutral,
             _ => ChipTone::Ok,
         };
+        let sym_label = format!("Sym · {}", self.symmetry.label());
         let size_label = format!("{}×{} SMU", self.map_size.smu_x, self.map_size.smu_z);
-        egui::Frame::new()
-            .inner_margin(egui::Margin {
-                left: 14,
-                right: 14,
-                top: 6,
-                bottom: 4,
-            })
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    crate::ui::widgets::chip(ui, sym_tone, format!("Sym · {sym_label}"))
-                        .on_hover_text(help(HelpId::InspectorSymmetryChip));
-                    crate::ui::widgets::chip(ui, ChipTone::Neutral, size_label)
-                        .on_hover_text(help(HelpId::InspectorMapSizeChip));
-                });
-                ui.add_space(2.0);
-                // 1-px divider line so the chip row reads as a band.
-                let avail = ui.available_width();
-                let (rect, _) =
-                    ui.allocate_exact_size(egui::vec2(avail, 1.0), egui::Sense::hover());
-                ui.painter().rect_filled(rect, 0.0, t.border);
-            });
+        sticky_chip_strip(
+            ui,
+            &[
+                ChipDesc {
+                    tone: sym_tone,
+                    label: &sym_label,
+                    hover_help: HelpId::InspectorSymmetryChip,
+                },
+                ChipDesc {
+                    tone: ChipTone::Neutral,
+                    label: &size_label,
+                    hover_help: HelpId::InspectorMapSizeChip,
+                },
+            ],
+        );
     }
 
     fn inspector_select(&self, ui: &mut egui::Ui) {

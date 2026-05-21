@@ -609,6 +609,46 @@ pub fn brush_card(ui: &mut Ui, card: BrushCard<'_>) -> Response {
     response.on_hover_text(help(card.hover_help))
 }
 
+/// Sprint 27 / U5 — descriptor for the chips in [`sticky_chip_strip`].
+/// `hover_help` is a [`HelpId`] so each chip's tooltip routes through
+/// the central catalogue.
+pub struct ChipDesc<'a> {
+    pub tone: ChipTone,
+    pub label: &'a str,
+    pub hover_help: HelpId,
+}
+
+/// Sprint 27 / U5 — sticky symmetry + map-size chip strip rendered
+/// at the top of every tool's Inspector body, between the persistent
+/// header and the first section. Replaces the per-tool inline
+/// `App::inspector_sticky_chips` so the band reads identically
+/// across all 9 inspectors.
+///
+/// Layout: 14 px horizontal padding, 6 / 4 px top / bottom, with a
+/// 1-pixel divider below the chips so the row reads as a band even
+/// against the section that follows.
+pub fn sticky_chip_strip(ui: &mut Ui, chips: &[ChipDesc<'_>]) {
+    let t = Tokens::DARK;
+    egui::Frame::new()
+        .inner_margin(egui::Margin {
+            left: 14,
+            right: 14,
+            top: 6,
+            bottom: 4,
+        })
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                for c in chips {
+                    chip(ui, c.tone, c.label).on_hover_text(help(c.hover_help));
+                }
+            });
+            ui.add_space(2.0);
+            let avail = ui.available_width();
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(avail, 1.0), Sense::hover());
+            ui.painter().rect_filled(rect, 0.0, t.border);
+        });
+}
+
 #[cfg(test)]
 mod tests {
     /// Pure helper: given a value+range, compute the normalised t in [0,1].
