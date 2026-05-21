@@ -259,6 +259,13 @@ struct App {
     /// is false; re-runnable from the Help menu's "Start guided
     /// tour" item.
     tour: crate::ui::tour::TourState,
+    /// Sprint 22 / U2 — per-tool intro overlay state. `pending =
+    /// Some(accel)` when the tool was just entered for the first
+    /// time (i.e. the accel isn't in
+    /// `EditorConfig.tool_intros_seen`). [`set_tool`] populates
+    /// this; [`crate::ui::tool_intro::render`] resolves on user
+    /// action.
+    tool_intro: crate::ui::tool_intro::ToolIntroState,
     /// Sprint 19 / U1 — is the lint-panel window open this frame? Driven by
     /// the top-bar validation chip and the status-strip issue-count label.
     lint_panel_open: bool,
@@ -1347,6 +1354,7 @@ impl App {
             show_cheat_sheet: false,
             help_center: crate::ui::help_center::HelpCenter::default(),
             tour: crate::ui::tour::TourState::default(),
+            tool_intro: crate::ui::tool_intro::ToolIntroState::default(),
             lint_panel_open: false,
             lint_panel_was_open: false,
             lint_summary: Vec::new(),
@@ -5971,6 +5979,19 @@ impl App {
         // emit a MoveStartPosition undo entry (no committed move).
         self.dragging_start_pos = None;
         self.dragging_start_pos_from = None;
+        // Sprint 22 / U2: pop per-tool intro on first entry. Skip if
+        // an intro is already pending (avoids stacking when the user
+        // rapidly cycles tools) and skip during an active tour
+        // (tour callouts are already explaining the tools).
+        let accel = new.accel();
+        if !self.editor_config.tool_intro_seen(accel)
+            && self.tool_intro.pending.is_none()
+            && !self.tour.active
+        {
+            self.tool_intro.pending = Some(accel.to_string());
+            self.tool_intro.dont_show_again = false;
+            trace!(target: "barme::tool_intro", accel, "intro queued for first-entry");
+        }
     }
 
     /// Keyboard: Ctrl-Z / Ctrl-Shift-Z / Ctrl-Y for undo / redo,
@@ -10577,6 +10598,22 @@ impl eframe::App for App {
         // cheat sheet — both can be open at once.
         crate::ui::help_center::help_window(ctx, &mut self.help_center);
 
+        // Sprint 22 / U2: per-tool intro overlay. `pending` is set
+        // by `set_tool` on first entry; we render here so the tool
+        // strip + inspector are already painted underneath.
+        let intro_action = crate::ui::tool_intro::render(ctx, &mut self.tool_intro);
+        match intro_action {
+            crate::ui::tool_intro::ToolIntroAction::None
+            | crate::ui::tool_intro::ToolIntroAction::DismissTemp => {}
+            crate::ui::tool_intro::ToolIntroAction::DismissPersist { accel } => {
+                self.editor_config.mark_tool_intro_seen(&accel);
+                self.editor_config.save();
+            }
+            crate::ui::tool_intro::ToolIntroAction::OpenHelp { article } => {
+                self.help_center.open_at(article);
+            }
+        }
+
         // Sprint 22 / U2: guided tour overlay. Runs on top of every
         // panel; the App registers target rects per-frame on its
         // panel-render path. Completion / skip flips the
@@ -10797,6 +10834,7 @@ mod tests {
             show_cheat_sheet: false,
             help_center: crate::ui::help_center::HelpCenter::default(),
             tour: crate::ui::tour::TourState::default(),
+            tool_intro: crate::ui::tool_intro::ToolIntroState::default(),
             lint_panel_open: false,
             lint_panel_was_open: false,
             lint_summary: Vec::new(),
