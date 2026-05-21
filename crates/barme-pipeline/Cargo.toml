@@ -17,6 +17,10 @@ sha2.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true
+# Sprint 24 (T2): parallel DNTS bake across DNTS-bound layers via a
+# scoped rayon pool. See `crates/barme-pipeline/src/splat_pipeline.rs`
+# and `docs/research/multithreading/PROPOSAL.md` §3.
+rayon.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

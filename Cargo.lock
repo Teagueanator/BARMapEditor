@@ -365,6 +365,7 @@ dependencies = [
  "anyhow",
  "barme-core",
  "image",
+ "rayon",
  "serde",
  "serde_json",
  "sha2",
