@@ -37,3 +37,7 @@ path = "examples/gen_fixture.rs"
 [[example]]
 name = "bench-brushes"
 path = "examples/bench_brushes.rs"
+
+[[example]]
+name = "bench-procgen"
+path = "examples/bench_procgen.rs"
