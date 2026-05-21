@@ -600,6 +600,13 @@ impl StockManifest {
     pub fn contains(&self, name: &str) -> bool {
         self.names.contains(name)
     }
+
+    /// `true` when the manifest holds zero names — used by the
+    /// `FeatureNotInStockManifest` rule to skip emission when the
+    /// stock catalogue failed to load.
+    pub fn is_empty(&self) -> bool {
+        self.names.is_empty()
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -668,13 +675,25 @@ mod tests {
         assert!(m.contains("pinetree"), "stock manifest missing pinetree");
     }
 
-    /// A fresh wizard-style project lints clean for hard errors.
-    /// Warnings are allowed (the user may have a project state that
-    /// trips a sane warning like "no start positions") but no
-    /// `LintSeverity::Error` should fire on a vanilla project.
+    /// A wizard-style fixture (one ally group with one start
+    /// position; everything else default) lints clean for hard
+    /// errors. Warnings are allowed (the project might trip a sane
+    /// warning), but no `LintSeverity::Error` should fire.
+    ///
+    /// `Project::new` alone has no ally groups → `TeamsEmpty` would
+    /// fire; the wizard seeds at least one. This test mirrors the
+    /// wizard's post-state, matching the Sprint 21 prompt's smoke
+    /// criterion "Default wizard project → 0 errors".
     #[test]
-    fn fresh_project_emits_no_hard_errors() {
-        let p = Project::new("smoke", 4);
+    fn wizard_style_fixture_emits_no_hard_errors() {
+        use barme_core::{AllyGroup, StartPosition};
+        let mut p = Project::new("smoke", 4);
+        let mut g = AllyGroup::new(0);
+        g.start_positions.push(StartPosition {
+            x_elmo: 512,
+            z_elmo: 512,
+        });
+        p.ally_groups.push(g);
         let issues = lint(&p);
         let errors: Vec<&LintIssue> = issues
             .iter()
@@ -682,7 +701,7 @@ mod tests {
             .collect();
         assert!(
             errors.is_empty(),
-            "fresh project produced hard errors: {errors:#?}"
+            "wizard-style fixture produced hard errors: {errors:#?}"
         );
     }
 }
