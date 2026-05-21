@@ -270,6 +270,14 @@ struct App {
     /// built at startup; the field carries the runtime open / query
     /// / selection state.
     command_palette: crate::ui::command_palette::CommandPalette,
+    /// Sprint 22 / U2 — "What's this?" hover-popover mode. When
+    /// `true`, hover-tooltips wrapped via
+    /// [`crate::ui::help_text::show_popover`] surface as
+    /// click-pinned popovers with a "Read more" link to the help
+    /// center. Toggled by Ctrl+Shift+H (or the View command in the
+    /// palette). Per critical pitfall #8: NOT persisted across
+    /// restarts; this is an exploration mode, not a default.
+    whats_this_mode: bool,
     /// Sprint 19 / U1 — is the lint-panel window open this frame? Driven by
     /// the top-bar validation chip and the status-strip issue-count label.
     lint_panel_open: bool,
@@ -1360,6 +1368,7 @@ impl App {
             tour: crate::ui::tour::TourState::default(),
             tool_intro: crate::ui::tool_intro::ToolIntroState::default(),
             command_palette: crate::ui::command_palette::CommandPalette::default(),
+            whats_this_mode: false,
             lint_panel_open: false,
             lint_panel_was_open: false,
             lint_summary: Vec::new(),
@@ -6005,19 +6014,21 @@ impl App {
     /// `TextEdit` doesn't eat keystrokes and bounce the user out of
     /// Procgen mid-edit.
     fn handle_keyboard(&mut self, ctx: &egui::Context, action: &mut Option<FileAction>) {
-        let (key_undo, key_redo, key_save, key_save_as, key_palette) = ctx.input(|i| {
+        let (key_undo, key_redo, key_save, key_save_as, key_palette, key_whats_this) = ctx.input(|i| {
             let cmd = i.modifiers.command;
             let shift = i.modifiers.shift;
             let z = i.key_pressed(egui::Key::Z);
             let y = i.key_pressed(egui::Key::Y);
             let s = i.key_pressed(egui::Key::S);
             let k = i.key_pressed(egui::Key::K);
+            let h = i.key_pressed(egui::Key::H);
             (
                 cmd && !shift && z,
                 (cmd && shift && z) || (cmd && y),
                 cmd && !shift && s,
                 cmd && shift && s,
                 cmd && k,
+                cmd && shift && h,
             )
         });
         if key_undo {
@@ -6045,6 +6056,16 @@ impl App {
             } else {
                 self.command_palette.show();
             }
+        }
+        // Sprint 22 / U2 — Ctrl+Shift+H toggles "What's this?" mode.
+        // Not persisted across restarts (critical pitfall #8).
+        if key_whats_this {
+            self.whats_this_mode = !self.whats_this_mode;
+            info!(
+                target: "barme::whats_this",
+                on = self.whats_this_mode,
+                "what's-this mode toggled"
+            );
         }
 
         if ctx.wants_keyboard_input() {
@@ -6252,9 +6273,7 @@ impl App {
                 self.buildable_overlay_on = !self.buildable_overlay_on
             }
             C::ToggleWhatsThisMode => {
-                // Sprint 22 commit 5 wires the actual mode; the
-                // toggle is a no-op until then. Kept in the palette
-                // so the catalogue stays stable across commits.
+                self.whats_this_mode = !self.whats_this_mode;
             }
             C::Recenter => {
                 let (ex, ez) = self.map_size.elmo_extents();
@@ -7074,6 +7093,28 @@ impl App {
                                 .sense(egui::Sense::hover()),
                         )
                         .on_hover_text(help(HelpId::StatusBrushChip));
+                    });
+                }
+                // Sprint 22 / U2 — "What's this?" mode indicator.
+                // Right-aligned chip in the status strip, only
+                // visible while the mode is on. Click to toggle off.
+                if self.whats_this_mode {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let resp = crate::ui::widgets::chip(
+                            ui,
+                            crate::ui::theme::ChipTone::Warn,
+                            "What's this? · Ctrl+Shift+H",
+                        );
+                        if resp
+                            .on_hover_text(
+                                "What's this? mode is on. Hover any widget for the\n\
+                                 catalogue tooltip; the next click on a widget will\n\
+                                 jump to its help-center article. Ctrl+Shift+H toggles off.",
+                            )
+                            .clicked()
+                        {
+                            self.whats_this_mode = false;
+                        }
                     });
                 }
             });
@@ -10947,6 +10988,7 @@ mod tests {
             tour: crate::ui::tour::TourState::default(),
             tool_intro: crate::ui::tool_intro::ToolIntroState::default(),
             command_palette: crate::ui::command_palette::CommandPalette::default(),
+            whats_this_mode: false,
             lint_panel_open: false,
             lint_panel_was_open: false,
             lint_summary: Vec::new(),
@@ -11134,6 +11176,83 @@ mod tests {
         app.set_tool(Tool::StartPositions);
         assert_eq!(app.tool, Tool::StartPositions);
         assert_eq!(app.previous_tool, Tool::Procgen);
+    }
+
+    /// Sprint 22 / U2 — apply_command toggles whats_this_mode and
+    /// the toggle is independent of the keyboard handler.
+    #[test]
+    fn apply_command_toggles_whats_this_mode() {
+        let mut app = make_test_app();
+        assert!(!app.whats_this_mode, "default off");
+        let mut sink: Option<FileAction> = None;
+        app.apply_command(
+            crate::ui::command_palette::CommandAction::ToggleWhatsThisMode,
+            &mut sink,
+        );
+        assert!(app.whats_this_mode);
+        app.apply_command(
+            crate::ui::command_palette::CommandAction::ToggleWhatsThisMode,
+            &mut sink,
+        );
+        assert!(!app.whats_this_mode);
+    }
+
+    /// Sprint 22 / U2 — palette SwitchTool dispatches to set_tool
+    /// via the accel mapping.
+    #[test]
+    fn apply_command_switch_tool_resolves_accel() {
+        let mut app = make_test_app();
+        let mut sink: Option<FileAction> = None;
+        app.apply_command(
+            crate::ui::command_palette::CommandAction::SwitchTool("L"),
+            &mut sink,
+        );
+        assert_eq!(app.tool, Tool::PaintLayer);
+    }
+
+    /// Sprint 22 / U2 — palette OpenHelpArticle opens the help
+    /// center at the requested article.
+    #[test]
+    fn apply_command_open_help_article_opens_center() {
+        let mut app = make_test_app();
+        let mut sink: Option<FileAction> = None;
+        let article = crate::ui::help_center::HelpArticleId::Pitfall04HeightmapDims;
+        app.apply_command(
+            crate::ui::command_palette::CommandAction::OpenHelpArticle(article),
+            &mut sink,
+        );
+        assert!(app.help_center.open);
+        assert_eq!(app.help_center.active_article, article);
+    }
+
+    /// Sprint 22 / U2 — palette StartTour resets the completion
+    /// flag and activates the tour.
+    #[test]
+    fn apply_command_start_tour_resets_and_activates() {
+        let mut app = make_test_app();
+        app.editor_config.mark_tour_completed_for_current_version();
+        assert!(app.editor_config.tour_completed_for_current_version());
+        let mut sink: Option<FileAction> = None;
+        app.apply_command(crate::ui::command_palette::CommandAction::StartTour, &mut sink);
+        assert!(app.tour.active);
+        assert!(!app.editor_config.tour_completed_for_current_version());
+    }
+
+    /// Sprint 22 / U2 — palette ResetToolIntros clears the
+    /// EditorConfig set.
+    #[test]
+    fn apply_command_reset_tool_intros_clears_set() {
+        let mut app = make_test_app();
+        app.editor_config.mark_tool_intro_seen("L");
+        app.editor_config.mark_tool_intro_seen("B");
+        assert!(app.editor_config.tool_intro_seen("L"));
+        let mut sink: Option<FileAction> = None;
+        app.apply_command(
+            crate::ui::command_palette::CommandAction::ResetToolIntros,
+            &mut sink,
+        );
+        assert!(!app.editor_config.tool_intro_seen("L"));
+        assert!(!app.editor_config.tool_intro_seen("B"));
     }
 
     /// Leaving any tool must cancel an in-flight marker drag —

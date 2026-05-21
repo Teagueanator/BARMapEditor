@@ -31,6 +31,8 @@ pub const CAMERA_BINDINGS: &[(&str, &str)] = &[
     ("Arrow keys", "Pan camera (Shift = 5× faster)"),
     ("Ctrl+Z", "Undo"),
     ("Ctrl+Shift+Z / Ctrl+Y", "Redo"),
+    ("Ctrl+K", "Open command palette"),
+    ("Ctrl+Shift+H", "Toggle what's-this hover mode"),
     ("?", "Open this cheat-sheet"),
     ("Esc", "Close cheat-sheet / dismiss intro"),
 ];

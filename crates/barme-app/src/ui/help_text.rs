@@ -635,6 +635,58 @@ pub fn help(id: HelpId) -> &'static str {
     }
 }
 
+/// Sprint 22 / U2 — `show_popover` is the wrapper Sprint 19's
+/// `.on_hover_text(help(id))` call sites should migrate to once the
+/// Sprint 22 framework is in place.
+///
+/// Behaviour:
+/// - `whats_this == false`: identical to `response.on_hover_text(help(id))`.
+/// - `whats_this == true`: in addition to the hover tooltip, renders
+///   a small `[?]` chip overlaid in the top-right of `response.rect`
+///   when hovered, signalling that the user can click to pin the
+///   popover and jump to the help center. (The "true pinned popover
+///   stays open after the cursor moves" UX is a Stage 2 polish item;
+///   Sprint 22 ships the affordance + the keyboard toggle so users
+///   can discover the API.)
+///
+/// `article`: optional help-center article to jump to via the
+/// pinned popover's "Read more" button. `None` means "no
+/// dedicated article exists; just show the tooltip."
+///
+/// The function returns the same `Response` the caller passed in,
+/// so it can be chained as a drop-in replacement.
+#[allow(dead_code)] // wired by call-site migrations in commit 6 and Stage 2 polish
+pub fn show_popover(
+    ui: &mut eframe::egui::Ui,
+    response: eframe::egui::Response,
+    id: HelpId,
+    whats_this: bool,
+    _article: Option<crate::ui::help_center::HelpArticleId>,
+) -> eframe::egui::Response {
+    let text = help(id);
+    let response = response.on_hover_text(text);
+    if whats_this && response.hovered() {
+        let painter = ui.painter();
+        let center = eframe::egui::pos2(
+            response.rect.right() - 6.0,
+            response.rect.top() + 6.0,
+        );
+        painter.circle_filled(
+            center,
+            5.0,
+            eframe::egui::Color32::from_rgb(220, 175, 90),
+        );
+        painter.text(
+            center,
+            eframe::egui::Align2::CENTER_CENTER,
+            "?",
+            eframe::egui::FontId::monospace(8.0),
+            eframe::egui::Color32::BLACK,
+        );
+    }
+    response
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
