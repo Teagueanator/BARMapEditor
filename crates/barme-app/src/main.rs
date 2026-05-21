@@ -6641,32 +6641,75 @@ impl App {
                     open_lint = true;
                 }
                 ui.separator();
-                let install_resp = match &self.last_install {
-                    Some(Ok(p)) => ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(format!(
-                                "Installed: {}",
-                                p.file_name()
-                                    .and_then(|s| s.to_str())
-                                    .unwrap_or_else(|| p.to_str().unwrap_or("?")),
-                            ))
-                            .color(egui::Color32::GREEN),
-                        )
-                        .sense(egui::Sense::hover()),
-                    ),
-                    Some(Err(msg)) => ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(format!("Install failed: {msg}"))
-                                .color(egui::Color32::RED),
-                        )
-                        .sense(egui::Sense::hover()),
-                    ),
-                    None => ui.add(
-                        egui::Label::new(egui::RichText::new("Build: idle").weak())
-                            .sense(egui::Sense::hover()),
-                    ),
+                // Sprint 20 / chunk 6 — status strip mirrors the
+                // BuildState machine. Running shows the active stage
+                // and elapsed; Done / Failed / Cancelled stay sticky
+                // until the next build kicks off. Every variant is
+                // click-to-show-log.
+                let mut open_build_log = false;
+                let build_chip_text: egui::RichText = match &self.build_state {
+                    build_runner::BuildState::Running {
+                        current_stage,
+                        started_at,
+                        ..
+                    } => egui::RichText::new(format!(
+                        "Building: {} · {}s",
+                        current_stage.label(),
+                        started_at.elapsed().as_secs(),
+                    ))
+                    .color(egui::Color32::from_rgb(180, 200, 240)),
+                    build_runner::BuildState::Done {
+                        sd7_path, duration, ..
+                    } => egui::RichText::new(format!(
+                        "✓ {} in {}s",
+                        sd7_path.file_name().and_then(|s| s.to_str()).unwrap_or("?"),
+                        duration.as_secs(),
+                    ))
+                    .color(egui::Color32::from_rgb(110, 200, 120)),
+                    build_runner::BuildState::Failed { error, .. } => {
+                        egui::RichText::new(format!("✗ Build failed: {}", short_error(error)))
+                            .color(egui::Color32::from_rgb(220, 110, 90))
+                    }
+                    build_runner::BuildState::Cancelled { duration, .. } => {
+                        egui::RichText::new(format!("Build cancelled ({}s)", duration.as_secs()))
+                            .weak()
+                    }
+                    build_runner::BuildState::Idle => match &self.last_install {
+                        Some(Ok(p)) => egui::RichText::new(format!(
+                            "Installed: {}",
+                            p.file_name()
+                                .and_then(|s| s.to_str())
+                                .unwrap_or_else(|| p.to_str().unwrap_or("?")),
+                        ))
+                        .color(egui::Color32::from_rgb(110, 200, 120)),
+                        Some(Err(msg)) => {
+                            egui::RichText::new(format!("Install failed: {}", short_error(msg)))
+                                .color(egui::Color32::from_rgb(220, 110, 90))
+                        }
+                        None => egui::RichText::new("Build: idle").weak(),
+                    },
                 };
-                install_resp.on_hover_text(help(HelpId::StatusInstall));
+                // The Idle / no-prior-install variant gets hover-only
+                // semantics (nothing to show in the log); every other
+                // variant is click-to-show-log.
+                let clickable = !matches!(
+                    (&self.build_state, &self.last_install),
+                    (build_runner::BuildState::Idle, None)
+                );
+                let sense = if clickable {
+                    egui::Sense::click()
+                } else {
+                    egui::Sense::hover()
+                };
+                let build_chip_resp = ui
+                    .add(egui::Label::new(build_chip_text).sense(sense))
+                    .on_hover_text(help(HelpId::StatusInstall));
+                if clickable && build_chip_resp.clicked() {
+                    open_build_log = true;
+                }
+                if open_build_log {
+                    self.build_log_open = true;
+                }
                 if let Some(err) = &self.last_error {
                     ui.separator();
                     ui.colored_label(egui::Color32::RED, err);
