@@ -192,7 +192,23 @@ Implements SRS F1–F12. Ships a Windows `.exe` and a Linux AppImage.
       through to PyMapConv's `-p` flag. Headless wgpu was scoped
       out per the kickoff devlog (the CPU input matches what the
       `.sd7` ships; a GPU render would only invite drift).
-- [ ] **F11** One-click `.sd7` build via PyMapConv
+- [~] **F11** One-click `.sd7` build via PyMapConv — Sprint 20 / U3
+      ships the async + visible-feedback half. Build runs on a worker
+      thread; `BuildState` machine drives a centred progress overlay
+      (current stage, sub-progress, MM:SS elapsed, Cancel button) and
+      a live build log panel that streams PyMapConv + Compressonator
+      lines through the new `invoke_with_streaming` primitive. Status
+      strip mirrors Running / Done / Failed / Cancelled with
+      click-to-show-log. `File > Recent projects (N)` submenu + an
+      empty-state CTA recent-projects block surface the last 10
+      opened-or-saved projects (cap 10, dedupe, missing files drop
+      silently). Save-before-build modal gates dirty builds; disk-
+      space check warns at <2 GB free without gating. The
+      synchronous `launcher::build_and_install` path is retired —
+      all build invocations go through the worker. Underlying
+      compile contract (PyMapConv flags, artifact-presence success
+      heuristic, non-solid `.sd7`) is unchanged from Sprint 12;
+      Sprint 20 is pure UX / reliability.
 - [ ] **F12** "Launch in BAR" button (invokes Recoil with `--map`)
 - [x] **Editor maturity (Phase 2 closer)** — undo/redo over dirty-rect
       snapshots with stroke coalescing + barriers on procgen/load/new
