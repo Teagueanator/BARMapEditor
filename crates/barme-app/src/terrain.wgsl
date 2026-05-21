@@ -439,5 +439,57 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         }
     }
 
-    return vec4<f32>(lit, 1.0);
+    // ─── 9. Exponential height fog (Sprint 28 / R2 / ADR-040) ────
+    //
+    // BAR's `Atmosphere.cpp::DrawFog` shapes terrain fog as a function
+    // of distance from the camera AND fragment altitude — atmospheres
+    // thin with altitude, so a mountain peak at the same horizontal
+    // distance reads as less foggy than a valley floor. The math is a
+    // smoothstep over the BAR-normalised `(fog_start, fog_end)` range
+    // (typically 0.1..1.0), with the input pre-scaled by an
+    // exponential height factor.
+    //
+    // Normalised distance: we measure dist along the view axis as a
+    // fraction of the world's far-plane extent (sqrt of XZ map size
+    // ≈ camera's framing distance). That matches BAR's `fogStart` /
+    // `fogEnd` being unitless `[0, 1]` ranges, not elmos.
+    //
+    // Height factor: `exp(-y · falloff)`. At sea level (y=0) the
+    // factor is 1; at altitude 100 elmos with falloff 0.01 the factor
+    // drops to ~0.37 (e^-1). Multiplying the normalised distance by
+    // this factor moves the smoothstep input toward 0 with altitude,
+    // bringing high terrain *out* of the fog band.
+    //
+    // PITFALL #1 from the sprint prompt: fog does NOT apply to the
+    // skybox. Our offscreen RT's clear-colour IS the sky (commit 3
+    // changes it to `atmos.sky_color`), so terrain fog blending
+    // toward `fog_color` and the sky background colour being separate
+    // is what makes the horizon read correctly. The fragment shader
+    // only runs on rasterized terrain pixels, so the clear-colour sky
+    // background is untouched here.
+    //
+    // PITFALL #5: `fog_start == fog_end` is a Sprint 21 lint error,
+    // but a freshly-typed value could transit through the F9 form
+    // before the lint runs. `smoothstep` is defensively safe — it
+    // clamps to [0, 1] without NaN even at the degenerate input
+    // (returns 0 below the range, 1 above).
+    // `to_eye` is in scope from §7's view-vector setup; reuse it
+    // instead of redefining (WGSL flags redefinition as an error).
+    let world_extent = max(u.params.z, u.params.w);
+    let view_dist = length(to_eye);
+    let dist_norm = view_dist / max(world_extent, 1.0);
+    let height_factor = exp(-max(in.world_pos.y, 0.0) * atmos.fog_start_end.z);
+    let fog_input = dist_norm * height_factor;
+    let fog_t = smoothstep(
+        atmos.fog_start_end.x,
+        atmos.fog_start_end.y,
+        fog_input,
+    );
+    // Fog density (`fog_color.w`) scales the blend so even a strong
+    // fog setting doesn't fully overwrite terrain colour at the far
+    // plane — keeps distant features just legible.
+    let fog_blend = fog_t * atmos.fog_color.a;
+    let fogged = mix(lit, atmos.fog_color.rgb, fog_blend);
+
+    return vec4<f32>(fogged, 1.0);
 }
