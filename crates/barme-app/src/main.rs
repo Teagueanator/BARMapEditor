@@ -1,6 +1,7 @@
 mod build_runner;
 mod config;
 mod launcher;
+mod parity_fixtures;
 mod render;
 mod ui;
 
