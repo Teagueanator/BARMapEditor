@@ -7847,10 +7847,11 @@ impl App {
                                                 .fixed_decimals(2),
                                         )
                                         .on_hover_text(help(HelpId::MetalSpotValue));
-                                        if ui
-                                            .small_button("×")
-                                            .on_hover_text(help(HelpId::MetalSpotDelete))
-                                            .clicked()
+                                        if crate::ui::widgets::row_delete_button(
+                                            ui,
+                                            HelpId::MetalSpotDelete,
+                                        )
+                                        .clicked()
                                         {
                                             to_delete = Some(i);
                                         }
@@ -7975,10 +7976,11 @@ impl App {
                                                 .prefix("z "),
                                         )
                                         .on_hover_text(help(HelpId::GeoVentZ));
-                                        if ui
-                                            .small_button("×")
-                                            .on_hover_text(help(HelpId::GeoVentDelete))
-                                            .clicked()
+                                        if crate::ui::widgets::row_delete_button(
+                                            ui,
+                                            HelpId::GeoVentDelete,
+                                        )
+                                        .clicked()
                                         {
                                             to_delete = Some(i);
                                         }
@@ -8212,10 +8214,11 @@ impl App {
                                                 .sense(egui::Sense::hover()),
                                             )
                                             .on_hover_text("Feature `name` field — matches a FeatureDef in BAR's featuredefs.lua (or the map-bundled set.lua for custom features).");
-                                            if ui
-                                                .small_button("×")
-                                                .on_hover_text(help(HelpId::FeaturePlacedDelete))
-                                                .clicked()
+                                            if crate::ui::widgets::row_delete_button(
+                                                ui,
+                                                HelpId::FeaturePlacedDelete,
+                                            )
+                                            .clicked()
                                             {
                                                 to_delete = Some(i);
                                             }
@@ -9371,10 +9374,11 @@ impl App {
                                         {
                                             new_active = Some(g_id);
                                         }
-                                        if ui
-                                            .small_button("delete group")
-                                            .on_hover_text(help(HelpId::StartAllyDelete))
-                                            .clicked()
+                                        if crate::ui::widgets::row_delete_button(
+                                            ui,
+                                            HelpId::StartAllyDelete,
+                                        )
+                                        .clicked()
                                         {
                                             to_delete_group = Some(g_id);
                                         }
@@ -9394,10 +9398,11 @@ impl App {
                                                 "#{}: ({}, {})",
                                                 i, pos.x_elmo, pos.z_elmo
                                             ));
-                                            if ui
-                                                .small_button("×")
-                                                .on_hover_text(help(HelpId::StartPosDelete))
-                                                .clicked()
+                                            if crate::ui::widgets::row_delete_button(
+                                                ui,
+                                                HelpId::StartPosDelete,
+                                            )
+                                            .clicked()
                                             {
                                                 to_delete_pos = Some((g_id, *i));
                                             }

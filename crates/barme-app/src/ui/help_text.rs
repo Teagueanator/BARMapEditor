@@ -117,6 +117,8 @@ pub enum HelpId {
     PaintFillTargetVisible,
     PaintMaskOnlyPreview,
     PaintViewMaskPreviewChip,
+    // Sprint 27 / U5 — Layers panel rows.
+    LayerRowDelete,
 
     // ──────────────── Water / lava tool ────────────────
     WaterPresetNone,
@@ -257,6 +259,7 @@ impl HelpId {
         HelpId::PaintFillTargetVisible,
         HelpId::PaintMaskOnlyPreview,
         HelpId::PaintViewMaskPreviewChip,
+        HelpId::LayerRowDelete,
         // water
         HelpId::WaterPresetNone,
         HelpId::WaterPresetCustom,
@@ -518,6 +521,9 @@ pub fn help(id: HelpId) -> &'static str {
         }
         HelpId::PaintViewMaskPreviewChip => {
             "Active layer's mask value at the cursor (0..255) and the layer name. None = cursor is off-map."
+        }
+        HelpId::LayerRowDelete => {
+            "Delete this layer and its mask. The composite re-bakes without it. [Shortcut: Ctrl+Z to restore]"
         }
 
         // ──────────────── Water tool ────────────────

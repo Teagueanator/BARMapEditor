@@ -856,10 +856,8 @@ fn render_layer_row(
                     }
                 });
 
-            // ── Delete ──
-            if ui
-                .add(egui::Button::new("×").small())
-                .on_hover_text("Delete layer")
+            // ── Delete ── (Sprint 27 / U5 — standardised row delete)
+            if widgets::row_delete_button(ui, crate::ui::help_text::HelpId::LayerRowDelete)
                 .clicked()
             {
                 actions

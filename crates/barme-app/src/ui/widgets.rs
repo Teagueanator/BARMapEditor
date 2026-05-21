@@ -530,6 +530,28 @@ pub fn icon_button(ui: &mut Ui, icon: Icon, size: f32, tooltip: &str) -> Respons
     response.on_hover_text(tooltip)
 }
 
+/// Sprint 27 / U5 — standardised row delete button. 16 px square,
+/// `Icon::X` glyph in muted grey by default, `t.red` on hover.
+/// Tooltip is sourced from [`HelpId`] so the delete-text convention
+/// ("Delete <X>. [Shortcut: Ctrl+Z to restore]") stays consistent
+/// across every row type (metal spots, geo vents, features, start
+/// positions, ally groups, layers).
+///
+/// Replaces the legacy `ui.small_button("×")` pattern that produced
+/// inconsistent sizes / colours across inspectors.
+pub fn row_delete_button(ui: &mut Ui, hover_help: HelpId) -> Response {
+    let t = Tokens::DARK;
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(16.0), Sense::click());
+    let painter = ui.painter();
+    if response.hovered() {
+        painter.rect_filled(rect, CornerRadius::same(3), t.hover);
+    }
+    let color = if response.hovered() { t.red } else { t.muted };
+    let icon_rect = rect.shrink(2.0);
+    icons::paint_icon(painter, icon_rect, Icon::X, color, 1.6);
+    response.on_hover_text(help(hover_help))
+}
+
 /// Sprint 27 / U5 — descriptor for [`brush_card`]. The struct exists
 /// so the call-site reads top-down (`label … active … hover_help`)
 /// instead of guessing positional arguments.
