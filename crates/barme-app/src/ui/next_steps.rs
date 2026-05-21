@@ -52,7 +52,13 @@ pub fn render_next_steps_hint(ctx: &egui::Context, open: &mut bool) -> Option<Ne
                 ui.label(format!("• {bullet}"));
             }
             ui.add_space(8.0);
-            if ui.button("Got it").clicked() {
+            if ui
+                .button("Got it")
+                .on_hover_text(
+                    "Dismiss this hint for the current project. Save/load preserves the dismissal.",
+                )
+                .clicked()
+            {
                 dismissed = true;
             }
         });

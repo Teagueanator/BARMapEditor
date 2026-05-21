@@ -131,6 +131,9 @@ pub fn render(app: &mut App, ui: &mut egui::Ui) {
             // affordances (Import / Duplicate / pick-anything-empty).
             ui.horizontal(|ui| {
                 let (primary, caret) = widgets::split_button(ui, None, "Add layer", true);
+                let primary = primary
+                    .on_hover_text("Open the stock-texture picker. Click a slot to add it as a new layer.");
+                let caret = caret.on_hover_text("Secondary add affordances: import a custom texture, duplicate the active layer, or add from a heightmap range.");
                 egui::Popup::menu(&primary)
                     .close_behavior(egui::PopupCloseBehavior::CloseOnClick)
                     .show(|ui| {
@@ -150,10 +153,18 @@ pub fn render(app: &mut App, ui: &mut egui::Ui) {
                         ui.add_space(6.0);
                         ui.separator();
                         ui.add_space(4.0);
-                        if ui.button("Import texture from disk…").clicked() {
+                        if ui
+                            .button("Import texture from disk…")
+                            .on_hover_text("Load a PNG / JPG / DDS as a new layer. The layer source is the file path (preserved across save/open).")
+                            .clicked()
+                        {
                             actions.borrow_mut().push(LayerAction::AddLayerFromImport);
                         }
-                        if ui.button("Add empty layer (any unused slot)").clicked() {
+                        if ui
+                            .button("Add empty layer (any unused slot)")
+                            .on_hover_text("Add a layer bound to the next-unused stock slot. Useful when you'll set the source later via 'Change slot…'.")
+                            .clicked()
+                        {
                             actions.borrow_mut().push(LayerAction::AddLayer);
                         }
                     });
@@ -161,18 +172,23 @@ pub fn render(app: &mut App, ui: &mut egui::Ui) {
                     .close_behavior(egui::PopupCloseBehavior::CloseOnClick)
                     .show(|ui| {
                         ui.set_min_width(220.0);
-                        if ui.button("Import texture from disk…").clicked() {
+                        if ui
+                            .button("Import texture from disk…")
+                            .on_hover_text("Same as the primary popup's import — quick access from the caret.")
+                            .clicked()
+                        {
                             actions.borrow_mut().push(LayerAction::AddLayerFromImport);
                         }
                         if ui
                             .add_enabled(has_active, egui::Button::new("Duplicate active"))
+                            .on_hover_text("Clone the active layer's source, mask, transform, and colour into a new top-of-stack layer.")
                             .clicked()
                         {
                             actions.borrow_mut().push(LayerAction::DuplicateActive);
                         }
                         ui.separator();
                         ui.add_enabled(false, egui::Button::new("Add from heightmap range…"))
-                            .on_hover_text("Coming in a future sprint.");
+                            .on_disabled_hover_text("Coming in a future sprint — auto-mask a layer by elevation band (e.g. 'snow above 3000 elmos').");
                     });
             });
             ui.add_space(6.0);
@@ -738,11 +754,13 @@ fn render_layer_row(
 
             // ── Name (inline rename) ──
             let mut name_mut = name.clone();
-            let name_resp = ui.add(
-                egui::TextEdit::singleline(&mut name_mut)
-                    .desired_width(ui.available_width() - 96.0)
-                    .frame(false),
-            );
+            let name_resp = ui
+                .add(
+                    egui::TextEdit::singleline(&mut name_mut)
+                        .desired_width(ui.available_width() - 96.0)
+                        .frame(false),
+                )
+                .on_hover_text("Click to make active. Type to rename — the edit commits on focus loss.");
             if name_resp.lost_focus() && name_mut != name {
                 actions
                     .borrow_mut()
@@ -832,12 +850,16 @@ fn render_layer_row(
         });
         // Second row: source label + opacity slider + import.
         ui.horizontal(|ui| {
-            ui.label(
-                egui::RichText::new(&source_label)
-                    .color(t.muted)
-                    .size(10.0)
-                    .monospace(),
-            );
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(&source_label)
+                        .color(t.muted)
+                        .size(10.0)
+                        .monospace(),
+                )
+                .sense(Sense::hover()),
+            )
+            .on_hover_text("Layer source — either a stock slot id or an imported texture path. Click 'Change slot…' in the active-layer properties to rebind.");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
                     .add(egui::Button::new("Import…").small())
@@ -994,9 +1016,17 @@ fn render_active_properties(
                         } else {
                             format!("Slot {id:02} · {slot_name}")
                         };
-                        ui.label(egui::RichText::new(label).color(t.muted).monospace());
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(label).color(t.muted).monospace(),
+                            )
+                            .sense(egui::Sense::hover()),
+                        )
+                        .on_hover_text("Stock slot id (00..15) and friendly name. The slot drives the diffuse + DNTS textures BAR loads at runtime.");
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            let change_resp = ui.button("Change slot…");
+                            let change_resp = ui
+                                .button("Change slot…")
+                                .on_hover_text("Rebind this layer to a different stock slot. The mask survives the swap.");
                             egui::Popup::menu(&change_resp)
                                 .close_behavior(egui::PopupCloseBehavior::CloseOnClick)
                                 .show(|ui| {
@@ -1021,14 +1051,22 @@ fn render_active_properties(
                     });
                 }
                 LayerSource::Imported { path } => {
-                    ui.label(
-                        egui::RichText::new(format!("imp: {}", path.display()))
-                            .color(t.muted)
-                            .size(10.0)
-                            .monospace(),
-                    );
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(format!("imp: {}", path.display()))
+                                .color(t.muted)
+                                .size(10.0)
+                                .monospace(),
+                        )
+                        .sense(egui::Sense::hover()),
+                    )
+                    .on_hover_text("Imported texture source path. Saved verbatim in the project file; missing paths produce a pink layer at load.");
                     ui.horizontal(|ui| {
-                        if ui.button("Replace…").clicked() {
+                        if ui
+                            .button("Replace…")
+                            .on_hover_text("Pick a new PNG / JPG / DDS to replace this layer's source. Mask and transform are preserved.")
+                            .clicked()
+                        {
                             actions
                                 .borrow_mut()
                                 .push(LayerAction::ImportTexture(layer_id.clone()));
@@ -1057,6 +1095,7 @@ fn render_active_properties(
                     t.accent,
                     label,
                 )
+                .on_hover_text("Horizontal shift of the layer texture in elmos. Useful for sliding a tileable rock to break repetition.")
                 .changed()
                 {
                     changed = true;
@@ -1072,6 +1111,7 @@ fn render_active_properties(
                     t.accent,
                     label,
                 )
+                .on_hover_text("Vertical shift of the layer texture in elmos.")
                 .changed()
                 {
                     changed = true;
@@ -1087,6 +1127,7 @@ fn render_active_properties(
                     t.accent,
                     label,
                 )
+                .on_hover_text("Uniform texture scale multiplier (0.1× – 8×). 1.0 = native sampling rate; smaller = tile finer, larger = stretch the pattern.")
                 .changed()
                 {
                     changed = true;
@@ -1103,6 +1144,7 @@ fn render_active_properties(
                     t.accent,
                     label,
                 )
+                .on_hover_text("Rotate the layer's UV by degrees (-180..180). Stored internally as radians.")
                 .changed()
                 {
                     transform_local.rotation_rad = rot_deg.to_radians();
@@ -1112,12 +1154,18 @@ fn render_active_properties(
                 // Mirror toggles.
                 ui.horizontal(|ui| {
                     let mut mx = transform_local.mirror_x;
-                    if widgets::pill_toggle(ui, "Mirror X", &mut mx).clicked() {
+                    if widgets::pill_toggle(ui, "Mirror X", &mut mx)
+                        .on_hover_text("Flip the layer texture horizontally.")
+                        .clicked()
+                    {
                         transform_local.mirror_x = mx;
                         changed = true;
                     }
                     let mut my = transform_local.mirror_y;
-                    if widgets::pill_toggle(ui, "Mirror Y", &mut my).clicked() {
+                    if widgets::pill_toggle(ui, "Mirror Y", &mut my)
+                        .on_hover_text("Flip the layer texture vertically.")
+                        .clicked()
+                    {
                         transform_local.mirror_y = my;
                         changed = true;
                     }
@@ -1143,6 +1191,7 @@ fn render_active_properties(
                     ui.label(egui::RichText::new("Tint").color(t.muted).size(11.0));
                     if ui
                         .color_edit_button_rgb(&mut color_local.tint_rgb)
+                        .on_hover_text("Multiplicative RGB tint over the layer's diffuse. White = unchanged. Useful for warming a forest to autumn or cooling a beach to dusk.")
                         .changed()
                     {
                         changed = true;
@@ -1158,6 +1207,7 @@ fn render_active_properties(
                     t.accent,
                     label,
                 )
+                .on_hover_text("Additive brightness offset (-1..+1). 0 = unchanged.")
                 .changed()
                 {
                     changed = true;
@@ -1181,7 +1231,7 @@ fn render_active_properties(
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("Mode").color(t.muted).size(11.0));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        egui::ComboBox::from_id_salt(egui::Id::new(("blend_combo", &layer_id)))
+                        let combo = egui::ComboBox::from_id_salt(egui::Id::new(("blend_combo", &layer_id)))
                             .selected_text(blend_label(blend_local))
                             .show_ui(ui, |ui| {
                                 if ui
@@ -1198,6 +1248,7 @@ fn render_active_properties(
                                     ));
                                 }
                             });
+                        combo.response.on_hover_text("Layer blend mode. Today only Normal is wired; Multiply / Add / Screen ship in a future sprint.");
                     });
                 });
                 ui.label(
@@ -1227,6 +1278,7 @@ fn render_active_properties(
                         t.accent,
                         label,
                     )
+                    .on_hover_text("DNTS detail-normal texture frequency. Emitted into mapinfo.resources.splatDetailNormalTexScales. Real BAR maps cluster around 0.005-0.02.")
                     .changed()
                     {
                         actions
@@ -1243,6 +1295,7 @@ fn render_active_properties(
                         t.accent,
                         label,
                     )
+                    .on_hover_text("DNTS detail-normal intensity. Emitted into mapinfo.resources.splatDetailNormalTexMults. 0 hides the DNTS contribution; 1.0 is the engine default.")
                     .changed()
                     {
                         actions
@@ -1295,15 +1348,21 @@ fn render_footer(
         |_ui| {},
         |ui| {
             ui.horizontal_wrapped(|ui| {
-                widgets::chip(ui, ChipTone::Neutral, format!("{n} layers"));
-                widgets::chip(ui, mem_chip_tone, format!("{mb} MB masks"));
+                widgets::chip(ui, ChipTone::Neutral, format!("{n} layers"))
+                    .on_hover_text("Total layers in the stack. Order top-to-bottom in the panel = composite order (top wins).");
+                widgets::chip(ui, mem_chip_tone, format!("{mb} MB masks"))
+                    .on_hover_text("Resident mask memory across all layers. Warns above 256 MB; each unique 4096² mask is ~16 MB.");
                 if n > 16 {
-                    widgets::chip(ui, ChipTone::Warn, "Preview approximate · 16-layer cap");
+                    widgets::chip(ui, ChipTone::Warn, "Preview approximate · 16-layer cap")
+                        .on_hover_text("The GPU composite samples at most 16 layers per pass. Layers beyond 16 still bake into the SMT diffuse, but the preview shows only the top 16.");
                 }
             });
             ui.add_space(6.0);
             let mut diffuse_in_alpha = diffuse_in_alpha_in;
-            if widgets::pill_toggle(ui, "Diffuse in DNTS alpha", &mut diffuse_in_alpha).clicked() {
+            if widgets::pill_toggle(ui, "Diffuse in DNTS alpha", &mut diffuse_in_alpha)
+                .on_hover_text("Mirrors mapinfo.resources.splatDetailNormalDiffuseAlpha. On = pack diffuse into the DNTS alpha channel; off = leave alpha empty.")
+                .clicked()
+            {
                 actions
                     .borrow_mut()
                     .push(LayerAction::SetDntsDiffuseInAlpha(diffuse_in_alpha));

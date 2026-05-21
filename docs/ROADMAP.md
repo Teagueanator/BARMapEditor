@@ -516,6 +516,35 @@ Implements SRS F1–F12. Ships a Windows `.exe` and a Linux AppImage.
       Tool::PaintLayer entry; this rollup's dedup-snapshot fix
       mitigates the worst per-stamp allocation churn but
       doesn't root-cause the entry transient).
+- [x] **STATUS UPDATE 2026-05-20 (Sprint 19 / U1).** UI
+      discoverability + feedback pass. NEW `ui::help_text`
+      module — 107 `HelpId` variants × matching strings, used
+      by every Inspector tool's DragValue / ComboBox / Button /
+      Slider / Chip via `.on_hover_text(help(HelpId::Foo))`.
+      Hover-text coverage grep: 56 → 202 (target was >200).
+      NEW `ui::lint_panel` stub (egui::Window) wired to both the
+      top-bar validation chip and the status-strip issue-count
+      label (replaces the hard-coded `"0 issues"`). NEW top-bar
+      Help icon opens the cheat sheet. Save tooltip cites real
+      Ctrl+S binding — chord wired in `handle_keyboard`
+      alongside Ctrl+Shift+S = Save as. `viewport_chrome` drops
+      the bogus `(G)` / `(L)` / `(W)` chord hints (those letters
+      bind to tool accelerators). `brush_ring_color` extended
+      from 3 sculpt brushes to 7 — mask-reveal / hide / smooth /
+      fill pull from `Tokens::DARK` so they match the
+      inspector_paint_layer brush card palette. Minimap symmetry
+      guide rewrite: replaces the unconditional vertical
+      bisector with `paint_minimap_symmetry` + the testable
+      `minimap_symmetry_segments` helper that reads
+      `Project.symmetry`. NEW `App::inspector_sticky_chips`
+      prepends a Symmetry + Map size chip row to each tool's
+      body. Tests: barme-app 253 → 263 (10 new — 4 lint_panel,
+      8 minimap symmetry geometry, 2 mask-brush colours; 5
+      help_text catalogue exhaustiveness / chord-binding tests
+      from the first commit). 5 commits on `main`. Out of scope
+      for Sprint 19: per-rule lint registry (Sprint 21 / C8),
+      onboarding tour (Sprint 22), async build pipeline (Sprint
+      20), inspector layout refactor (Sprint 27).
 - [ ] Beherith (or active mapper) reviews `.sd7` byte-for-byte against PyMapConv
       reference output on three test maps
 - [ ] Listed on `beyondallreason.info/guide/mapmaking-resources` as beta

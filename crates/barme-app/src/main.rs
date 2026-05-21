@@ -5094,7 +5094,8 @@ impl App {
                         egui::TextEdit::singleline(&mut self.wizard.project_name)
                             .desired_width(f32::INFINITY)
                             .font(egui::FontId::monospace(13.0)),
-                    );
+                    )
+                    .on_hover_text("Display name + filename root. Sanitised to [A-Za-z0-9_-] for the saved .barmeproj — see the 'Saves as:' line below.");
                     let sanitized = sanitize_name(&self.wizard.project_name);
                     lcol.label(
                         egui::RichText::new(format!("Saves as: {sanitized}"))
@@ -5109,13 +5110,11 @@ impl App {
                             .strong(),
                     );
                     lcol.horizontal(|ui| {
-                        ui.add(
-                            egui::DragValue::new(&mut self.wizard.smu_x).range(2u32..=64),
-                        );
+                        ui.add(egui::DragValue::new(&mut self.wizard.smu_x).range(2u32..=64))
+                            .on_hover_text("Map width in SMU (1 SMU = 512 elmos = 65 heightmap pixels). Heightmap dims follow `64·N + 1`. PITFALL §4.");
                         ui.label(egui::RichText::new("×").color(t.dim));
-                        ui.add(
-                            egui::DragValue::new(&mut self.wizard.smu_z).range(2u32..=64),
-                        );
+                        ui.add(egui::DragValue::new(&mut self.wizard.smu_z).range(2u32..=64))
+                            .on_hover_text("Map depth in SMU. Asymmetric sizes are valid — e.g. 8×16 for a corridor map.");
                         ui.label(
                             egui::RichText::new(format!(
                                 "= {} × {} px",
@@ -5141,7 +5140,8 @@ impl App {
                         64.0..=4096.0,
                         t.accent,
                         label,
-                    );
+                    )
+                    .on_hover_text("World Y at heightmap value 65535 (elmos). Picking a biome auto-sets this to the biome's recommended cap; manually tweaking detaches the link.");
                     if r.changed() {
                         self.wizard.height_from_biome = false;
                     }
@@ -5229,6 +5229,7 @@ impl App {
                                                 .fill(t.accent)
                                                 .min_size(egui::vec2(96.0, 30.0)),
                                         )
+                                        .on_hover_text("Generate the heightmap + project from these settings. The wizard closes; edits land via Ctrl+Z if you want to undo.")
                                         .clicked()
                                     {
                                         action = Some(WizardAction::Apply);
@@ -5238,6 +5239,7 @@ impl App {
                                             egui::Button::new("Cancel")
                                                 .min_size(egui::vec2(80.0, 30.0)),
                                         )
+                                        .on_hover_text("Close the wizard without creating anything.")
                                         .clicked()
                                     {
                                         action = Some(WizardAction::Cancel);
@@ -5293,7 +5295,15 @@ impl App {
             egui::FontId::proportional(11.0),
             if active { t.text } else { t.muted },
         );
-        response.clicked()
+        let hover = match label {
+            "None" => "No symmetry. Stamps land only at the cursor.".to_string(),
+            "Horizontal" => "Mirror strokes across the horizontal centreline (Z = ez/2).".to_string(),
+            "Vertical" => "Mirror strokes across the vertical centreline (X = ex/2).".to_string(),
+            "Quad" => "Mirror both axes — every stamp produces 4 copies.".to_string(),
+            "Rotational" => "Replicate strokes N times around the map centre. Set the fold count after creation.".to_string(),
+            other => format!("Biome preset · {other}. Sets diffuse / max-height defaults; you can change them later."),
+        };
+        response.on_hover_text(hover).clicked()
     }
 
     fn wizard_biome_card(ui: &mut egui::Ui, label: &str, active: bool) -> bool {
@@ -5997,26 +6007,48 @@ impl App {
 
     fn top_bar_menus(&mut self, ui: &mut egui::Ui, action: &mut Option<FileAction>) {
         ui.menu_button("File", |ui| {
-            if ui.button("New project…").clicked() {
+            if ui
+                .button("New project…")
+                .on_hover_text("Open the wizard to seed a new project (name, size, biome, symmetry).")
+                .clicked()
+            {
                 *action = Some(FileAction::OpenWizard);
                 ui.close();
             }
-            if ui.button("Open project…").clicked() {
+            if ui
+                .button("Open project…")
+                .on_hover_text("Load an existing .barmeproj from disk.")
+                .clicked()
+            {
                 *action = Some(FileAction::Open);
                 ui.close();
             }
-            if ui.button("Save project").clicked() {
+            if ui
+                .button("Save project")
+                .on_hover_text("Save to the current .barmeproj path. [Shortcut: Ctrl+S]")
+                .clicked()
+            {
                 *action = Some(FileAction::Save);
                 ui.close();
             }
-            if ui.button("Save project as…").clicked() {
+            if ui
+                .button("Save project as…")
+                .on_hover_text("Save to a new .barmeproj path. [Shortcut: Ctrl+Shift+S]")
+                .clicked()
+            {
                 *action = Some(FileAction::SaveAs);
                 ui.close();
             }
             ui.separator();
             ui.label("Load fixture heightmap");
             for smu in [2u32, 4, 16] {
-                if ui.button(format!("{smu}×{smu} SMU")).clicked() {
+                if ui
+                    .button(format!("{smu}×{smu} SMU"))
+                    .on_hover_text(format!(
+                        "Load the bundled {smu}×{smu} SMU test heightmap. Useful for quick smoke tests of the editor."
+                    ))
+                    .clicked()
+                {
                     *action = Some(FileAction::LoadHeightmap(fixture_path(smu)));
                     ui.close();
                 }
@@ -6027,6 +6059,7 @@ impl App {
             let can_redo = self.history.can_redo();
             if ui
                 .add_enabled(can_undo, egui::Button::new("Undo\tCtrl+Z"))
+                .on_hover_text("Roll back the last edit. History ring is capped at 100 MB; older entries drop off the tail.")
                 .clicked()
             {
                 *action = Some(FileAction::Undo);
@@ -6034,6 +6067,7 @@ impl App {
             }
             if ui
                 .add_enabled(can_redo, egui::Button::new("Redo\tCtrl+Shift+Z"))
+                .on_hover_text("Re-apply the most recently undone edit.")
                 .clicked()
             {
                 *action = Some(FileAction::Redo);
@@ -6043,18 +6077,21 @@ impl App {
         ui.menu_button("View", |ui| {
             if ui
                 .checkbox(&mut self.grid_overlay_on, "Coordinate grid")
+                .on_hover_text("Toggle the world-aligned grid overlay on the 3D terrain preview.")
                 .clicked()
             {
                 ui.close();
             }
             if ui
                 .checkbox(&mut self.lighting_on, "Lighting (preview only)")
+                .on_hover_text("Toggle directional-light shading. Preview-only — the in-game render is governed by mapinfo.lighting.")
                 .clicked()
             {
                 ui.close();
             }
             if ui
                 .checkbox(&mut self.wireframe_on, "Wireframe (preview only)")
+                .on_hover_text("Toggle wireframe overlay on the terrain mesh.")
                 .clicked()
             {
                 ui.close();
@@ -6064,6 +6101,7 @@ impl App {
             let enabled = self.heightmap.is_some();
             if ui
                 .add_enabled(enabled, egui::Button::new("Build & Install to BAR"))
+                .on_hover_text("Compile the project to a .sd7 and install into BAR's user maps directory. Same as the top-bar split-button primary.")
                 .clicked()
             {
                 *action = Some(FileAction::BuildAndInstall);
@@ -6111,7 +6149,12 @@ impl App {
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     let mut on_state = on;
-                    if crate::ui::widgets::pill_toggle(ui, "Symmetry", &mut on_state).clicked() {
+                    if crate::ui::widgets::pill_toggle(ui, "Symmetry", &mut on_state)
+                        .on_hover_text(crate::ui::help_text::help(
+                            crate::ui::help_text::HelpId::TopBarSymmetryPill,
+                        ))
+                        .clicked()
+                    {
                         // Toggle behaviour: remember the user's last
                         // non-None mode so on→off→on returns there.
                         if on_state {
@@ -6129,6 +6172,9 @@ impl App {
                         ui.label(egui::RichText::new("Fold").color(t.muted).size(11.0));
                         if ui
                             .add(egui::DragValue::new(&mut f).range(2..=12).speed(0.1))
+                            .on_hover_text(crate::ui::help_text::help(
+                                crate::ui::help_text::HelpId::TopBarSymmetryFold,
+                            ))
                             .changed()
                         {
                             self.symmetry = SymmetryAxis::Rotational {
@@ -6181,7 +6227,10 @@ impl App {
                 });
             })
             .response
-            .interact(egui::Sense::click());
+            .interact(egui::Sense::click())
+            .on_hover_text(crate::ui::help_text::help(
+                crate::ui::help_text::HelpId::TopBarSymmetryMode,
+            ));
         egui::Popup::menu(&resp)
             .close_behavior(egui::PopupCloseBehavior::CloseOnClick)
             .show(|ui| {
@@ -6797,10 +6846,11 @@ impl App {
         let radius_before = self.extractor_radius;
         let mut radius_edit = radius_before;
         let is_default = (radius_before - default_extractor_radius()).abs() < 0.01;
-        crate::ui::widgets::section(
+        crate::ui::widgets::section_with_hover(
             ui,
             "Global",
             true,
+            "Project-wide metal settings. Per-spot fields live in the SPOTS section below.",
             |ui| {
                 let tone = if is_default {
                     crate::ui::theme::ChipTone::Ok
@@ -6846,10 +6896,11 @@ impl App {
         let spots_snapshot: Vec<MetalSpot> = self.metal_spots.clone();
         let spot_count = spots_snapshot.len();
         let title = format!("Spots · {}", spot_count);
-        crate::ui::widgets::section(
+        crate::ui::widgets::section_with_hover(
             ui,
             &title,
             false,
+            "Per-spot metal entries. Position is in elmos from the south-west corner; the value is the per-spot metal multiplier.",
             |ui| {
                 if ui
                     .add(egui::Button::new("+ Add"))
@@ -6886,12 +6937,16 @@ impl App {
                                 .inner_margin(egui::Margin::symmetric(8, 4))
                                 .show(ui, |ui| {
                                     ui.horizontal(|ui| {
-                                        ui.label(
-                                            egui::RichText::new(format!("M{:02}", i + 1))
-                                                .color(t.muted)
-                                                .monospace()
-                                                .size(11.0),
-                                        );
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(format!("M{:02}", i + 1))
+                                                    .color(t.muted)
+                                                    .monospace()
+                                                    .size(11.0),
+                                            )
+                                            .sense(egui::Sense::hover()),
+                                        )
+                                        .on_hover_text("Metal-spot index (1-based, for display only). The engine identifies spots by position, not by id.");
                                         ui.add(
                                             egui::DragValue::new(&mut edited.x_elmo)
                                                 .range(0..=(ex as i32))
@@ -7020,11 +7075,17 @@ impl App {
                                 .inner_margin(egui::Margin::symmetric(8, 4))
                                 .show(ui, |ui| {
                                     ui.horizontal(|ui| {
-                                        ui.label(
-                                            egui::RichText::new(format!("V{:02}", i + 1))
-                                                .color(t.muted)
-                                                .monospace()
-                                                .size(11.0),
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(format!("V{:02}", i + 1))
+                                                    .color(t.muted)
+                                                    .monospace()
+                                                    .size(11.0),
+                                            )
+                                            .sense(egui::Sense::hover()),
+                                        )
+                                        .on_hover_text(
+                                            "Geo-vent index (1-based, for display only).",
                                         );
                                         ui.add(
                                             egui::DragValue::new(&mut edited.x_elmo)
@@ -7096,10 +7157,11 @@ impl App {
         // CATEGORY section.
         let categories: Vec<String> = self.feature_state.manifest.category_names();
         let no_catalog = categories.is_empty();
-        crate::ui::widgets::section(
+        crate::ui::widgets::section_with_hover(
             ui,
             "Category",
             true,
+            "Pick the feature catalogue — trees / rocks / props / wreckage / geo. Switching categories resets the pending placement.",
             |_ui| {},
             |ui| {
                 if no_catalog {
@@ -7256,18 +7318,26 @@ impl App {
                                 .show(ui, |ui| {
                                     ui.vertical(|ui| {
                                         ui.horizontal(|ui| {
-                                            ui.label(
-                                                egui::RichText::new(format!("F{:02}", i + 1))
-                                                    .color(t.muted)
-                                                    .monospace()
-                                                    .size(11.0),
-                                            );
-                                            ui.label(
-                                                egui::RichText::new(&original.name)
-                                                    .color(t.text)
-                                                    .monospace()
-                                                    .size(11.0),
-                                            );
+                                            ui.add(
+                                                egui::Label::new(
+                                                    egui::RichText::new(format!("F{:02}", i + 1))
+                                                        .color(t.muted)
+                                                        .monospace()
+                                                        .size(11.0),
+                                                )
+                                                .sense(egui::Sense::hover()),
+                                            )
+                                            .on_hover_text("Feature instance index (1-based, for display only).");
+                                            ui.add(
+                                                egui::Label::new(
+                                                    egui::RichText::new(&original.name)
+                                                        .color(t.text)
+                                                        .monospace()
+                                                        .size(11.0),
+                                                )
+                                                .sense(egui::Sense::hover()),
+                                            )
+                                            .on_hover_text("Feature `name` field — matches a FeatureDef in BAR's featuredefs.lua (or the map-bundled set.lua for custom features).");
                                             if ui
                                                 .small_button("×")
                                                 .on_hover_text(help(HelpId::FeaturePlacedDelete))
@@ -7365,10 +7435,11 @@ impl App {
         crate::ui::layers_panel::render(self, ui);
 
         // ---- BRUSH section (session-only state, stays inline) ----
-        crate::ui::widgets::section(
+        crate::ui::widgets::section_with_hover(
             ui,
             "Brush",
             false,
+            "Pick a mask-paint brush. Reveal = increase active layer alpha; Hide = decrease; Smooth = blur; Fill = stamp the entire footprint at the target value.",
             |_ui| {},
             |ui| {
                 let brushes: [(&str, &str, egui::Color32, HelpId); 4] = [
@@ -7461,10 +7532,11 @@ impl App {
             ),
         ];
         let mut new_brush: Option<Option<String>> = None;
-        crate::ui::widgets::section(
+        crate::ui::widgets::section_with_hover(
             ui,
             "Brush",
             true,
+            "Pick the active sculpt brush. Off disables stamping while keeping the tool selected.",
             |_ui| {},
             |ui| {
                 ui.columns(4, |cols| {
@@ -7486,10 +7558,11 @@ impl App {
         // SHAPE section: ramp sliders.
         let mut radius_raw = self.brush_radius;
         let strength_raw = &mut self.brush_strength;
-        crate::ui::widgets::section(
+        crate::ui::widgets::section_with_hover(
             ui,
             "Shape",
             false,
+            "Brush radius (elmos) + per-stamp strength (0..1). The falloff curve is fixed for Sprint 19; per-brush curves come later.",
             |_ui| {},
             |ui| {
                 let r_label = format!("{:.0} elmos", radius_raw);
@@ -7602,10 +7675,11 @@ impl App {
         let active_mode = self.water_mode;
         let mut new_mode: Option<WaterMode> = None;
         let custom_overrides_count = water_override_count(&self.water_overrides);
-        crate::ui::widgets::section(
+        crate::ui::widgets::section_with_hover(
             ui,
             "Preset",
             true,
+            "Drop a stock water/lava style. Each preset is a bag of WaterBlock overrides; pick Custom to start from a blank slate.",
             |_ui| {},
             |ui| {
                 ui.horizontal_wrapped(|ui| {
@@ -7669,10 +7743,11 @@ impl App {
         // plane is fixed at Y=0 (`Ground.h::GetWaterPlaneLevel` is
         // `consteval`); the user adjusts the heightmap range to slide
         // terrain above / below it.
-        crate::ui::widgets::section(
+        crate::ui::widgets::section_with_hover(
             ui,
             "Heightmap range",
             false,
+            "Duplicates the Project header sliders, surfaced here because flooding decisions live with the water tool. Floor and ceiling map raw heightmap u16 values to world Y.",
             |_ui| {},
             |ui| {
                 ui.label(
@@ -7876,7 +7951,11 @@ impl App {
                             .size(11.0),
                     );
                     let mh_chip = format!("{:.0} elmos", self.heightmap_observed_min_height());
-                    ui.label(egui::RichText::new(mh_chip).color(t.text).size(11.0));
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(mh_chip).color(t.text).size(11.0))
+                            .sense(egui::Sense::hover()),
+                    )
+                    .on_hover_text("Deepest world-Y the current heightmap reaches. Compare against the sea-floor depth above to predict where water will be visible.");
                 });
 
                 ui.add_space(6.0);
@@ -7912,16 +7991,20 @@ impl App {
 
         // ── ADVANCED ────────────────────────────────────
         ui.collapsing("Advanced (raw mapinfo fields)", |ui| {
-            ui.label(
-                egui::RichText::new(
-                    "Full 30-field form ships from Sprint 18's F9 mapinfo \
-                     form. The advanced tab will reach the same \
-                     water_overrides this Inspector edits — Tool::Water \
-                     remains the primary entry point.",
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(
+                        "Full 30-field form ships from Sprint 18's F9 mapinfo \
+                         form. The advanced tab will reach the same \
+                         water_overrides this Inspector edits — Tool::Water \
+                         remains the primary entry point.",
+                    )
+                    .color(t.dim)
+                    .size(10.0),
                 )
-                .color(t.dim)
-                .size(10.0),
-            );
+                .sense(egui::Sense::hover()),
+            )
+            .on_hover_text("Open the F9 mapinfo form (top-bar icon or F9 chord) for the full WaterBlock field set.");
         });
     }
 
@@ -7946,7 +8029,8 @@ impl App {
                     crate::ui::theme::ChipTone::Warn
                 };
                 let label = if applied { "Applied" } else { "Not applied" };
-                crate::ui::widgets::chip(ui, tone, label);
+                crate::ui::widgets::chip(ui, tone, label)
+                    .on_hover_text("Whether the lava atmosphere patch is currently active. Click the Apply / Revert button below to toggle.");
             },
             |ui| {
                 ui.label(
@@ -8236,10 +8320,11 @@ impl App {
 
         // LAYOUT section: preset chip + drag-paint toggle + Balanced chip.
         let balanced = self.start_positions_balanced();
-        crate::ui::widgets::section(
+        crate::ui::widgets::section_with_hover(
             ui,
             "Layout",
             true,
+            "Apply a stock allyteam layout, or LMB-drag a line on the canvas to drop N positions equally spaced.",
             |ui| {
                 let tone = if balanced {
                     crate::ui::theme::ChipTone::Ok
@@ -8302,10 +8387,11 @@ impl App {
 
         let group_count = self.ally_groups.len();
         let group_title = format!("Allyteams · {}", group_count);
-        crate::ui::widgets::section(
+        crate::ui::widgets::section_with_hover(
             ui,
             &group_title,
             false,
+            "One collapsible card per ally team. Source positions are authored here; symmetry mirrors render as greyed `↳` entries.",
             |ui| {
                 if ui
                     .add(egui::Button::new("+ Add"))
@@ -8492,10 +8578,11 @@ impl App {
             .map(|p| p.label);
 
         // PRESET section: chip row.
-        crate::ui::widgets::section(
+        crate::ui::widgets::section_with_hover(
             ui,
             "Preset",
             true,
+            "Stock procgen formulas. Picking one fills the Custom expression below and switches domain to match.",
             |_ui| {},
             |ui| {
                 ui.horizontal_wrapped(|ui| {
@@ -8607,19 +8694,30 @@ impl App {
             |ui| {
                 if let Some(tex) = self.procgen_thumbnail.as_ref() {
                     let max_side = ui.available_width().min(PROCGEN_THUMBNAIL_PX as f32);
-                    ui.add(egui::Image::new(tex).fit_to_exact_size(egui::vec2(max_side, max_side)));
+                    ui.add(egui::Image::new(tex).fit_to_exact_size(egui::vec2(max_side, max_side)))
+                        .on_hover_text(
+                            "256×256 grayscale preview of the formula. Updates after a short debounce so live keystrokes don't thrash the GPU.",
+                        );
                 } else if !valid {
-                    ui.label(
-                        egui::RichText::new("(fix expression to render preview)")
-                            .color(t.dim)
-                            .size(11.0),
-                    );
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new("(fix expression to render preview)")
+                                .color(t.dim)
+                                .size(11.0),
+                        )
+                        .sense(egui::Sense::hover()),
+                    )
+                    .on_hover_text("The expression failed to parse — fix the red-outlined TextEdit above to bake a fresh preview.");
                 } else {
-                    ui.label(
-                        egui::RichText::new("(baking preview…)")
-                            .color(t.dim)
-                            .size(11.0),
-                    );
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new("(baking preview…)")
+                                .color(t.dim)
+                                .size(11.0),
+                        )
+                        .sense(egui::Sense::hover()),
+                    )
+                    .on_hover_text("Preview bake is scheduled — appears after a short debounce so live keystrokes don't thrash the GPU.");
                 }
                 ui.add_space(8.0);
                 // Commit button — disabled until parse succeeds.

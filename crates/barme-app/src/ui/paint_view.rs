@@ -232,11 +232,15 @@ pub fn paint_view(
             egui::pos2(rect.right() - 162.0, rect.top() + 8.0),
             egui::vec2(154.0, 22.0),
         );
-        let chip_response = ui.interact(
-            chip_rect,
-            ui.id().with("paint_mask_only"),
-            egui::Sense::click(),
-        );
+        let chip_response = ui
+            .interact(
+                chip_rect,
+                ui.id().with("paint_mask_only"),
+                egui::Sense::click(),
+            )
+            .on_hover_text(crate::ui::help_text::help(
+                crate::ui::help_text::HelpId::PaintMaskOnlyPreview,
+            ));
         let bg = if input.mask_only_preview {
             ui.visuals().selection.bg_fill
         } else {
@@ -259,6 +263,38 @@ pub fn paint_view(
         }
     }
 
+    // Sprint 19 / U1 — pan / zoom hint chip in the top-left corner of
+    // the viewport. Surfaces the three gestures that drive the paint
+    // viewport (middle-drag pan, scroll zoom, double-click reset)
+    // since pre-Sprint-19 there was no on-screen affordance for them.
+    {
+        let hint_rect = egui::Rect::from_min_size(
+            egui::pos2(rect.left() + 8.0, rect.top() + 8.0),
+            egui::vec2(240.0, 22.0),
+        );
+        let hint_response = ui
+            .interact(
+                hint_rect,
+                ui.id().with("paint_view_pan_zoom_hint"),
+                egui::Sense::hover(),
+            )
+            .on_hover_text(
+                "Paint viewport gestures: middle-mouse drag = pan; scroll wheel = zoom \
+                 (cursor-pivoted, 0.25× – 16×); double-click = reset to auto-fit. LMB \
+                 drag drives the active brush.",
+            );
+        let painter = ui.painter_at(hint_rect);
+        painter.rect_filled(hint_rect, 4.0, ui.visuals().widgets.inactive.bg_fill);
+        painter.text(
+            hint_rect.left_center() + egui::vec2(8.0, 0.0),
+            egui::Align2::LEFT_CENTER,
+            "MMB pan · scroll zoom · 2× reset",
+            egui::FontId::proportional(11.0),
+            ui.visuals().weak_text_color(),
+        );
+        let _ = hint_response;
+    }
+
     // Status strip at the bottom of the viewport: cursor coord +
     // active layer's mask value + active layer name.
     {
@@ -266,6 +302,15 @@ pub fn paint_view(
             egui::pos2(rect.left() + 8.0, rect.bottom() - 22.0),
             egui::pos2(rect.right() - 8.0, rect.bottom() - 4.0),
         );
+        let strip_response = ui
+            .interact(
+                strip_rect,
+                ui.id().with("paint_view_status_strip"),
+                egui::Sense::hover(),
+            )
+            .on_hover_text(crate::ui::help_text::help(
+                crate::ui::help_text::HelpId::PaintViewMaskPreviewChip,
+            ));
         let painter = ui.painter_at(strip_rect);
         let cursor_text = match cursor_elmos {
             Some(p) => format!("({}, {}) elmos", p.x.round() as i32, p.y.round() as i32),
@@ -287,6 +332,7 @@ pub fn paint_view(
             egui::FontId::monospace(11.0),
             ui.visuals().weak_text_color(),
         );
+        let _ = strip_response;
     }
 
     PaintViewOutput {

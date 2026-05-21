@@ -145,11 +145,26 @@ pub fn show_window(
                     let lint_count = form.lint_per_tab[t as usize];
                     let label = t.label();
                     let active = *tab == t;
+                    let hover = match t {
+                        MapInfoTab::General => "Project identity: name, author, version, description.",
+                        MapInfoTab::Map => "Top-level map fields: gravity, water level, max metal, voidGround / voidWater toggles.",
+                        MapInfoTab::Smf => "SMF metadata: filename root, minimap path, type-texture path, metalmap path.",
+                        MapInfoTab::Lighting => "Sun direction + lighting RGB colours.",
+                        MapInfoTab::Atmosphere => "Sky / fog / cloud RGB. Default is BAR convention.",
+                        MapInfoTab::Water => "Engine water-block fields: surface / plane colours, damage, void water, tidal.",
+                        MapInfoTab::Resources => "Texture resources: detail, splat distribution, splat detail normals, specular.",
+                        MapInfoTab::Splats => "Read-only splat summary derived from the active Layers stack (Sprint 17).",
+                        MapInfoTab::TerrainTypes => "Per-type-index hardness + movement speeds. Drives unit move costs across terrain.",
+                        MapInfoTab::Custom => "Free-form `mapinfo.custom.*` key/value pairs for gadget consumption.",
+                        MapInfoTab::RawLua => "Read-only rendering of the full mapinfo.lua. Useful for diffing against a reference map.",
+                        MapInfoTab::Minimap => "Minimap preview + optional override PNG (D7 / Sprint 18).",
+                    };
                     let resp = if active {
                         ui.add(egui::Button::new(label).fill(Tokens::DARK.accent))
                     } else {
                         ui.add(egui::Button::new(label).fill(Tokens::DARK.panel2))
-                    };
+                    }
+                    .on_hover_text(hover);
                     // C8 (Sprint 21) lint chip dot — stubbed at 0 in
                     // Sprint 18. The rendering is live so the wiring is
                     // proven before lint output exists.
@@ -259,12 +274,14 @@ fn general_tab(ui: &mut egui::Ui, form: &FormCtx<'_>, out: &mut Vec<MapInfoPatch
         |_| {},
         |ui| {
             let mut desc = form.info.description.clone().unwrap_or_default();
-            let resp = ui.add(
-                egui::TextEdit::multiline(&mut desc)
-                    .hint_text("Short blurb shown in Chobby")
-                    .desired_rows(4)
-                    .desired_width(f32::INFINITY),
-            );
+            let resp = ui
+                .add(
+                    egui::TextEdit::multiline(&mut desc)
+                        .hint_text("Short blurb shown in Chobby")
+                        .desired_rows(4)
+                        .desired_width(f32::INFINITY),
+                )
+                .on_hover_text("Free-form blurb shown under the map in Chobby's browser. Markdown is NOT rendered; keep it short.");
             if commit_text(&resp) {
                 out.push(MapInfoPatch::Description(if desc.is_empty() {
                     None
@@ -652,12 +669,16 @@ fn atmosphere_tab(ui: &mut egui::Ui, form: &FormCtx<'_>, out: &mut Vec<MapInfoPa
             let mut changed_axis = false;
             ui.horizontal(|ui| {
                 for (i, label) in ["x", "y", "z"].iter().enumerate() {
-                    let resp = ui.add(
-                        egui::DragValue::new(&mut s[i])
-                            .range(-1.0..=1.0)
-                            .speed(0.01)
-                            .prefix(format!("{label}=")),
-                    );
+                    let resp = ui
+                        .add(
+                            egui::DragValue::new(&mut s[i])
+                                .range(-1.0..=1.0)
+                                .speed(0.01)
+                                .prefix(format!("{label}=")),
+                        )
+                        .on_hover_text(format!(
+                            "Sky axis {label} component (-1..1). Together with the angle below, defines the skybox rotation. PITFALL §12: replaces the legacy `skyDir`."
+                        ));
                     if commit_drag(&resp) {
                         changed_axis = true;
                     }
@@ -744,16 +765,20 @@ fn water_tab(ui: &mut egui::Ui, form: &FormCtx<'_>, _out: &mut Vec<MapInfoPatch>
                     ),
                 );
             });
-            ui.label(
-                egui::RichText::new(
-                    "The dedicated Water tool (keyboard `W`) is the canonical entry point — \
-                     preset chips, behaviour, appearance, flood. This tab is a power-user \
-                     backstop showing every raw WaterBlock field; edits flow through the \
-                     same `Project.water_overrides` overlay.",
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(
+                        "The dedicated Water tool (keyboard `W`) is the canonical entry point — \
+                         preset chips, behaviour, appearance, flood. This tab is a power-user \
+                         backstop showing every raw WaterBlock field; edits flow through the \
+                         same `Project.water_overrides` overlay.",
+                    )
+                    .color(Tokens::DARK.muted)
+                    .size(10.5),
                 )
-                .color(Tokens::DARK.muted)
-                .size(10.5),
-            );
+                .sense(egui::Sense::hover()),
+            )
+            .on_hover_text("Sprint 18: the Water tab is read-only here; Sprint 26 (water polish) will land per-field DragValue edits on this tab.");
         },
     );
     let block = form
@@ -812,22 +837,30 @@ fn water_tab(ui: &mut egui::Ui, form: &FormCtx<'_>, _out: &mut Vec<MapInfoPatch>
             readonly_opt_str(ui, "texture", block.texture.as_deref());
             readonly_opt_str(ui, "foamTexture", block.foam_texture.as_deref());
             readonly_opt_str(ui, "normalTexture", block.normal_texture.as_deref());
-            ui.label(
-                egui::RichText::new(format!("caustics: {} frame(s)", block.caustics.len()))
-                    .color(Tokens::DARK.muted)
-                    .size(11.0),
-            );
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(format!("caustics: {} frame(s)", block.caustics.len()))
+                        .color(Tokens::DARK.muted)
+                        .size(11.0),
+                )
+                .sense(egui::Sense::hover()),
+            )
+            .on_hover_text("Caustic animation frame count. Each frame is one Lua-table entry in the water block.");
         },
     );
-    ui.label(
-        egui::RichText::new(
-            "Sprint 18 ships this tab as read-only — Sprint 26 (water polish) introduces \
-             per-field DragValue edits on top of the same `Project.water_overrides` overlay. \
-             For now, use the dedicated Water tool's Inspector for non-default settings.",
+    ui.add(
+        egui::Label::new(
+            egui::RichText::new(
+                "Sprint 18 ships this tab as read-only — Sprint 26 (water polish) introduces \
+                 per-field DragValue edits on top of the same `Project.water_overrides` overlay. \
+                 For now, use the dedicated Water tool's Inspector for non-default settings.",
+            )
+            .color(Tokens::DARK.muted)
+            .size(10.5),
         )
-        .color(Tokens::DARK.muted)
-        .size(10.5),
-    );
+        .sense(egui::Sense::hover()),
+    )
+    .on_hover_text("Sprint 26 / U5 will replace this footer with per-field DragValue editors.");
 }
 
 fn resources_tab(ui: &mut egui::Ui, form: &FormCtx<'_>, out: &mut Vec<MapInfoPatch>) {
@@ -895,14 +928,18 @@ fn resources_tab(ui: &mut egui::Ui, form: &FormCtx<'_>, out: &mut Vec<MapInfoPat
         |_| {},
         |ui| {
             readonly_opt_str(ui, "splatDistrTex", r.splat_distr_tex.as_deref());
-            ui.label(
-                egui::RichText::new(format!(
-                    "splatDetailNormalTex: {} entry(ies)",
-                    r.splat_detail_normal_tex.len()
-                ))
-                .color(Tokens::DARK.muted)
-                .size(11.0),
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(format!(
+                        "splatDetailNormalTex: {} entry(ies)",
+                        r.splat_detail_normal_tex.len()
+                    ))
+                    .color(Tokens::DARK.muted)
+                    .size(11.0),
+                )
+                .sense(egui::Sense::hover()),
             )
+            .on_hover_text("Count of DNTS layer textures in the Layers stack. Edits flow through the Paint Layer Inspector — this tab just mirrors them.")
             .on_hover_text(
                 "Driven by the Layers panel's DNTS bindings. Edit those in the Layers \
                  panel (keyboard `L`) — not here.",
@@ -930,23 +967,35 @@ fn splats_tab(ui: &mut egui::Ui, form: &FormCtx<'_>) {
             } else {
                 for (layer_idx, name, ch, scale, mult) in &form.dnts_summary {
                     ui.horizontal(|ui| {
-                        ui.label(
-                            egui::RichText::new(format!("ch {ch}"))
-                                .color(Tokens::DARK.accent)
-                                .size(11.0)
-                                .monospace(),
-                        );
-                        ui.label(
-                            egui::RichText::new(format!("layer #{layer_idx}: {name}"))
-                                .color(Tokens::DARK.text)
-                                .size(11.0),
-                        );
-                        ui.label(
-                            egui::RichText::new(format!("scale {scale:.4} mult {mult:.2}"))
-                                .color(Tokens::DARK.muted)
-                                .size(10.5)
-                                .monospace(),
-                        );
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(format!("ch {ch}"))
+                                    .color(Tokens::DARK.accent)
+                                    .size(11.0)
+                                    .monospace(),
+                            )
+                            .sense(egui::Sense::hover()),
+                        )
+                        .on_hover_text("Splat distribution channel (R/G/B/A) this DNTS layer binds to.");
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(format!("layer #{layer_idx}: {name}"))
+                                    .color(Tokens::DARK.text)
+                                    .size(11.0),
+                            )
+                            .sense(egui::Sense::hover()),
+                        )
+                        .on_hover_text("Source layer's stack position + display name. Edit in the Paint Layer Inspector.");
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(format!("scale {scale:.4} mult {mult:.2}"))
+                                    .color(Tokens::DARK.muted)
+                                    .size(10.5)
+                                    .monospace(),
+                            )
+                            .sense(egui::Sense::hover()),
+                        )
+                        .on_hover_text("DNTS tex_scale (frequency) and tex_mult (intensity) — emitted into mapinfo.resources.splatDetailNormalTexScales / Mults.");
                     });
                 }
             }
@@ -971,7 +1020,11 @@ fn terrain_types_tab(ui: &mut egui::Ui, form: &FormCtx<'_>, out: &mut Vec<MapInf
         "Per-type gameplay scalars",
         true,
         |ui| {
-            if ui.small_button("+ Add type").clicked() {
+            if ui
+                .small_button("+ Add type")
+                .on_hover_text("Append a new terrain-type row. Index = max+1; defaults to hardness=1, tracks=on, all move speeds=1.")
+                .clicked()
+            {
                 add_row = true;
             }
         },
@@ -981,73 +1034,63 @@ fn terrain_types_tab(ui: &mut egui::Ui, form: &FormCtx<'_>, out: &mut Vec<MapInf
                 .num_columns(8)
                 .striped(true)
                 .show(ui, |ui| {
-                    ui.label(
-                        egui::RichText::new("idx")
-                            .color(Tokens::DARK.muted)
-                            .size(10.5),
-                    );
-                    ui.label(
-                        egui::RichText::new("name")
-                            .color(Tokens::DARK.muted)
-                            .size(10.5),
-                    );
-                    ui.label(
-                        egui::RichText::new("hard")
-                            .color(Tokens::DARK.muted)
-                            .size(10.5),
-                    );
-                    ui.label(
-                        egui::RichText::new("tracks")
-                            .color(Tokens::DARK.muted)
-                            .size(10.5),
-                    );
-                    ui.label(
-                        egui::RichText::new("tank")
-                            .color(Tokens::DARK.muted)
-                            .size(10.5),
-                    );
-                    ui.label(
-                        egui::RichText::new("kbot")
-                            .color(Tokens::DARK.muted)
-                            .size(10.5),
-                    );
-                    ui.label(
-                        egui::RichText::new("hover")
-                            .color(Tokens::DARK.muted)
-                            .size(10.5),
-                    );
-                    ui.label(
-                        egui::RichText::new("ship + del")
-                            .color(Tokens::DARK.muted)
-                            .size(10.5),
-                    );
+                    let headers: &[(&str, &str)] = &[
+                        ("idx", "Engine type-index (0..255). The type-texture pixel value at each tile picks the entry."),
+                        ("name", "Editor-only display name."),
+                        ("hard", "Hardness multiplier — higher = stiffer ground, units sink less."),
+                        ("tracks", "Whether vehicle tracks render on this terrain type."),
+                        ("tank", "Tank-class movement multiplier on this terrain (0 = blocked)."),
+                        ("kbot", "Kbot-class movement multiplier on this terrain (0 = blocked)."),
+                        ("hover", "Hover-class movement multiplier on this terrain (0 = blocked)."),
+                        ("ship + del", "Ship-class movement multiplier + delete button."),
+                    ];
+                    for (label, hover) in headers {
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(*label)
+                                    .color(Tokens::DARK.muted)
+                                    .size(10.5),
+                            )
+                            .sense(egui::Sense::hover()),
+                        )
+                        .on_hover_text(*hover);
+                    }
                     ui.end_row();
                     for (row_idx, t) in types.iter_mut().enumerate() {
                         let mut idx = t.index as u32;
-                        let resp = ui.add(egui::DragValue::new(&mut idx).range(0..=255));
+                        let resp = ui
+                            .add(egui::DragValue::new(&mut idx).range(0..=255))
+                            .on_hover_text("Terrain-type index (0..255). Maps the type texture's pixel value to this entry.");
                         if commit_drag(&resp) && idx as u8 != t.index {
                             t.index = idx as u8;
                             changed = true;
                         }
                         let mut name = t.name.clone().unwrap_or_default();
-                        let resp =
-                            ui.add(egui::TextEdit::singleline(&mut name).desired_width(80.0));
+                        let resp = ui
+                            .add(egui::TextEdit::singleline(&mut name).desired_width(80.0))
+                            .on_hover_text("Display name for this terrain type. Engine ignores it; useful for editor notes.");
                         if commit_text(&resp) {
                             t.name = if name.is_empty() { None } else { Some(name) };
                             changed = true;
                         }
                         let mut hardness = t.hardness.unwrap_or(1.0);
-                        let resp = ui.add(
-                            egui::DragValue::new(&mut hardness)
-                                .range(0.0..=10.0)
-                                .speed(0.05),
-                        );
+                        let resp = ui
+                            .add(
+                                egui::DragValue::new(&mut hardness)
+                                    .range(0.0..=10.0)
+                                    .speed(0.05),
+                            )
+                            .on_hover_text("Terrain hardness multiplier (0..10). Higher = stiffer ground, units sink less. 1.0 is the engine default.");
                         if commit_drag(&resp) {
                             t.hardness = Some(hardness);
                             changed = true;
                         }
                         let mut tracks = t.receive_tracks.unwrap_or(true);
-                        if ui.checkbox(&mut tracks, "").changed() {
+                        if ui
+                            .checkbox(&mut tracks, "")
+                            .on_hover_text("Whether vehicle tracks render on this terrain type. Off = tracks are hidden (water / lava surfaces).")
+                            .changed()
+                        {
                             t.receive_tracks = Some(tracks);
                             changed = true;
                         }
@@ -1102,7 +1145,9 @@ fn terrain_types_tab(ui: &mut egui::Ui, form: &FormCtx<'_>, out: &mut Vec<MapInf
 
 fn move_speed_drag(ui: &mut egui::Ui, v: &mut Option<f32>) -> bool {
     let mut val = v.unwrap_or(1.0);
-    let resp = ui.add(egui::DragValue::new(&mut val).range(0.0..=2.0).speed(0.02));
+    let resp = ui
+        .add(egui::DragValue::new(&mut val).range(0.0..=2.0).speed(0.02))
+        .on_hover_text("Per-class movement multiplier on this terrain (0..2). 1.0 = engine default. Below 1 slows the class; 0 blocks it.");
     if commit_drag(&resp) {
         *v = Some(val);
         return true;
@@ -1153,7 +1198,11 @@ fn custom_tab(ui: &mut egui::Ui, form: &FormCtx<'_>, out: &mut Vec<MapInfoPatch>
                                     .size(11.0)
                                     .monospace(),
                             );
-                            if ui.small_button("×").clicked() {
+                            if ui
+                                .small_button("×")
+                                .on_hover_text("Remove this custom field.")
+                                .clicked()
+                            {
                                 out.push(MapInfoPatch::CustomField {
                                     key: (*k).clone(),
                                     value: None,
@@ -1184,13 +1233,20 @@ fn custom_tab(ui: &mut egui::Ui, form: &FormCtx<'_>, out: &mut Vec<MapInfoPatch>
                     egui::TextEdit::singleline(&mut new_key)
                         .hint_text("key")
                         .desired_width(160.0),
-                );
+                )
+                .on_hover_text("Key for the new custom field. Maps to `mapinfo.custom.<key>` in the rendered Lua.");
                 ui.add(
                     egui::TextEdit::singleline(&mut new_val)
                         .hint_text("string value")
                         .desired_width(220.0),
-                );
-                if ui.button("Add").clicked() && !new_key.is_empty() {
+                )
+                .on_hover_text("String value. Numbers / bools need to be entered as their TOML literal — Sprint 22+ adds typed inputs.");
+                if ui
+                    .button("Add")
+                    .on_hover_text("Commit the new key/value pair. Existing keys are overwritten.")
+                    .clicked()
+                    && !new_key.is_empty()
+                {
                     out.push(MapInfoPatch::CustomField {
                         key: new_key.clone(),
                         value: Some(toml::Value::String(new_val.clone())),
@@ -1229,7 +1285,8 @@ fn raw_lua_tab(ui: &mut egui::Ui, form: &FormCtx<'_>) {
                     .desired_rows(28)
                     .desired_width(f32::INFINITY)
                     .interactive(false),
-            );
+            )
+            .on_hover_text("Read-only rendering. Use the other tabs to edit fields; this view re-bakes every frame and reflects them.");
         },
     );
 }
@@ -1380,7 +1437,11 @@ fn opt_drag_value<F>(
                         .italics(),
                 )
                 .on_hover_text(tooltip);
-                if ui.small_button("Override").clicked() {
+                if ui
+                    .small_button("Override")
+                    .on_hover_text("Start overriding this field. Initial value lands at the slider midpoint; tweak to commit.")
+                    .clicked()
+                {
                     let mid = (*range.start() + *range.end()) * 0.5;
                     on_commit(Some(mid));
                 }
@@ -1401,7 +1462,9 @@ where
         );
         match value {
             Some(mut c) => {
-                let resp = ui.color_edit_button_rgb(&mut c);
+                let resp = ui
+                    .color_edit_button_rgb(&mut c)
+                    .on_hover_text("RGB override (0..1 per channel). Drag the swatch to open the picker; click × to revert to the engine default.");
                 if resp.changed() || resp.lost_focus() {
                     on_commit(Some(c));
                 }
@@ -1420,7 +1483,11 @@ where
                         .size(11.0)
                         .italics(),
                 );
-                if ui.small_button("Override").clicked() {
+                if ui
+                    .small_button("Override")
+                    .on_hover_text("Start overriding this colour. Initial value is mid-grey; tweak to commit.")
+                    .clicked()
+                {
                     on_commit(Some([0.5, 0.5, 0.5]));
                 }
             }
@@ -1457,12 +1524,20 @@ fn sun_dir_editor(ui: &mut egui::Ui, sd: &mut SunDir) -> bool {
     let mut changed = false;
     ui.horizontal(|ui| {
         for (i, label) in ["x", "y", "z", "w (intensity)"].iter().enumerate() {
-            let resp = ui.add(
-                egui::DragValue::new(&mut sd[i])
-                    .range(if i == 3 { 0.0..=4.0 } else { -1.0..=1.0 })
-                    .speed(0.01)
-                    .prefix(format!("{label}=")),
-            );
+            let hover = match i {
+                0 => "Sun direction x component (-1..1). Together with y and z, points toward the sun from the map.",
+                1 => "Sun direction y component (-1..1). Positive = sun above the map.",
+                2 => "Sun direction z component (-1..1). Engine reads only the camelCase sunDir; PITFALL §11.",
+                _ => "Sun intensity scalar (0..4). BAR convention is 1.0; the earlier '1e9' research artefact was wrong — PITFALL §18.",
+            };
+            let resp = ui
+                .add(
+                    egui::DragValue::new(&mut sd[i])
+                        .range(if i == 3 { 0.0..=4.0 } else { -1.0..=1.0 })
+                        .speed(0.01)
+                        .prefix(format!("{label}=")),
+                )
+                .on_hover_text(hover);
             if commit_drag(&resp) {
                 changed = true;
             }
