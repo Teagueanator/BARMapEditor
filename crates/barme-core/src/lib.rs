@@ -22,9 +22,10 @@ pub mod water_presets;
 pub use brushes::{Brush, BrushRegistry, BrushStamp, DirtyRect};
 pub use heightmap::{DimMismatch, Heightmap};
 pub use layers::{
-    BlendMode, ClosureSlotResolver, LayerColor, LayerMask, LayerSource, LayerStack, LayerTransform,
-    MaskBrush, MaskBrushRegistry, MaskFill, MaskHide, MaskReveal, MaskSmooth, MaskStamp,
-    SlotResolver, TILE_DIM, TILE_PIXELS, TextureLayer, TileCoord, alloc_layer_id,
+    BlendMode, ClosureSlotResolver, GcReport, LayerColor, LayerMask, LayerSource, LayerStack,
+    LayerTransform, MaskBrush, MaskBrushRegistry, MaskFill, MaskHide, MaskReveal, MaskSmooth,
+    MaskStamp, SlotResolver, TILE_DIM, TILE_PIXELS, TextureLayer, TileCoord, alloc_layer_id,
+    garbage_collect_textures,
 };
 pub use map_size::MapSize;
 pub use mapinfo_schema::{

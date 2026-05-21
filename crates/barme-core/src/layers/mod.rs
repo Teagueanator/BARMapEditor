@@ -37,7 +37,9 @@
 pub mod brushes;
 pub mod mask;
 
-use std::path::PathBuf;
+use std::collections::HashSet;
+use std::io;
+use std::path::{Path, PathBuf};
 
 use image::{Rgb, RgbImage};
 use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
@@ -47,6 +49,7 @@ use tracing::{info, warn};
 
 use crate::MapSize;
 use crate::brushes::DirtyRect;
+use crate::project::Project;
 use crate::splat::{SplatChannel, SplatConfig};
 
 pub use brushes::{MaskBrush, MaskBrushRegistry, MaskFill, MaskHide, MaskReveal, MaskSmooth};
@@ -78,6 +81,26 @@ impl LayerSource {
                 .and_then(|s| s.to_str())
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| "Imported".to_string()),
+        }
+    }
+
+    /// Sprint 23 (T1 / orphan-GC): UUID embedded in the imported
+    /// texture's project-relative path. For Sprint 17's import flow
+    /// the path is `textures/<uuid>.png`, so the file stem is the
+    /// UUID. Returns `None` for `Slot`-sourced layers and for
+    /// `Imported` paths whose stem isn't UTF-8 readable.
+    ///
+    /// Used by [`garbage_collect_textures`] to compute the set of
+    /// UUIDs the project's live layers still reference; any file in
+    /// `<project>/textures/` whose UUID is NOT in that set is an
+    /// orphan and the GC pass unlinks it.
+    pub fn imported_uuid(&self) -> Option<String> {
+        match self {
+            Self::Slot { .. } => None,
+            Self::Imported { path } => path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .map(|s| s.to_string()),
         }
     }
 }
@@ -827,6 +850,148 @@ fn ch_idx_label(i: u8) -> &'static str {
 }
 
 // ---------------------------------------------------------------------------
+// Orphan-texture GC (Sprint 23 / T1, ADR-041 amendment)
+// ---------------------------------------------------------------------------
+
+/// Outcome of one [`garbage_collect_textures`] pass.
+///
+/// `orphans_removed` carries the on-disk paths the GC unlinked;
+/// `orphans_removed_bytes` is the total stat'd size before unlink
+/// (reported via the `last_error` toast so users see "Removed N
+/// orphans (~M MB)").
+/// `orphans_in_use_count` is the count of files the GC inspected
+/// and LEFT alone because their UUID is still referenced by a live
+/// layer — a sanity counter.
+/// `errors` collects per-file unlink failures; the GC continues on
+/// error so a single permission-denied entry doesn't abort the rest
+/// of the pass.
+///
+/// A non-existent `<project_root>/textures/` directory is NOT an
+/// error — it just means the project has never imported a texture.
+/// `garbage_collect_textures` returns an empty report in that case.
+#[derive(Debug, Default)]
+pub struct GcReport {
+    pub orphans_removed: Vec<PathBuf>,
+    pub orphans_removed_bytes: u64,
+    pub orphans_in_use_count: usize,
+    pub errors: Vec<(PathBuf, io::Error)>,
+}
+
+impl GcReport {
+    /// Number of orphan files removed.
+    pub fn count_removed(&self) -> usize {
+        self.orphans_removed.len()
+    }
+}
+
+/// Walk `<project_root>/textures/*.{png,meta.toml}` and unlink any
+/// file whose UUID isn't referenced by the project's live layer
+/// stack. Returns a [`GcReport`] summarising what was removed,
+/// preserved, and what failed.
+///
+/// **Trigger points (per Sprint 23 / T1 design):**
+/// - On project save (cheap; runs after the file write).
+/// - Manual `File > Garbage collect orphan textures` menu item.
+/// - **NOT** on `ProjectDiff::RemoveLayer` — the 100 MB undo ring
+///   may still hold a snapshot of the removed layer with its source
+///   path, and a user Ctrl+Z within the undo window expects the file
+///   to be on disk. Sprint 23 keeps the policy "GC at save / on
+///   request only"; ADR-033's eviction-driven GC is a follow-up.
+///
+/// **Safety contract:** the in-use UUID set is computed from
+/// [`LayerSource::imported_uuid`] across every layer. Files whose
+/// stem matches an in-use UUID are NEVER unlinked — pinned by
+/// [`tests::gc_preserves_in_use_textures`].
+///
+/// **No-textures-dir is not an error.** Returns an empty report.
+pub fn garbage_collect_textures(
+    project: &Project,
+    project_root: &Path,
+) -> io::Result<GcReport> {
+    let textures_dir = project_root.join("textures");
+    let mut report = GcReport::default();
+    let in_use: HashSet<String> = project
+        .layers
+        .layers
+        .iter()
+        .filter_map(|l| l.source.imported_uuid())
+        .collect();
+
+    let read = match std::fs::read_dir(&textures_dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            tracing::info!(
+                root = %project_root.display(),
+                "garbage_collect_textures: no textures/ dir; report empty"
+            );
+            return Ok(report);
+        }
+        Err(e) => return Err(e),
+    };
+
+    let mut bytes_freed: u64 = 0;
+    for entry in read {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                report.errors.push((textures_dir.clone(), e));
+                continue;
+            }
+        };
+        let path = entry.path();
+        // We only manage `*.png` + `*.meta.toml` — anything else
+        // (user-dropped notes, screenshots, etc.) gets skipped
+        // entirely.
+        let name = match path.file_name().and_then(|s| s.to_str()) {
+            Some(n) => n,
+            None => continue,
+        };
+        let Some(uuid) = name
+            .strip_suffix(".meta.toml")
+            .or_else(|| name.strip_suffix(".png"))
+            .map(|stem| stem.to_string())
+        else {
+            continue;
+        };
+        if in_use.contains(&uuid) {
+            report.orphans_in_use_count += 1;
+            continue;
+        }
+        // Stat the file BEFORE unlinking so the freed-bytes counter
+        // is honest for the toast surface.
+        let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+        match std::fs::remove_file(&path) {
+            Ok(()) => {
+                bytes_freed = bytes_freed.saturating_add(size);
+                tracing::info!(
+                    path = %path.display(),
+                    size_bytes = size,
+                    "garbage_collect_textures: orphan unlinked"
+                );
+                report.orphans_removed.push(path);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "garbage_collect_textures: unlink failed"
+                );
+                report.errors.push((path, e));
+            }
+        }
+    }
+    report.orphans_removed_bytes = bytes_freed;
+    tracing::info!(
+        removed = report.orphans_removed.len(),
+        in_use = report.orphans_in_use_count,
+        errors = report.errors.len(),
+        bytes_freed,
+        "garbage_collect_textures: pass complete"
+    );
+    Ok(report)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1388,6 +1553,136 @@ mod tests {
                  (wgpu zero-init default already matches)",
             );
         }
+    }
+
+    // ─── Sprint 23 / T1 — orphan-texture GC ─────────────────────────
+
+    /// `LayerSource::imported_uuid` returns `None` for slot sources
+    /// and the file stem for imported ones. The stem IS the UUID in
+    /// the Sprint 17 import flow (`textures/<uuid>.png`).
+    #[test]
+    fn imported_uuid_extracts_file_stem_from_imported_path() {
+        let slot = LayerSource::Slot { id: 7 };
+        assert!(slot.imported_uuid().is_none());
+        let img = LayerSource::Imported {
+            path: PathBuf::from("textures/deadbeefcafe.png"),
+        };
+        assert_eq!(img.imported_uuid().as_deref(), Some("deadbeefcafe"));
+        // Absolute paths still surface the stem; the GC's in-use
+        // set is keyed by stem regardless of how the user wrote it.
+        let abs = LayerSource::Imported {
+            path: PathBuf::from("/tmp/whatever/abc123.png"),
+        };
+        assert_eq!(abs.imported_uuid().as_deref(), Some("abc123"));
+    }
+
+    /// Bare bones: a project with no imports and no textures/ dir
+    /// returns an empty report (no error).
+    #[test]
+    fn gc_no_textures_dir_is_empty_report_not_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = crate::Project::new("empty", 4);
+        let report = garbage_collect_textures(&project, dir.path()).unwrap();
+        assert!(report.orphans_removed.is_empty());
+        assert_eq!(report.orphans_removed_bytes, 0);
+        assert_eq!(report.orphans_in_use_count, 0);
+        assert!(report.errors.is_empty());
+    }
+
+    /// Defensive: an in-use imported texture is NEVER unlinked.
+    /// Create a project with one Imported layer pointing at
+    /// `textures/keep.png`, drop the file on disk, GC, assert the
+    /// file is still there.
+    #[test]
+    fn gc_preserves_in_use_textures() {
+        let dir = tempfile::tempdir().unwrap();
+        let textures = dir.path().join("textures");
+        std::fs::create_dir_all(&textures).unwrap();
+        let keep = textures.join("keep.png");
+        std::fs::write(&keep, b"png-bytes").unwrap();
+        let mut project = crate::Project::new("keep-test", 4);
+        // Replace the default biome-base layer with one that points
+        // at the on-disk file we want to preserve.
+        project.layers = LayerStack {
+            layers: vec![TextureLayer::new(
+                LayerSource::Imported {
+                    path: PathBuf::from("textures/keep.png"),
+                },
+                project.size,
+                255,
+            )],
+        };
+        let report = garbage_collect_textures(&project, dir.path()).unwrap();
+        assert!(report.orphans_removed.is_empty(), "must not unlink in-use file");
+        assert_eq!(report.orphans_in_use_count, 1);
+        assert!(keep.exists(), "in-use texture must survive GC");
+    }
+
+    /// Happy path: an orphan `<uuid>.png` + matching `.meta.toml`
+    /// get unlinked; the report carries paths + bytes.
+    #[test]
+    fn gc_removes_orphan_png_and_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let textures = dir.path().join("textures");
+        std::fs::create_dir_all(&textures).unwrap();
+        // Project with NO imported layers — anything in textures/
+        // is an orphan.
+        let project = crate::Project::new("orphan-test", 4);
+        // Plant one orphan pair: <uuid>.png (1432 bytes payload) +
+        // <uuid>.meta.toml.
+        let orphan_uuid = "abc123";
+        let orphan_png = textures.join(format!("{orphan_uuid}.png"));
+        let orphan_meta = textures.join(format!("{orphan_uuid}.meta.toml"));
+        let payload = vec![0u8; 1432];
+        std::fs::write(&orphan_png, &payload).unwrap();
+        std::fs::write(&orphan_meta, b"name = \"x\"\n").unwrap();
+        let report = garbage_collect_textures(&project, dir.path()).unwrap();
+        assert_eq!(report.orphans_removed.len(), 2, "PNG + meta both unlinked");
+        assert!(!orphan_png.exists());
+        assert!(!orphan_meta.exists());
+        // Bytes count includes both files; lower bound is the PNG
+        // payload alone.
+        assert!(
+            report.orphans_removed_bytes >= payload.len() as u64,
+            "freed bytes report should cover the PNG: got {}",
+            report.orphans_removed_bytes
+        );
+    }
+
+    /// Idempotent: a second GC pass on a swept project finds zero
+    /// orphans. Pins the contract for callers that re-run on every
+    /// save.
+    #[test]
+    fn gc_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let textures = dir.path().join("textures");
+        std::fs::create_dir_all(&textures).unwrap();
+        let project = crate::Project::new("idem-test", 4);
+        std::fs::write(textures.join("zzz.png"), b"x").unwrap();
+        let first = garbage_collect_textures(&project, dir.path()).unwrap();
+        assert_eq!(first.orphans_removed.len(), 1);
+        let second = garbage_collect_textures(&project, dir.path()).unwrap();
+        assert!(second.orphans_removed.is_empty());
+        assert_eq!(second.orphans_in_use_count, 0);
+    }
+
+    /// Non-PNG / non-meta files (e.g. user-dropped notes) are
+    /// ignored by the GC even when the project doesn't reference
+    /// them. The GC's scope is explicitly `*.png` + `*.meta.toml`.
+    #[test]
+    fn gc_ignores_unrelated_files_in_textures_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let textures = dir.path().join("textures");
+        std::fs::create_dir_all(&textures).unwrap();
+        let note = textures.join("README.txt");
+        let screenshot = textures.join("scratch.jpg");
+        std::fs::write(&note, b"notes").unwrap();
+        std::fs::write(&screenshot, b"jpg").unwrap();
+        let project = crate::Project::new("unrelated", 4);
+        let report = garbage_collect_textures(&project, dir.path()).unwrap();
+        assert!(report.orphans_removed.is_empty());
+        assert!(note.exists());
+        assert!(screenshot.exists());
     }
 
     /// The harness itself: snapshot RSS before and after building a

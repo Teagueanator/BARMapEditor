@@ -1770,13 +1770,81 @@ impl App {
                 self.last_error = None;
                 self.dirty = false;
                 // Sprint 20 / chunk 7 — record in recent projects.
-                self.editor_config.push_recent(path);
+                self.editor_config.push_recent(path.clone());
                 self.editor_config.save();
+                // Sprint 23 / T1 (ADR-041 amendment) — sweep any
+                // imported-texture files no longer referenced by the
+                // layer stack. Quiet (no toast) when there's nothing
+                // to do; on success surfaces the freed-bytes total
+                // via `last_error` so the user knows the disk
+                // footprint changed.
+                self.run_orphan_texture_gc(&path, RunGcSource::AutoSave);
             }
             Err(e) => {
                 error!(path = %path.display(), error = %format!("{e:#}"), "project save failed");
                 self.last_error = Some(format!("save: {e:#}"));
             }
+        }
+    }
+
+    /// Sprint 23 / T1 (ADR-041 amendment) — run the orphan-imported-
+    /// texture sweep. Reads the live project state, walks
+    /// `<project_root>/textures/`, and unlinks anything whose UUID
+    /// isn't referenced by any layer.
+    ///
+    /// `source = AutoSave` keeps the toast quiet when the report is
+    /// empty (the auto-run on every save shouldn't spam a status
+    /// line saying "no orphans"). `source = Manual` always surfaces
+    /// the report so the user knows the menu item ran.
+    fn run_orphan_texture_gc(&mut self, project_path: &Path, source: RunGcSource) {
+        let Some(root) = project_path.parent() else {
+            warn!(
+                project_path = %project_path.display(),
+                "garbage_collect_textures: project path has no parent; skipping"
+            );
+            return;
+        };
+        let snap = self.snapshot_project();
+        let report = match barme_core::garbage_collect_textures(&snap, root) {
+            Ok(r) => r,
+            Err(e) => {
+                self.last_error = Some(format!(
+                    "Texture GC failed at {}: {}",
+                    root.display(),
+                    e
+                ));
+                return;
+            }
+        };
+        let removed = report.count_removed();
+        let mb = report.orphans_removed_bytes as f64 / (1024.0 * 1024.0);
+        info!(
+            removed,
+            bytes_freed = report.orphans_removed_bytes,
+            in_use = report.orphans_in_use_count,
+            errors = report.errors.len(),
+            source = ?source,
+            "orphan texture GC pass complete",
+        );
+        match (source, removed) {
+            (RunGcSource::Manual, 0) => {
+                self.last_error = Some("GC: no orphan textures found.".into());
+            }
+            (RunGcSource::Manual, n) | (RunGcSource::AutoSave, n) if n > 0 => {
+                self.last_error = Some(format!(
+                    "Garbage-collected {n} orphan texture{plural} (~{mb:.1} MB).",
+                    plural = if n == 1 { "" } else { "s" },
+                ));
+            }
+            // AutoSave with zero orphans: stay silent.
+            _ => {}
+        }
+        for (path, err) in &report.errors {
+            warn!(
+                path = %path.display(),
+                error = %err,
+                "garbage_collect_textures: per-file error"
+            );
         }
     }
 
@@ -5946,6 +6014,17 @@ fn short_error(msg: &str) -> String {
 /// Discrete user intent collected during UI building. We don't perform IO
 /// inside the egui closure; we drain this after the panel closes so borrow
 /// checking stays simple.
+/// Sprint 23 / T1 (ADR-041 amendment) — distinguishes the two
+/// invocation sites for `App::run_orphan_texture_gc`. Auto-save runs
+/// silently when the report is empty (otherwise the status strip
+/// would spam "no orphans" on every Ctrl+S); manual runs always
+/// surface the report so the user sees the menu item did something.
+#[derive(Debug, Clone, Copy)]
+enum RunGcSource {
+    AutoSave,
+    Manual,
+}
+
 enum FileAction {
     LoadHeightmap(PathBuf),
     /// Open the F1 new-project wizard (ADR-024). Creating happens on the
@@ -5962,6 +6041,11 @@ enum FileAction {
     ApplyProcGen,
     Undo,
     Redo,
+    /// Sprint 23 (T1, ADR-041 amendment) — run the orphan-imported-
+    /// texture sweep against `<project>/textures/`. Manual trigger
+    /// for `File > Garbage collect orphan textures`; auto-runs
+    /// after every successful save via [`App::save_to`].
+    GarbageCollectTextures,
 }
 
 /// Layout-shell methods for the five-zone UI introduced in ADR-030. Each
@@ -6546,6 +6630,24 @@ impl App {
                 .clicked()
             {
                 *action = Some(FileAction::SaveAs);
+                ui.close();
+            }
+            ui.separator();
+            // Sprint 23 / T1 (ADR-041 amendment) — manual orphan
+            // sweep. Auto-runs on every save; the menu item is the
+            // power-user backstop for projects that import-then-undo
+            // without saving in between, or anywhere a user wants to
+            // free disk before checking project size.
+            if ui
+                .button("Garbage collect orphan textures")
+                .on_hover_text(
+                    "Unlink any <project>/textures/<uuid>.png + meta files no \
+                     longer referenced by the layer stack. Runs automatically \
+                     on every save; this menu item is the manual trigger.",
+                )
+                .clicked()
+            {
+                *action = Some(FileAction::GarbageCollectTextures);
                 ui.close();
             }
             ui.separator();
@@ -10674,6 +10776,20 @@ impl App {
             Some(FileAction::ApplyProcGen) => self.apply_procgen(),
             Some(FileAction::Undo) => self.undo_one(),
             Some(FileAction::Redo) => self.redo_one(),
+            Some(FileAction::GarbageCollectTextures) => {
+                // Sprint 23 / T1 (ADR-041 amendment) — manual sweep.
+                // Bails with a toast if the project hasn't been
+                // saved (no <project>/textures/ to sweep yet).
+                let Some(project_path) = self.current_project_path.clone() else {
+                    self.last_error = Some(
+                        "Save the project before garbage-collecting textures \
+                         (the textures live next to the .barmeproj)."
+                            .into(),
+                    );
+                    return;
+                };
+                self.run_orphan_texture_gc(&project_path, RunGcSource::Manual);
+            }
             None => {}
         }
     }
