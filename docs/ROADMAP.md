@@ -576,8 +576,16 @@ SRS F13–F17 plus quality-of-life.
 - [ ] **F15** Type-map editor + per-terraintype gameplay params
 - [ ] **F16** Skybox picker / atmospheric preset library
 - [ ] **F17** Pathability overlay
-- [ ] "Lint My Map" pass — catches all ten silent `mapinfo.lua` pitfalls in
-      `docs/PITFALLS.md`
+- [x] **C8** "Lint My Map" pass — Sprint 21 ships `barme-pipeline::lint`
+      with a 31-variant `LintRule` registry covering every silent
+      failure mode in PITFALLS.md §1–§28 plus FINDINGS §12 / NEW-1..NEW-10.
+      10 hard errors gate the Build button; 18 warnings + 3 info-tier
+      surface in the lint panel without blocking. Sprint 19's panel
+      stub gets a real body grouped by severity, Fix buttons that
+      dispatch through `ProjectDiff::EditMapInfo` for undo, and F9
+      form per-tab dots that route by `field_path` prefix. App's
+      `validation_summary` heuristics retire — chip tone aggregates
+      from the registry every frame.
 - [ ] Procedural template library (Quicksilver, Glitters, Throne, Supreme
       Isthmus archetypes)
 

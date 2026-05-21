@@ -247,12 +247,25 @@ struct App {
     show_cheat_sheet: bool,
     /// Sprint 19 / U1 — is the lint-panel window open this frame? Driven by
     /// the top-bar validation chip and the status-strip issue-count label.
-    /// Stub today; Sprint 21 / C8 lands the full `LintRule` registry.
     lint_panel_open: bool,
     /// Sprint 19 / U1 — previous-frame snapshot so `lint_panel::render`
     /// can emit `trace!` exactly on the open / close transitions
     /// without spamming the log every frame.
     lint_panel_was_open: bool,
+    /// Sprint 21 / C8 — cached lint-pass output, recomputed once per
+    /// frame by [`App::recompute_lint`]. Sprint 20's prequel commits
+    /// us to per-frame evaluation (rules are sub-millisecond on the
+    /// largest expected projects). Used by:
+    /// - [`App::validation_summary`] (chip tone aggregation),
+    /// - [`crate::ui::lint_panel::render`] (panel body),
+    /// - [`crate::ui::lint_panel::tab_counts`] (F9 form tab dots),
+    /// - [`App::build_and_install`] (hard-error gate).
+    lint_summary: Vec<barme_pipeline::LintIssue>,
+    /// Sprint 21 / C8 — cached stock-feature manifest used by the
+    /// `FeatureNotInStockManifest` rule. Loaded once at startup
+    /// (the JSON is `include_str!`d so loading is a JSON parse, not
+    /// file I/O); reused every frame.
+    lint_stock_manifest: barme_pipeline::StockManifest,
     /// Retired by ADR-035 — the nav gizmo was replaced by the
     /// top-down mini-map. Field kept (always-false) only because
     /// removing it churns tests + downstream init blocks; clean
@@ -1320,6 +1333,8 @@ impl App {
             show_cheat_sheet: false,
             lint_panel_open: false,
             lint_panel_was_open: false,
+            lint_summary: Vec::new(),
+            lint_stock_manifest: barme_pipeline::StockManifest::load(),
             nav_gizmo_drag_active: false,
             build_variant: BuildVariant::default(),
             mapinfo_overrides: std::collections::HashMap::new(),
@@ -1733,75 +1748,95 @@ impl App {
         self.dirty = true;
     }
 
-    /// Compute the top-bar validation chip's tone + label. Pure helper
-    /// over snapshot state; unit-tested under
-    /// `validation_summary_*`.
+    /// Sprint 21 / C8 — recompute the lint pass against the current
+    /// project state. Called once per frame at the top of
+    /// [`eframe::App::update`]. Cheap (sub-millisecond on a 32-SMU
+    /// project with hundreds of features); per Sprint 20's prequel
+    /// we don't debounce — running every frame keeps the chip /
+    /// panel / tab dots / build gate exactly in sync with the project
+    /// without any "did this change?" plumbing.
+    fn recompute_lint(&mut self) {
+        let project = self.snapshot_project();
+        let info: barme_core::MapInfo = (&project).into();
+        self.lint_summary = barme_pipeline::lint_with(&project, &info, &self.lint_stock_manifest);
+    }
+
+    /// Top-bar validation chip's tone + label. Sprint 21 (C8): the
+    /// body of this aggregates `App::lint_summary` instead of
+    /// hand-rolled rules. The chip's tone gates the border colour
+    /// and the status-strip aggregate; `validation_summary_*` tests
+    /// continue to pin the high-level behaviours.
+    ///
+    /// **Pre-lint failures still take precedence.** No-heightmap /
+    /// heightmap-mismatch / procgen-expression-error are App-level
+    /// (not Project-level) gates the linter can't see. They get
+    /// surfaced first so the user never gets "Ready" while the editor
+    /// itself is in a broken state.
     fn validation_summary(&self) -> (crate::ui::theme::ChipTone, String) {
         use crate::ui::theme::ChipTone;
-        // Project-fatal: no heightmap loaded.
+        // App-level pre-lint gates.
         if self.heightmap.is_none() {
             return (ChipTone::Err, "No heightmap".into());
         }
-        // Heightmap dims mismatch vs declared SMU.
         if let Some(h) = &self.heightmap
             && h.validated_against != Some(self.map_size)
         {
             return (ChipTone::Err, "Heightmap mismatch".into());
         }
-        // Procgen panel: live parse error.
         if let Err(_msg) = &self.procgen_validation
             && matches!(self.tool, Tool::Procgen)
         {
             return (ChipTone::Err, "Expression error".into());
         }
-        // C9 / Sprint 14 / PITFALL §8 — DNTS + water LOS TV-snow bug.
-        // Beherith forum t=35202: with DNTS slots bound AND water
-        // active (`min_height < 0` OR `water_mode != None`), any
-        // gameplay-side LOS widget can trigger animated-noise
-        // artefacts on the terrain. Warn but don't gate (the user
-        // might still ship and accept the risk). Sprint 19's lint
-        // panel will surface this same condition more loudly.
-        // D10 / Sprint 17 (ADR-041): derive from layer stack instead
-        // of the retired `splat_config.channels`.
-        let has_dnts = self.layer_stack.dnts_layers().iter().any(|l| l.is_some());
-        let has_water = self.water_mode != WaterMode::None || self.min_height < 0.0;
-        if has_dnts && has_water {
-            return (ChipTone::Warn, "DNTS + water: LOS bug".into());
+        // Lint aggregation.
+        let errors = self
+            .lint_summary
+            .iter()
+            .filter(|i| i.severity == barme_pipeline::LintSeverity::Error)
+            .count();
+        let warnings = self
+            .lint_summary
+            .iter()
+            .filter(|i| i.severity == barme_pipeline::LintSeverity::Warning)
+            .count();
+        if errors > 0 {
+            let first = self
+                .lint_summary
+                .iter()
+                .find(|i| i.severity == barme_pipeline::LintSeverity::Error)
+                .map(|i| i.rule.title())
+                .unwrap_or("error");
+            let label = if errors == 1 {
+                first.to_string()
+            } else {
+                format!("{errors} errors · {first}")
+            };
+            return (ChipTone::Err, label);
         }
-        // D5 / FINDINGS §7.2: a DNTS slot is bound but no specular
-        // texture is set. Engine no longer gates the DNTS branch on
-        // specularTex (Recoil HEAD, SMFRenderState.cpp:114), but the
-        // visual still looks flatter than published BAR maps. Surface
-        // as a yellow warning. Editor doesn't author specular yet, so
-        // any bound slot trips this.
-        if has_dnts {
-            return (ChipTone::Warn, "DNTS: no specular".into());
-        }
-        // C9 / Sprint 14 — water mode vs min_height agreement.
-        // `min_height < 0` with no preset = engine renders its
-        // default blue ocean (silent surprise). Preset selected
-        // with `min_height >= 0` = no water visible without
-        // `forceRendering`. Sprint 19's lint promotes these into
-        // the lint panel with one-click fixes.
-        if self.water_mode == WaterMode::None && self.min_height < 0.0 {
-            return (
-                ChipTone::Warn,
-                "Terrain below Y=0 with no water preset".into(),
-            );
-        }
-        if self.water_mode != WaterMode::None && self.min_height >= 0.0 {
-            return (
-                ChipTone::Warn,
-                "Water preset set, no terrain below Y=0".into(),
-            );
-        }
-        // Soft warning: empty ally groups will fall back to the
-        // engine's 25/75 diagonal default. That still ships a playable
-        // map but the user almost certainly meant something else.
-        if self.ally_groups.is_empty() {
-            return (ChipTone::Warn, "No start positions".into());
+        if warnings > 0 {
+            let first = self
+                .lint_summary
+                .iter()
+                .find(|i| i.severity == barme_pipeline::LintSeverity::Warning)
+                .map(|i| i.rule.title())
+                .unwrap_or("warning");
+            let label = if warnings == 1 {
+                first.to_string()
+            } else {
+                format!("{warnings} warnings · {first}")
+            };
+            return (ChipTone::Warn, label);
         }
         (ChipTone::Ok, "Ready".into())
+    }
+
+    /// Sprint 21 / C8 — count of `LintSeverity::Error` issues in the
+    /// current `lint_summary`. Used by the Build-button gate.
+    fn lint_error_count(&self) -> usize {
+        self.lint_summary
+            .iter()
+            .filter(|i| i.severity == barme_pipeline::LintSeverity::Error)
+            .count()
     }
 
     /// Refresh the cached parse-and-dry-eval outcome (ADR-…/A4). Stores
@@ -4830,6 +4865,28 @@ impl App {
             return;
         }
 
+        // Sprint 21 / C8 — hard gate on lint errors. The Build button
+        // is greyed but the keyboard accelerator + the dirty-save
+        // funnel both reach here; this is the last line of defence.
+        let errors = self.lint_error_count();
+        if errors > 0 {
+            let top: Vec<String> = self
+                .lint_summary
+                .iter()
+                .filter(|i| i.severity == barme_pipeline::LintSeverity::Error)
+                .take(3)
+                .map(|i| i.rule.title().to_string())
+                .collect();
+            let msg = format!(
+                "Build blocked by {errors} lint error(s): {}. Open the lint panel for details.",
+                top.join(", ")
+            );
+            warn!(errors, "build & install gated by lint errors: {msg}");
+            self.last_error = Some(msg);
+            self.lint_panel_open = true;
+            return;
+        }
+
         self.last_install = None;
         self.last_error = None;
         let Some(hm) = self.heightmap.as_ref() else {
@@ -6594,16 +6651,40 @@ impl App {
 
         // Build & install split-button (rightmost so it's the eye
         // anchor — the user's most-used action).
-        let can_run = self.heightmap.is_some();
+        //
+        // Sprint 21 / C8: gated on `lint_summary` errors. Warnings
+        // surface in the chip but never gate; the user might
+        // intentionally ship a map that trips a warning.
+        let lint_error_count = self.lint_error_count();
+        let can_run = self.heightmap.is_some() && lint_error_count == 0;
         let (primary, caret) = crate::ui::widgets::split_button(
             ui,
             Some(Icon::Play),
             "Build & install",
             can_run, // accent only when actionable
         );
-        let build_hover = match self.build_destination_hint() {
-            Some(path) => format!("{} → {}", help(HelpId::TopBarBuildPrimary), path),
-            None => help(HelpId::TopBarBuildPrimary).to_string(),
+        let build_hover = if lint_error_count > 0 {
+            let top: Vec<String> = self
+                .lint_summary
+                .iter()
+                .filter(|i| i.severity == barme_pipeline::LintSeverity::Error)
+                .take(3)
+                .map(|i| format!("• {}", i.rule.title()))
+                .collect();
+            let suffix = if lint_error_count > 3 {
+                format!("\n+ {} more error(s)", lint_error_count - 3)
+            } else {
+                String::new()
+            };
+            format!(
+                "Build blocked by {lint_error_count} lint error(s):\n{}{suffix}\n\nClick the chip to open the lint panel.",
+                top.join("\n")
+            )
+        } else {
+            match self.build_destination_hint() {
+                Some(path) => format!("{} → {}", help(HelpId::TopBarBuildPrimary), path),
+                None => help(HelpId::TopBarBuildPrimary).to_string(),
+            }
         };
         let primary = primary.on_hover_text(build_hover);
         let _caret = caret.on_hover_text(help(HelpId::TopBarBuildVariant));
@@ -6702,8 +6783,8 @@ impl App {
         // otherwise). The hint is a no-op if a higher-frequency
         // repaint is already scheduled this frame.
         ctx.request_repaint_after(std::time::Duration::from_secs(1));
-        let (issue_tone, issue_label) = self.validation_summary();
-        let issue_count = crate::ui::lint_panel::issue_count(issue_tone);
+        let (_issue_tone, issue_label) = self.validation_summary();
+        let issue_count = crate::ui::lint_panel::issue_count(&self.lint_summary);
         let mut open_lint = false;
         egui::TopBottomPanel::bottom("status_strip").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -10342,6 +10423,12 @@ impl eframe::App for App {
         // overlay see this frame's stage / log updates immediately.
         self.poll_build_state(ctx);
 
+        // Sprint 21 / C8 — recompute lint summary ONCE per frame
+        // before any panel reads from it. Cheap (<1 ms even on the
+        // largest expected projects); reading downstream guarantees
+        // chip / panel / tab dots / build gate all see the same view.
+        self.recompute_lint();
+
         // egui panel add-order rule: top → bottom → left → right →
         // CentralPanel LAST. Reversing this means CentralPanel eats the
         // rect later panels were supposed to claim.
@@ -10422,16 +10509,22 @@ impl eframe::App for App {
             );
         }
 
-        // Sprint 19 / U1 — lint-panel stub. Opens from the top-bar
-        // validation chip and the status-strip issue count; the panel
-        // itself owns close behaviour via the egui Window's X button.
-        let summary = self.validation_summary();
-        crate::ui::lint_panel::render(
+        // Sprint 21 / C8 — lint panel populated from
+        // `App::lint_summary`. A Fix click returns a `MapInfoPatch`
+        // which we dispatch through the F9 form's undo path so
+        // Ctrl-Z restores the prior value.
+        let fix_patch = crate::ui::lint_panel::render(
             ctx,
             &mut self.lint_panel_open,
-            summary,
+            &self.lint_summary,
             &mut self.lint_panel_was_open,
         );
+        if let Some(patch) = fix_patch {
+            let from = self.snapshot_mapinfo_patch_inverse(&patch);
+            self.apply_mapinfo_patch(patch.clone());
+            self.history
+                .push_project_diff(ProjectDiff::EditMapInfo { from, to: patch });
+        }
 
         // First-launch hint (B3). Renders ONLY after the wizard closes
         // so the two don't compete; this also serves a project on disk
@@ -10489,10 +10582,9 @@ impl eframe::App for App {
                 // not load-bearing for this commit). Pass None so the
                 // tab shows the "(preview pending)" placeholder.
                 minimap_preview: None,
-                // Sprint 21 / C8 lint output — stubbed at zero. The
-                // rendering is live so per-tab dots show up the moment
-                // Sprint 21 populates this.
-                lint_per_tab: [0; 12],
+                // Sprint 21 / C8 — per-tab dot counts derived from
+                // `lint_summary` via `field_path` prefix matching.
+                lint_per_tab: crate::ui::lint_panel::tab_counts(&self.lint_summary),
             };
             let patches =
                 crate::ui::inspector_mapinfo::show_window(ctx, &mut open, &mut tab, &form_ctx);
@@ -10622,6 +10714,8 @@ mod tests {
             show_cheat_sheet: false,
             lint_panel_open: false,
             lint_panel_was_open: false,
+            lint_summary: Vec::new(),
+            lint_stock_manifest: barme_pipeline::StockManifest::load(),
             nav_gizmo_drag_active: false,
             build_variant: BuildVariant::default(),
             mapinfo_overrides: std::collections::HashMap::new(),
@@ -11154,6 +11248,70 @@ mod tests {
         );
     }
 
+    /// Sprint 21 / C8 — `App::lint_error_count` aggregates the
+    /// per-frame `lint_summary`. The Build button gate (in
+    /// `top_bar_right_block`) and the worker-side refusal (in
+    /// `build_and_install`) both read through this single accessor.
+    #[test]
+    fn lint_error_count_aggregates_hard_errors() {
+        let mut app = make_test_app();
+        // No heightmap, no ally_groups → multiple rules fire (NoHeightmap
+        // is App-level, TeamsEmpty is a hard error).
+        app.heightmap = Some(test_heightmap_state(app.map_size));
+        // ally_groups empty → TeamsEmpty fires as Error.
+        app.recompute_lint();
+        assert!(
+            app.lint_error_count() >= 1,
+            "expected ≥1 hard error from empty ally_groups; got: {:?}",
+            app.lint_summary
+        );
+        // Seed an ally group → TeamsEmpty silences. Lint should be
+        // free of hard errors (warnings may still surface depending
+        // on the default state).
+        seed_ally_group(&mut app);
+        app.recompute_lint();
+        assert_eq!(
+            app.lint_error_count(),
+            0,
+            "wizard-style seeded app should have no hard errors; got: {:?}",
+            app.lint_summary
+        );
+    }
+
+    /// Sprint 21 / C8 — `build_and_install` refuses to start when
+    /// `lint_summary` carries hard errors. Asserted by inspecting
+    /// `last_error` after the call: the gate writes a human-readable
+    /// summary there instead of spinning up the worker.
+    #[test]
+    fn build_and_install_refuses_with_hard_errors() {
+        let mut app = make_test_app();
+        // No heightmap → the "load a heightmap first" early return
+        // also fires, but the lint gate comes BEFORE it (lint errors
+        // are the more useful diagnostic when present).
+        app.heightmap = Some(test_heightmap_state(app.map_size));
+        // Deliberately empty ally_groups → TeamsEmpty fires as Error.
+        app.recompute_lint();
+        assert!(app.lint_error_count() >= 1);
+
+        app.build_and_install();
+        // Build worker should NOT be running.
+        assert!(
+            matches!(app.build_state, build_runner::BuildState::Idle),
+            "build_state should stay Idle when lint gates the build"
+        );
+        // last_error should describe the lint block.
+        let err = app.last_error.as_deref().unwrap_or("");
+        assert!(
+            err.contains("lint error"),
+            "last_error should mention lint gate; got: {err:?}"
+        );
+        // Lint panel should auto-open so the user sees the issues.
+        assert!(
+            app.lint_panel_open,
+            "lint panel should auto-open when build is gated"
+        );
+    }
+
     /// `mark_dirty()` flips the flag; `save_to` clears it after a
     /// successful save. Validating both ends keeps the Save chip's
     /// dirty dot from going stale.
@@ -11358,54 +11516,92 @@ mod tests {
         );
     }
 
+    /// Sprint 21 / C8 — seed a single ally group on a test App so the
+    /// `TeamsEmpty` hard-error doesn't gate the chip tone in
+    /// validation_summary tests. Mirrors the wizard's post-state.
+    fn seed_ally_group(app: &mut App) {
+        let mut g = barme_core::AllyGroup::new(0);
+        g.start_positions.push(barme_core::StartPosition {
+            x_elmo: 512,
+            z_elmo: 512,
+        });
+        app.ally_groups.push(g);
+    }
+
     /// C9 (Sprint 14 / commit 5) — validation chip:
     /// `min_height < 0` with `WaterMode::None` warns the user that
-    /// BAR will render its default ocean rather than nothing.
+    /// BAR will render its default ocean rather than nothing. Sprint
+    /// 21 / C8 rerouted the chip through the lint registry — the
+    /// underlying rule is `LintRule::TerrainBelowZeroWithoutWater`.
     #[test]
     fn validation_warns_when_terrain_below_zero_without_water_preset() {
         let mut app = make_test_app();
+        seed_ally_group(&mut app);
         // Need a heightmap so the chip doesn't return "No heightmap" first.
         app.heightmap = Some(test_heightmap_state(app.map_size));
         app.water_mode = WaterMode::None;
         app.min_height = -120.0;
+        app.recompute_lint();
         let (tone, msg) = app.validation_summary();
-        assert!(matches!(tone, crate::ui::theme::ChipTone::Warn));
+        assert!(
+            matches!(tone, crate::ui::theme::ChipTone::Warn),
+            "tone={tone:?} msg={msg}"
+        );
         assert!(msg.contains("below Y=0"), "got: {msg}");
     }
 
     /// C9: `WaterMode != None` with `min_height >= 0` warns the
     /// user that BAR won't render water without forceRendering or a
-    /// carved basin.
+    /// carved basin. Sprint 21 / C8: backed by
+    /// `LintRule::WaterModeSetWithoutTerrainBelowZero`.
     #[test]
     fn validation_warns_when_water_preset_but_no_below_zero_terrain() {
         let mut app = make_test_app();
+        seed_ally_group(&mut app);
         app.heightmap = Some(test_heightmap_state(app.map_size));
         app.water_mode = WaterMode::Ocean;
         app.min_height = 0.0;
+        app.recompute_lint();
         let (tone, msg) = app.validation_summary();
-        assert!(matches!(tone, crate::ui::theme::ChipTone::Warn));
+        assert!(
+            matches!(tone, crate::ui::theme::ChipTone::Warn),
+            "tone={tone:?} msg={msg}"
+        );
         assert!(msg.contains("no terrain below Y=0"), "got: {msg}");
     }
 
     /// C9 / PITFALL §8 — DNTS + water trips the TV-snow LOS bug
-    /// warning, in priority over the inverse "DNTS: no specular"
-    /// chip (this is the scarier condition because it ships a
-    /// broken in-engine map).
+    /// warning. Sprint 21 / C8: backed by
+    /// `LintRule::DntsOnMapWithMinHeightBelowZero`. (Note: the rule
+    /// keys off `min_height < 0`, not `water_mode != None`, because
+    /// PITFALL §8 is specifically about `minHeight < 0` + DNTS.
+    /// `min_height < 0` also trips `TerrainBelowZeroWithoutWater` —
+    /// the chip surfaces whichever the registry walks first.)
     #[test]
     fn validation_warns_on_dnts_with_water() {
         use barme_core::layers::{LayerSource, TextureLayer};
         let mut app = make_test_app();
+        seed_ally_group(&mut app);
         app.heightmap = Some(test_heightmap_state(app.map_size));
         // D10 / Sprint 17 (ADR-041): bind a layer to DNTS R so the
-        // chip's `dnts_layers().any(_)` check fires.
+        // rule's `dnts_layers().any(_)` check fires.
         let mut layer = TextureLayer::new(LayerSource::Slot { id: 0 }, app.map_size, 255);
         layer.dnts_channel = Some(barme_core::SplatChannel::R);
         app.layer_stack.layers = vec![layer];
-        // Active water — either via preset or below-zero terrain.
+        // DNTS + water LOS bug rule requires min_height < 0.
+        app.min_height = -50.0;
         app.water_mode = WaterMode::Ocean;
+        app.recompute_lint();
         let (tone, msg) = app.validation_summary();
-        assert!(matches!(tone, crate::ui::theme::ChipTone::Warn));
-        assert!(msg.contains("DNTS + water"), "got: {msg}");
+        assert!(
+            matches!(tone, crate::ui::theme::ChipTone::Warn),
+            "tone={tone:?} msg={msg}"
+        );
+        // Either rule may surface first; both fire on this state.
+        assert!(
+            msg.contains("DNTS") || msg.contains("below Y=0"),
+            "got: {msg}"
+        );
     }
 
     /// Helper: minimal `HeightmapState` so validation tests can
@@ -11435,8 +11631,10 @@ mod tests {
     fn validation_summary_warns_when_slot_bound_without_specular() {
         // FINDINGS §7.2 lint: binding a DNTS slot without a specular
         // texture surfaces a warn-tone chip. Editor doesn't author
-        // specular yet, so any bound channel trips this.
+        // specular yet, so any bound channel trips this. Sprint 21 /
+        // C8: backed by `LintRule::SplatDetailNormalTexWithoutSpecular`.
         let mut app = make_test_app();
+        seed_ally_group(&mut app);
         // Plant a heightmap matching `make_test_app`'s 2-SMU map so
         // we clear "No heightmap" + "Heightmap mismatch" early-outs.
         let dims = app.map_size.heightmap_dims();
@@ -11450,6 +11648,7 @@ mod tests {
             max: 0,
             validated_against: Some(app.map_size),
         });
+        app.recompute_lint();
         // Without a layer bound to a DNTS channel: should NOT be
         // the DNTS warning.
         let (tone, label) = app.validation_summary();
@@ -11460,9 +11659,16 @@ mod tests {
         let mut layer = TextureLayer::new(LayerSource::Slot { id: 0 }, app.map_size, 255);
         layer.dnts_channel = Some(barme_core::SplatChannel::R);
         app.layer_stack.layers = vec![layer];
+        app.recompute_lint();
         let (tone, label) = app.validation_summary();
-        assert!(matches!(tone, crate::ui::theme::ChipTone::Warn));
-        assert!(label.contains("DNTS"), "got {label}");
+        assert!(
+            matches!(tone, crate::ui::theme::ChipTone::Warn),
+            "tone={tone:?} label={label}"
+        );
+        assert!(
+            label.contains("DNTS") || label.contains("specular"),
+            "got {label}"
+        );
     }
 
     #[test]

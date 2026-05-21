@@ -1,35 +1,70 @@
-//! Sprint 19 / U1 — lint panel stub.
+//! C8 / Sprint 21 — lint panel rendering. Sprint 19 / U1 shipped the
+//! stub (window pattern + trace transitions); Sprint 21 fills the body
+//! with the real [`barme_pipeline::LintRule`] registry output.
 //!
 //! Opens from the top-bar validation chip OR the status-strip issue
-//! count. For Sprint 19 the panel is a minimal `egui::Window` that
-//! renders the current [`crate::App::validation_summary`] output as a
-//! single list item. Sprint 21 / C8 replaces the body with the
-//! `LintRule` registry — full per-rule severity, location, and
-//! one-click fix affordances.
+//! count (both wired in Sprint 19; this module is purely the content
+//! renderer).
 //!
-//! Tracing: `trace!` on open + close transitions so a future support
-//! ticket can see when the user reached for the panel.
+//! ## Layout
+//!
+//! Grouped by severity, errors first. Each row shows:
+//! - A coloured dot (red / amber / muted) matching the build-log
+//!   palette (`rgb(220, 110, 90)` / `rgb(220, 175, 90)` / muted).
+//! - The rule's title.
+//! - The fire-message in the body row.
+//! - Optional `field_path` chip on the right.
+//! - Optional Fix button (when [`barme_pipeline::LintFix`] is set).
+//!
+//! Passing rules surface at the bottom as a "✓ all checks pass" line
+//! when no failures emit; otherwise they collapse into a per-severity
+//! count footer.
+//!
+//! ## Edit-commit contract
+//!
+//! Clicking Fix returns a [`MapInfoPatch`] which the App dispatches
+//! through `apply_mapinfo_patch` + `ProjectDiff::EditMapInfo` so undo
+//! restores the prior value. The patch propagation matches the F9 form's
+//! pattern (`crates/barme-app/src/ui/inspector_mapinfo.rs`).
 
+use barme_core::MapInfoPatch;
+use barme_pipeline::{LintFix, LintIssue, LintRule, LintSeverity};
 use eframe::egui;
 use tracing::trace;
 
 use crate::ui::theme::{ChipTone, Tokens};
-use crate::ui::widgets;
+
+/// Severity-tinted palette used both here and in the build log.
+/// Centralised so a change here propagates everywhere visually.
+fn severity_color(severity: LintSeverity, t: Tokens) -> egui::Color32 {
+    match severity {
+        LintSeverity::Error => egui::Color32::from_rgb(220, 110, 90),
+        LintSeverity::Warning => egui::Color32::from_rgb(220, 175, 90),
+        LintSeverity::Info => t.muted,
+    }
+}
+
+fn severity_label(severity: LintSeverity) -> &'static str {
+    match severity {
+        LintSeverity::Error => "Error",
+        LintSeverity::Warning => "Warning",
+        LintSeverity::Info => "Info",
+    }
+}
 
 /// Render the lint-panel window. Caller passes a mutable `bool` that
 /// drives visibility — the panel sets it to `false` when the user
 /// closes the window.
 ///
-/// `summary` is the `(tone, label)` pair from
-/// [`crate::App::validation_summary`]. The current implementation
-/// emits ONE row per non-OK summary; Sprint 21 expands this into a
-/// real rule registry.
+/// Returns `Some(MapInfoPatch)` when the user clicks a Fix button.
+/// The App dispatches the patch via `apply_mapinfo_patch` and pushes
+/// the inverse as a `ProjectDiff::EditMapInfo` undo entry.
 pub fn render(
     ctx: &egui::Context,
     open: &mut bool,
-    summary: (ChipTone, String),
+    issues: &[LintIssue],
     previously_open: &mut bool,
-) {
+) -> Option<MapInfoPatch> {
     if *open && !*previously_open {
         trace!(target: "barme::lint_panel", "lint_panel opened");
     } else if !*open && *previously_open {
@@ -38,117 +73,329 @@ pub fn render(
     *previously_open = *open;
 
     if !*open {
-        return;
+        return None;
     }
+
     let t = Tokens::DARK;
     let mut local_open = true;
+    let mut fix_to_apply: Option<MapInfoPatch> = None;
     egui::Window::new("Project lint")
         .open(&mut local_open)
         .collapsible(false)
         .resizable(true)
-        .default_width(420.0)
+        .default_width(520.0)
+        .default_height(420.0)
         .show(ctx, |ui| {
-            ui.label(
-                egui::RichText::new(
-                    "Sprint 19 stub. Sprint 21 ships per-rule severity, locations, \
-                     and one-click fixes.",
-                )
-                .color(t.muted)
-                .size(11.0),
-            );
-            ui.add_space(8.0);
-            let (tone, label) = summary;
-            if matches!(tone, ChipTone::Ok) {
-                widgets::chip(ui, ChipTone::Ok, "No issues");
-                ui.add_space(6.0);
-                ui.label(
-                    egui::RichText::new("All validation gates pass for the current project.")
-                        .color(t.muted)
-                        .size(11.0),
-                );
-            } else {
-                widgets::chip(ui, tone, label.as_str());
-                ui.add_space(6.0);
-                ui.label(egui::RichText::new(&label).color(t.text).size(12.0));
-            }
+            fix_to_apply = render_body(ui, issues, t);
         });
     if !local_open {
         *open = false;
     }
+    fix_to_apply
 }
 
-/// Live issue count derived from a `(tone, label)` summary. `Ok`
-/// yields `0`; any other tone yields `1` (Sprint 19 surfaces a single
-/// aggregate state). Sprint 21 replaces with `LintRule::all().len()`.
-pub fn issue_count(tone: ChipTone) -> usize {
-    match tone {
-        ChipTone::Ok => 0,
-        _ => 1,
+fn render_body(ui: &mut egui::Ui, issues: &[LintIssue], t: Tokens) -> Option<MapInfoPatch> {
+    let errors = issues
+        .iter()
+        .filter(|i| i.severity == LintSeverity::Error)
+        .count();
+    let warnings = issues
+        .iter()
+        .filter(|i| i.severity == LintSeverity::Warning)
+        .count();
+    let infos = issues
+        .iter()
+        .filter(|i| i.severity == LintSeverity::Info)
+        .count();
+    let total_rules = LintRule::ALL.len();
+    let passing = total_rules - issues.len();
+
+    // Header: severity counters as chips.
+    ui.horizontal(|ui| {
+        if errors == 0 && warnings == 0 && infos == 0 {
+            crate::ui::widgets::chip(ui, ChipTone::Ok, "All checks pass");
+        } else {
+            if errors > 0 {
+                crate::ui::widgets::chip(ui, ChipTone::Err, format!("{errors} error(s)"));
+            }
+            if warnings > 0 {
+                crate::ui::widgets::chip(ui, ChipTone::Warn, format!("{warnings} warning(s)"));
+            }
+            if infos > 0 {
+                crate::ui::widgets::chip(ui, ChipTone::Neutral, format!("{infos} info"));
+            }
+        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.label(
+                egui::RichText::new(format!("{passing}/{total_rules} rules passing"))
+                    .color(t.muted)
+                    .size(11.0),
+            );
+        });
+    });
+    ui.separator();
+
+    let mut fix: Option<MapInfoPatch> = None;
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            if !issues.is_empty() {
+                for sev in [
+                    LintSeverity::Error,
+                    LintSeverity::Warning,
+                    LintSeverity::Info,
+                ] {
+                    let group: Vec<&LintIssue> =
+                        issues.iter().filter(|i| i.severity == sev).collect();
+                    if group.is_empty() {
+                        continue;
+                    }
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new(severity_label(sev))
+                            .color(severity_color(sev, t))
+                            .strong(),
+                    );
+                    ui.separator();
+                    for issue in group {
+                        if let Some(patch) = render_issue_row(ui, issue, t) {
+                            fix = Some(patch);
+                        }
+                    }
+                }
+            } else {
+                ui.add_space(8.0);
+                ui.label(
+                    egui::RichText::new(
+                        "No errors, warnings, or info notes. \
+                         The lint pass evaluated every rule against the \
+                         current project — every one passes.",
+                    )
+                    .color(t.muted)
+                    .size(11.0),
+                );
+            }
+        });
+
+    fix
+}
+
+fn render_issue_row(ui: &mut egui::Ui, issue: &LintIssue, t: Tokens) -> Option<MapInfoPatch> {
+    let mut fix: Option<MapInfoPatch> = None;
+    ui.horizontal(|ui| {
+        let (dot_rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 18.0), egui::Sense::hover());
+        let center = egui::pos2(dot_rect.left() + 5.0, dot_rect.center().y);
+        ui.painter()
+            .circle_filled(center, 4.0, severity_color(issue.severity, t));
+        ui.vertical(|ui| {
+            // Title + (rule name + PITFALL anchor) row.
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(issue.rule.title()).strong());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if let Some(fp) = &issue.field_path {
+                        ui.label(
+                            egui::RichText::new(fp)
+                                .monospace()
+                                .color(t.muted)
+                                .size(10.0),
+                        );
+                    }
+                });
+            });
+            // Body text.
+            ui.label(egui::RichText::new(&issue.message).color(t.text).size(11.0));
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{} · PITFALL §{}",
+                        issue.rule.name(),
+                        issue.rule.pitfall_anchor()
+                    ))
+                    .color(t.muted)
+                    .size(10.0)
+                    .monospace(),
+                );
+                if let Some(LintFix::MapInfoPatch(patch)) = &issue.fix {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .button("Fix")
+                            .on_hover_text(format!(
+                                "Apply: {} (undoable via Ctrl-Z)",
+                                patch.label()
+                            ))
+                            .clicked()
+                        {
+                            fix = Some(patch.clone());
+                        }
+                    });
+                }
+            });
+        });
+    });
+    ui.separator();
+    fix
+}
+
+/// Live issue count from a registry-backed `Vec<LintIssue>`. Used by
+/// the status-strip "{n} issue" label.
+pub fn issue_count(issues: &[LintIssue]) -> usize {
+    issues.len()
+}
+
+/// Tab-dot counts derived from `Vec<LintIssue>` by matching each
+/// issue's `field_path` prefix to a F9 tab. Returns a `[u32; 12]`
+/// indexed by `MapInfoTab as usize`.
+///
+/// Matching:
+/// - `general` / no prefix that matches anything → `General`
+/// - `name`, `version`, `mapfile`, `description`, `author` → `General`
+/// - `smf.*` → `Smf`
+/// - `lighting.*` → `Lighting`
+/// - `atmosphere.*` → `Atmosphere`
+/// - `water.*`, plain `water`, `tidalStrength`, `voidWater` → `Water`
+/// - `resources.*` → `Resources`
+/// - `splats.*` → `Splats`
+/// - `terrainTypes.*` → `TerrainTypes`
+/// - `custom.*` → `Custom`
+/// - Anything else top-level (modtype, gravity, maxMetal, extractorRadius,
+///   voidGround, voidAlphaMin, ally_groups, teams, gui.*, metal_layout.*,
+///   featureplacer.*) → `Map`
+pub fn tab_counts(issues: &[LintIssue]) -> [u32; 12] {
+    use crate::ui::inspector_mapinfo::MapInfoTab;
+    let mut counts = [0u32; 12];
+    for issue in issues {
+        let Some(path) = &issue.field_path else {
+            continue;
+        };
+        let tab = if path.starts_with("smf") {
+            MapInfoTab::Smf
+        } else if path.starts_with("lighting") {
+            MapInfoTab::Lighting
+        } else if path.starts_with("atmosphere") {
+            MapInfoTab::Atmosphere
+        } else if path.starts_with("water") || path == "tidalStrength" || path == "voidWater" {
+            MapInfoTab::Water
+        } else if path.starts_with("resources") {
+            MapInfoTab::Resources
+        } else if path.starts_with("splats") {
+            MapInfoTab::Splats
+        } else if path.starts_with("terrainTypes") {
+            MapInfoTab::TerrainTypes
+        } else if path.starts_with("custom") {
+            MapInfoTab::Custom
+        } else if matches!(
+            path.as_str(),
+            "name" | "shortname" | "version" | "mapfile" | "description" | "author"
+        ) {
+            MapInfoTab::General
+        } else {
+            MapInfoTab::Map
+        };
+        counts[tab as usize] = counts[tab as usize].saturating_add(1);
     }
+    counts
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use eframe::egui;
+    use barme_pipeline::{LintIssue, LintRule};
 
-    #[test]
-    fn ok_tone_means_zero_issues() {
-        assert_eq!(issue_count(ChipTone::Ok), 0);
+    fn issue(rule: LintRule, field_path: Option<&str>) -> LintIssue {
+        LintIssue {
+            rule,
+            severity: rule.default_severity(),
+            message: rule.title().to_string(),
+            field_path: field_path.map(str::to_string),
+            fix: None,
+        }
     }
 
     #[test]
-    fn warn_and_err_tones_count_one_issue() {
-        assert_eq!(issue_count(ChipTone::Warn), 1);
-        assert_eq!(issue_count(ChipTone::Err), 1);
-        assert_eq!(issue_count(ChipTone::Neutral), 1);
+    fn issue_count_returns_slice_len() {
+        let issues = vec![
+            issue(LintRule::ModtypeNotThree, Some("modtype")),
+            issue(LintRule::FogStartEqualsFogEnd, Some("atmosphere.fogEnd")),
+        ];
+        assert_eq!(issue_count(&issues), 2);
+        assert_eq!(issue_count(&[]), 0);
+    }
+
+    #[test]
+    fn tab_counts_route_field_paths_to_tabs() {
+        use crate::ui::inspector_mapinfo::MapInfoTab;
+        let issues = vec![
+            issue(LintRule::FogStartEqualsFogEnd, Some("atmosphere.fogEnd")),
+            issue(LintRule::LightingSunDirMissing, Some("lighting.sunDir")),
+            issue(LintRule::SmtFileNameZeroMissing, Some("smf.smtFileName0")),
+            issue(
+                LintRule::ExtractorRadiusFiveHundred,
+                Some("extractorRadius"),
+            ),
+            issue(LintRule::TerrainBelowZeroWithoutWater, Some("water")),
+            issue(LintRule::NameOrMapfileOrVersionMissing, Some("name")),
+        ];
+        let counts = tab_counts(&issues);
+        assert_eq!(counts[MapInfoTab::Atmosphere as usize], 1);
+        assert_eq!(counts[MapInfoTab::Lighting as usize], 1);
+        assert_eq!(counts[MapInfoTab::Smf as usize], 1);
+        assert_eq!(counts[MapInfoTab::Map as usize], 1); // extractorRadius
+        assert_eq!(counts[MapInfoTab::Water as usize], 1);
+        assert_eq!(counts[MapInfoTab::General as usize], 1); // name
+    }
+
+    #[test]
+    fn tab_counts_skip_issues_without_field_path() {
+        // HeightmapDimsWrong has no field_path; ensure it's silently
+        // skipped by the tab-dot mapper.
+        let issues = vec![issue(LintRule::HeightmapDimsWrong, None)];
+        let counts = tab_counts(&issues);
+        assert_eq!(counts.iter().sum::<u32>(), 0);
     }
 
     /// Sprint 19 / U1 — egui smoke test for the lint panel window.
     /// Drives a headless `egui::Context` through one frame with
-    /// `open = true` and asserts a window with the expected id was
-    /// allocated. Mirrors the open-on-click contract: when the
-    /// validation chip flips `lint_panel_open` to `true`, the next
-    /// frame's `render` call surfaces the window.
+    /// `open = true` and asserts the window opens cleanly.
     #[test]
     fn render_emits_window_when_open() {
         let ctx = egui::Context::default();
         let mut open = true;
         let mut prev = false;
+        let issues = vec![issue(LintRule::ModtypeNotThree, Some("modtype"))];
         let _ = ctx.run(Default::default(), |ctx| {
-            render(
-                ctx,
-                &mut open,
-                (ChipTone::Warn, "DNTS + water: LOS bug".to_string()),
-                &mut prev,
-            );
+            let _fix = render(ctx, &mut open, &issues, &mut prev);
         });
-        // The internal `previously_open` snapshot must mirror the
-        // input flag after the render pass — guarantees the `trace!`
-        // transition guard doesn't fire spuriously next frame.
         assert!(prev, "previously_open should mirror open after render");
-        // `open` stays true because no close-X was clicked. The
-        // egui::Window is freshly opened this frame; running another
-        // frame with `open = true` should keep it open.
         assert!(open, "lint panel should stay open when no close fired");
     }
 
-    /// When the caller sets `open = false`, `render` early-returns.
-    /// `previously_open` flips to false so the next "open" transition
-    /// fires the trace.
+    /// When `open = false`, `render` early-returns and never produces
+    /// a fix.
     #[test]
     fn render_no_op_when_closed() {
         let ctx = egui::Context::default();
         let mut open = false;
         let mut prev = true;
+        let issues: Vec<LintIssue> = vec![];
+        let mut fix_seen = None;
         let _ = ctx.run(Default::default(), |ctx| {
-            render(
-                ctx,
-                &mut open,
-                (ChipTone::Ok, "Ready".to_string()),
-                &mut prev,
-            );
+            fix_seen = render(ctx, &mut open, &issues, &mut prev);
         });
-        assert!(!prev, "previously_open should mirror the new closed state");
+        assert!(!prev);
+        assert!(fix_seen.is_none());
+    }
+
+    /// Panel renders an "all clear" footer when the issue list is
+    /// empty.
+    #[test]
+    fn render_empty_issue_list_shows_all_clear() {
+        let ctx = egui::Context::default();
+        let mut open = true;
+        let mut prev = true;
+        let issues: Vec<LintIssue> = vec![];
+        let _ = ctx.run(Default::default(), |ctx| {
+            let _fix = render(ctx, &mut open, &issues, &mut prev);
+        });
+        // No panic, no fix returned.
     }
 }

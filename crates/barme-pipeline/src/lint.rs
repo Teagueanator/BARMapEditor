@@ -102,7 +102,10 @@ pub enum LintRule {
     /// without `specularTex`, but the result looks noticeably flatter
     /// than published BAR maps. The build pipeline ships a grey-BC1
     /// fallback in D6 (Sprint 12); this lint catches the upstream
-    /// case where the user actively unset both.
+    /// case where the user actively unset both. Severity: Warning —
+    /// the engine no longer gates DNTS on `specularTex` at the C++
+    /// render-state level (`SMFRenderState.cpp:114`), so the
+    /// map still ships and runs.
     SplatDetailNormalTexWithoutSpecular,
     /// PITFALL §6. `fogStart == fogEnd` breaks the build-ETA grid
     /// renderer.
@@ -358,10 +361,15 @@ impl LintRule {
             | Self::VoidWaterWithPlaneColor
             | Self::TeamsEmpty
             | Self::FeatureNotInStockManifest
-            | Self::SplatDetailNormalTexWithoutSpecular
             | Self::FogStartEqualsFogEnd
             | Self::HeightmapDimsWrong => LintSeverity::Error,
-            Self::LightingSunDirMissing
+            // Per FINDINGS §7.2 the engine no longer gates DNTS on
+            // `specularTex`; this is a visual-quality warning, not a
+            // build-blocker. Demoted from Error after the matching
+            // `validation_summary_warns_when_slot_bound_without_specular`
+            // test (Sprint 14 / C9) pinned the Warning expectation.
+            Self::SplatDetailNormalTexWithoutSpecular
+            | Self::LightingSunDirMissing
             | Self::AtmosphereSkyDirPresent
             | Self::GuiMinimapRotationPresent
             | Self::ExtractorRadiusFiveHundred
