@@ -257,8 +257,7 @@ fn render_issue_row(ui: &mut egui::Ui, issue: &LintIssue, t: Tokens) -> LintPane
                         ))
                         .clicked()
                     {
-                        row_outcome.open_help =
-                            Some(HelpArticleId::from_pitfall_anchor(anchor_n));
+                        row_outcome.open_help = Some(HelpArticleId::from_pitfall_anchor(anchor_n));
                     }
                 });
             });

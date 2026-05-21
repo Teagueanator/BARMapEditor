@@ -347,13 +347,9 @@ pub fn render(ctx: &egui::Context, viewport_rect: egui::Rect, state: &mut TourSt
                     // Header: step counter + headline
                     ui.horizontal(|ui| {
                         ui.label(
-                            egui::RichText::new(format!(
-                                "Step {}/{}",
-                                step_index + 1,
-                                total_steps
-                            ))
-                            .color(t.muted)
-                            .size(11.0),
+                            egui::RichText::new(format!("Step {}/{}", step_index + 1, total_steps))
+                                .color(t.muted)
+                                .size(11.0),
                         );
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui
@@ -378,11 +374,7 @@ pub fn render(ctx: &egui::Context, viewport_rect: egui::Rect, state: &mut TourSt
                     ui.add_space(4.0);
 
                     // Body
-                    ui.label(
-                        egui::RichText::new(step.body)
-                            .color(t.text)
-                            .size(12.0),
-                    );
+                    ui.label(egui::RichText::new(step.body).color(t.text).size(12.0));
                     if let Some(hint) = step.action_hint {
                         ui.add_space(6.0);
                         ui.label(
@@ -400,9 +392,7 @@ pub fn render(ctx: &egui::Context, viewport_rect: egui::Rect, state: &mut TourSt
                         let is_last = step_index + 1 >= total_steps;
                         let primary_label = if is_last { "Finish" } else { "Next" };
                         if ui
-                            .button(
-                                egui::RichText::new(primary_label).size(12.0).strong(),
-                            )
+                            .button(egui::RichText::new(primary_label).size(12.0).strong())
                             .clicked()
                         {
                             action = if is_last {
@@ -484,7 +474,11 @@ mod tests {
     #[test]
     fn tour_steps_have_content() {
         for step in TOUR_STEPS {
-            assert!(!step.headline.is_empty(), "empty headline for {:?}", step.target);
+            assert!(
+                !step.headline.is_empty(),
+                "empty headline for {:?}",
+                step.target
+            );
             assert!(!step.body.is_empty(), "empty body for {:?}", step.target);
         }
     }

@@ -165,12 +165,9 @@ fn render_header(ui: &mut egui::Ui, state: &BuildState, t: &Tokens, clicks: &mut
             // documented there.
             ui.horizontal(|ui| {
                 ui.label(
-                    egui::RichText::new(format!(
-                        "✗ Failed after {}s: {error}",
-                        duration.as_secs()
-                    ))
-                    .color(egui::Color32::from_rgb(220, 110, 90))
-                    .size(12.0),
+                    egui::RichText::new(format!("✗ Failed after {}s: {error}", duration.as_secs()))
+                        .color(egui::Color32::from_rgb(220, 110, 90))
+                        .size(12.0),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui

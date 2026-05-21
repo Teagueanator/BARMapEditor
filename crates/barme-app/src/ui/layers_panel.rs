@@ -204,12 +204,12 @@ pub fn render(app: &mut App, ui: &mut egui::Ui) {
                 // click path to the data-model + bake explanation.
                 if ui
                     .small_button("How layers work")
-                    .on_hover_text(
-                        "Open the Layered painter reference article in the help center.",
-                    )
+                    .on_hover_text("Open the Layered painter reference article in the help center.")
                     .clicked()
                 {
-                    actions.borrow_mut().push(LayerAction::OpenHelpHowLayersWork);
+                    actions
+                        .borrow_mut()
+                        .push(LayerAction::OpenHelpHowLayersWork);
                 }
                 return;
             }

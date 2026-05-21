@@ -449,9 +449,7 @@ impl CommandPalette {
                 label: "Open help: §6 Mapinfo silent deps",
                 shortcut: None,
                 category: CommandCategory::Help,
-                action: CommandAction::OpenHelpArticle(
-                    HelpArticleId::Pitfall06MapInfoSilentDeps,
-                ),
+                action: CommandAction::OpenHelpArticle(HelpArticleId::Pitfall06MapInfoSilentDeps),
             },
             Command {
                 label: "Open help: §13 Metalmap zero",
@@ -463,9 +461,7 @@ impl CommandPalette {
                 label: "Open help: §15 Splat subtable form",
                 shortcut: None,
                 category: CommandCategory::Help,
-                action: CommandAction::OpenHelpArticle(
-                    HelpArticleId::Pitfall15SplatSubtableForm,
-                ),
+                action: CommandAction::OpenHelpArticle(HelpArticleId::Pitfall15SplatSubtableForm),
             },
         ]);
 
@@ -640,12 +636,7 @@ pub fn render(ctx: &egui::Context, state: &mut CommandPalette) -> CommandPalette
     action
 }
 
-fn render_row(
-    ui: &mut egui::Ui,
-    cmd: &Command,
-    is_selected: bool,
-    t: Tokens,
-) -> egui::Response {
+fn render_row(ui: &mut egui::Ui, cmd: &Command, is_selected: bool, t: Tokens) -> egui::Response {
     let bg = if is_selected {
         Some(t.accent_alpha(0x40))
     } else {
@@ -834,7 +825,11 @@ mod tests {
     #[test]
     fn help_category_actions_are_help_shaped() {
         let p = CommandPalette::new();
-        for cmd in p.commands.iter().filter(|c| c.category == CommandCategory::Help) {
+        for cmd in p
+            .commands
+            .iter()
+            .filter(|c| c.category == CommandCategory::Help)
+        {
             assert!(
                 matches!(
                     cmd.action,
@@ -854,7 +849,11 @@ mod tests {
     #[test]
     fn tools_category_actions_are_switch_tool() {
         let p = CommandPalette::new();
-        for cmd in p.commands.iter().filter(|c| c.category == CommandCategory::Tools) {
+        for cmd in p
+            .commands
+            .iter()
+            .filter(|c| c.category == CommandCategory::Tools)
+        {
             assert!(
                 matches!(cmd.action, CommandAction::SwitchTool(_)),
                 "Tools-category command `{}` is not SwitchTool",

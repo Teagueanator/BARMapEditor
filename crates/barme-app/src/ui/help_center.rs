@@ -466,11 +466,7 @@ pub fn help_window(ctx: &egui::Context, hc: &mut HelpCenter) {
 fn render_body(ui: &mut egui::Ui, hc: &mut HelpCenter, t: Tokens) {
     // ─── Search header ─────────────────────────────────────────────
     ui.horizontal(|ui| {
-        ui.label(
-            egui::RichText::new("Search")
-                .color(t.muted)
-                .size(11.0),
-        );
+        ui.label(egui::RichText::new("Search").color(t.muted).size(11.0));
         let edit = egui::TextEdit::singleline(&mut hc.search)
             .desired_width(280.0)
             .hint_text("substring across article bodies");
@@ -480,12 +476,9 @@ fn render_body(ui: &mut egui::Ui, hc: &mut HelpCenter, t: Tokens) {
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.label(
-                egui::RichText::new(format!(
-                    "{} articles",
-                    HelpArticleId::ALL.len()
-                ))
-                .color(t.muted)
-                .size(11.0),
+                egui::RichText::new(format!("{} articles", HelpArticleId::ALL.len()))
+                    .color(t.muted)
+                    .size(11.0),
             );
         });
     });
@@ -634,36 +627,21 @@ pub fn render_markdown(ui: &mut egui::Ui, body: &str, t: Tokens) {
         if let Some(rest) = trimmed.strip_prefix("# ") {
             flush_paragraph(ui, &mut paragraph, t);
             ui.add_space(2.0);
-            ui.label(
-                egui::RichText::new(rest)
-                    .color(t.text)
-                    .size(18.0)
-                    .strong(),
-            );
+            ui.label(egui::RichText::new(rest).color(t.text).size(18.0).strong());
             ui.add_space(6.0);
             continue;
         }
         if let Some(rest) = trimmed.strip_prefix("## ") {
             flush_paragraph(ui, &mut paragraph, t);
             ui.add_space(4.0);
-            ui.label(
-                egui::RichText::new(rest)
-                    .color(t.text)
-                    .size(15.0)
-                    .strong(),
-            );
+            ui.label(egui::RichText::new(rest).color(t.text).size(15.0).strong());
             ui.add_space(4.0);
             continue;
         }
         if let Some(rest) = trimmed.strip_prefix("### ") {
             flush_paragraph(ui, &mut paragraph, t);
             ui.add_space(2.0);
-            ui.label(
-                egui::RichText::new(rest)
-                    .color(t.muted)
-                    .size(13.0)
-                    .strong(),
-            );
+            ui.label(egui::RichText::new(rest).color(t.muted).size(13.0).strong());
             ui.add_space(3.0);
             continue;
         }
@@ -836,7 +814,10 @@ mod tests {
     fn no_duplicate_article_ids_in_all() {
         let mut seen = std::collections::HashSet::new();
         for id in HelpArticleId::ALL {
-            assert!(seen.insert(*id), "duplicate id in HelpArticleId::ALL: {id:?}");
+            assert!(
+                seen.insert(*id),
+                "duplicate id in HelpArticleId::ALL: {id:?}"
+            );
         }
     }
 

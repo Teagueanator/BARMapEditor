@@ -816,12 +816,24 @@ A single-window, single-executable desktop app that produces a *playable* BAR ma
   (load / save / build / generate / adapter selection), `trace!` on per-stamp brush diagnostics.
   UI error strings render full `#[source]` chains via `{e:#}`. Boot logs include backend, adapter
   name, vendor, and device type so bug reports include the GPU context out-of-the-box.
+- **NFR-Discoverability:** Every interactive widget carries a hover-tooltip
+  pulled from the `ui::help_text` catalogue (Sprint 19 / U1, 107+ entries).
+  Tool-specific help reaches the user via a re-openable Help Center
+  (Sprint 22 / U2, 33 articles), a 7-step guided tour, per-tool intro
+  overlays, a Ctrl+K command palette (49 commands), and the `?` cheat
+  sheet. Every lint-rule row links to its PITFALL article; every build
+  failure links to the Build pipeline article. Three UI polish sprints
+  (19 / 20 / 22) target this NFR; Sprint 21's lint registry feeds the
+  in-app surface.
 
 > **STATUS UPDATE 2026-05-17:** NFR-Toolchain corrected — ADR-004 replaced
 > nvdxt.exe with AMD Compressonator (ADR-014 vendors it separately under
 > `tools/compressonator/`). NFR-Observability added after the Stage 1
 > logging audit; convention is documented in ADR-018 / ADR-019 / ADR-020.
 > NFR-Crash safety (autosave) is still aspirational — Phase 2+ work.
+> NFR-Discoverability (Sprint 22 / U2) closes the onboarding loop the
+> 2026-05-20 UX audit identified — `?` chord was previously the only
+> help discovery channel.
 
 ### 3.4 Architecture (conceptual)
 

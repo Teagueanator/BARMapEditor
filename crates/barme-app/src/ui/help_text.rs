@@ -667,15 +667,8 @@ pub fn show_popover(
     let response = response.on_hover_text(text);
     if whats_this && response.hovered() {
         let painter = ui.painter();
-        let center = eframe::egui::pos2(
-            response.rect.right() - 6.0,
-            response.rect.top() + 6.0,
-        );
-        painter.circle_filled(
-            center,
-            5.0,
-            eframe::egui::Color32::from_rgb(220, 175, 90),
-        );
+        let center = eframe::egui::pos2(response.rect.right() - 6.0, response.rect.top() + 6.0);
+        painter.circle_filled(center, 5.0, eframe::egui::Color32::from_rgb(220, 175, 90));
         painter.text(
             center,
             eframe::egui::Align2::CENTER_CENTER,

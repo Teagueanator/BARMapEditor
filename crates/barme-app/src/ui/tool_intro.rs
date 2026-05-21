@@ -296,11 +296,7 @@ pub fn render(ctx: &egui::Context, state: &mut ToolIntroState) -> ToolIntroActio
         .default_width(380.0)
         .show(ctx, |ui| {
             for paragraph in content.body {
-                ui.label(
-                    egui::RichText::new(*paragraph)
-                        .color(t.text)
-                        .size(12.0),
-                );
+                ui.label(egui::RichText::new(*paragraph).color(t.text).size(12.0));
                 ui.add_space(4.0);
             }
             if !content.controls.is_empty() {
@@ -310,11 +306,7 @@ pub fn render(ctx: &egui::Context, state: &mut ToolIntroState) -> ToolIntroActio
                     .spacing(egui::vec2(12.0, 4.0))
                     .show(ui, |ui| {
                         for (combo, what) in content.controls {
-                            ui.label(
-                                egui::RichText::new(*combo)
-                                    .monospace()
-                                    .color(t.muted),
-                            );
+                            ui.label(egui::RichText::new(*combo).monospace().color(t.muted));
                             ui.label(egui::RichText::new(*what).color(t.text));
                             ui.end_row();
                         }
@@ -333,14 +325,14 @@ pub fn render(ctx: &egui::Context, state: &mut ToolIntroState) -> ToolIntroActio
                 }
                 ui.add_space(8.0);
                 ui.checkbox(&mut state.dont_show_again, "Don't show again")
-                    .on_hover_text(
-                        "Persist across sessions. Re-arm via Help > Reset tool intros.",
-                    );
+                    .on_hover_text("Persist across sessions. Re-arm via Help > Reset tool intros.");
             });
         });
     if !local_open {
         action = if state.dont_show_again {
-            ToolIntroAction::DismissPersist { accel: accel.clone() }
+            ToolIntroAction::DismissPersist {
+                accel: accel.clone(),
+            }
         } else {
             ToolIntroAction::DismissTemp
         };

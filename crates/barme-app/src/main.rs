@@ -2199,11 +2199,7 @@ impl App {
         // who haven't seen it for this editor version. Critical
         // pitfall #1: only auto-run on a brand-new project so we
         // don't interfere with active work.
-        if !self
-            .editor_config
-            .tour_completed_for_current_version()
-            && !self.tour.active
-        {
+        if !self.editor_config.tour_completed_for_current_version() && !self.tour.active {
             self.tour.start();
         }
     }
@@ -6020,23 +6016,24 @@ impl App {
     /// `TextEdit` doesn't eat keystrokes and bounce the user out of
     /// Procgen mid-edit.
     fn handle_keyboard(&mut self, ctx: &egui::Context, action: &mut Option<FileAction>) {
-        let (key_undo, key_redo, key_save, key_save_as, key_palette, key_whats_this) = ctx.input(|i| {
-            let cmd = i.modifiers.command;
-            let shift = i.modifiers.shift;
-            let z = i.key_pressed(egui::Key::Z);
-            let y = i.key_pressed(egui::Key::Y);
-            let s = i.key_pressed(egui::Key::S);
-            let k = i.key_pressed(egui::Key::K);
-            let h = i.key_pressed(egui::Key::H);
-            (
-                cmd && !shift && z,
-                (cmd && shift && z) || (cmd && y),
-                cmd && !shift && s,
-                cmd && shift && s,
-                cmd && k,
-                cmd && shift && h,
-            )
-        });
+        let (key_undo, key_redo, key_save, key_save_as, key_palette, key_whats_this) =
+            ctx.input(|i| {
+                let cmd = i.modifiers.command;
+                let shift = i.modifiers.shift;
+                let z = i.key_pressed(egui::Key::Z);
+                let y = i.key_pressed(egui::Key::Y);
+                let s = i.key_pressed(egui::Key::S);
+                let k = i.key_pressed(egui::Key::K);
+                let h = i.key_pressed(egui::Key::H);
+                (
+                    cmd && !shift && z,
+                    (cmd && shift && z) || (cmd && y),
+                    cmd && !shift && s,
+                    cmd && shift && s,
+                    cmd && k,
+                    cmd && shift && h,
+                )
+            });
         if key_undo {
             *action = Some(FileAction::Undo);
         } else if key_redo {
@@ -6275,9 +6272,7 @@ impl App {
             C::ToggleWireframe => self.wireframe_on = !self.wireframe_on,
             C::ToggleLighting => self.lighting_on = !self.lighting_on,
             C::ToggleGrid => self.grid_overlay_on = !self.grid_overlay_on,
-            C::ToggleBuildableOverlay => {
-                self.buildable_overlay_on = !self.buildable_overlay_on
-            }
+            C::ToggleBuildableOverlay => self.buildable_overlay_on = !self.buildable_overlay_on,
             C::ToggleWhatsThisMode => {
                 self.whats_this_mode = !self.whats_this_mode;
             }
@@ -6312,9 +6307,8 @@ impl App {
                 }
             }
             C::OpenHelpCenter => {
-                self.help_center.open_at(
-                    crate::ui::help_center::HelpArticleId::GettingStarted,
-                );
+                self.help_center
+                    .open_at(crate::ui::help_center::HelpArticleId::GettingStarted);
             }
             C::OpenHelpArticle(article) => self.help_center.open_at(article),
             C::OpenCheatSheet => self.show_cheat_sheet = true,
@@ -10737,8 +10731,7 @@ impl eframe::App for App {
         // so a "Build and install" / "Save" / etc. selection in the
         // palette flows through the same FileAction sink as the
         // menu items + keyboard chords.
-        let palette_action =
-            crate::ui::command_palette::render(ctx, &mut self.command_palette);
+        let palette_action = crate::ui::command_palette::render(ctx, &mut self.command_palette);
         if let crate::ui::command_palette::CommandPaletteAction::Execute(cmd) = palette_action {
             self.apply_command(cmd, &mut action);
         }
@@ -10831,8 +10824,7 @@ impl eframe::App for App {
             tour_action,
             crate::ui::tour::TourAction::Skipped | crate::ui::tour::TourAction::Finished
         ) {
-            self.editor_config
-                .mark_tour_completed_for_current_version();
+            self.editor_config.mark_tour_completed_for_current_version();
             self.editor_config.save();
         }
 
@@ -11298,7 +11290,10 @@ mod tests {
         app.editor_config.mark_tour_completed_for_current_version();
         assert!(app.editor_config.tour_completed_for_current_version());
         let mut sink: Option<FileAction> = None;
-        app.apply_command(crate::ui::command_palette::CommandAction::StartTour, &mut sink);
+        app.apply_command(
+            crate::ui::command_palette::CommandAction::StartTour,
+            &mut sink,
+        );
         assert!(app.tour.active);
         assert!(!app.editor_config.tour_completed_for_current_version());
     }

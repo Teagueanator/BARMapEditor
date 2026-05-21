@@ -561,6 +561,56 @@ Implements SRS F1–F12. Ships a Windows `.exe` and a Linux AppImage.
       for Sprint 19: per-rule lint registry (Sprint 21 / C8),
       onboarding tour (Sprint 22), async build pipeline (Sprint
       20), inspector layout refactor (Sprint 27).
+- [x] **STATUS UPDATE 2026-05-20 (Sprint 22 / U2).** Onboarding
+      loop closure — the third and final UI/UX polish sprint
+      (19 / 20 / 22). Five new surfaces wired into the Sprint
+      19 / 20 / 21 framework. NEW `ui::help_center` module —
+      33 inline-bundled markdown articles (4 meta + 9 tool + 3
+      reference + 17 pitfall) baked via `include_str!`,
+      rendered through a minimal in-module markdown subset
+      renderer pinned to `Tokens::DARK` (egui_commonmark
+      deferred — not in offline cache; Stage 2 polish can swap).
+      NEW `ui::tour` module — 7-step guided walkthrough
+      (project header → tools → inspector → canvas → minimap →
+      status → help icon) with darkened backdrop, target
+      cutout, 8s inactivity advance, and per-step `[Next]` /
+      `[Skip tour]` callout. Auto-triggers on first new project;
+      re-runnable from `Help > Start guided tour`. NEW
+      `ui::tool_intro` — non-modal per-tool intro overlay on
+      first entry; "Don't show again" checkbox persists to
+      `EditorConfig.tool_intros_seen` only on explicit click
+      (Esc-dismiss is temporary per critical pitfall #2). NEW
+      `ui::command_palette` — Ctrl+K opens a centred Window with
+      ≥40 commands (49 baseline registered); fuzzy substring
+      filter; arrow / Enter / Esc; select-and-Enter is the only
+      execute gesture (critical pitfall #3). NEW Ctrl+Shift+H
+      "What's this?" hover-popover mode + `help_text::show_popover`
+      helper + status-strip indicator chip (not persisted across
+      restarts per critical pitfall #8). Entry-point wiring:
+      top-bar Help icon → help center, lint-rule rows gain
+      `[Help…]` → PITFALL article, build-log Failed header
+      gains `[What does this mean?]` → BuildPipeline article,
+      wizard next_steps Window gains `[Start the tour]`, Layers
+      panel empty state gains `[How layers work]` →
+      LayeredPainter article, Help menu (Open help center /
+      Start guided tour / Reset tool intros / Cheat sheet /
+      Command palette). `EditorConfig` extended with
+      `tour_completed_for: Option<String>` +
+      `tool_intros_seen: BTreeSet<String>` (forward-compat via
+      `#[serde(default)]`; pre-Sprint-22 configs load cleanly).
+      Tests: 50 new — 11 help_center (article count, paragraph
+      floor, category split, pitfall round-trip), 11 tour, 9
+      tool_intro, 12 command_palette, 5 apply_command, 2
+      EditorConfig U2 fields. Workspace total: 281 → 331
+      barme-app unit tests. 7 commits on `main`. Three UI
+      polish sprints (19 / 20 / 22) now complete; Sprint 21's
+      lint registry (C8) feeds the help-center wiring. Out of
+      scope for Sprint 22: 16-SMU OOM root-cause + orphan-
+      texture GC + legacy `SplatConfig` retire (Sprint 23
+      cleanup); animated tour callouts (text-only ships);
+      runtime article loading (recompile-only for now);
+      i18n / localisation; interactive sandbox tutorials;
+      toast queue / proper modals (Sprint 31).
 - [ ] Beherith (or active mapper) reviews `.sd7` byte-for-byte against PyMapConv
       reference output on three test maps
 - [ ] Listed on `beyondallreason.info/guide/mapmaking-resources` as beta
