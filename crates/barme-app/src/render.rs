@@ -1,22 +1,29 @@
-//! Stage 1 terrain renderer (ADR-017 vertex; ADR-036 fragment).
+//! Stage 1 terrain renderer (ADR-017 vertex; ADR-043 fragment —
+//! supersedes the Sprint 9 / D4 ADR-036 baseline as of Sprint 25 / R1).
 //!
 //! Heightmap lives on the GPU as an `r16uint` texture; the vertex shader
 //! samples it for Y displacement so brush edits are texture writes, not
 //! full-mesh rebuilds. A 4-tap finite difference of neighbouring heights
-//! produces a per-vertex world-space normal used by the fragment stage
-//! for Lambert lighting.
+//! produces a per-vertex world-space normal kept as the base-normal
+//! fallback for the fragment stage (the engine samples a baked R+A
+//! normal texture per-fragment via `SMFFragProg.glsl:146-150`; the
+//! editor doesn't run that bake at preview time, so the vertex normal
+//! carries the real signal until a future sprint plumbs the bake).
 //!
-//! The fragment stage composites four diffuse layers from a
-//! `texture_2d_array` by the `splatCofac` weight (per FINDINGS §7.3),
-//! falling back to a heightmap-driven biome gradient when no slot is
-//! painted — see `crates/barme-app/src/terrain.wgsl` for the math and
-//! ADR-036 for the rationale.
+//! The fragment stage is the Sprint-25 line-by-line port of Recoil's
+//! `SMFFragProg.glsl` `SMF_DETAIL_NORMAL_TEXTURE_SPLATTING` branch.
+//! See ADR-043 (and FINDINGS §7.1–§7.6) for the transcription rules.
+//! When the project's layer stack is non-empty the diffuse base is the
+//! Sprint-16 composite RT; otherwise the shader falls back to a
+//! height-keyed biome gradient. DNTS normal blending, per-fragment
+//! specular, and base-normal sampling all run on top of that base.
 //!
 //! See ADR-008 for coords (Y-up, left-handed, 8 elmos per heightmap
 //! pixel). Persistent GPU state (pipeline + bind group + grid + textures)
 //! lives inside `egui_wgpu::CallbackResources` as [`RenderResources`];
 //! the per-frame [`TerrainCallback`] only carries camera matrix +
-//! lighting tunables.
+//! lighting tunables (sun direction, ambient / diffuse / specular
+//! colours, and the world-space eye for the Blinn-Phong half-vector).
 
 use barme_core::{
     DirtyRect, Heightmap, LayerMask, SPLAT_DIM, SplatDistribution, TILE_DIM, TILE_PIXELS, TileCoord,
@@ -35,7 +42,7 @@ const HEIGHTMAP_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R16Uint;
 const SPLAT_DISTR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 const SLOT_DIFFUSE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 
-/// Sprint 25 / R1 / ADR-038 — base normal map format. Engine `normalsTex`
+/// Sprint 25 / R1 / ADR-043 — base normal map format. Engine `normalsTex`
 /// is a two-channel BC5 / RG8 map; we use RGBA8Unorm so the shader can
 /// sample R+A per FINDINGS §7.5. The 1×1 fallback packs `(128, 0, 0, 128)`
 /// so the R+A decode `(0, sqrt(1), 0)` produces a pure-up normal — i.e.
@@ -44,14 +51,14 @@ const SLOT_DIFFUSE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm
 /// normal map.
 const BASE_NORMAL_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 
-/// Sprint 25 / R1 / ADR-038 — specular texture format. RGB = colour,
+/// Sprint 25 / R1 / ADR-043 — specular texture format. RGB = colour,
 /// A = exponent coefficient (per FINDINGS §7.6 specular_exp = A × 16.0).
 /// The 1×1 fallback packs `(128, 128, 128, 64)` for a neutral grey with
 /// `exp ≈ 4` (matte) so the shader never produces a runaway highlight
 /// when no real map is bound.
 const SPECULAR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 
-/// Sprint 25 / R1 / ADR-038 — DNTS slot normal-array format. 4-layer
+/// Sprint 25 / R1 / ADR-043 — DNTS slot normal-array format. 4-layer
 /// `Rgba8Unorm`; each layer holds one of the engine's
 /// `splatDetailNormalTex1..4` slots. Defaults to "flat-up"
 /// `(128, 128, 255, 128)` so the per-fragment `* 2 - 1` decode produces
@@ -317,7 +324,7 @@ impl Default for CompositeU {
 /// `terrain.wgsl::SplatU` exactly (`bytemuck::Pod` enforces no padding
 /// gymnastics, but order is on us).
 ///
-/// Sprint 25 / R1 / ADR-038 extended the block with `ground_specular`
+/// Sprint 25 / R1 / ADR-043 extended the block with `ground_specular`
 /// (per-fragment specular fallback when no specular texture is bound,
 /// FINDINGS §7.6) and `camera_pos` (the world-space eye position the
 /// fragment shader needs for the Blinn-Phong half-vector).
@@ -357,13 +364,13 @@ pub struct SplatUniforms {
     /// §7.1) so the WGSL stays clean. `.w` unused.
     pub ground_ambient: [f32; 4],
     pub ground_diffuse: [f32; 4],
-    /// Sprint 25 / R1 / ADR-038 — fallback specular state used when no
+    /// Sprint 25 / R1 / ADR-043 — fallback specular state used when no
     /// per-fragment specular texture is bound. `.xyz` = colour;
     /// `.w` = exponent (engine default `100.0`, per
     /// `MapInfo.cpp:line 145 specularExponent = 100.0` /
     /// `SMFRenderState.cpp:167 sunLighting->specularExponent`).
     pub ground_specular: [f32; 4],
-    /// Sprint 25 / R1 / ADR-038 — world-space camera position. Drives
+    /// Sprint 25 / R1 / ADR-043 — world-space camera position. Drives
     /// the per-fragment Blinn-Phong half-vector
     /// `halfDir = normalize(sun_dir + normalize(camera - worldPos))`.
     /// The engine computes `halfDir` in `SMFVertProg.glsl:34-41`; we
@@ -609,7 +616,7 @@ struct SplatResources {
     distr_view: wgpu::TextureView,
     distr_dims: (u32, u32),
     distr_samp: wgpu::Sampler,
-    /// Sprint 25 / R1 / ADR-038 — 4-layer DNTS slot NORMAL array. The
+    /// Sprint 25 / R1 / ADR-043 — 4-layer DNTS slot NORMAL array. The
     /// engine binds `splatDetailNormalTex1..4` to four separate
     /// samplers; we coalesce into one `texture_2d_array` so the WGSL
     /// can index by channel. Sprint 9 / D4's original "slot diffuse
@@ -622,7 +629,7 @@ struct SplatResources {
     slot_normals_tex: wgpu::Texture,
     slot_normals_view: wgpu::TextureView,
     slot_normals_samp: wgpu::Sampler,
-    /// Sprint 25 / R1 / ADR-038 — base-normal map. Engine `normalsTex`;
+    /// Sprint 25 / R1 / ADR-043 — base-normal map. Engine `normalsTex`;
     /// FINDINGS §7.5 reads only `.r` and `.a`. Defaults to a 1×1
     /// "up" texture; a future sprint bakes a heightmap-derived R+A
     /// normal map and uploads via `upload_base_normal`.
@@ -630,7 +637,7 @@ struct SplatResources {
     normals_tex: wgpu::Texture,
     normals_view: wgpu::TextureView,
     normals_samp: wgpu::Sampler,
-    /// Sprint 25 / R1 / ADR-038 — specular map. Engine `specularTex`.
+    /// Sprint 25 / R1 / ADR-043 — specular map. Engine `specularTex`.
     /// RGBA8 with `.rgb` = colour and `.a` = exponent coefficient per
     /// FINDINGS §7.6 (`specular_exp = a × 16.0`). Defaults to a 1×1
     /// matte grey; `upload_specular` swaps in a real map.
@@ -762,9 +769,7 @@ impl RenderResources {
     /// Mirrors [`Self::composite_terrain_view`].
     fn heightmap_terrain_view(&self) -> wgpu::TextureView {
         match &self.heightmap {
-            Some(h) => h
-                .tex
-                .create_view(&wgpu::TextureViewDescriptor::default()),
+            Some(h) => h.tex.create_view(&wgpu::TextureViewDescriptor::default()),
             None => self
                 ._dummy_tex
                 .create_view(&wgpu::TextureViewDescriptor::default()),
@@ -870,7 +875,7 @@ fn bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
                 ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                 count: None,
             },
-            // 5: DNTS slot normal array (Sprint 25 / R1 / ADR-038).
+            // 5: DNTS slot normal array (Sprint 25 / R1 / ADR-043).
             // 4 layers — one per engine `splatDetailNormalTex[i]`. Was
             // the Sprint-9 "slot diffuse" array; that role retired in
             // Sprint 17 when the composite RT took over the diffuse
@@ -915,7 +920,7 @@ fn bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
                 ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                 count: None,
             },
-            // 9: base normal map (Sprint 25 / R1 / ADR-038). Engine
+            // 9: base normal map (Sprint 25 / R1 / ADR-043). Engine
             // `normalsTex`; FINDINGS §7.5 reads R + A only.
             wgpu::BindGroupLayoutEntry {
                 binding: 9,
@@ -935,7 +940,7 @@ fn bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
                 ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                 count: None,
             },
-            // 11: specular map (Sprint 25 / R1 / ADR-038). Engine
+            // 11: specular map (Sprint 25 / R1 / ADR-043). Engine
             // `specularTex`; FINDINGS §7.6 — `.a × 16.0` is the
             // per-fragment exponent.
             wgpu::BindGroupLayoutEntry {
@@ -1030,7 +1035,7 @@ fn make_bind_group(
 }
 
 fn install_splat_resources(device: &wgpu::Device, queue: &wgpu::Queue) -> SplatResources {
-    // Distribution: SPLAT_DIM² rgba8 zeros. ADR-036 — fragment shader
+    // Distribution: SPLAT_DIM² rgba8 zeros. ADR-043 — fragment shader
     // multiplies the sample by `tex_mults * active_slot_mask`, so all-
     // zero distribution + zero mask = fallback gradient shows.
     let distr_tex = device.create_texture(&wgpu::TextureDescriptor {
@@ -1065,7 +1070,7 @@ fn install_splat_resources(device: &wgpu::Device, queue: &wgpu::Queue) -> SplatR
         ..Default::default()
     });
 
-    // Sprint 25 / R1 / ADR-038 — DNTS slot normal array. 4 layers at
+    // Sprint 25 / R1 / ADR-043 — DNTS slot normal array. 4 layers at
     // SLOT_DIFFUSE_DIM² (1024²) — one per engine
     // `splatDetailNormalTex[i]`. Default content: "flat-up"
     // `(128, 128, 255, 128)` so the WGSL's `* 2 - 1` decode produces a
@@ -1134,7 +1139,7 @@ fn install_splat_resources(device: &wgpu::Device, queue: &wgpu::Queue) -> SplatR
         ..Default::default()
     });
 
-    // Sprint 25 / R1 / ADR-038 — base normal map. 1×1 fallback.
+    // Sprint 25 / R1 / ADR-043 — base normal map. 1×1 fallback.
     // `(128, 0, 0, 128)` so the R+A decode (FINDINGS §7.5) produces
     // `nx = 0, nz = 0, ny = sqrt(1)` = pure up. The shader gates the
     // sampled normal on the `has_base_normal_tex` bit (flags.w & 1u);
@@ -1148,7 +1153,7 @@ fn install_splat_resources(device: &wgpu::Device, queue: &wgpu::Queue) -> SplatR
         wgpu::AddressMode::ClampToEdge,
     );
 
-    // Sprint 25 / R1 / ADR-038 — specular map. 1×1 matte grey fallback.
+    // Sprint 25 / R1 / ADR-043 — specular map. 1×1 matte grey fallback.
     // `(128, 128, 128, 64)` → colour mid-grey, exponent ≈ 4 (matte).
     let (specular_tex, specular_view, specular_samp) = install_default_2d_texture(
         device,
@@ -1191,7 +1196,7 @@ fn install_splat_resources(device: &wgpu::Device, queue: &wgpu::Queue) -> SplatR
 
 /// Allocate a 1×1 default 2D texture pre-filled with `pixel_rgba`.
 /// Returns the kept-alive `Texture`, its default view, and a matching
-/// sampler. Sprint 25 / R1 / ADR-038 — each Group-0 base normal /
+/// sampler. Sprint 25 / R1 / ADR-043 — each Group-0 base normal /
 /// specular slot uses one of these as the fallback while no real
 /// terrain texture is bound, so the shader bind group never changes
 /// shape per frame.
@@ -2483,9 +2488,9 @@ pub fn upload_splat_distribution(render_state: &egui_wgpu::RenderState, dist: &S
 }
 
 /// Sub-upload a dirty rect of the splat distribution. Mirrors
-/// [`write_heightmap_rect`] (ADR-017 / D4 ADR-036): the caller hands
-/// the full RGBA8 array + dims so we can compute the byte offset
-/// without copying.
+/// [`write_heightmap_rect`] (ADR-017 / ADR-043, originally ADR-036):
+/// the caller hands the full RGBA8 array + dims so we can compute the
+/// byte offset without copying.
 #[allow(dead_code)] // D5 wires this from the brush-stroke dispatch.
 pub fn write_splat_rect(
     render_state: &egui_wgpu::RenderState,
@@ -2552,15 +2557,11 @@ pub fn write_splat_rect(
 /// `Rgba<u8>` pixels — callers resize incoming PNGs to that fixed dim
 /// before invoking. Logs at `info!` per the tracing convention.
 ///
-/// Sprint 25 / R1 / ADR-038 — the binding's old "slot diffuse" role
+/// Sprint 25 / R1 / ADR-043 — the binding's old "slot diffuse" role
 /// retired in Sprint 17 (the composite RT carries the diffuse base);
 /// the same texture slot now holds normals.
 #[allow(dead_code)] // Future sprint wires this from the layer-stack DNTS bind path.
-pub fn upload_slot_normal_layer(
-    render_state: &egui_wgpu::RenderState,
-    layer: u32,
-    rgba: &[u8],
-) {
+pub fn upload_slot_normal_layer(render_state: &egui_wgpu::RenderState, layer: u32, rgba: &[u8]) {
     if layer >= SLOT_LAYER_COUNT {
         warn!(layer, "upload_slot_normal_layer: layer out of range");
         return;
@@ -2569,8 +2570,7 @@ pub fn upload_slot_normal_layer(
     if rgba.len() != expected {
         warn!(
             got = rgba.len(),
-            expected,
-            "upload_slot_normal_layer: byte length mismatch; resize before calling"
+            expected, "upload_slot_normal_layer: byte length mismatch; resize before calling"
         );
         return;
     }
@@ -2611,7 +2611,7 @@ pub fn upload_slot_normal_layer(
 /// and re-binds the terrain group so subsequent draws sample the new
 /// map. `rgba` MUST be `width × height × 4` bytes (RGBA8).
 ///
-/// Sprint 25 / R1 / ADR-038. The caller is responsible for setting
+/// Sprint 25 / R1 / ADR-043. The caller is responsible for setting
 /// `SplatUniforms.flags.w |= 1` (the `has_base_normal_tex` bit) so the
 /// fragment shader actually consumes the sample instead of falling back
 /// to the vertex normal — `upload_base_normal` doesn't touch the
@@ -3222,7 +3222,7 @@ pub struct TerrainCallback {
     pub world_extent_x: f32,
     pub world_extent_z: f32,
     pub splat: SplatUniforms,
-    /// Sprint 25 / R1 / ADR-038 — world-space camera eye position.
+    /// Sprint 25 / R1 / ADR-043 — world-space camera eye position.
     /// Written into `SplatUniforms.camera_pos` at `prepare()` time so
     /// the fragment shader can build the Blinn-Phong half-vector
     /// `halfDir = normalize(sun_dir + normalize(eye - worldPos))`.
@@ -3336,13 +3336,18 @@ impl egui_wgpu::CallbackTrait for TerrainCallback {
                 ],
             },
         );
-        // Sprint 25 / R1 / ADR-038 — inject the per-frame camera eye
+        // Sprint 25 / R1 / ADR-043 — inject the per-frame camera eye
         // into the splat uniforms. The App owns the persistent
         // `SplatUniforms` (sun direction, lighting colours, tex
         // multipliers, flags), but the camera moves every frame and
         // doesn't belong in that struct's persistent state.
         let mut splat = self.splat;
-        splat.camera_pos = [self.camera_pos[0], self.camera_pos[1], self.camera_pos[2], 1.0];
+        splat.camera_pos = [
+            self.camera_pos[0],
+            self.camera_pos[1],
+            self.camera_pos[2],
+            1.0,
+        ];
         res.write_splat_uniforms(queue, &splat);
 
         // Step 1d — Sprint 16 / D9 / ADR-039 — encode the layered
@@ -3650,7 +3655,7 @@ mod tests {
         assert_eq!(SLOT_LAYER_COUNT, 4);
     }
 
-    /// Sprint 25 / R1 / ADR-038 — `SplatUniforms` MUST match the WGSL
+    /// Sprint 25 / R1 / ADR-043 — `SplatUniforms` MUST match the WGSL
     /// `terrain.wgsl::SplatU` block layout exactly, otherwise the
     /// per-frame uniform write uploads garbage into the shader's
     /// bindings.
@@ -3704,7 +3709,7 @@ mod tests {
 
     #[test]
     fn texture_format_constants_pinned() {
-        // Sprint 25 / R1 / ADR-038 — the new texture bindings carry
+        // Sprint 25 / R1 / ADR-043 — the new texture bindings carry
         // RGBA8 in unsigned-normalised form (the shader does `* 2 - 1`
         // for the normal-map decode). A future change to a signed or
         // BC-compressed format is a coordinated WGSL + sampler edit.
@@ -3713,7 +3718,7 @@ mod tests {
         assert_eq!(SLOT_NORMAL_FORMAT, wgpu::TextureFormat::Rgba8Unorm);
     }
 
-    /// Sprint 25 / R1 / ADR-038 — parse + validate `terrain.wgsl` at
+    /// Sprint 25 / R1 / ADR-043 — parse + validate `terrain.wgsl` at
     /// `cargo test` time using wgpu's re-exported naga. wgpu only
     /// compiles the WGSL at GPU `create_shader_module` time, which we
     /// can't reach in headless CI; this test catches WGSL syntax /

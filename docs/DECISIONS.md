@@ -2537,7 +2537,18 @@ user-quit-without-save doesn't dangle the imported file.
 
 ## ADR-036 — Terrain fragment shader: splat-blended diffuse composite (Sprint 9 / D4)
 
-**Status:** Accepted 2026-05-18 — superseded the draft research note at
+**Status:** Accepted 2026-05-18; **superseded by ADR-043** 2026-05-21
+(Sprint 25 / R1). The diffuse-only simplification described here
+served its purpose for Sprint 9's preview MVP; Sprint 25 ports the
+full `SMFFragProg.glsl` `SMF_DETAIL_NORMAL_TEXTURE_SPLATTING` branch
+(base-normal sampling, per-fragment TBN, DNTS normal blending, per-
+fragment specular). The `splatCofac` math itself carries forward
+into ADR-043 unchanged; what changes is which textures the cofactor
+weights — Sprint 25 swaps the slot DIFFUSE array (whose role retired
+in Sprint 17's ADR-041 when the composite RT took over the diffuse
+base) for the slot NORMAL array.
+
+Originally superseded the draft research note at
 `docs/research/splat-rendering/claude findings.md` (drafted as
 "ADR-035" before the UI overhaul claimed that slot).
 
@@ -3787,6 +3798,194 @@ Critical files:
   `LintWarning`.
 - `crates/barme-pipeline/src/lib.rs::build_sd7` — `layer_inputs:
   Option<LayerSplatBakeInputs>` parameter + dispatch branch.
+
+## ADR-043 — Unified terrain shader: line-by-line port of SMFFragProg.glsl (Sprint 25 / R1)
+
+**Status:** Accepted 2026-05-21. Supersedes ADR-036 (the Sprint 9 / D4
+diffuse-only splat composite). Opens the **renderer-parity arc**
+(Sprints 25-36, per
+`docs/research/renderer-bar-parity/ROADMAP.md`). After SRS §2.1 #11
+was reversed on 2026-05-18, the editor's terrain renderer must
+visually reproduce Recoil's render at editor camera distances. This
+ADR pins the architecture for the fragment stage; Sprints 26-35 add
+water polish, atmosphere, shadows, features, grass, emission, and
+parallax on top of the same shader contract.
+
+**Context.** The renderer-bar-parity ROADMAP authored 2026-05-18 (the
+day the §2.1 #11 reversal landed) sketched a 9-sprint arc starting
+with "Sprint 16 — Terrain shader parity". Planner-arc renumbering
+since then moved that work to **Sprint 25 / R1**. ADR-036 — the
+Sprint 9 / D4 splat-blended diffuse composite — was always an
+explicit simplification (diffuse-only; no normal mapping, no
+per-fragment specular, no base-normal sampling); the engine's
+`SMFFragProg.glsl` `SMF_DETAIL_NORMAL_TEXTURE_SPLATTING` branch is
+the real spec. FINDINGS §7.1–§7.6 (source-audit 2026-05-18) corrected
+five inherited claims about the composite math (constant name typo,
+TBN derivation, base normal R+A decoding, specular exponent formula,
+alpha-sign interpretation); this sprint is the first to implement the
+corrected version end-to-end.
+
+Sprint 17 (ADR-041) retired the Sprint 9 slot-DIFFUSE array role
+when the layered painter's composite RT took over as the diffuse
+base. That left the 4-layer texture array (binding 5) bound but
+unused at runtime. ADR-043 repurposes the binding as the
+**DNTS slot NORMAL array** — the same 4 slots the engine binds at
+`splatDetailNormalTex1..4`.
+
+**Decision.**
+
+1. **The fragment stage is a transcription, not interpretation.**
+   Each WGSL section in `crates/barme-app/src/terrain.wgsl` cites
+   the source GLSL line in `SMFFragProg.glsl` plus the FINDINGS
+   subsection it implements. A future re-audit can read the WGSL
+   alongside the GLSL line-by-line.
+
+2. **Texture bind order** (Group 0, one bind-group layout — packing
+   into the wgpu `MAX_BIND_GROUPS_PER_PIPELINE = 4` cap):
+
+   | Binding | Resource                          | Engine analogue              | FINDINGS |
+   |---------|-----------------------------------|------------------------------|----------|
+   | 0       | terrain `Uniforms`                | engine uniform block         |          |
+   | 1       | heightmap `texture_2d<u32>`       | (synth — engine reads at vs) |          |
+   | 2       | `SplatU` uniforms                 | engine uniform block         |          |
+   | 3       | splat distribution                | `splatDistrTex`              | §7.3     |
+   | 4       | splat distribution sampler        |                              |          |
+   | 5       | **slot normals texture array** (4 layers) | `splatDetailNormalTex1..4` | §7.3 |
+   | 6       | slot normals sampler (Repeat)     |                              |          |
+   | 7       | composite RT                      | (Sprint 16 — diffuse base)   |          |
+   | 8       | composite sampler (Clamp)         |                              |          |
+   | 9       | base normal map                   | `normalsTex`                 | §7.5     |
+   | 10      | base normal sampler (Clamp)       |                              |          |
+   | 11      | specular map                      | `specularTex`                | §7.6     |
+   | 12      | specular sampler (Clamp)          |                              |          |
+
+   Total: 13 bindings in one group. Within the per-group cap on every
+   wgpu backend we ship to.
+
+3. **Uniform block extension.** `SplatUniforms` grows two vec4s:
+   - `ground_specular`: `.xyz` = fallback colour, `.w` = global
+     exponent — both consulted only when no specular texture is
+     bound (FINDINGS §7.6).
+   - `camera_pos`: `.xyz` = world eye for the Blinn-Phong half-
+     vector. The engine builds this in `SMFVertProg.glsl:34-41` but
+     our vertex shader doesn't carry it; we hoist to per-frame
+     fragment uniform via `TerrainCallback::camera_pos`.
+
+   `flags.w` repurposed as a 3-bit texture-presence bitfield:
+   - bit 0 = has_base_normal_tex
+   - bit 1 = has_specular_tex
+   - bit 2 = has_dnts_slot_normals (engine's
+     `SMF_DETAIL_NORMAL_TEXTURE_SPLATTING` gate per
+     `SMFRenderState.cpp:114` — NOT AND-ed with specular)
+
+4. **GLSL → WGSL line mapping** (the core transcription
+   correspondence):
+
+   | GLSL line                | WGSL section                            |
+   |--------------------------|------------------------------------------|
+   | 146-150 `GetFragmentNormal`     | §2 base normal sample + R+A decode |
+   | 174-198 `GetSplatDetailTextureNormal` | §4 DNTS composite + clamp .y, §7.3 |
+   | 189 `.y = max(.y, 0.01)` | §4 clamp .y                              |
+   | 192 `clamp(splatDetailNormal.a, -1, 1)` | §4 detail_strength_y       |
+   | 205-206 `groundShadeInt`  | §7 shade_int (pre-dimmed CPU-side, §7.1) |
+   | 269 `normal = GetFragmentNormal(...)` | §2 normal mix              |
+   | 276-278 TBN matrix       | §3 per-fragment TBN, §7.4                |
+   | 328 mix(normal, ...)      | §5 final normal blend                   |
+   | 333-334 cosAngleDiffuse / cosAngleSpecular | §7 Lambert + Blinn-Phong |
+   | 381 fragColor compose    | §8 final compose                         |
+   | 404-422 specular branch  | §7 spec_col / spec_exp / spec_pow, §7.6  |
+
+5. **Fallback textures.** Each of the new texture bindings gets a
+   1×1 fallback so the bind group never changes shape per frame:
+   - base normal default = `(128, 0, 0, 128)` — R+A decode produces
+     `(0, sqrt(1), 0)` = pure up; the vertex normal carries the
+     real signal when no real bake is loaded.
+   - specular default = `(128, 128, 128, 64)` — mid-grey with
+     exponent ≈ 4 (matte).
+   - slot normals default = 4 layers of `(128, 128, 255, 128)` —
+     the `* 2 - 1` decode produces `(0, 0, 1, 0)`, contributing
+     nothing through `cofac × decoded`.
+
+   The `flags.w` texture-presence bits are 0 by default; the shader
+   mixes between sampled and fallback using uniform-controlled
+   factors so WGSL doesn't flag non-uniform control flow.
+
+6. **Pre-applied `SMF_INTENSITY_MULT = 210/255`.** Per FINDINGS §7.1,
+   the engine multiplies `(ambient + diffuse * NdotL)` by this
+   constant inside `GetShadeInt`. We pre-multiply
+   `ground_ambient` + `ground_diffuse` CPU-side in
+   `default_ground_ambient()` / `default_ground_diffuse()` so the
+   WGSL stays free of the per-fragment multiply. The constant is
+   exposed publicly as `render::SMF_INTENSITY_MULT` for the parity-
+   fixture loader.
+
+7. **WGSL parse + validate at `cargo test` time.** A new test
+   `terrain_wgsl_parses_and_validates` uses wgpu's re-exported
+   `naga::front::wgsl::parse_str` + the full Naga validator. The
+   shader is only compiled on the GPU at `create_shader_module`
+   time (which we can't reach in headless CI); this test catches
+   WGSL syntax / type / binding-layout drift before the user runs
+   the app. Failure messages emit Naga's source-line diagnostic.
+
+**Alternatives considered.**
+
+- *Keep ADR-036's diffuse-only shader and add normals as a separate
+  pass.* Rejected — two shaders sampling the same heightmap doubles
+  the draw + uniform overhead with no architectural benefit; the
+  engine itself runs a single fragment shader.
+- *Bake the heightmap-derived base normal CPU-side now.* Deferred —
+  the vertex normal is good enough as a fallback for Sprint 25's
+  acceptance criteria; the bake adds CPU work that's better done
+  alongside Sprint 30's shadow map (both feed the same TBN-using
+  surface model). The base-normal binding stays plumbed so the
+  bake can drop in without a uniform-layout change.
+- *Pack the 4 DNTS slot normals as 4 separate textures (engine's
+  approach).* Rejected — texture arrays let one `textureSample(...,
+  layer)` call replace 4 separate samplers, halving the bind-group
+  cost.
+- *Sample specular through a uniform-flagged `if`.* Rejected per
+  pitfall #10 — uniform-controlled `mix` is cleaner and matches the
+  WGSL spec's preferred pattern. The two-sample cost on a 1×1
+  fallback is negligible.
+
+**Consequence.**
+
+- `crates/barme-app/src/terrain.wgsl` is the canonical port; future
+  per-feature sprints (water, atmosphere, shadows, features, grass,
+  emission, parallax) extend this same shader rather than spawning
+  parallel WGSL files (one shader per terrain pass).
+- ADR-036's "diffuse-only" gating disappears from the codebase.
+  Historical comments in `barme-core::splat` and `ui::minimap` that
+  cite "D5 / Sprint 9" remain accurate dev-log traces.
+- `render::SplatResources` field rename: `slot_array_*` →
+  `slot_normals_*` (the binding's new role). Sprint 9 / D4's
+  `upload_diffuse_layer` → `upload_slot_normal_layer`.
+- `render::TerrainCallback::new` now extracts `camera.eye()` and
+  injects it into `SplatUniforms.camera_pos` at `prepare()` time.
+- The renderer-bar-parity ROADMAP originally reserved ADR-038 for
+  this work; the Sprint 15 layered-painter trio claimed that number
+  earlier in 2026-05. We use **ADR-043**, the next free slot. The
+  renderer-arc's later ADRs slide accordingly (atmosphere = 044,
+  water polish folds into the existing ADR-042 amendment, shadows =
+  045, etc. — to be pinned as each sprint opens).
+
+**Deferred items** (each gets its own ADR when its sprint opens):
+
+- **Sprint 26** (water polish: fresnel + foam + caustics + perlin +
+  refraction + reflection) — ADR-042 amendment.
+- **Sprint 28** (atmosphere + fog + sun + sky / skybox).
+- **Sprint 29** (S3O / 3DO features as Sprint 11 / C5 markers retire).
+- **Sprint 30** (directional shadow map).
+- **Sprint 34** (grass blade instancing).
+- **Sprint 35** (emission + sky-reflect + parallax).
+- **Sprint 36** (parity validation: ΔE harness vs BAR reference).
+- Heightmap → R+A base normal bake.
+- Per-slot DDS / normal-PNG upload from the layer-stack DNTS bind
+  (currently the slot-normal array stays at the 1×1 "flat-up"
+  fallback because no upload path exists yet).
+- ADR-034 high-pass diffuse-alpha workflow — the `diffuse_in_alpha`
+  flag stays plumbed and the WGSL implements the `splat_detail_normal
+  .a` path; runtime activation waits on the high-pass DNTS bake.
 
 ## ADR template
 

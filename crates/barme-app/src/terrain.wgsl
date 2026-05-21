@@ -1,6 +1,6 @@
 // Stage 1 terrain shader.
 //
-// Sprint 25 / R1 / ADR-038 — UNIFIED port of Recoil's
+// Sprint 25 / R1 / ADR-043 — UNIFIED port of Recoil's
 // `cont/base/springcontent/shaders/GLSL/SMFFragProg.glsl`
 // (`SMF_DETAIL_NORMAL_TEXTURE_SPLATTING` branch). Each fragment-stage
 // section cites the GLSL source line so a reviewer can read the WGSL
@@ -67,7 +67,7 @@ struct Uniforms {
     params2: vec4<f32>,
 };
 
-// Per-channel splat tuning + lighting state (ADR-036 / ADR-038).
+// Per-channel splat tuning + lighting state (ADR-036 / ADR-043).
 //
 // `tex_scales` maps directly to mapinfo `splats.texScales` — each
 // channel scales `worldPos.xz` to produce the per-layer detail UV
@@ -88,7 +88,7 @@ struct Uniforms {
 // world-normal Y slope drops below cos(10°) get mixed with a red
 // "too steep" overlay.
 //
-// `flags.w = tex_present_bits` (Sprint 25 / R1 / ADR-038):
+// `flags.w = tex_present_bits` (Sprint 25 / R1 / ADR-043):
 //   bit 0 = base-normal texture bound (sample normals_tex.ra);
 //   bit 1 = specular texture bound (per-fragment exponent);
 //   bit 2 = DNTS slot-normal array populated (do the §7.3 blend).
@@ -118,7 +118,7 @@ struct SplatU {
 @group(0) @binding(2)  var<uniform> sp: SplatU;
 @group(0) @binding(3)  var splat_distr: texture_2d<f32>;
 @group(0) @binding(4)  var splat_distr_samp: sampler;
-// Sprint 25 / R1 / ADR-038 — slot-normal array. Was the Sprint-9
+// Sprint 25 / R1 / ADR-043 — slot-normal array. Was the Sprint-9
 // 4-layer slot diffuse array; Sprint 17 retired the diffuse role
 // (composite RT takes over) and Sprint 25 repurposes the binding
 // as DNTS normals (engine `splatDetailNormalTex1..4`).
@@ -130,11 +130,11 @@ struct SplatU {
 // coordinate. CPU bake stays authoritative for the .sd7 export.
 @group(0) @binding(7)  var composite_rt: texture_2d<f32>;
 @group(0) @binding(8)  var composite_samp: sampler;
-// Sprint 25 / R1 / ADR-038 — base normal map (engine `normalsTex`).
+// Sprint 25 / R1 / ADR-043 — base normal map (engine `normalsTex`).
 // FINDINGS §7.5 — only R + A channels read; ny = sqrt(1 - nx² - nz²).
 @group(0) @binding(9)  var normals_tex: texture_2d<f32>;
 @group(0) @binding(10) var normals_samp: sampler;
-// Sprint 25 / R1 / ADR-038 — specular map (engine `specularTex`).
+// Sprint 25 / R1 / ADR-043 — specular map (engine `specularTex`).
 // FINDINGS §7.6 — `specular_exp = sample.a × 16.0` per fragment.
 @group(0) @binding(11) var specular_tex: texture_2d<f32>;
 @group(0) @binding(12) var specular_samp: sampler;

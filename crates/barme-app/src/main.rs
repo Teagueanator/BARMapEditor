@@ -989,7 +989,7 @@ fn load_slot_thumbnail_rgba(slot: &SlotMeta) -> Option<image::RgbaImage> {
 /// 1024² so the happy path skips the resize). Returns the RGBA8 bytes;
 /// see `crates/barme-app/src/render.rs` for the matching GPU upload
 /// helpers (`upload_slot_normal_layer`, `upload_base_normal`,
-/// `upload_specular`) — Sprint 25 / ADR-038 renamed the slot uploader
+/// `upload_specular`) — Sprint 25 / ADR-043 renamed the slot uploader
 /// from the retired `upload_diffuse_layer` to reflect the binding's
 /// new role.
 fn load_slot_full_rgba(slot: &SlotMeta) -> Option<image::RgbaImage> {
@@ -2415,7 +2415,7 @@ impl App {
                 active_mask |= 1 << ch;
             }
         }
-        // Sprint 25 / R1 / ADR-038 — `flags.w` is the texture-presence
+        // Sprint 25 / R1 / ADR-043 — `flags.w` is the texture-presence
         // bitfield. Sprint 25 ships the WGSL transcription with the
         // base-normal / specular / DNTS-slot-normals bindings; until a
         // future sprint wires real upload paths from the layer stack +
