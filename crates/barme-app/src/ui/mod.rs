@@ -21,5 +21,6 @@ pub mod overlay;
 pub mod paint_view;
 pub mod save_before_build;
 pub mod theme;
+pub mod tour;
 pub mod viewport_chrome;
 pub mod widgets;

@@ -252,6 +252,13 @@ struct App {
     /// command palette + lint-panel `[Help…]` rows +
     /// build-overlay `[What does this mean?]` button).
     help_center: crate::ui::help_center::HelpCenter,
+    /// Sprint 22 / U2 — guided tour state. `active=true` while
+    /// the 7-step walkthrough is running. Auto-triggered on a
+    /// brand-new project when
+    /// [`config::EditorConfig::tour_completed_for_current_version`]
+    /// is false; re-runnable from the Help menu's "Start guided
+    /// tour" item.
+    tour: crate::ui::tour::TourState,
     /// Sprint 19 / U1 — is the lint-panel window open this frame? Driven by
     /// the top-bar validation chip and the status-strip issue-count label.
     lint_panel_open: bool,
@@ -1339,6 +1346,7 @@ impl App {
             show_intro,
             show_cheat_sheet: false,
             help_center: crate::ui::help_center::HelpCenter::default(),
+            tour: crate::ui::tour::TourState::default(),
             lint_panel_open: false,
             lint_panel_was_open: false,
             lint_summary: Vec::new(),
@@ -2164,6 +2172,18 @@ impl App {
         // hint (per-project flag, not per-user), letting reopening a
         // fresh project re-show the hint.
         self.show_next_steps = !self.next_steps_dismissed;
+
+        // Sprint 22 / U2: auto-trigger the guided tour for users
+        // who haven't seen it for this editor version. Critical
+        // pitfall #1: only auto-run on a brand-new project so we
+        // don't interfere with active work.
+        if !self
+            .editor_config
+            .tour_completed_for_current_version()
+            && !self.tour.active
+        {
+            self.tour.start();
+        }
     }
 
     /// B8: seed the freshly-wizard'd project with two default start
@@ -6748,13 +6768,16 @@ impl App {
         }
         ui.add_space(4.0);
 
-        // Sprint 19 / U1 — top-bar Help (?) icon. Opens the cheat
-        // sheet (also reachable via the `?` chord). Sprint 22
-        // extends this into a full help center.
-        if crate::ui::widgets::icon_button(ui, Icon::Help, 30.0, help(HelpId::TopBarHelpIcon))
-            .clicked()
-        {
-            self.show_cheat_sheet = !self.show_cheat_sheet;
+        // Sprint 19 / U1 — top-bar Help (?) icon. Sprint 22 / U2:
+        // re-wired to open the help center (the principal entry
+        // point); the `?` chord still opens the cheat sheet as the
+        // keyboard backstop per critical pitfall #10.
+        let help_resp =
+            crate::ui::widgets::icon_button(ui, Icon::Help, 30.0, help(HelpId::TopBarHelpIcon));
+        self.tour
+            .set_target_rect(crate::ui::tour::TourTarget::TopBarHelpIcon, help_resp.rect);
+        if help_resp.clicked() {
+            self.help_center.open = !self.help_center.open;
         }
         ui.add_space(4.0);
 
@@ -6794,7 +6817,7 @@ impl App {
         let (_issue_tone, issue_label) = self.validation_summary();
         let issue_count = crate::ui::lint_panel::issue_count(&self.lint_summary);
         let mut open_lint = false;
-        egui::TopBottomPanel::bottom("status_strip").show(ctx, |ui| {
+        let panel_resp = egui::TopBottomPanel::bottom("status_strip").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 let cam = &self.camera;
                 ui.add(
@@ -6933,6 +6956,11 @@ impl App {
                 }
             });
         });
+        // Sprint 22 / U2: tour status-strip target.
+        self.tour.set_target_rect(
+            crate::ui::tour::TourTarget::StatusStrip,
+            panel_resp.response.rect,
+        );
         if open_lint {
             self.lint_panel_open = true;
         }
@@ -6950,7 +6978,7 @@ impl App {
     /// is a placeholder for editor preferences (Phase 9+).
     fn tool_strip(&mut self, ctx: &egui::Context) {
         let t = crate::ui::theme::Tokens::DARK;
-        egui::SidePanel::left("tool_strip")
+        let panel_resp = egui::SidePanel::left("tool_strip")
             .resizable(false)
             .exact_width(48.0)
             .frame(
@@ -6981,6 +7009,11 @@ impl App {
                     let _ = resp; // wired in Phase 9+
                 });
             });
+        // Sprint 22 / U2: tour tool-strip target.
+        self.tour.set_target_rect(
+            crate::ui::tour::TourTarget::ToolStrip,
+            panel_resp.response.rect,
+        );
     }
 
     fn tool_strip_tile(&mut self, ui: &mut egui::Ui, tool: Tool, active: bool) {
@@ -7037,7 +7070,7 @@ impl App {
     /// new `Tool` variant produces a compile error at this match site
     /// — that's the safety property the enum buys us.
     fn inspector(&mut self, ctx: &egui::Context, action: &mut Option<FileAction>) {
-        egui::SidePanel::right("inspector")
+        let panel_resp = egui::SidePanel::right("inspector")
             .resizable(true)
             .default_width(300.0)
             .show(ctx, |ui| {
@@ -7059,6 +7092,18 @@ impl App {
                         }
                     });
             });
+        // Sprint 22 / U2: tour targets — Inspector + ProjectHeader
+        // share the inspector rect. The Project section is the top
+        // chunk of the inspector; the highlight + callout read
+        // cleanly when the whole inspector glows.
+        self.tour.set_target_rect(
+            crate::ui::tour::TourTarget::Inspector,
+            panel_resp.response.rect,
+        );
+        self.tour.set_target_rect(
+            crate::ui::tour::TourTarget::ProjectHeader,
+            panel_resp.response.rect,
+        );
     }
 
     /// Persistent Inspector header (ADR-035). Project name + size +
@@ -9321,6 +9366,11 @@ impl App {
             let (rect, response) =
                 ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
 
+            // Sprint 22 / U2: tour Canvas target. Set early so the
+            // PaintLayer fast-path (return below) still registers.
+            self.tour
+                .set_target_rect(crate::ui::tour::TourTarget::Canvas, rect);
+
             // D9 / Sprint 16 (ADR-040) — `Tool::PaintLayer` swaps the
             // central viewport for the 2D paint view. Pointer dispatch
             // happens entirely inside `central_paint_layer`; the 3D
@@ -9358,6 +9408,9 @@ impl App {
                     crate::ui::minimap::Minimap::PANEL_H,
                 ),
             );
+            // Sprint 22 / U2: tour Minimap target.
+            self.tour
+                .set_target_rect(crate::ui::tour::TourTarget::Minimap, minimap_rect);
             let cursor_in_gizmo = ctx
                 .pointer_interact_pos()
                 .map(|p| minimap_rect.contains(p))
@@ -10524,6 +10577,21 @@ impl eframe::App for App {
         // cheat sheet — both can be open at once.
         crate::ui::help_center::help_window(ctx, &mut self.help_center);
 
+        // Sprint 22 / U2: guided tour overlay. Runs on top of every
+        // panel; the App registers target rects per-frame on its
+        // panel-render path. Completion / skip flips the
+        // EditorConfig flag so the tour doesn't auto-restart.
+        let viewport_rect = ctx.content_rect();
+        let tour_action = crate::ui::tour::render(ctx, viewport_rect, &mut self.tour);
+        if matches!(
+            tour_action,
+            crate::ui::tour::TourAction::Skipped | crate::ui::tour::TourAction::Finished
+        ) {
+            self.editor_config
+                .mark_tour_completed_for_current_version();
+            self.editor_config.save();
+        }
+
         // Sprint 21 / C8 — lint panel populated from
         // `App::lint_summary`. A Fix click returns a `MapInfoPatch`
         // which we dispatch through the F9 form's undo path so
@@ -10728,6 +10796,7 @@ mod tests {
             show_intro: false,
             show_cheat_sheet: false,
             help_center: crate::ui::help_center::HelpCenter::default(),
+            tour: crate::ui::tour::TourState::default(),
             lint_panel_open: false,
             lint_panel_was_open: false,
             lint_summary: Vec::new(),
