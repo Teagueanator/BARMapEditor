@@ -128,13 +128,17 @@ fn count_accent(body: &str) -> (usize, usize) {
 /// Per-tool inspectors that the user actually cycles through in the
 /// right-strip. `inspector_header` is the persistent header (always
 /// 0 accent sections); `inspector_sticky_chips` is the strip helper;
-/// `inspector_select` has no sections; `inspector_water_atmosphere_offer`
-/// is a sub-component. The audit table excludes these.
+/// `inspector_water_atmosphere_offer` is a sub-component. The audit
+/// table excludes these.
+///
+/// `inspector_paint_layer` is special-cased: its accent section
+/// lives in `layers_panel.rs::render`, so the in-fn count is 0.
+/// The `paint_layer_accent_lives_in_layers_panel` test covers it.
 const TOOL_INSPECTORS: &[&str] = &[
+    "inspector_select",
     "inspector_metal",
     "inspector_geo",
     "inspector_feature",
-    "inspector_paint_layer",
     "inspector_sculpt",
     "inspector_water",
     "inspector_start_positions",
@@ -142,7 +146,7 @@ const TOOL_INSPECTORS: &[&str] = &[
 ];
 
 #[test]
-fn each_tool_inspector_emits_at_most_one_accent_section() {
+fn each_tool_inspector_emits_exactly_one_accent_section() {
     let main_src = read("src/main.rs");
     let bodies = inspector_bodies(&main_src);
     for (name, body) in &bodies {
@@ -150,10 +154,10 @@ fn each_tool_inspector_emits_at_most_one_accent_section() {
             continue;
         }
         let (t, _f) = count_accent(body);
-        assert!(
-            t <= 1,
-            "{name} emits {t} accent: true sections — the pattern allows at most one. \
-             Demote secondary sections to accent: false.",
+        assert_eq!(
+            t, 1,
+            "{name} emits {t} accent: true sections — the canonical \
+             skeleton requires exactly one primary section per inspector.",
         );
     }
 }
@@ -184,8 +188,13 @@ fn every_tool_inspector_renders_the_sticky_chip_strip() {
     // of every tool inspector body — that's the Sprint 27 promise.
     let main_src = read("src/main.rs");
     let bodies = inspector_bodies(&main_src);
+    // PaintLayer joins the audit here too — its accent section lives
+    // in layers_panel.rs but the sticky chip call still runs in the
+    // inspector body itself.
+    let mut to_check: Vec<&str> = TOOL_INSPECTORS.to_vec();
+    to_check.push("inspector_paint_layer");
     for (name, body) in &bodies {
-        if !TOOL_INSPECTORS.contains(&name.as_str()) {
+        if !to_check.contains(&name.as_str()) {
             continue;
         }
         assert!(

@@ -7703,19 +7703,33 @@ impl App {
 
     fn inspector_select(&self, ui: &mut egui::Ui) {
         use crate::ui::help_text::{HelpId, help};
+        let t = crate::ui::theme::Tokens::DARK;
         self.inspector_sticky_chips(ui);
-        ui.add(
-            egui::Label::new(egui::RichText::new("Select / orbit").heading())
-                .sense(egui::Sense::hover()),
-        )
-        .on_hover_text(help(HelpId::SelectModeInfo));
-        ui.label(
-            egui::RichText::new(
-                "Camera-only mode. LMB orbits, MMB pans, RMB orbits, scroll zooms.\n\
-                 Pick a tool on the left strip to start editing.",
-            )
-            .small()
-            .weak(),
+        // Sprint 27 / U5 — wrap the Select info in the canonical
+        // section pattern (one accent section per inspector) so the
+        // tool reads as a member of the same family as the editors.
+        crate::ui::widgets::section_with_hover(
+            ui,
+            "Mode",
+            true,
+            help(HelpId::SelectModeInfo),
+            |_ui| {},
+            |ui| {
+                ui.label(
+                    egui::RichText::new("Camera-only mode.")
+                        .color(t.text)
+                        .size(13.0),
+                );
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(
+                        "LMB orbits · MMB pans · RMB orbits · scroll zooms.\n\
+                         Pick a tool on the left strip to start editing.",
+                    )
+                    .color(t.muted)
+                    .size(11.0),
+                );
+            },
         );
     }
 
