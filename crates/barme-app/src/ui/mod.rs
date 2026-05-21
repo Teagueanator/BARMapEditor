@@ -4,6 +4,7 @@
 //! once `central()` would otherwise grow past ~500 lines. B3
 //! grows it with `gizmo`, `cheat_sheet`, and `intro`.
 
+pub mod build_overlay;
 pub mod cheat_sheet;
 pub mod help_text;
 pub mod icons;

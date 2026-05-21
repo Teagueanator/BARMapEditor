@@ -10070,6 +10070,14 @@ impl App {
                 }
             }
         });
+
+        // Sprint 20 / chunk 4 — progress overlay floats above the central
+        // panel while a build is running. Doesn't allocate UI rect (uses
+        // `egui::Area::Foreground`); rendered AFTER central so it draws
+        // on top.
+        let overlay_rect = ctx.available_rect();
+        let click = crate::ui::build_overlay::render(ctx, overlay_rect, &self.build_state);
+        crate::ui::build_overlay::apply_click(click, &self.build_state, &mut self.build_log_open);
     }
 
     /// Drain the per-frame `FileAction` queued by panel handlers. Done
