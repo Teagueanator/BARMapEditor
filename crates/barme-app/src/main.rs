@@ -8864,6 +8864,107 @@ impl App {
             },
         );
 
+        // ── POLISH (Sprint 26 / R3 / ADR-044) ────────────────
+        //
+        // The renderer-parity polish parameters. Reflections toggle is
+        // App session state (not persisted in `.barmeproj`); all other
+        // fields live on `Project.water_overrides` and round-trip
+        // through `EditWaterField`. Section ships collapsible-closed
+        // by default — the defaults work for the stock presets and
+        // most users won't open it on day one.
+        ui.collapsing("Polish (reflections / fresnel / waves)", |ui| {
+            ui.label(
+                egui::RichText::new(
+                    "Renderer-side polish. Reflections add ~1 ms per frame \
+                     on iGPUs; disable if you're hitting frame-budget on \
+                     low-end hardware.",
+                )
+                .color(t.dim)
+                .size(10.0),
+            );
+            ui.add_space(6.0);
+
+            // Reflections toggle (App session state, not in WaterBlock).
+            ui.horizontal(|ui| {
+                let mut on = self.water_reflections;
+                let resp = ui
+                    .checkbox(&mut on, "Planar reflections")
+                    .on_hover_text(help(HelpId::WaterReflectionsToggle));
+                if resp.changed() {
+                    self.water_reflections = on;
+                    tracing::info!(reflections = on, "water reflections toggled");
+                }
+            });
+
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new("Fresnel (reflection vs refraction at angle)")
+                    .color(t.muted)
+                    .size(10.0),
+            );
+            self.water_field_float_slider(
+                ui,
+                "Fresnel min",
+                WaterField::FresnelMin,
+                |o| o.fresnel_min,
+                0.0..=1.0,
+                "",
+                help(HelpId::WaterFresnelMin),
+            );
+            self.water_field_float_slider(
+                ui,
+                "Fresnel max",
+                WaterField::FresnelMax,
+                |o| o.fresnel_max,
+                0.0..=2.0,
+                "",
+                help(HelpId::WaterFresnelMax),
+            );
+            self.water_field_float_slider(
+                ui,
+                "Fresnel power",
+                WaterField::FresnelPower,
+                |o| o.fresnel_power,
+                0.5..=10.0,
+                "",
+                help(HelpId::WaterFresnelPower),
+            );
+
+            ui.add_space(6.0);
+            ui.label(
+                egui::RichText::new("Distortion + perlin wave motion")
+                    .color(t.muted)
+                    .size(10.0),
+            );
+            self.water_field_float_slider(
+                ui,
+                "Reflection distortion",
+                WaterField::ReflectionDistortion,
+                |o| o.reflection_distortion,
+                0.0..=4.0,
+                "",
+                help(HelpId::WaterReflectionDistortion),
+            );
+            self.water_field_float_slider(
+                ui,
+                "Perlin start freq",
+                WaterField::PerlinStartFreq,
+                |o| o.perlin_start_freq,
+                0.5..=16.0,
+                "",
+                help(HelpId::WaterPerlinStartFreq),
+            );
+            self.water_field_float_slider(
+                ui,
+                "Perlin lacunarity",
+                WaterField::PerlinLacunarity,
+                |o| o.perlin_lacunarity,
+                1.5..=6.0,
+                "",
+                help(HelpId::WaterPerlinLacunarity),
+            );
+        });
+
         // ── ADVANCED ────────────────────────────────────
         ui.collapsing("Advanced (raw mapinfo fields)", |ui| {
             ui.add(

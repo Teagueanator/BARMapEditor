@@ -140,6 +140,14 @@ pub enum HelpId {
     WaterAutoMinHeight,
     WaterLavaAtmosphereApply,
     WaterLavaAtmosphereRevert,
+    // Sprint 26 / R3 / ADR-044 — water polish section.
+    WaterReflectionsToggle,
+    WaterFresnelMin,
+    WaterFresnelMax,
+    WaterFresnelPower,
+    WaterReflectionDistortion,
+    WaterPerlinStartFreq,
+    WaterPerlinLacunarity,
 
     // ──────────────── Start-positions tool ────────────────
     StartLayoutBalancedChip,
@@ -271,6 +279,13 @@ impl HelpId {
         HelpId::WaterAutoMinHeight,
         HelpId::WaterLavaAtmosphereApply,
         HelpId::WaterLavaAtmosphereRevert,
+        HelpId::WaterReflectionsToggle,
+        HelpId::WaterFresnelMin,
+        HelpId::WaterFresnelMax,
+        HelpId::WaterFresnelPower,
+        HelpId::WaterReflectionDistortion,
+        HelpId::WaterPerlinStartFreq,
+        HelpId::WaterPerlinLacunarity,
         // start positions
         HelpId::StartLayoutBalancedChip,
         HelpId::StartPresetCombo,
@@ -568,6 +583,28 @@ pub fn help(id: HelpId) -> &'static str {
         }
         HelpId::WaterLavaAtmosphereRevert => {
             "Remove the lava-atmosphere patch, restoring the BAR default fog / sun / cloud. The water preset itself stays unchanged."
+        }
+        // Sprint 26 / R3 / ADR-044 — polish hover text.
+        HelpId::WaterReflectionsToggle => {
+            "Planar reflections render the terrain a second time (mirrored through y=0) and sample it under the surface. Disabling recovers ~1 ms per frame on iGPUs. Session-only — not saved to .barmeproj."
+        }
+        HelpId::WaterFresnelMin => {
+            "Minimum reflection contribution when looking straight down at the surface (cos(view, normal) ≈ 1). Engine default 0.2 — lower = more refraction, higher = more mirror-like."
+        }
+        HelpId::WaterFresnelMax => {
+            "Maximum reflection contribution at grazing angles (cos ≈ 0). Engine default 0.8. Together with fresnel_min and _power this is Schlick's approximation."
+        }
+        HelpId::WaterFresnelPower => {
+            "Curve exponent for the angle-to-reflection mapping. Higher = sharper transition between refraction-dominated head-on and reflection-dominated grazing. Engine default 4.0."
+        }
+        HelpId::WaterReflectionDistortion => {
+            "How strongly the surface normal perturbs the reflection / refraction sampling UV. 0 = mirror-flat; 4 = chaotic. Engine default 1.0."
+        }
+        HelpId::WaterPerlinStartFreq => {
+            "Base spatial frequency of the surface wave noise. Higher = more, smaller waves. Engine default 8.0."
+        }
+        HelpId::WaterPerlinLacunarity => {
+            "Per-octave frequency multiplier in the 4-octave fbm. Engine default 3.0 — each octave is 3× finer than the previous."
         }
 
         // ──────────────── Start-positions tool ────────────────
