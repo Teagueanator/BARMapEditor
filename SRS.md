@@ -171,6 +171,35 @@ PA's in-game system designer is the cited gold standard. It does the following w
     > sprints: 28 atmosphere + fog, 29 features (S3O / 3DO), 30
     > shadows, 34 grass, 35 emission + sky-reflect + parallax, 36
     > parity validation + §2.1 #11 closeout.
+    >
+    > **STATUS UPDATE 2026-05-21 (Sprint 26 / R3 / ADR-044 — water
+    > polish shipped):** the Sprint 14 / C9 / ADR-042 flat alpha-
+    > blended water MVP is superseded by a port of Recoil's
+    > `cont/base/springcontent/shaders/GLSL/BumpWaterFS.glsl` to
+    > `crates/barme-app/src/water.wgsl`. The render pipeline splits
+    > the offscreen pass into terrain → COPY (offscreen.color →
+    > refraction_copy) → water + lines + markers; the water shader
+    > samples the pre-water snapshot for refraction. A new fixed-
+    > size 1024² reflection RT receives a second terrain pass with
+    > a mirrored-Y camera (`OrbitCamera::view_proj_matrix_reflected_y0`,
+    > Face::Front cull) so the water shader can sample the
+    > above-water terrain through perturbed UV. The surface normal
+    > comes from a WGSL 4-octave Quilez gradient noise (we don't
+    > vendor the engine's `waterbump.png` since it's GPL-2.0
+    > inherited). Fresnel uses Schlick's approximation with clamped
+    > `dot` (PITFALL #6); foam ships as a refraction-luma proxy
+    > until Sprint 27 / R4 bakes the engine's coastmap; caustics
+    > are a two-octave procedural sine pattern; lava emission
+    > self-illuminates when `water_mode ∈ {Lava, Magma}`, with
+    > a hardcoded `0.5` daylight factor until Sprint 28 wires the
+    > atmosphere sun dot. The inspector grew a collapsible "Polish"
+    > section with seven new controls + tooltips. `WaterU` expanded
+    > from 96 to 192 bytes; the size + round-trip tests pin the
+    > layout. Two new naga-validated WGSL tests and two new camera
+    > reflection-math tests pin the contract. The renderer-parity
+    > arc is now **2 / 8 done**; Sprint 27 = Inspector consistency
+    > refactor + brush-card lift (off-arc UX work), and the next
+    > arc sprint is Sprint 28 (atmosphere + fog).
 12. **Decompilation fidelity.** Round-tripping an existing `.sd7` loses information: the recovered diffuse PNG has been through DXT1 (color precision loss); heightmap, metal, and type maps are exact; mapinfo.lua is exact; auxiliary splat textures survive untouched. Reuse PyMapConv's decompile path.
 13. **GPU brush latency.** Spring/Recoil maps can theoretically reach 96×96 SMUs. Sub-millisecond brush response at 32×32+ requires the heightmap to live on the GPU as a storage texture, edited by compute shaders. Read-back to CPU happens only at save.
 

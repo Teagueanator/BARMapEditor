@@ -772,6 +772,64 @@ Implements SRS F1–F12. Ships a Windows `.exe` and a Linux AppImage.
       29 features (S3O / 3DO), 30 shadows, 34 grass, 35 emission +
       sky-reflect + parallax, 36 parity validation + SRS §2.1 #11
       closeout.
+- [x] **STATUS UPDATE 2026-05-21 (Sprint 26 / R3, ADR-044 — water
+      polish, BumpWater port).** Amends ADR-042 by replacing the
+      Sprint 14 flat alpha-blended water MVP with a port of
+      `cont/base/springcontent/shaders/GLSL/BumpWaterFS.glsl` to
+      `crates/barme-app/src/water.wgsl`. **8 commits on main**:
+      (1) `render: planar reflection pass + mirrored-Y camera` —
+      fixed 1024² `ReflectionTarget` (RGBA8 + Depth32Float), second
+      terrain pipeline with `Face::Front` cull to compensate for the
+      mirrored-Y winding, `OrbitCamera::view_proj_matrix_reflected_y0`
+      with two unit tests pinning eye/target/up flip + above↔below-Y
+      projection equivalence, `App.water_reflections: bool`
+      (per-session, default ON).
+      (2) `render: refraction copy + render-pass split, water samples
+      refraction + reflection` — single offscreen pass splits into
+      terrain → COPY (`offscreen.color → refraction_copy`) → water +
+      lines + markers (LoadOp::Load). Water bind group expands from 1
+      (uniform) to 5 (uniform + refraction tex/sampler + reflection
+      tex/sampler) rebuilt on offscreen-RT resize via
+      `RenderResources::rebind_water`. `WaterU` grows 96 → 176 B.
+      WGSL gets a `naga::front::wgsl::parse_str` + validate test.
+      (3) `render(water): fbm-driven surface normal via WGSL perlin` —
+      Quilez 2D hash + quintic-smoothed bilerp + 4-octave fbm with
+      3.0 lacunarity matches BumpWaterFS::GetNormal's four normalmap
+      taps. Procedural (no GPL-2.0 `waterbump.png` vendoring).
+      (4) `render(water): fresnel + foam + caustics composite` —
+      Schlick fresnel with clamped `dot` (PITFALL #6 NaN guard),
+      refraction-luma foam proxy (the coastmap bake is Sprint 27
+      candidate), two-axis sine caustics gated on refraction luma.
+      `WaterU` grows 176 → 192 B with `eye: vec4<f32>`.
+      (5) `render(water): lava emission self-illumination` — gated
+      branch when `water_mode ∈ {Lava, Magma}`; emission_color × (1 +
+      caust · 0.5) × hardcoded 0.5 daylight (Sprint 28 plumbs the
+      sun-dot ramp; Sprint 30 inhibits under cast shadows).
+      (6) `ui(water): Polish section in inspector` — collapsible
+      "Polish" below Flood: reflections toggle, fresnel min/max/power,
+      reflection distortion, perlin start freq + lacunarity. Seven
+      new `HelpId::Water*` variants with FINDINGS §1.5 default
+      citations in the hover text.
+      (7) `docs: ADR-044` — full decision record. Amends ADR-042;
+      notes the prompt's ADR-039 vs actual ADR-044 numbering
+      correction; documents the 8 load-bearing changes, alternatives
+      (vendor BAR assets, ping-pong RTs, full-res reflection, sky
+      cubemap, coastmap bake, schema lift for missing `WaterBlock`
+      fields), consequences, and operational pitfalls for follow-up
+      sprints (Face::Front cull discipline, two-uniform-buffers
+      requirement, foam proxy edge cases, lava daylight + shadow
+      wiring hooks for Sprints 28/30).
+      (8) `docs: SRS + ROADMAP rollup + parity fixtures` — this
+      STATUS UPDATE plus `assets/parity-fixtures/{coastlines,gecko,
+      lava-sample}/README.md` shipping manual-smoke procedures
+      anchored to the Ocean / Tropical / Lava preset baselines (the
+      Sprint 36 ΔE harness will automate against these).
+      Tests: barme-app 350 → 353 (+3: 2 reflection camera-math + 1
+      water.wgsl naga validator); barme-core 279 unchanged;
+      barme-pipeline 213 unchanged. cargo fmt / clippy / test green.
+      **Renderer-parity arc: 2 / 8 done.** Sprint 27 = Inspector
+      consistency refactor + brush-card lift (off-arc UX work).
+      Next arc sprint is Sprint 28 (atmosphere + fog).
 - [ ] Beherith (or active mapper) reviews `.sd7` byte-for-byte against PyMapConv
       reference output on three test maps
 - [ ] Listed on `beyondallreason.info/guide/mapmaking-resources` as beta
