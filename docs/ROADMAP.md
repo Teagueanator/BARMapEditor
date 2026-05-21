@@ -704,6 +704,74 @@ Implements SRS F1–F12. Ships a Windows `.exe` and a Linux AppImage.
       parallel perf budget); barme-pipeline 212 → 213 (+1:
       parallel-bake regression). Sprint 25 = terrain shader parity
       (port SMFFragProg.glsl).
+- [x] **STATUS UPDATE 2026-05-21 (Sprint 25 / R1, ADR-043 — opens the
+      renderer-parity arc).** The Sprint-9 / D4 diffuse-only splat
+      composite (ADR-036) is replaced by a line-by-line transcription
+      of `SMFFragProg.glsl`'s `SMF_DETAIL_NORMAL_TEXTURE_SPLATTING`
+      branch. **4 commits on the sprint branch** (then a 5th rollup):
+      (1) `render: extend terrain bind group + uniforms for SMFFragProg
+      port` — `SplatUniforms` grows `ground_specular` + `camera_pos`;
+      `flags.w` packs the texture-presence bitfield (bit 0 base
+      normal, bit 1 specular, bit 2 DNTS normals); bind group adds
+      base-normal + specular + slot-normal-array bindings with 1×1
+      fallbacks so the layout never changes per frame.
+      `RenderResources::heightmap_terrain_view` mirrors the existing
+      `composite_terrain_view` fallback so `rebind()` is safe to call
+      before a heightmap is uploaded. Five new tests pin
+      `SplatUniforms = 128 B`, `SMF_INTENSITY_MULT = 210/255`, the
+      engine-matching default specular `(0.1, 0.1, 0.1, 100.0)`, the
+      texture format constants, and `camera_pos` default = origin.
+      (2) `render: port SMFFragProg.glsl into terrain.wgsl` — base
+      normal R+A decode (§7.5), per-fragment TBN from
+      `cross(normal, vec3(-1, 0, 0))` (§7.4), full-RGBA `* 2 - 1`
+      signed-decoded DNTS slot blend with per-channel `tex_scales` UV
+      streams (§7.3), `splat_detail_strength.y = clamp(.a, -1, 1) ×
+      diffuse_in_alpha`, normal blend in world space via the per-
+      fragment STN matrix, Lambert + Blinn-Phong using
+      `camera_pos.xyz - world_pos` for the half-vector, specular
+      exponent `α × 16.0` with global fallback (§7.6). Each WGSL
+      section cites the source GLSL line. A naga-backed
+      `terrain_wgsl_parses_and_validates` test catches WGSL drift
+      without a GPU.
+      (3) `docs: ADR-043 (Unified terrain shader); amend ADR-036
+      superseded` — full GLSL → WGSL line-mapping table, texture bind
+      order (binding 0 → 12, all in Group 0), uniform-layout decoding
+      of `flags.w` bits, 1×1 fallback policy, pre-applied
+      `SMF_INTENSITY_MULT` reasoning, alternatives considered, and the
+      list of items deferred to Sprints 26-36. ADR-036's status moves
+      to "Accepted 2026-05-18; superseded by ADR-043 2026-05-21". The
+      renderer-bar-parity ROADMAP's pre-renumbering reservation of
+      ADR-038 for this work is documented; we took ADR-043 because
+      ADR-038 was already claimed by Sprint 15's layered painter
+      trio.
+      (4) `render: Comet Catcher Remake parity fixture + manual-smoke
+      README` — `crates/barme-app/src/parity_fixtures.rs` exposes
+      `comet_catcher_fixture()` returning a `CometFixture { project,
+      heightmap, splat }` shaped to the real BAR map's SMF header
+      (16×12 SMU, heightmap 1025×769) + mapinfo (splat scales
+      `{0.004, 0.007, 0.003, 0.0018}`, mults `{0.4, 0.4, 0.65, 0.9}`,
+      sun_dir normalised from `(1.2, 0.92, -0.79)`, ambient
+      `(0.55, 0.51, 0.51) × SMF_INTENSITY_MULT` pre-dimmed CPU-side,
+      `splatDetailNormalDiffuseAlpha = 1`, the texture-presence
+      bitfield set to `0b111`). 13 tests pin the fixture's shape.
+      `assets/parity-fixtures/comet/README.md` documents the manual
+      smoke procedure: capture BAR reference screenshots at 3 angles,
+      load the fixture in the editor, eyeball-compare at 2-8 SMU.
+      Heightmap is synthesised because `*.smf` is gitignored;
+      Sprint 36 (parity-validation) ships an SMF parser alongside the
+      mandatory headless-render harness.
+      (5) `docs: SRS + ROADMAP rollup for Sprint 25 (R1 — terrain
+      shader parity)` — this STATUS UPDATE.
+      Tests: barme-app 337 → 350 (+13 fixture +
+      `terrain_wgsl_parses_and_validates` + 5 new unit pins);
+      barme-core 279 unchanged; barme-pipeline 213 unchanged.
+      Workspace total 829 → 842. cargo fmt / clippy / test all green.
+      **Renderer-parity arc: 1 / 8 done.** Sprint 26 = water polish
+      (fresnel + foam + caustics + perlin + refraction + reflection —
+      amends ADR-042). Subsequent arc sprints: 28 atmosphere + fog,
+      29 features (S3O / 3DO), 30 shadows, 34 grass, 35 emission +
+      sky-reflect + parallax, 36 parity validation + SRS §2.1 #11
+      closeout.
 - [ ] Beherith (or active mapper) reviews `.sd7` byte-for-byte against PyMapConv
       reference output on three test maps
 - [ ] Listed on `beyondallreason.info/guide/mapmaking-resources` as beta

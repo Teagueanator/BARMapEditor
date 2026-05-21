@@ -139,6 +139,38 @@ PA's in-game system designer is the cited gold standard. It does the following w
     > water polish + shadows + features + grass + emission + parity
     > validation) is **Sprints 20–27** in the new numbering; the
     > "reproduce within ΔE < 5.0" target carries over unchanged.
+    >
+    > **STATUS UPDATE 2026-05-21 (Sprint 25 / R1 / ADR-043 — terrain
+    > shader parity shipped):** the renderer-parity arc opens. The
+    > Sprint-9 / D4 diffuse-only splat composite (ADR-036) is replaced
+    > by a line-by-line transcription of Recoil's
+    > `cont/base/springcontent/shaders/GLSL/SMFFragProg.glsl`
+    > `SMF_DETAIL_NORMAL_TEXTURE_SPLATTING` branch. The fragment stage
+    > now does base normal R+A decode (FINDINGS §7.5), per-fragment
+    > TBN from `cross(N, vec3(-1, 0, 0))` (FINDINGS §7.4), full-RGBA
+    > signed-decoded DNTS slot-normal blend with per-channel UV
+    > scales (FINDINGS §7.3), per-fragment specular exponent
+    > `α × 16.0` with a global fallback (FINDINGS §7.6), and Lambert +
+    > Blinn-Phong using a world-space camera eye threaded through
+    > `TerrainCallback::camera_pos`. `SMF_INTENSITY_MULT = 210/255` is
+    > pre-applied CPU-side to `ground_ambient` + `ground_diffuse`
+    > (FINDINGS §7.1). The 4-layer texture array (binding 5) was the
+    > Sprint-9 slot diffuse — Sprint 17 retired that role, Sprint 25
+    > repurposes it as the engine's
+    > `splatDetailNormalTex1..4` slot normal array. A naga-backed
+    > parse + validate test catches WGSL drift at `cargo test` time
+    > without a GPU. The Comet Catcher Remake parity fixture
+    > (`crates/barme-app/src/parity_fixtures.rs`, 13 unit tests +
+    > `assets/parity-fixtures/comet/README.md`) ships with mapinfo
+    > values reproduced verbatim and a manual smoke procedure
+    > documenting 3-angle BAR-vs-editor visual comparison. ΔE
+    > automation is **Sprint 36** (parity-validation, the arc's
+    > closer). The renderer-parity arc is now **1 / 8 done**;
+    > Sprint 26 = water polish (fresnel + foam + caustics + perlin +
+    > refraction + reflection — amends ADR-042). Subsequent arc
+    > sprints: 28 atmosphere + fog, 29 features (S3O / 3DO), 30
+    > shadows, 34 grass, 35 emission + sky-reflect + parallax, 36
+    > parity validation + §2.1 #11 closeout.
 12. **Decompilation fidelity.** Round-tripping an existing `.sd7` loses information: the recovered diffuse PNG has been through DXT1 (color precision loss); heightmap, metal, and type maps are exact; mapinfo.lua is exact; auxiliary splat textures survive untouched. Reuse PyMapConv's decompile path.
 13. **GPU brush latency.** Spring/Recoil maps can theoretically reach 96×96 SMUs. Sub-millisecond brush response at 32×32+ requires the heightmap to live on the GPU as a storage texture, edited by compute shaders. Read-back to CPU happens only at save.
 
