@@ -8054,10 +8054,13 @@ impl App {
         // CATEGORY section.
         let categories: Vec<String> = self.feature_state.manifest.category_names();
         let no_catalog = categories.is_empty();
+        // Sprint 27 / U5 — Category demoted from accent. Picker is the
+        // tool's primary work surface (where the user arms a feature
+        // for placement); Category and Placed are supporting rails.
         crate::ui::widgets::section_with_hover(
             ui,
             "Category",
-            true,
+            false,
             "Pick the feature catalogue — trees / rocks / props / wreckage / geo. Switching categories resets the pending placement.",
             |_ui| {},
             |ui| {
@@ -8182,10 +8185,11 @@ impl App {
         let mut to_move: Option<(usize, FeatureInstance, FeatureInstance)> = None;
         let features_snapshot: Vec<FeatureInstance> = self.features.clone();
         let placed_title = format!("Placed · {}", features_snapshot.len());
+        // Sprint 27 / U5 — Placed demoted from accent (see Category note).
         crate::ui::widgets::section(
             ui,
             &placed_title,
-            true,
+            false,
             |_ui| {},
             |ui| {
                 if features_snapshot.is_empty() {
