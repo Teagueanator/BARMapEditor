@@ -196,8 +196,14 @@ pub fn compute_active_channels(project: &Project) -> [bool; 4] {
     let Some(dist) = project.splat_distribution.as_ref() else {
         return mask;
     };
-    for (ch, binding) in project.splat_config.channels.iter().enumerate() {
-        if binding.is_none() {
+    // Sprint 23 (T1): SplatConfig retired. A channel is bound when
+    // a layer in the stack carries `dnts_channel = Some(_)` for it
+    // (Sprint 17 / ADR-041). The painted-distribution check still
+    // gates emission so the legacy pre-Sprint-17 path stays a true
+    // no-op for unpainted projects.
+    let dnts = project.layers.dnts_layers();
+    for (ch, layer) in dnts.iter().enumerate() {
+        if layer.is_none() {
             continue;
         }
         mask[ch] = channel_has_non_zero_pixel(dist, ch);
@@ -558,10 +564,10 @@ pub fn populate_resources(
             entries[dds.channel] = format!("maps/textures/{}", dds.filename);
         }
         info.resources.splat_detail_normal_tex = entries.to_vec();
-        // ADR-025 baseline: subtable alpha = false. ADR-034 (the
-        // high-pass diffuse-in-alpha workflow) toggles this when it
-        // lands.
-        info.resources.splat_detail_normal_tex_alpha = Some(project.splat_config.diffuse_in_alpha);
+        // Sprint 23 (T1): SplatConfig retired. The per-project
+        // `dnts_diffuse_in_alpha` flag (Sprint 17 / ADR-041) is the
+        // source of truth now.
+        info.resources.splat_detail_normal_tex_alpha = Some(project.dnts_diffuse_in_alpha);
     }
 
     // specularTex
@@ -573,9 +579,21 @@ pub fn populate_resources(
         info.resources.specular_tex = Some(format!("maps/{filename}"));
     }
 
-    // splats.texScales / texMults mirror the project's config.
-    info.splats.tex_scales = project.splat_config.tex_scales;
-    info.splats.tex_mults = project.splat_config.tex_mults;
+    // Sprint 23 (T1): SplatConfig retired. Per-channel `texScales`
+    // and `texMults` now derive from each DNTS-bound layer's
+    // `dnts_tex_scale` / `dnts_tex_mult` fields (Sprint 17 / ADR-041).
+    // Unbound channels keep the engine default (0.02 / 1.0).
+    let dnts = project.layers.dnts_layers();
+    let mut tex_scales = [0.02f32; 4];
+    let mut tex_mults = [1.0f32; 4];
+    for (ch, layer) in dnts.iter().enumerate() {
+        if let Some(l) = layer {
+            tex_scales[ch] = l.dnts_tex_scale;
+            tex_mults[ch] = l.dnts_tex_mult;
+        }
+    }
+    info.splats.tex_scales = tex_scales;
+    info.splats.tex_mults = tex_mults;
 }
 
 /// D10 / Sprint 17 (ADR-041) — layer-driven counterpart to
@@ -808,12 +826,23 @@ mod tests {
     use barme_core::MapSize;
 
     fn project_with_painted_channels(painted: &[usize]) -> Project {
+        use barme_core::{LayerSource, SplatChannel, TextureLayer};
         let mut p = Project::new("paint", 4);
-        // Bind every channel the test wants painted to a stock slot
-        // id. The slot id is opaque here — `compute_active_channels`
-        // only checks for `is_some()`.
+        // Sprint 23 (T1): bindings now live on the layer stack.
+        // Append one DNTS-bound layer per requested channel. The
+        // slot id is opaque here — `compute_active_channels` only
+        // checks whether a layer is bound to the channel.
         for &ch in painted {
-            p.splat_config.channels[ch] = Some(ch as u8);
+            let channel = match ch {
+                0 => SplatChannel::R,
+                1 => SplatChannel::G,
+                2 => SplatChannel::B,
+                3 => SplatChannel::A,
+                _ => unreachable!("test only uses channels 0..=3"),
+            };
+            let mut layer = TextureLayer::new(LayerSource::Slot { id: ch as u8 }, p.size, 0);
+            layer.dnts_channel = Some(channel);
+            p.layers.layers.push(layer);
         }
         // Allocate a distribution and paint one pixel per requested
         // channel so the non-zero check passes.
@@ -835,7 +864,12 @@ mod tests {
 
         // A bound-but-unpainted channel is NOT active.
         let mut p = Project::new("bound-unpainted", 4);
-        p.splat_config.channels[2] = Some(7);
+        // Sprint 23 (T1): bind via the layer stack, not the
+        // retired `splat_config.channels`.
+        let mut layer =
+            barme_core::TextureLayer::new(barme_core::LayerSource::Slot { id: 7 }, p.size, 0);
+        layer.dnts_channel = Some(barme_core::SplatChannel::B);
+        p.layers.layers.push(layer);
         // No distribution allocated → mask all-false.
         let active = compute_active_channels(&p);
         assert_eq!(active, [false; 4]);

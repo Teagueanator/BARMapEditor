@@ -50,7 +50,7 @@ use tracing::{info, warn};
 use crate::MapSize;
 use crate::brushes::DirtyRect;
 use crate::project::Project;
-use crate::splat::{SplatChannel, SplatConfig};
+use crate::splat::SplatChannel;
 
 pub use brushes::{MaskBrush, MaskBrushRegistry, MaskFill, MaskHide, MaskReveal, MaskSmooth};
 pub use mask::{LayerMask, MaskStamp, TILE_DIM, TILE_PIXELS, Tile, TileCoord};
@@ -318,58 +318,12 @@ impl LayerStack {
         }
     }
 
-    /// Migrate from a pre-D8 [`SplatConfig`] to a layer stack. One
-    /// layer per bound DNTS channel, in R/G/B/A order, each with
-    /// `dnts_channel = Some(channel)`. Masks start FULL (255) for the
-    /// bottom layer and EMPTY (0) for the rest — the pre-D8 splat
-    /// painting is NOT migrated to mask pixels in Sprint 15 (the data
-    /// shape is different; Sprint 17 will offer a one-time migration
-    /// when the user opens an older project).
-    ///
-    /// The pre-D8 `splat_config.tex_scales` / `tex_mults` are
-    /// preserved on `Project.splat_config` for runtime DNTS — they
-    /// are NOT migrated into the layer model here.
-    ///
-    /// `slot_id_for_channel` resolves a channel index to its bound
-    /// slot id. The app passes a closure that consults
-    /// `config.channels[i]`; tests can substitute. Channels resolving
-    /// to `None` produce no layer.
-    pub fn migrate_from_splat_config(
-        config: &SplatConfig,
-        slot_id_for_channel: impl Fn(u8) -> Option<u8>,
-        size: MapSize,
-    ) -> Self {
-        let mut layers = Vec::new();
-        // R / G / B / A — channel index drives the [`SplatChannel`]
-        // discriminant.
-        for ch_idx in 0..4u8 {
-            let Some(slot_id) = slot_id_for_channel(ch_idx) else {
-                continue;
-            };
-            // Bottom of the stack gets a full mask so the bake has
-            // something to start from; subsequent layers come in
-            // empty so they don't clobber what's below.
-            let fill = if layers.is_empty() { 255 } else { 0 };
-            let mut layer = TextureLayer::new(LayerSource::Slot { id: slot_id }, size, fill);
-            layer.dnts_channel = Some(channel_index_to_enum(ch_idx));
-            // D10 / Sprint 17 (PITFALL §17.8): copy the legacy
-            // per-channel `tex_scales` / `tex_mults` into the new
-            // per-layer fields so the migrated project's DNTS bake
-            // matches the pre-Sprint-14 visuals.
-            layer.dnts_tex_scale = config.tex_scales[ch_idx as usize];
-            layer.dnts_tex_mult = config.tex_mults[ch_idx as usize];
-            // Cosmetic: name reflects the channel binding so users
-            // recognise migrated layers in Sprint 17's Layers panel.
-            layer.name = format!("Slot {slot_id:02} (channel {})", ch_idx_label(ch_idx));
-            layers.push(layer);
-        }
-        // Sanity guard: the splat config has at most 4 channels so
-        // the migration is bounded by definition. The 4-layer cap
-        // also matches the mask-byte-budget ceiling discussed in the
-        // module docs.
-        debug_assert!(layers.len() <= 4);
-        Self { layers }
-    }
+    // Sprint 23 (T1 / ADR-041 amendment): `migrate_from_splat_config`
+    // retired with the `SplatConfig` struct itself. Legacy
+    // `.barmeproj` files now flow through
+    // [`legacy_splat_config_to_layers`] (free function below), which
+    // parses the on-disk `[splat_config]` table as a `toml::Value`
+    // and rebuilds the layer stack — no typed struct required.
 
     /// D10 / Sprint 17 (ADR-041): the bottom-most DNTS-bound layer per
     /// channel, in R/G/B/A order. Returns `[None; 4]` for a project with
@@ -850,6 +804,99 @@ fn ch_idx_label(i: u8) -> &'static str {
 }
 
 // ---------------------------------------------------------------------------
+// Legacy splat_config migration (Sprint 23 / T1, ADR-041 amendment)
+// ---------------------------------------------------------------------------
+
+/// Sprint 23 (T1 / ADR-041 amendment) — rebuild a [`LayerStack`] from
+/// a legacy `[splat_config]` TOML table.
+///
+/// Replaces the retired `LayerStack::migrate_from_splat_config` +
+/// `SplatConfig` struct path. Takes the raw `toml::Value` for the
+/// `[splat_config]` block (whatever shape the pre-Sprint-17 wire used)
+/// and recovers the per-channel slot id + `tex_scales` + `tex_mults`
+/// via best-effort field reads. Missing or malformed fields fall back
+/// to the engine defaults:
+///
+/// - `channels`: 4-element signed-int array (`-1` = unbound,
+///   `0..=255` = slot id), per the pre-Sprint-23 `channels_wire`
+///   serialiser. Unbound channels produce no layer.
+/// - `tex_scales`: 4-element float array; default `0.02` per FINDINGS
+///   §1.6.
+/// - `tex_mults`: 4-element float array; default `1.0`.
+///
+/// One layer per bound channel, in R/G/B/A order. Bottom layer
+/// (mask=255) is the first bound channel; subsequent layers come in
+/// with mask=0 so they don't clobber what's below. Each gets the
+/// migrated `tex_scales[i]` and `tex_mults[i]` baked onto its new
+/// per-layer `dnts_tex_scale` / `dnts_tex_mult` fields (the
+/// runtime-DNTS data path Sprint 17 ADR-041 established).
+///
+/// Used exclusively by [`crate::Project::after_load_migrate`] at
+/// load time. The `diffuse_in_alpha` flag is read by the project's
+/// migration call site directly (separate scalar lift); this
+/// function focuses on the per-channel layer construction.
+pub fn legacy_splat_config_to_layers(splat: &toml::Value, size: MapSize) -> LayerStack {
+    let channels = read_legacy_channels(splat);
+    let tex_scales = read_legacy_f32_array(splat, "tex_scales", 0.02);
+    let tex_mults = read_legacy_f32_array(splat, "tex_mults", 1.0);
+
+    let mut layers = Vec::new();
+    for ch_idx in 0..4u8 {
+        let Some(slot_id) = channels[ch_idx as usize] else {
+            continue;
+        };
+        let fill = if layers.is_empty() { 255 } else { 0 };
+        let mut layer = TextureLayer::new(LayerSource::Slot { id: slot_id }, size, fill);
+        layer.dnts_channel = Some(channel_index_to_enum(ch_idx));
+        layer.dnts_tex_scale = tex_scales[ch_idx as usize];
+        layer.dnts_tex_mult = tex_mults[ch_idx as usize];
+        layer.name = format!("Slot {slot_id:02} (channel {})", ch_idx_label(ch_idx));
+        layers.push(layer);
+    }
+    debug_assert!(layers.len() <= 4);
+    LayerStack { layers }
+}
+
+/// Read a 4-element integer array from the legacy `[splat_config]`
+/// table, mapping `-1` to `None` (the wire convention from the
+/// retired `channels_wire` serde shim). Out-of-bounds slot ids
+/// (`v > 255`) and non-array values both fall back to all-`None`.
+fn read_legacy_channels(splat: &toml::Value) -> [Option<u8>; 4] {
+    let mut out = [None; 4];
+    let Some(arr) = splat.get("channels").and_then(|v| v.as_array()) else {
+        return out;
+    };
+    for (i, entry) in arr.iter().enumerate().take(4) {
+        let Some(v) = entry.as_integer() else {
+            continue;
+        };
+        if !(0..=255).contains(&v) {
+            continue;
+        }
+        out[i] = Some(v as u8);
+    }
+    out
+}
+
+/// Read a 4-element float array from the legacy `[splat_config]`
+/// table. Missing / malformed entries fall back to `default`. Used
+/// for `tex_scales` (default 0.02) and `tex_mults` (default 1.0).
+fn read_legacy_f32_array(splat: &toml::Value, key: &str, default: f32) -> [f32; 4] {
+    let mut out = [default; 4];
+    let Some(arr) = splat.get(key).and_then(|v| v.as_array()) else {
+        return out;
+    };
+    for (i, entry) in arr.iter().enumerate().take(4) {
+        if let Some(f) = entry.as_float() {
+            out[i] = f as f32;
+        } else if let Some(int) = entry.as_integer() {
+            out[i] = int as f32;
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
 // Orphan-texture GC (Sprint 23 / T1, ADR-041 amendment)
 // ---------------------------------------------------------------------------
 
@@ -904,10 +951,7 @@ impl GcReport {
 /// [`tests::gc_preserves_in_use_textures`].
 ///
 /// **No-textures-dir is not an error.** Returns an empty report.
-pub fn garbage_collect_textures(
-    project: &Project,
-    project_root: &Path,
-) -> io::Result<GcReport> {
+pub fn garbage_collect_textures(project: &Project, project_root: &Path) -> io::Result<GcReport> {
     let textures_dir = project_root.join("textures");
     let mut report = GcReport::default();
     let in_use: HashSet<String> = project
@@ -1110,21 +1154,22 @@ mod tests {
         assert!(stack.layers[0].dnts_channel.is_none());
     }
 
+    /// Sprint 23 (T1 / ADR-041 amendment) — successor to the
+    /// retired `migrate_from_splat_config_seeds_one_layer_per_bound_channel`.
+    /// Same contract, exercised against the new
+    /// [`legacy_splat_config_to_layers`] (toml-Value-driven) API.
     #[test]
-    fn migrate_from_splat_config_seeds_one_layer_per_bound_channel() {
-        // R, G, A bound; B unbound.
-        let cfg = SplatConfig {
-            channels: [Some(0), Some(3), None, Some(5)],
-            tex_scales: [0.005, 0.012, 0.02, 0.04],
-            tex_mults: [0.9, 1.1, 1.0, 1.3],
-            ..SplatConfig::default()
-        };
-        let stack =
-            LayerStack::migrate_from_splat_config(&cfg, |i| cfg.channels[i as usize], tiny_size());
+    fn legacy_splat_config_to_layers_seeds_one_per_bound_channel() {
+        // R, G, A bound; B unbound. Wire shape matches what
+        // pre-Sprint-23 `channels_wire` would have serialised.
+        let toml_str = r#"
+channels = [0, 3, -1, 5]
+tex_scales = [0.005, 0.012, 0.02, 0.04]
+tex_mults = [0.9, 1.1, 1.0, 1.3]
+"#;
+        let value: toml::Value = toml::from_str(toml_str).unwrap();
+        let stack = legacy_splat_config_to_layers(&value, tiny_size());
         assert_eq!(stack.layers.len(), 3, "one layer per bound channel");
-        // PITFALL §17.8: scales + mults must migrate into the new
-        // per-layer fields. Channel R → layer 0, Channel G → layer 1,
-        // Channel A → layer 2 (B was unbound so it doesn't seed a layer).
         assert!(
             (stack.layers[0].dnts_tex_scale - 0.005).abs() < 1e-6,
             "R tex_scale should migrate to layer 0",
@@ -1140,7 +1185,6 @@ mod tests {
         assert!((stack.layers[0].dnts_tex_mult - 0.9).abs() < 1e-6);
         assert!((stack.layers[1].dnts_tex_mult - 1.1).abs() < 1e-6);
         assert!((stack.layers[2].dnts_tex_mult - 1.3).abs() < 1e-6);
-        // Order matches channel order R, G, A → slot ids 0, 3, 5.
         assert!(matches!(
             stack.layers[0].source,
             LayerSource::Slot { id: 0 }
@@ -1153,11 +1197,9 @@ mod tests {
             stack.layers[2].source,
             LayerSource::Slot { id: 5 }
         ));
-        // DNTS bindings match the source channel index (R/G/A).
         assert_eq!(stack.layers[0].dnts_channel, Some(SplatChannel::R));
         assert_eq!(stack.layers[1].dnts_channel, Some(SplatChannel::G));
         assert_eq!(stack.layers[2].dnts_channel, Some(SplatChannel::A));
-        // Bottom mask full; subsequent empty.
         assert_eq!(stack.layers[0].mask.sample(512, 512), 255);
         assert_eq!(stack.layers[1].mask.sample(512, 512), 0);
         assert_eq!(stack.layers[2].mask.sample(512, 512), 0);
@@ -1166,12 +1208,11 @@ mod tests {
     #[test]
     fn dnts_layers_returns_bound_layers_per_channel() {
         // Build a stack with three bound layers: R / B / A (G unbound).
-        let cfg = SplatConfig {
-            channels: [Some(0), None, Some(2), Some(3)],
-            ..SplatConfig::default()
-        };
-        let stack =
-            LayerStack::migrate_from_splat_config(&cfg, |i| cfg.channels[i as usize], tiny_size());
+        let toml_str = r#"
+channels = [0, -1, 2, 3]
+"#;
+        let value: toml::Value = toml::from_str(toml_str).unwrap();
+        let stack = legacy_splat_config_to_layers(&value, tiny_size());
         let dnts = stack.dnts_layers();
         assert!(dnts[0].is_some(), "R channel should be bound");
         assert!(dnts[1].is_none(), "G channel was unbound");
@@ -1205,10 +1246,15 @@ mod tests {
     }
 
     #[test]
-    fn migrate_from_unbound_config_produces_empty_stack() {
-        let cfg = SplatConfig::default(); // all channels None
-        let stack = LayerStack::migrate_from_splat_config(&cfg, |_| None, tiny_size());
+    fn legacy_splat_config_to_layers_with_no_bound_channels_is_empty() {
+        // All four channels unbound (`-1` sentinel) → no layers.
+        let value: toml::Value = toml::from_str("channels = [-1, -1, -1, -1]").unwrap();
+        let stack = legacy_splat_config_to_layers(&value, tiny_size());
         assert!(stack.layers.is_empty());
+        // Defensive: missing `channels` array also yields empty.
+        let empty: toml::Value = toml::from_str("").unwrap();
+        let stack2 = legacy_splat_config_to_layers(&empty, tiny_size());
+        assert!(stack2.layers.is_empty());
     }
 
     #[test]
@@ -1336,15 +1382,10 @@ mod tests {
 
     #[test]
     fn resident_mask_bytes_sums_each_layer_under_tile_budget() {
-        let cfg = SplatConfig {
-            channels: [Some(0), Some(1), None, None],
-            ..Default::default()
-        };
-        let stack = LayerStack::migrate_from_splat_config(
-            &cfg,
-            |i| cfg.channels[i as usize],
-            MapSize::square(2),
-        );
+        // Sprint 23 (T1): the migration helper now reads off a
+        // raw TOML value rather than a typed `SplatConfig`.
+        let value: toml::Value = toml::from_str("channels = [0, 1, -1, -1]").unwrap();
+        let stack = legacy_splat_config_to_layers(&value, MapSize::square(2));
         // Sprint 16: two layers with uniformly-filled masks → both
         // collapse to all-`Uniform` tile grids. Cost is dominated by
         // the 16-tile metadata, ~16 bytes per Tile + 8 bytes per
@@ -1510,9 +1551,11 @@ mod tests {
             layers: vec![TextureLayer::new(LayerSource::Slot { id: 0 }, size, 255)],
         };
         for slot_id in 1..=3u8 {
-            stack
-                .layers
-                .push(TextureLayer::new(LayerSource::Slot { id: slot_id }, size, 0));
+            stack.layers.push(TextureLayer::new(
+                LayerSource::Slot { id: slot_id },
+                size,
+                0,
+            ));
         }
         let bytes = stack.resident_mask_bytes();
         // 4 layers × ~24 KB tile metadata = ~96 KB. Generous budget
@@ -1613,7 +1656,10 @@ mod tests {
             )],
         };
         let report = garbage_collect_textures(&project, dir.path()).unwrap();
-        assert!(report.orphans_removed.is_empty(), "must not unlink in-use file");
+        assert!(
+            report.orphans_removed.is_empty(),
+            "must not unlink in-use file"
+        );
         assert_eq!(report.orphans_in_use_count, 1);
         assert!(keep.exists(), "in-use texture must survive GC");
     }
@@ -1703,9 +1749,11 @@ mod tests {
             layers: vec![TextureLayer::new(LayerSource::Slot { id: 0 }, size, 255)],
         };
         for slot_id in 1..=3u8 {
-            stack
-                .layers
-                .push(TextureLayer::new(LayerSource::Slot { id: slot_id }, size, 0));
+            stack.layers.push(TextureLayer::new(
+                LayerSource::Slot { id: slot_id },
+                size,
+                0,
+            ));
         }
         let after = crate::rss::current("16smu-4layer-after").unwrap();
         let delta_bytes = after.rss_bytes.saturating_sub(before.rss_bytes);

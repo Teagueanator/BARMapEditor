@@ -45,99 +45,16 @@ use serde::{Deserialize, Serialize};
 /// docs for the rationale.
 pub const SPLAT_DIM: u32 = 1024;
 
-/// Persisted per-channel splat config (D5 / Sprint 9). Maps directly
-/// to the `mapinfo.splats` block and the `mapinfo.resources.
-/// splatDetailNormalTex[]` subtable form (D6 emission, Sprint 12).
-///
-/// `channels[i] = Some(slot_id)` binds slot `slot_id` (an index into
-/// the `tools/textures/<NN-slot>/` registry — D1 / ADR-027) to the
-/// corresponding RGBA channel of the splat distribution:
-/// - channels[0] → R
-/// - channels[1] → G
-/// - channels[2] → B
-/// - channels[3] → A
-///
-/// `None` = the channel is unbound. The GPU shader gates per-layer
-/// sampling on an active-slot mask derived from these `Option`s
-/// (D4 / ADR-036).
-///
-/// `tex_scales` / `tex_mults` mirror `mapinfo.splats.texScales` /
-/// `texMults` exactly — float4, defaults `0.02` / `1.0` per FINDINGS
-/// §1.6.
-///
-/// `diffuse_in_alpha` mirrors `mapinfo.resources.
-/// splatDetailNormalDiffuseAlpha`. ADR-034 is the open ADR for the
-/// high-pass diffuse-offset workflow; baseline is `false` per
-/// ADR-025.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SplatConfig {
-    /// Per-channel slot bindings. Serialized as a 4-element array of
-    /// signed ints (`-1` = unbound, `0..=255` = slot id) because TOML
-    /// arrays have no null variant. The Rust API stays `Option<u8>`
-    /// for type safety; the wire conversion lives in [`channels_wire`].
-    #[serde(with = "channels_wire")]
-    pub channels: [Option<u8>; 4],
-    pub tex_scales: [f32; 4],
-    pub tex_mults: [f32; 4],
-    #[serde(default)]
-    pub diffuse_in_alpha: bool,
-}
-
-/// Serde shim for `[Option<u8>; 4]` ↔ `[i16; 4]`. TOML arrays cannot
-/// hold a null sentinel, so we encode `None` as `-1`. `u8::MAX` would
-/// be ambiguous with a real slot id once the registry exceeds 256
-/// entries (unlikely but the math is cheap).
-mod channels_wire {
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
-
-    pub fn serialize<S: Serializer>(v: &[Option<u8>; 4], s: S) -> Result<S::Ok, S::Error> {
-        let wire: [i16; 4] = [
-            v[0].map(|x| x as i16).unwrap_or(-1),
-            v[1].map(|x| x as i16).unwrap_or(-1),
-            v[2].map(|x| x as i16).unwrap_or(-1),
-            v[3].map(|x| x as i16).unwrap_or(-1),
-        ];
-        wire.serialize(s)
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[Option<u8>; 4], D::Error> {
-        let wire: [i16; 4] = <[i16; 4]>::deserialize(d)?;
-        let mut out = [None; 4];
-        for (o, w) in out.iter_mut().zip(wire.iter()) {
-            *o = if *w < 0 { None } else { Some(*w as u8) };
-        }
-        Ok(out)
-    }
-}
-
-impl Default for SplatConfig {
-    fn default() -> Self {
-        // Defaults match `splats.texScales = vec4(0.02)` and
-        // `splats.texMults = vec4(1.0)` from MapInfo.cpp::ReadSplats
-        // (FINDINGS §1.6). All channels unbound — fresh projects
-        // render the fallback gradient until the user paints.
-        Self {
-            channels: [None; 4],
-            tex_scales: [0.02; 4],
-            tex_mults: [1.0; 4],
-            diffuse_in_alpha: false,
-        }
-    }
-}
-
-impl SplatConfig {
-    /// Bit `i` set iff `channels[i].is_some()`. The D4 shader gates
-    /// per-layer sampling on this mask.
-    pub fn active_mask(&self) -> u32 {
-        let mut m = 0u32;
-        for (i, c) in self.channels.iter().enumerate() {
-            if c.is_some() {
-                m |= 1 << i;
-            }
-        }
-        m
-    }
-}
+// Sprint 23 (T1 / ADR-041 amendment): the legacy `SplatConfig` /
+// `channels_wire` types retired here. Sprint 17 marked
+// `Project.splat_config` as `#[serde(skip_serializing)]` and moved the
+// runtime data into per-layer `dnts_channel` / `dnts_tex_scale` /
+// `dnts_tex_mult` fields on [`crate::layers::TextureLayer`]. Sprint 23
+// drops the struct, the field, and the migration scaffolding entirely.
+// Legacy `.barmeproj` files (pre-Sprint-17) still load via
+// [`crate::layers::legacy_splat_config_to_layers`], which parses the
+// on-disk `[splat_config]` block as a `toml::Value` and rebuilds the
+// layer stack — no `SplatConfig` struct required.
 
 /// RGBA splat distribution. Channel weights — not transparency —
 /// drive which DNTS slot lights each fragment. The engine multiplies
@@ -908,40 +825,13 @@ mod tests {
         assert_eq!(SPLAT_DIM, 1024);
     }
 
-    #[test]
-    fn splat_config_default_matches_engine_defaults() {
-        // FINDINGS §1.6 — splats default texScales=0.02, texMults=1.0.
-        let c = SplatConfig::default();
-        assert_eq!(c.channels, [None; 4]);
-        assert_eq!(c.tex_scales, [0.02; 4]);
-        assert_eq!(c.tex_mults, [1.0; 4]);
-        // ADR-025 baseline — diffuse_in_alpha workflow stays off
-        // until ADR-034 lands.
-        assert!(!c.diffuse_in_alpha);
-    }
-
-    #[test]
-    fn splat_config_active_mask_reflects_bound_channels() {
-        let mut c = SplatConfig::default();
-        assert_eq!(c.active_mask(), 0);
-        c.channels[0] = Some(5);
-        c.channels[2] = Some(3);
-        // R + B bound → bits 0 and 2 = 0b101 = 5.
-        assert_eq!(c.active_mask(), 0b101);
-        c.channels[3] = Some(9);
-        assert_eq!(c.active_mask(), 0b1101);
-    }
-
-    #[test]
-    fn splat_config_round_trips_through_toml() {
-        let c = SplatConfig {
-            channels: [Some(0), Some(2), None, Some(8)],
-            tex_scales: [0.02, 0.004, 0.02, 0.0015],
-            tex_mults: [1.0, 1.5, 1.0, 0.8],
-            diffuse_in_alpha: true,
-        };
-        let s = toml::to_string(&c).unwrap();
-        let c2: SplatConfig = toml::from_str(&s).unwrap();
-        assert_eq!(c, c2);
-    }
+    // Sprint 23 (T1 / ADR-041 amendment): SplatConfig retired. The
+    // three tests that used to live here
+    // (`splat_config_default_matches_engine_defaults`,
+    // `splat_config_active_mask_reflects_bound_channels`,
+    // `splat_config_round_trips_through_toml`) went with it. The
+    // engine-default tex_scales / tex_mults / diffuse_in_alpha
+    // semantics are now exercised by the layers tests via
+    // `default_dnts_tex_scale` / `default_one_f32` / the
+    // `dnts_diffuse_in_alpha` per-project field.
 }

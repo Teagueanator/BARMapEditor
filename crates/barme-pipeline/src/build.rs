@@ -441,13 +441,14 @@ pub fn execute_stages(
     check_cancel(cancel, &BuildStage::StageSplatAssets)?;
     emit_stage(events, BuildStage::StageSplatAssets);
     let use_layers = layer_inputs.is_some() && !project.layers.layers.is_empty();
+    // Sprint 23 (T1): SplatConfig retired. Both branches now read the
+    // per-project `dnts_diffuse_in_alpha` (Sprint 17 / ADR-041). The
+    // legacy fallback branch is kept for callers that explicitly pass
+    // `layer_inputs = None` (smoke binary); it sees the same value
+    // since the legacy field is gone.
     let bake_opts = BakeOptions {
         yflip_normal: false,
-        diffuse_in_alpha: if use_layers {
-            project.dnts_diffuse_in_alpha
-        } else {
-            project.splat_config.diffuse_in_alpha
-        },
+        diffuse_in_alpha: project.dnts_diffuse_in_alpha,
     };
     let (splat_staged, _lints) = if use_layers {
         let li = layer_inputs.expect("guarded by use_layers");

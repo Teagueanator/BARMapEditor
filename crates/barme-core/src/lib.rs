@@ -25,7 +25,7 @@ pub use layers::{
     BlendMode, ClosureSlotResolver, GcReport, LayerColor, LayerMask, LayerSource, LayerStack,
     LayerTransform, MaskBrush, MaskBrushRegistry, MaskFill, MaskHide, MaskReveal, MaskSmooth,
     MaskStamp, SlotResolver, TILE_DIM, TILE_PIXELS, TextureLayer, TileCoord, alloc_layer_id,
-    garbage_collect_textures,
+    garbage_collect_textures, legacy_splat_config_to_layers,
 };
 pub use map_size::MapSize;
 pub use mapinfo_schema::{
@@ -42,7 +42,7 @@ pub use project::{
 };
 pub use splat::{
     Erase as SplatErase, PaintChannel, SPLAT_DIM, Smooth as SplatSmooth, SplatBrush,
-    SplatBrushRegistry, SplatChannel, SplatConfig, SplatDistribution, SplatStamp,
+    SplatBrushRegistry, SplatChannel, SplatDistribution, SplatStamp,
 };
 pub use symmetry::SymmetryAxis;
 pub use undo::{

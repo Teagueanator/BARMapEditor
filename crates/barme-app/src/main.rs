@@ -12,8 +12,8 @@ use barme_core::{
     ALLY_GROUP_PALETTE, AllyGroup, BAR_DEFAULT_SURFACE_ALPHA, BAR_DEFAULT_SURFACE_COLOR, BIOMES,
     BrushRegistry, BrushStamp, DirtyRect, FeatureInstance, GeoVent, Heightmap, History,
     HistoryEntry, LayerPropertyValue, LayerStack, MapSize, MetalSpot, PROJECT_EXTENSION, Project,
-    ProjectDiff, SlotResolver, SplatConfig, StartPosition, SymmetryAxis, TextureLayer, WaterBlock,
-    WaterField, WaterMode, WaterValue, WizardSnapshot,
+    ProjectDiff, SlotResolver, StartPosition, SymmetryAxis, TextureLayer, WaterBlock, WaterField,
+    WaterMode, WaterValue, WizardSnapshot,
     brushes::pixel_bbox,
     default_extractor_radius, merge_overrides, preset_water_block,
     procgen::{
@@ -1614,11 +1614,11 @@ impl App {
             mapinfo_overrides: self.mapinfo_overrides.clone(),
             next_steps_dismissed: self.next_steps_dismissed,
             migration_toast_dismissed: self.migration_toast_dismissed,
-            // D10 / Sprint 17 (ADR-041): `splat_config` is
-            // `#[serde(skip_serializing)]` so this default never hits
-            // disk on new saves; legacy projects still load through
-            // the migration path. App-side fields retired.
-            splat_config: SplatConfig::default(),
+            // Sprint 23 (T1 / ADR-041 amendment): `splat_config`
+            // retired entirely. The per-project
+            // `dnts_diffuse_in_alpha` flag and per-layer
+            // `dnts_tex_scale` / `dnts_tex_mult` fields cover what
+            // the legacy struct held.
             dnts_diffuse_in_alpha: self.dnts_diffuse_in_alpha,
             layers: self.layer_stack.clone(),
             splat_distribution: None,
@@ -1663,27 +1663,34 @@ impl App {
         p
     }
 
-    /// D6 (Sprint 12): translate `Project.splat_config.channels`
-    /// (slot ids 0..=255) to per-channel directories under
-    /// `tools/textures/<NN-slug>/`. Unbound channels stay `None`;
-    /// bound channels resolve to the slot registry entry the user
-    /// picked in the F4 splat inspector. The splat pipeline calls
-    /// `bake_dnts` only for `Some(_)` entries that ALSO have non-
-    /// zero distribution pixels — see
-    /// `splat_pipeline::compute_active_channels`.
+    /// D6 (Sprint 12), updated for Sprint 23 (T1 / ADR-041 amendment):
+    /// derive per-channel directories under `tools/textures/<NN-slug>/`
+    /// from the project's DNTS-bound layers
+    /// (`Project.layers.dnts_layers()`). Replaces the retired
+    /// `Project.splat_config.channels` read; the slot id now comes
+    /// from each bound layer's `LayerSource::Slot { id }`. Imported-
+    /// source DNTS layers have no `tools/textures/` directory so
+    /// they stay `None` here — the build's
+    /// `stage_splat_assets_from_layers` raises `LintWarning::
+    /// ImportedLayerDnts` for them.
     fn resolve_splat_bake_inputs(&self, project: &Project) -> barme_pipeline::SplatBakeInputs {
         let mut out = barme_pipeline::SplatBakeInputs::default();
-        for (ch, binding) in project.splat_config.channels.iter().enumerate() {
-            let Some(slot_id) = binding else {
+        let dnts = project.layers.dnts_layers();
+        for (ch, layer) in dnts.iter().enumerate() {
+            let Some(layer) = layer else {
                 continue;
             };
-            if let Some(slot) = self.slot_registry.iter().find(|m| m.id == *slot_id) {
+            let slot_id = match &layer.source {
+                barme_core::LayerSource::Slot { id } => *id,
+                barme_core::LayerSource::Imported { .. } => continue,
+            };
+            if let Some(slot) = self.slot_registry.iter().find(|m| m.id == slot_id) {
                 out.channel_slot_dirs[ch] = Some(slot.dir.clone());
             } else {
                 warn!(
                     channel = ch,
                     slot_id = slot_id,
-                    "splat channel binding references missing slot in registry"
+                    "DNTS channel binding references missing slot in registry"
                 );
             }
         }
@@ -1808,11 +1815,7 @@ impl App {
         let report = match barme_core::garbage_collect_textures(&snap, root) {
             Ok(r) => r,
             Err(e) => {
-                self.last_error = Some(format!(
-                    "Texture GC failed at {}: {}",
-                    root.display(),
-                    e
-                ));
+                self.last_error = Some(format!("Texture GC failed at {}: {}", root.display(), e));
                 return;
             }
         };
@@ -5281,8 +5284,15 @@ impl App {
     fn open_from(&mut self, path: PathBuf) {
         self.end_stroke();
         self.history.barrier();
-        match Project::load_from_file(&path) {
-            Ok(p) => {
+        // Sprint 23 (T1 / ADR-041 amendment): use the
+        // raw-TOML-aware loader so the legacy `[splat_config]`
+        // block can be parsed off disk during the migration
+        // (`Project.splat_config` no longer exists).
+        let project_root = path.parent().map(std::path::Path::to_path_buf);
+        let resolver =
+            AppSlotResolver::with_project_root(&self.slot_registry, project_root.as_deref());
+        match Project::load_from_file_reporting_migration(&path, &resolver) {
+            Ok((p, ran_migration)) => {
                 info!(
                     "opened project '{}' ({}×{} SMU, heightmap={}) from {}",
                     p.name,
@@ -5316,41 +5326,15 @@ impl App {
                 self.next_steps_dismissed = p.next_steps_dismissed;
                 self.show_next_steps = false;
 
-                // D10 / Sprint 17 (ADR-041): `App::splat_config` +
-                // `App::splat_distribution` retired. The legacy
-                // `Project.splat_config` still exists on the wire
-                // for one more sprint so pre-Sprint-14 projects can
-                // migrate; we read it once below into the migration
-                // shadow and discard.
+                // Sprint 23 (T1 / ADR-041 amendment): the loader
+                // (`load_from_file_reporting_migration`) already ran
+                // `Project::after_load_migrate` with the raw TOML, so
+                // both the layer stack and `dnts_diffuse_in_alpha`
+                // are post-migration when we read them here. The
+                // pre-Sprint-23 "shadow project" + manual migration
+                // dance retired with the field.
                 self.dnts_diffuse_in_alpha = p.dnts_diffuse_in_alpha;
-
-                // D8 / Sprint 15 (ADR-038): hoist the layer stack onto
-                // App, then run the one-shot pre-D8 migration so
-                // pre-Sprint-15 `.barmeproj` files seed a stack from
-                // their persisted `splat_config`. `after_load_migrate`
-                // is idempotent — a stack the user has touched in
-                // Sprint 17+ survives unchanged.
-                //
-                // D10 / Sprint 17 (ADR-041): the same migration also
-                // promotes the legacy `splat_config.diffuse_in_alpha`
-                // to the new per-project `dnts_diffuse_in_alpha`. Pull
-                // both fields back out of the shadow.
-                let (stack, diffuse_in_alpha, ran_migration) = {
-                    let project_root = self.current_project_path.as_ref().and_then(|p| p.parent());
-                    let resolver =
-                        AppSlotResolver::with_project_root(&self.slot_registry, project_root);
-                    let mut shadow = Project::new("__migrate__", self.map_size.smu_x);
-                    shadow.layers = p.layers;
-                    shadow.splat_config = p.splat_config;
-                    shadow.dnts_diffuse_in_alpha = self.dnts_diffuse_in_alpha;
-                    shadow.size = self.map_size;
-                    let was_empty = shadow.layers.layers.is_empty();
-                    shadow.after_load_migrate(&resolver);
-                    let ran = was_empty && !shadow.layers.layers.is_empty();
-                    (shadow.layers, shadow.dnts_diffuse_in_alpha, ran)
-                };
-                self.layer_stack = stack;
-                self.dnts_diffuse_in_alpha = diffuse_in_alpha;
+                self.layer_stack = p.layers;
                 self.migration_toast_dismissed = p.migration_toast_dismissed;
                 self.pending_migration_toast = ran_migration && !self.migration_toast_dismissed;
                 if ran_migration {
@@ -12280,15 +12264,21 @@ mod tests {
     // `SplatChannel::{R,G,B,A}.index()` pin moves to barme-core
     // (`splat.rs::tests`).
 
-    /// D10 / Sprint 17 (ADR-041) — `snapshot_project` no longer
-    /// mirrors a per-`App` `splat_config`; it always emits the
-    /// default. Round-trip of new projects sees no `splat_config`
-    /// table on disk (the field is `#[serde(skip_serializing)]`).
+    /// Sprint 23 (T1 / ADR-041 amendment) — successor to the
+    /// retired `snapshot_project_emits_default_splat_config` test.
+    /// With `SplatConfig` deleted entirely, the contract collapses
+    /// to: the snapshotted `Project` carries no splat-config
+    /// vestige, and the serialised TOML never mentions
+    /// `splat_config`.
     #[test]
-    fn snapshot_project_emits_default_splat_config() {
+    fn snapshot_project_omits_legacy_splat_config_block() {
         let app = make_test_app();
         let p = app.snapshot_project();
-        assert_eq!(p.splat_config, SplatConfig::default());
+        let s = toml::to_string(&p).unwrap();
+        assert!(
+            !s.contains("splat_config"),
+            "Sprint 23: snapshot_project must not emit splat_config; got:\n{s}"
+        );
     }
 
     /// C4 (Sprint 11): `MetalState` is now slim view-state — the spot

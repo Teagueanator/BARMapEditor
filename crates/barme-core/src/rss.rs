@@ -86,7 +86,11 @@ mod tests {
         let snap = current("baseline").expect("Linux harness reads /proc/self/status");
         // Any running test process holds at least a few MB resident.
         // The hard floor is "non-zero" — even a hello-world is > 1 MB.
-        assert!(snap.rss_bytes > 1024 * 1024, "rss should be > 1 MB; got {} B", snap.rss_bytes);
+        assert!(
+            snap.rss_bytes > 1024 * 1024,
+            "rss should be > 1 MB; got {} B",
+            snap.rss_bytes
+        );
         assert!(
             snap.vm_peak_bytes >= snap.rss_bytes,
             "VmPeak >= VmRSS by definition; got peak={} rss={}",
