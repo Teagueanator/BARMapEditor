@@ -266,6 +266,10 @@ struct App {
     /// this; [`crate::ui::tool_intro::render`] resolves on user
     /// action.
     tool_intro: crate::ui::tool_intro::ToolIntroState,
+    /// Sprint 22 / U2 — Ctrl+K command palette. The catalogue is
+    /// built at startup; the field carries the runtime open / query
+    /// / selection state.
+    command_palette: crate::ui::command_palette::CommandPalette,
     /// Sprint 19 / U1 — is the lint-panel window open this frame? Driven by
     /// the top-bar validation chip and the status-strip issue-count label.
     lint_panel_open: bool,
@@ -1355,6 +1359,7 @@ impl App {
             help_center: crate::ui::help_center::HelpCenter::default(),
             tour: crate::ui::tour::TourState::default(),
             tool_intro: crate::ui::tool_intro::ToolIntroState::default(),
+            command_palette: crate::ui::command_palette::CommandPalette::default(),
             lint_panel_open: false,
             lint_panel_was_open: false,
             lint_summary: Vec::new(),
@@ -6000,17 +6005,19 @@ impl App {
     /// `TextEdit` doesn't eat keystrokes and bounce the user out of
     /// Procgen mid-edit.
     fn handle_keyboard(&mut self, ctx: &egui::Context, action: &mut Option<FileAction>) {
-        let (key_undo, key_redo, key_save, key_save_as) = ctx.input(|i| {
+        let (key_undo, key_redo, key_save, key_save_as, key_palette) = ctx.input(|i| {
             let cmd = i.modifiers.command;
             let shift = i.modifiers.shift;
             let z = i.key_pressed(egui::Key::Z);
             let y = i.key_pressed(egui::Key::Y);
             let s = i.key_pressed(egui::Key::S);
+            let k = i.key_pressed(egui::Key::K);
             (
                 cmd && !shift && z,
                 (cmd && shift && z) || (cmd && y),
                 cmd && !shift && s,
                 cmd && shift && s,
+                cmd && k,
             )
         });
         if key_undo {
@@ -6027,6 +6034,17 @@ impl App {
             // button's hover-text cites this chord; the binding lives
             // in `cheat_sheet::PROJECT_BINDINGS` for the cheat sheet.
             *action = Some(FileAction::Save);
+        }
+        // Sprint 22 / U2 — Ctrl+K toggles the command palette. Above
+        // the `wants_keyboard_input` early-return so it still fires
+        // even while a text edit holds focus (otherwise the user
+        // would have to click out before Ctrl+K worked).
+        if key_palette {
+            if self.command_palette.open {
+                self.command_palette.hide();
+            } else {
+                self.command_palette.show();
+            }
         }
 
         if ctx.wants_keyboard_input() {
@@ -6202,6 +6220,89 @@ impl App {
             project = %self.project_name,
             "B8 next-steps hint dismissed"
         );
+    }
+
+    /// Sprint 22 / U2 — dispatch a [`crate::ui::command_palette::CommandAction`]
+    /// returned by the Ctrl+K palette. Side-effect router; mutates
+    /// App state directly or funnels through the FileAction queue
+    /// to share the menu-side code paths.
+    fn apply_command(
+        &mut self,
+        cmd: crate::ui::command_palette::CommandAction,
+        action: &mut Option<FileAction>,
+    ) {
+        use crate::ui::command_palette::CommandAction as C;
+        info!(target: "barme::command_palette", ?cmd, "applying command");
+        match cmd {
+            C::OpenWizard => *action = Some(FileAction::OpenWizard),
+            C::OpenProject => *action = Some(FileAction::Open),
+            C::SaveProject => *action = Some(FileAction::Save),
+            C::SaveAs => *action = Some(FileAction::SaveAs),
+            C::Undo => *action = Some(FileAction::Undo),
+            C::Redo => *action = Some(FileAction::Redo),
+            C::SwitchTool(accel) => {
+                if let Some(t) = Tool::ALL.iter().find(|t| t.accel() == accel) {
+                    self.set_tool(*t);
+                }
+            }
+            C::ToggleWireframe => self.wireframe_on = !self.wireframe_on,
+            C::ToggleLighting => self.lighting_on = !self.lighting_on,
+            C::ToggleGrid => self.grid_overlay_on = !self.grid_overlay_on,
+            C::ToggleBuildableOverlay => {
+                self.buildable_overlay_on = !self.buildable_overlay_on
+            }
+            C::ToggleWhatsThisMode => {
+                // Sprint 22 commit 5 wires the actual mode; the
+                // toggle is a no-op until then. Kept in the palette
+                // so the catalogue stays stable across commits.
+            }
+            C::Recenter => {
+                let (ex, ez) = self.map_size.elmo_extents();
+                self.camera = OrbitCamera::framing(ex as f32, ez as f32);
+            }
+            C::BuildAndInstall => *action = Some(FileAction::BuildAndInstall),
+            C::OpenLintPanel => self.lint_panel_open = true,
+            C::OpenBuildLog => self.build_log_open = true,
+            C::OpenMapinfoForm => self.mapinfo_form_open = true,
+            C::ApplyWaterPreset(name) => {
+                let mode = match name {
+                    "Ocean" => Some(WaterMode::Ocean),
+                    "Tropical" => Some(WaterMode::Tropical),
+                    "Acid" => Some(WaterMode::Acid),
+                    "Lava" => Some(WaterMode::Lava),
+                    "Magma" => Some(WaterMode::Magma),
+                    _ => None,
+                };
+                if let Some(m) = mode {
+                    self.water_mode = m;
+                    self.set_tool(Tool::Water);
+                }
+            }
+            C::ApplyProcgenPreset(name) => {
+                if let Some(preset) = PRESETS.iter().find(|p| p.label == name) {
+                    self.procgen_expr = preset.expression.to_string();
+                    self.procgen_domain = preset.domain;
+                    self.revalidate_procgen();
+                    self.set_tool(Tool::Procgen);
+                }
+            }
+            C::OpenHelpCenter => {
+                self.help_center.open_at(
+                    crate::ui::help_center::HelpArticleId::GettingStarted,
+                );
+            }
+            C::OpenHelpArticle(article) => self.help_center.open_at(article),
+            C::OpenCheatSheet => self.show_cheat_sheet = true,
+            C::StartTour => {
+                self.editor_config.reset_tour_completion();
+                self.tour.start();
+            }
+            C::ResetToolIntros => {
+                self.editor_config.reset_tool_intros();
+                self.editor_config.save();
+                info!(target: "barme::tool_intro", "tool intros reset by user");
+            }
+        }
     }
 
     /// Top action bar (ADR-035): brand chip + File/Edit/View/Build
@@ -10536,6 +10637,16 @@ impl eframe::App for App {
             crate::ui::save_before_build::render(ctx, &mut self.save_before_build_open);
         self.apply_save_before_build_choice(save_choice);
 
+        // Sprint 22 / U2: command palette runs BEFORE drain_action
+        // so a "Build and install" / "Save" / etc. selection in the
+        // palette flows through the same FileAction sink as the
+        // menu items + keyboard chords.
+        let palette_action =
+            crate::ui::command_palette::render(ctx, &mut self.command_palette);
+        if let crate::ui::command_palette::CommandPaletteAction::Execute(cmd) = palette_action {
+            self.apply_command(cmd, &mut action);
+        }
+
         self.drain_action(action);
         self.symmetry_popover(ctx);
 
@@ -10835,6 +10946,7 @@ mod tests {
             help_center: crate::ui::help_center::HelpCenter::default(),
             tour: crate::ui::tour::TourState::default(),
             tool_intro: crate::ui::tool_intro::ToolIntroState::default(),
+            command_palette: crate::ui::command_palette::CommandPalette::default(),
             lint_panel_open: false,
             lint_panel_was_open: false,
             lint_summary: Vec::new(),

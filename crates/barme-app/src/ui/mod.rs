@@ -7,6 +7,7 @@
 pub mod build_log;
 pub mod build_overlay;
 pub mod cheat_sheet;
+pub mod command_palette;
 pub mod help_center;
 pub mod help_text;
 pub mod icons;
