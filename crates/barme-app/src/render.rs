@@ -476,6 +476,17 @@ pub struct OffscreenTarget {
     #[allow(dead_code)]
     depth: wgpu::Texture,
     depth_view: wgpu::TextureView,
+    /// Sprint 26 / R3 / ADR-044 — pre-water snapshot of the colour RT.
+    /// `encoder.copy_texture_to_texture(color → refraction_copy)` runs
+    /// between the terrain pass and the water pass so the water shader
+    /// can sample what's below the water surface through perturbed UV.
+    /// Sample-from-and-write-to of the same texture is UB on Vulkan /
+    /// D3D12; the snapshot pattern matches BAR's `BumpWater.cpp` which
+    /// also copies the framebuffer to its `refraction` sampler before
+    /// the water pass.
+    #[allow(dead_code)]
+    refraction_copy: wgpu::Texture,
+    refraction_copy_view: wgpu::TextureView,
     /// egui-side handle registered with `Renderer::register_native_texture`
     /// so `ui.painter().image(id, rect, ...)` can sample the offscreen
     /// colour. Re-registered on every resize; the old id is freed
@@ -497,6 +508,12 @@ impl OffscreenTarget {
     /// attachment in [`TerrainCallback::prepare`]).
     pub fn depth_view(&self) -> &wgpu::TextureView {
         &self.depth_view
+    }
+
+    /// Sprint 26 / R3 — refraction-copy view (the pre-water snapshot
+    /// the water shader samples as its `refraction` source).
+    pub fn refraction_copy_view(&self) -> &wgpu::TextureView {
+        &self.refraction_copy_view
     }
 }
 
@@ -541,13 +558,17 @@ impl ReflectionTarget {
     }
 }
 
-/// Allocate the colour + depth textures for an offscreen target at the
-/// given physical pixel size. Kept private; callers go through
-/// [`ensure_offscreen`].
+/// Allocate the colour + depth + refraction-copy textures for an
+/// offscreen target at the given physical pixel size. Kept private;
+/// callers go through [`ensure_offscreen`]. Sprint 26 / R3 / ADR-044
+/// extended the tuple with the refraction-copy.
+#[allow(clippy::type_complexity)]
 fn allocate_offscreen_textures(
     device: &wgpu::Device,
     size: (u32, u32),
 ) -> (
+    wgpu::Texture,
+    wgpu::TextureView,
     wgpu::Texture,
     wgpu::TextureView,
     wgpu::Texture,
@@ -585,7 +606,32 @@ fn allocate_offscreen_textures(
         view_formats: &[],
     });
     let depth_view = depth.create_view(&wgpu::TextureViewDescriptor::default());
-    (color, color_view, depth, depth_view)
+    // Sprint 26 / R3 / ADR-044 — refraction snapshot. Same format as
+    // colour so a 1:1 `copy_texture_to_texture` works (the engine
+    // copies into `gl::CopyTexSubImage2D` for the same reason).
+    let refraction_copy = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("offscreen.refraction_copy"),
+        size: wgpu::Extent3d {
+            width: size.0,
+            height: size.1,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: OFFSCREEN_COLOR_FORMAT,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let refraction_copy_view = refraction_copy.create_view(&wgpu::TextureViewDescriptor::default());
+    (
+        color,
+        color_view,
+        depth,
+        depth_view,
+        refraction_copy,
+        refraction_copy_view,
+    )
 }
 
 /// Clamp and validate a requested offscreen size. Returns `None` when
@@ -683,9 +729,10 @@ struct LineResources {
     vertex_buf: wgpu::Buffer,
 }
 
-/// CPU mirror of the WGSL `WaterU` block (C9 / ADR-042 — Sprint 14).
-/// Field order MUST match `water.wgsl::WaterU` exactly. `bytemuck::Pod`
-/// enforces no-padding sanity at compile time.
+/// CPU mirror of the WGSL `WaterU` block (Sprint 14 / C9 / ADR-042;
+/// extended by Sprint 26 / R3 / ADR-044). Field order MUST match
+/// `water.wgsl::WaterU` exactly. `bytemuck::Pod` enforces no-padding
+/// sanity at compile time.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 pub struct WaterU {
@@ -697,18 +744,72 @@ pub struct WaterU {
     /// field is plumbed in advance so a future renderer-parity sprint
     /// can carry it forward without reshuffling the uniform.
     pub extent: [f32; 4],
+    /// `[refraction_distortion, reflection_distortion, time_s,
+    /// reflections_enabled]`. Sprint 26 / R3 / ADR-044.
+    /// - `refraction_distortion` (engine `reflectionDistortion`, Lua
+    ///   `reflectionDistortion`; default 1.0 per FINDINGS §1.5) —
+    ///   scales the screen-space UV perturbation when sampling the
+    ///   refraction copy.
+    /// - `reflection_distortion` — separate knob for the reflection
+    ///   sampler; matches BAR's `0.09 × ReflDistortion` in
+    ///   `BumpWaterFS.glsl::GetReflection`.
+    /// - `time_s` — seconds since app start, modulo 1000 to keep
+    ///   `sin(time × freq)` bounded (PITFALL #4 — long-runtime
+    ///   precision drift).
+    /// - `reflections_enabled` — 1.0 when the reflection-pass RT is
+    ///   populated this frame, 0.0 otherwise. Shader gates the
+    ///   reflection contribution on this so disabling reflections
+    ///   doesn't pollute the surface colour with the previous frame.
+    pub polish_a: [f32; 4],
+    /// `[wind_speed_x, wind_speed_z, normal_scale, foam_height]`.
+    /// Sprint 26 / R3 / ADR-044. `wind_speed_*` × time animates the
+    /// surface-normal UV; `normal_scale` ties one elmo to one normal-
+    /// map repeat; `foam_height` (elmos) is the depth band the shore-
+    /// wave foam smoothsteps across.
+    pub polish_b: [f32; 4],
+    /// `[fresnel_min, fresnel_max, fresnel_power, lava_emission]`.
+    /// Sprint 26 / R3 / ADR-044. First three are Schlick's-approx
+    /// parameters from FINDINGS §1.5; `lava_emission` is `1.0` when
+    /// `water_mode ∈ {Lava, Magma}`, gating the self-illumination
+    /// branch in the shader (commit 5).
+    pub polish_c: [f32; 4],
+    /// `[caustics_resolution, caustics_strength, perlin_start_freq,
+    /// perlin_amplitude]`. Sprint 26 / R3 / ADR-044. Defaults from
+    /// FINDINGS §1.5: 75.0 / 0.08 / 8.0 / 0.9.
+    pub polish_d: [f32; 4],
+    /// `[screen_width_px, screen_height_px, 1/width, 1/height]`. Used
+    /// by the shader to convert `clip_pos` → screen UV for the
+    /// refraction + reflection samplers. Populated from the offscreen
+    /// RT's physical size.
+    pub screen: [f32; 4],
 }
 
-/// GPU state for the Sprint-14 water plane pipeline (C9 / ADR-042).
-/// Single 4-vertex `TriangleStrip` quad rendered with depth-test on /
-/// depth-write off + `PREMULTIPLIED_ALPHA_BLENDING`. Draws AFTER the
-/// terrain pipeline (so cliffs occlude the plane through depth) and
-/// BEFORE lines/markers (so brush rings + start-pos markers still
-/// stand on top of the water).
+/// GPU state for the Sprint-14 water plane pipeline (C9 / ADR-042;
+/// extended by Sprint 26 / R3 / ADR-044). Single 4-vertex
+/// `TriangleStrip` quad rendered with depth-test on / depth-write off
+/// and `PREMULTIPLIED_ALPHA_BLENDING`. Draws after the terrain pipeline
+/// and before lines or markers — cliffs occlude the plane through
+/// depth while brush rings and start-pos markers still stand on top.
+///
+/// Sprint 26 extended the bind group from 1 uniform to 5 bindings:
+/// refraction-copy view + sampler, reflection RT view + sampler. The
+/// refraction view changes on offscreen RT resize, so the bind group
+/// gets rebuilt via [`RenderResources::rebind_water`].
 struct WaterResources {
     pipeline: wgpu::RenderPipeline,
+    bind_group_layout: wgpu::BindGroupLayout,
     bind_group: wgpu::BindGroup,
     uniform_buf: wgpu::Buffer,
+    /// Shared sampler for refraction + reflection. Linear filter,
+    /// ClampToEdge — both samplers see screen-space UV that may
+    /// over-shoot the rect under heavy distortion.
+    sampler: wgpu::Sampler,
+    /// 1×1 dummy view bound at the refraction slot until the first
+    /// [`ensure_offscreen`] runs. Same shape as the offscreen colour
+    /// view so the bind group stays valid at app start.
+    #[allow(dead_code)]
+    dummy_refraction_tex: wgpu::Texture,
+    dummy_refraction_view: wgpu::TextureView,
 }
 
 struct SplatResources {
@@ -929,6 +1030,44 @@ impl RenderResources {
             &composite_view,
             &self.composite.mask_samp,
         );
+    }
+
+    /// Sprint 26 / R3 / ADR-044 — rebuild the water bind group to point
+    /// at the current refraction-copy view (rotates per offscreen RT
+    /// resize) and the reflection-RT view (fixed size, stable across
+    /// resizes). Called from `install()` after `RenderResources` is
+    /// fully built, and from `ensure_offscreen()` after each resize.
+    pub fn rebind_water(&mut self, device: &wgpu::Device) {
+        let refraction_view = match self.offscreen.as_ref() {
+            Some(rt) => rt.refraction_copy_view(),
+            None => &self.water.dummy_refraction_view,
+        };
+        self.water.bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("water.bg.rebound"),
+            layout: &self.water.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.water.uniform_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(refraction_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&self.water.sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(self.reflection.color_view()),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::Sampler(&self.reflection.sampler),
+                },
+            ],
+        });
     }
 }
 
@@ -1630,20 +1769,23 @@ fn install_line_resources(
     }
 }
 
-/// Build the Sprint-14 water plane pipeline + bind group + uniform
-/// buffer (C9 / ADR-042). One bind-group entry (`WaterU` uniform);
-/// no vertex buffer (the shader generates the 4 quad corners from
-/// `@builtin(vertex_index)` + extent).
+/// Build the water plane pipeline + bind group + uniform buffer.
+/// Sprint 14 / C9 / ADR-042 shipped this with one uniform binding;
+/// Sprint 26 / R3 / ADR-044 extended to five bindings (uniform +
+/// refraction view + refraction sampler + reflection view + reflection
+/// sampler). The refraction view rebinds per offscreen-RT resize via
+/// [`RenderResources::rebind_water`].
 ///
 /// Pipeline state:
 /// - Depth TEST: ON (terrain cliffs occlude the plane).
 /// - Depth WRITE: OFF (translucent; CPU-side draw order owns blend
-///   ordering — terrain → water → lines → markers).
-/// - Blend: `PREMULTIPLIED_ALPHA_BLENDING` (matches marker / line
-///   pipelines; CPU pre-multiplies the surface RGBA on its way to
-///   the uniform).
-/// - Cull: `Back`. Quad winding is CW seen from above.
-fn install_water_resources(device: &wgpu::Device) -> WaterResources {
+///   ordering — terrain → copy → water → lines → markers).
+/// - Blend: `PREMULTIPLIED_ALPHA_BLENDING`. The water shader returns
+///   pre-multiplied RGBA so the blend equation reduces to
+///   `out = src + (1 - src.a) × dst`.
+/// - Cull: `None` — the underside renders too when the camera orbits
+///   below Y=0 (rare but possible).
+fn install_water_resources(device: &wgpu::Device, queue: &wgpu::Queue) -> WaterResources {
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("water.wgsl"),
         source: wgpu::ShaderSource::Wgsl(include_str!("water.wgsl").into()),
@@ -1656,27 +1798,145 @@ fn install_water_resources(device: &wgpu::Device) -> WaterResources {
         mapped_at_creation: false,
     });
 
-    let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("water.bgl"),
-        entries: &[wgpu::BindGroupLayoutEntry {
-            binding: 0,
-            visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
-            ty: wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Uniform,
-                has_dynamic_offset: false,
-                min_binding_size: None,
-            },
-            count: None,
-        }],
+    // Shared linear / ClampToEdge sampler for refraction + reflection.
+    // Both sample screen-space UV that may overshoot under heavy
+    // perturbation; the clamp stops sampling garbage from outside the
+    // RT.
+    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("water.samp"),
+        address_mode_u: wgpu::AddressMode::ClampToEdge,
+        address_mode_v: wgpu::AddressMode::ClampToEdge,
+        address_mode_w: wgpu::AddressMode::ClampToEdge,
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        mipmap_filter: wgpu::FilterMode::Linear,
+        ..Default::default()
     });
 
+    // 1×1 dummy refraction view bound until ensure_offscreen runs.
+    // Format matches the real refraction copy so the bind group stays
+    // valid the first time the shader executes (e.g. during a parity-
+    // fixture preview before the central viewport sizes the RT).
+    let dummy_refraction_tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("water.refraction.dummy"),
+        size: wgpu::Extent3d {
+            width: 1,
+            height: 1,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: OFFSCREEN_COLOR_FORMAT,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &dummy_refraction_tex,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        &[0u8, 0, 0, 255],
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(4),
+            rows_per_image: Some(1),
+        },
+        wgpu::Extent3d {
+            width: 1,
+            height: 1,
+            depth_or_array_layers: 1,
+        },
+    );
+    let dummy_refraction_view =
+        dummy_refraction_tex.create_view(&wgpu::TextureViewDescriptor::default());
+
+    let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("water.bgl"),
+        entries: &[
+            // 0: WaterU uniform
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            // 1: refraction-copy view (pre-water snapshot of offscreen
+            // colour). Sampled by perturbed screen-space UV.
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            // 2: refraction sampler (shared linear/clamp).
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+            // 3: reflection-RT view (terrain mirrored through y=0).
+            wgpu::BindGroupLayoutEntry {
+                binding: 3,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            // 4: reflection sampler.
+            wgpu::BindGroupLayoutEntry {
+                binding: 4,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+        ],
+    });
+
+    // First-frame bind group binds the dummy refraction view + a
+    // dummy reflection view (the real reflection RT is built later in
+    // `install` — we'd race a circular dependency if we required it
+    // here). `rebind_water` swaps both for the real views as soon as
+    // `install` finishes wiring up `RenderResources`.
     let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("water.bg"),
         layout: &bgl,
-        entries: &[wgpu::BindGroupEntry {
-            binding: 0,
-            resource: uniform_buf.as_entire_binding(),
-        }],
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: uniform_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(&dummy_refraction_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::Sampler(&sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::TextureView(&dummy_refraction_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: wgpu::BindingResource::Sampler(&sampler),
+            },
+        ],
     });
 
     let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -1696,10 +1956,6 @@ fn install_water_resources(device: &wgpu::Device) -> WaterResources {
         },
         primitive: wgpu::PrimitiveState {
             topology: wgpu::PrimitiveTopology::TriangleStrip,
-            // No culling — viewing from below the water plane (rare,
-            // but possible during orbit) should still show the
-            // underside. The marker pipeline takes the same call for
-            // camera-aligned billboards (PrimitiveState L793).
             cull_mode: None,
             ..Default::default()
         },
@@ -1727,8 +1983,12 @@ fn install_water_resources(device: &wgpu::Device) -> WaterResources {
 
     WaterResources {
         pipeline,
+        bind_group_layout: bgl,
         bind_group,
         uniform_buf,
+        sampler,
+        dummy_refraction_tex,
+        dummy_refraction_view,
     }
 }
 
@@ -2183,7 +2443,7 @@ pub fn install(render_state: &egui_wgpu::RenderState) {
 
     let marker = install_marker_resources(device);
     let line = install_line_resources(device, &marker.uniform_buf);
-    let water = install_water_resources(device);
+    let water = install_water_resources(device, queue);
 
     // ─── Sprint 26 / R3 / ADR-044 — reflection pass resources ──────
     let reflection = install_reflection_target(device);
@@ -2244,11 +2504,9 @@ pub fn install(render_state: &egui_wgpu::RenderState) {
         cache: None,
     });
 
-    render_state
-        .renderer
-        .write()
-        .callback_resources
-        .insert(RenderResources {
+    {
+        let mut renderer = render_state.renderer.write();
+        renderer.callback_resources.insert(RenderResources {
             pipeline,
             bind_group_layout: bgl,
             bind_group,
@@ -2268,6 +2526,16 @@ pub fn install(render_state: &egui_wgpu::RenderState) {
             reflection_uniform_buf,
             reflection_bind_group,
         });
+        // Sprint 26 / R3 / ADR-044 — finalize the water bind group now
+        // that the reflection RT is owned by RenderResources. The
+        // initial bind group in `install_water_resources` binds the 1×1
+        // dummy at both refraction + reflection slots (a circular
+        // dependency on RenderResources at construction time); this
+        // call swaps the reflection-RT view in for the dummy.
+        if let Some(res) = renderer.callback_resources.get_mut::<RenderResources>() {
+            res.rebind_water(device);
+        }
+    }
 }
 
 /// Allocate/refresh the heightmap texture for the given CPU heightmap and
@@ -2413,7 +2681,8 @@ pub fn ensure_offscreen(
                 "offscreen RT size clamped (PITFALLS §1)"
             );
         }
-        let (color, color_view, depth, depth_view) = allocate_offscreen_textures(&device, size);
+        let (color, color_view, depth, depth_view, refraction_copy, refraction_copy_view) =
+            allocate_offscreen_textures(&device, size);
         // Register the colour view as an egui-side texture so the
         // painter can sample it. Linear filter so any DPI / clamp-driven
         // upscale doesn't look pixellated.
@@ -2439,9 +2708,16 @@ pub fn ensure_offscreen(
             color_view,
             depth,
             depth_view,
+            refraction_copy,
+            refraction_copy_view,
             egui_texture_id,
             size,
         });
+        // Sprint 26 / R3 / ADR-044 — the water bind group references
+        // the refraction-copy view + reflection RT view; both get
+        // recreated on RT resize. Re-bind the water resources so the
+        // sampler points at the fresh views.
+        res.rebind_water(&device);
         return Some(egui_texture_id);
     }
 
@@ -3421,10 +3697,9 @@ pub fn update_splat_uniforms(render_state: &egui_wgpu::RenderState, su: &SplatUn
     res.write_splat_uniforms(&render_state.queue, su);
 }
 
-/// Sprint-14 / C9 / ADR-042 — water plane draw payload. `None` skips
-/// the water pipeline entirely (matches `WaterMode::None`). When
-/// `Some`, the pre-multiplied RGBA + alpha scale drive the quad's
-/// fragment output; `extent_x` / `extent_z` size the quad.
+/// Water plane draw payload — Sprint 14 / C9 / ADR-042 (extended by
+/// Sprint 26 / R3 / ADR-044). `None` skips the water pipeline entirely
+/// (matches `WaterMode::None`).
 #[derive(Debug, Clone, Copy)]
 pub struct WaterDraw {
     /// Pre-multiplied RGBA — `(r·a, g·a, b·a, a)`.
@@ -3436,6 +3711,17 @@ pub struct WaterDraw {
     /// by this scalar — pre-multiplied scaling preserves the
     /// `(kα·c, kα·c, kα·c, kα)` invariant.
     pub alpha_scale: f32,
+    /// Sprint 26 / R3 / ADR-044 — polish uniform group A:
+    /// `[refraction_distortion, reflection_distortion, time_s,
+    /// reflections_enabled]`. See WGSL `WaterU` for semantics.
+    pub polish_a: [f32; 4],
+    /// `[wind_speed_x, wind_speed_z, normal_scale, foam_height]`.
+    pub polish_b: [f32; 4],
+    /// `[fresnel_min, fresnel_max, fresnel_power, lava_emission]`.
+    pub polish_c: [f32; 4],
+    /// `[caustics_resolution, caustics_strength, perlin_start_freq,
+    /// perlin_amplitude]`.
+    pub polish_d: [f32; 4],
 }
 
 pub struct TerrainCallback {
@@ -3734,6 +4020,14 @@ impl egui_wgpu::CallbackTrait for TerrainCallback {
             trace!("reflection pass encoded");
         }
 
+        // ─── PASS 1: terrain into offscreen.color ──────────────────
+        //
+        // Sprint 14 ran terrain + water + lines + markers in a single
+        // render pass; Sprint 26 splits the pass so the water shader
+        // can sample the pre-water colour via `refraction_copy`
+        // (sample-from-and-write-to of the same texture is UB on
+        // Vulkan / D3D12). Order: terrain → END → copy → water + lines
+        // + markers.
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("offscreen.terrain"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -3761,11 +4055,65 @@ impl egui_wgpu::CallbackTrait for TerrainCallback {
         pass.set_bind_group(0, &res.bind_group, &[]);
         pass.set_index_buffer(grid.index_buf.slice(..), wgpu::IndexFormat::Uint32);
         pass.draw_indexed(0..grid.index_count, 0, 0..1);
+        drop(pass);
 
-        // Sprint-14 / C9 — Water plane. Depth-tests against terrain
-        // (cliffs above Y=0 occlude the plane); doesn't write depth
-        // (translucent, blend order owned CPU-side: terrain → water →
-        // lines → markers).
+        // ─── COPY: offscreen.color → refraction_copy ───────────────
+        //
+        // Only needed when a water plane will draw this frame; the
+        // copy cost is one full-RT memcpy on the GPU (~0.1 ms at
+        // 2048²) which we skip when water is off.
+        if self.water.is_some() {
+            encoder.copy_texture_to_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &offscreen.color,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyTextureInfo {
+                    texture: &offscreen.refraction_copy,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d {
+                    width: offscreen.size.0,
+                    height: offscreen.size.1,
+                    depth_or_array_layers: 1,
+                },
+            );
+            trace!("refraction copy encoded");
+        }
+
+        // ─── PASS 2: water + lines + markers (load existing colour + depth)
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("offscreen.overlay"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: offscreen.color_view(),
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+                depth_slice: None,
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: offscreen.depth_view(),
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+
+        // Sprint-14 / C9 — Water plane (Sprint 26 — sampling refraction
+        // + reflection). Depth-tests against terrain (cliffs above Y=0
+        // occlude the plane); doesn't write depth (translucent, blend
+        // order owned CPU-side: terrain → copy → water → lines →
+        // markers).
         if let Some(w) = &self.water {
             queue.write_buffer(
                 &res.water.uniform_buf,
@@ -3774,6 +4122,16 @@ impl egui_wgpu::CallbackTrait for TerrainCallback {
                     view_proj: self.view_proj,
                     surface_rgba: w.surface_rgba,
                     extent: [w.extent_x, w.extent_z, 0.0, w.alpha_scale],
+                    polish_a: w.polish_a,
+                    polish_b: w.polish_b,
+                    polish_c: w.polish_c,
+                    polish_d: w.polish_d,
+                    screen: [
+                        offscreen.size.0 as f32,
+                        offscreen.size.1 as f32,
+                        1.0 / offscreen.size.0.max(1) as f32,
+                        1.0 / offscreen.size.1.max(1) as f32,
+                    ],
                 }),
             );
             pass.set_pipeline(&res.water.pipeline);
@@ -4039,6 +4397,26 @@ mod tests {
         }
     }
 
+    /// Sprint 26 / R3 / ADR-044 — same naga validation for water.wgsl.
+    /// Catches WGSL drift across the polish work (refraction/reflection
+    /// sampling, perlin, fresnel, foam, caustics, lava emission) at
+    /// `cargo test` time.
+    #[test]
+    fn water_wgsl_parses_and_validates() {
+        use wgpu::naga::front::wgsl;
+        use wgpu::naga::valid::{Capabilities, ValidationFlags, Validator};
+
+        let src = include_str!("water.wgsl");
+        let module = match wgsl::parse_str(src) {
+            Ok(m) => m,
+            Err(e) => panic!("water.wgsl parse failed:\n{}", e.emit_to_string(src)),
+        };
+        let mut validator = Validator::new(ValidationFlags::all(), Capabilities::all());
+        if let Err(e) = validator.validate(&module) {
+            panic!("water.wgsl validate failed:\n{e:?}");
+        }
+    }
+
     // ---- Phase 1 (Sprint 13 / ADR-037): offscreen RT size resolution ----
 
     #[test]
@@ -4252,18 +4630,20 @@ mod tests {
     /// uniform write at `prepare()` time uploads garbage data into
     /// the shader's bindings.
     ///
-    /// Expected layout:
+    /// Expected layout (Sprint 14 baseline + Sprint 26 polish):
     /// - `view_proj`: 64 B (4×4 f32)
     /// - `surface_rgba`: 16 B (f32×4)
     /// - `extent`: 16 B (f32×4)
+    /// - `polish_a / b / c / d`: 4 × 16 B = 64 B (Sprint 26 / R3)
+    /// - `screen`: 16 B (Sprint 26 / R3)
     ///
-    /// Total: 96 B.
+    /// Total: 176 B.
     #[test]
     fn water_uniform_size_matches_wgsl_layout() {
         assert_eq!(
             std::mem::size_of::<WaterU>(),
-            96,
-            "WaterU layout drift — water.wgsl expects 96 bytes"
+            176,
+            "WaterU layout drift — water.wgsl expects 176 bytes (Sprint 26 polish layout)"
         );
     }
 
@@ -4376,8 +4756,8 @@ mod tests {
     }
 
     /// `WaterU` is `bytemuck::Pod`; constructing one and round-tripping
-    /// it through `bytemuck::bytes_of` should produce 96 bytes whose
-    /// f32 view matches the original.
+    /// it through `bytemuck::bytes_of` produces a 176-byte slice whose
+    /// f32 view matches the original (Sprint 26 / R3 polish layout).
     #[test]
     fn water_uniform_round_trips_through_pod() {
         let u = WaterU {
@@ -4389,19 +4769,27 @@ mod tests {
             ],
             surface_rgba: [0.5, 0.4, 0.3, 0.6],
             extent: [8192.0, 8192.0, 0.0, 1.0],
+            polish_a: [1.0, 1.0, 12.5, 1.0],
+            polish_b: [0.05, 0.035, 0.0078, 8.0],
+            polish_c: [0.2, 0.8, 4.0, 0.0],
+            polish_d: [75.0, 0.08, 8.0, 0.9],
+            screen: [2048.0, 2048.0, 0.000488, 0.000488],
         };
         let bytes = bytemuck::bytes_of(&u);
-        assert_eq!(bytes.len(), 96);
+        assert_eq!(bytes.len(), 176);
         let view: &[f32] = bytemuck::cast_slice(bytes);
-        // Cell [3][3] of view_proj is at offset 15 (4*4 - 1 = 15
-        // f32 entries before extent starts).
+        // Cell [3][3] of view_proj is at offset 15.
         assert_eq!(view[15], 1.0);
         // surface_rgba starts at offset 16.
         assert_eq!(view[16], 0.5);
         assert_eq!(view[19], 0.6);
         // extent starts at offset 20.
         assert_eq!(view[20], 8192.0);
-        assert_eq!(view[22], 0.0);
-        assert_eq!(view[23], 1.0);
+        // polish_a starts at offset 24.
+        assert_eq!(view[26], 12.5);
+        // polish_d starts at offset 36 (24 + 3 × 4 = 36).
+        assert_eq!(view[36], 75.0);
+        // screen starts at offset 40 (36 + 4 = 40).
+        assert_eq!(view[40], 2048.0);
     }
 }

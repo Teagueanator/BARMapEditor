@@ -2485,19 +2485,80 @@ impl App {
         // shouldn't dominate the canvas while the user is sculpting
         // or painting. At full opacity only when `Tool::Water` is
         // active; otherwise 0.5× so the plane stays visible but
-        // doesn't take over. Pattern mirrors the marker / line
-        // cross-tool ghosts in `central()`.
+        // doesn't take over.
         let alpha_scale = if matches!(self.tool, Tool::Water) {
             1.0
         } else {
             0.5
         };
+
+        // Sprint 26 / R3 / ADR-044 — polish uniforms. Each value pulls
+        // through the WaterBlock override, falling back to the
+        // engine's documented default (FINDINGS §1.5). The values
+        // packed into polish_b/c/d feed shader effects that land
+        // commit-by-commit through this sprint; populating them all
+        // here means later commits add only WGSL changes, no CPU
+        // plumbing.
+        let refr_distort = merged.reflection_distortion.unwrap_or(1.0);
+        // Engine has one `reflectionDistortion` Lua key driving both
+        // sampling paths in `BumpWaterFS.glsl`; we keep a single dial
+        // for now and surface a second knob in commit 6 if needed.
+        let refl_distort = refr_distort;
+        let time_s = self.water_time_seconds();
+        let reflections_on = if self.water_reflections { 1.0 } else { 0.0 };
+
+        // Wind direction — engine reads `mapinfo.water.windSpeed`
+        // (FINDINGS §1.5). Sprint 26 splits into X and Z magnitudes;
+        // Sprint 28 ties direction to atmosphere wind.
+        let wind = 0.05; // engine default 1.0 scaled to "elmos per second" by 20×
+        let normal_scale = 1.0 / 128.0; // 1 normal-map repeat per 128 elmos
+        let foam_height = 8.0; // elmos band over which shore foam fades
+
+        let fresnel_min = merged.fresnel_min.unwrap_or(0.2);
+        let fresnel_max = merged.fresnel_max.unwrap_or(0.8);
+        let fresnel_power = merged.fresnel_power.unwrap_or(4.0);
+        // Lava emission gate — 1.0 for Lava/Magma so the shader's
+        // self-illumination branch (commit 5) lights up; 0.0 for
+        // every other preset so the same shader code path is dead.
+        let lava_emission = if matches!(self.water_mode, WaterMode::Lava | WaterMode::Magma) {
+            1.0
+        } else {
+            0.0
+        };
+
+        // Caustics + perlin — FINDINGS §1.5 defaults.
+        let caustics_res = 75.0;
+        let caustics_str = 0.08;
+        let perlin_start = merged.perlin_start_freq.unwrap_or(8.0);
+        let perlin_amp = merged.perlin_amplitude.unwrap_or(0.9);
+
         Some(WaterDraw {
             surface_rgba,
             extent_x,
             extent_z,
             alpha_scale,
+            polish_a: [refr_distort, refl_distort, time_s, reflections_on],
+            polish_b: [wind, wind * 0.7, normal_scale, foam_height],
+            polish_c: [fresnel_min, fresnel_max, fresnel_power, lava_emission],
+            polish_d: [caustics_res, caustics_str, perlin_start, perlin_amp],
         })
+    }
+
+    /// Sprint 26 / R3 — bounded-modulo time accumulator for the water
+    /// shader's animated UVs. Without this, `sin(time_s × freq)` loses
+    /// precision after ~24 hours of continuous runtime (PITFALL #4
+    /// from the sprint prompt). Reading the wall clock is cheap; the
+    /// modulo keeps the value bounded so the shader sees a stable
+    /// periodic input.
+    fn water_time_seconds(&self) -> f32 {
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+        // 1000 s ≈ 16 min — well above any visible animation period
+        // (caustics ~3 Hz; perlin ~0.5 Hz). Long enough to avoid
+        // visible discontinuities at the wrap.
+        (secs % 1000.0) as f32
     }
 
     /// D9 / Sprint 16 (ADR-039) — build the per-frame composite
