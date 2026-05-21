@@ -57,6 +57,16 @@ SRS.md         the canonical spec — do not edit casually
 6. **Prefer small, single-purpose crates over a monolith.** Workspace already
    set up — add new crates rather than growing existing ones.
 
+## Git workflow
+
+- Remote `origin` is `git@github.com:Teagueanator/BARMapEditor.git` (private,
+  used as a backup target during refactor-heavy sprints).
+- Commit messages are terse — one-line subject, short body only if needed.
+  **Never** add `Co-Authored-By: Claude` or "Generated with Claude Code"
+  trailers. Plain author commit.
+- After a successful commit, push with plain `git push` (no `--force` unless
+  explicitly asked). PRs / other `gh` commands remain opt-in.
+
 ## Build / run
 
 ```bash
