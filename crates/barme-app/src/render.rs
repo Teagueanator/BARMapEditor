@@ -447,6 +447,82 @@ fn default_ground_specular() -> [f32; 4] {
     [0.1, 0.1, 0.1, 100.0]
 }
 
+/// CPU mirror of the WGSL `AtmosphereU` block (Sprint 28 / R2 /
+/// ADR-040). Field order MUST match `terrain.wgsl::AtmosphereU`
+/// exactly. `bytemuck::Pod` enforces no-padding sanity at compile time;
+/// the [`atmosphere_uniforms_size_matches_wgsl_layout`] test pins the
+/// total byte count so a future field-shape drift fails fast instead
+/// of silently misaligning the GPU read.
+///
+/// Field semantics — fed from `mapinfo.atmosphere` + `mapinfo.lighting`
+/// by `App::atmosphere_uniforms_for_render()`:
+///
+/// - `sun_color`: `lighting.sun_color` (NOT `atmosphere.sun_color`;
+///   the atmosphere block's `sun_color` is the *disc* tint per
+///   FINDINGS §1.4 — separate role). `.w` = intensity scalar
+///   (unused, reserved for HDR pass).
+/// - `sky_color`: `atmosphere.sky_color`. `.w` = ambient strength
+///   (reserved).
+/// - `fog_color`: `atmosphere.fog_color`. `.w` = fog *density*
+///   `[0, 1]` — multiplier on the smoothstep result so a low-density
+///   fog still blends visibly toward fog_color without fully
+///   replacing terrain at the far plane.
+/// - `fog_start_end`: `[fog_start, fog_end, height_falloff, _]`. The
+///   first two are normalised view-distance fractions per FINDINGS
+///   §1.4 (`fogStart 0.1`, `fogEnd 1.0` default); `height_falloff`
+///   controls the exponential drop-off (atmospheres thin with
+///   altitude). `_` reserved.
+/// - `cloud_color`: `atmosphere.cloud_color`. `.w` = `cloud_density`
+///   `[0, 1]` (flat-layer cloud blend, no volumetrics this sprint).
+/// - `wind`: `[wind_x, wind_z, wind_speed, _]`. App-side derives
+///   deterministic per-frame wind from `min_wind`/`max_wind` via
+///   a `sin(time × 0.1) + cos(time × 0.07)` ramp (pitfall #7 — no
+///   seed-controlled noise; reproducible fixture output).
+/// - `sky_axis_angle`: `atmosphere.sky_axis_angle` per FINDINGS §1.3
+///   / PITFALL §12. `xyz` = rotation axis, `.w` = radians.
+///   Reserved for the deferred-cubemap sprint; current shader
+///   ignores it (no skybox bind yet).
+/// - `flags`: `[has_skybox, sun_disc_size, _, _]`. `has_skybox` stays
+///   `0` for Sprint 28 (cubemap deferred); `sun_disc_size` reserved
+///   for a future sun-disc rendering pass.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable)]
+pub struct AtmosphereUniforms {
+    pub sun_color: [f32; 4],
+    pub sky_color: [f32; 4],
+    pub fog_color: [f32; 4],
+    pub fog_start_end: [f32; 4],
+    pub cloud_color: [f32; 4],
+    pub wind: [f32; 4],
+    pub sky_axis_angle: [f32; 4],
+    pub flags: [u32; 4],
+}
+
+impl Default for AtmosphereUniforms {
+    /// Matches `MapInfo::bar_default().atmosphere` (FINDINGS §1.4)
+    /// plus `lighting.ground_diffuse_color` for the per-frame sun
+    /// tint. Wind defaults to a mid-band value (`(5 + 25) / 2 / 20 ≈
+    /// 0.75 elmos/s` — the same magnitude order the Sprint 26 stub
+    /// used so a project without a per-frame `prepare()` write sees
+    /// a sensible animation).
+    fn default() -> Self {
+        Self {
+            sun_color: [1.0, 1.0, 1.0, 1.0],
+            sky_color: [0.1, 0.15, 0.7, 1.0],
+            fog_color: [0.7, 0.7, 0.8, 0.6],
+            // Engine defaults per `MapInfo.cpp` ReadAtmosphere — fog
+            // distances are normalised (0..1 of far-plane), height
+            // falloff `0.01` gives a gentle altitude-thinning curve
+            // matching BAR's `Atmosphere.cpp::fogAltFactor`.
+            fog_start_end: [0.1, 1.0, 0.01, 0.0],
+            cloud_color: [1.0, 1.0, 1.0, 0.5],
+            wind: [0.05, 0.035, 15.0, 0.0],
+            sky_axis_angle: [0.0, 0.0, 1.0, 0.0],
+            flags: [0, 0, 0, 0],
+        }
+    }
+}
+
 struct Grid {
     index_buf: wgpu::Buffer,
     index_count: u32,
@@ -968,6 +1044,15 @@ pub struct RenderResources {
     /// specular) shares with the main bind group. Rebuilt by
     /// [`Self::rebind`] alongside the main one.
     reflection_bind_group: wgpu::BindGroup,
+    /// Sprint 28 / R2 / ADR-040 — atmosphere + fog uniform buffer.
+    /// Sized to `AtmosphereUniforms` (128 B). Lifetime: created in
+    /// [`install`], outlives the bind group it's bound into (the
+    /// bind group holds an entire-buffer binding handle, not a
+    /// lifetime borrow). The reflection bind group binds the SAME
+    /// buffer — atmosphere state is identical between the main and
+    /// reflection passes (the planar mirror only swaps view-proj,
+    /// not lighting).
+    atmosphere_uniform_buf: wgpu::Buffer,
 }
 
 impl RenderResources {
@@ -981,6 +1066,14 @@ impl RenderResources {
 
     fn write_composite_uniforms(&self, queue: &wgpu::Queue, cu: &CompositeU) {
         queue.write_buffer(&self.composite.uniform_buf, 0, bytemuck::bytes_of(cu));
+    }
+
+    /// Sprint 28 / R2 / ADR-040 — push the per-frame atmosphere block
+    /// (sun colour, sky colour, fog parameters, deterministic wind,
+    /// cloud colour) to the uniform buffer bound at terrain group 0
+    /// binding 13.
+    fn write_atmosphere_uniforms(&self, queue: &wgpu::Queue, au: &AtmosphereUniforms) {
+        queue.write_buffer(&self.atmosphere_uniform_buf, 0, bytemuck::bytes_of(au));
     }
 
     /// View bound at the terrain bind group's composite slot. Falls
@@ -1021,10 +1114,13 @@ impl RenderResources {
             &self.splat,
             &composite_view,
             &self.composite.mask_samp,
+            &self.atmosphere_uniform_buf,
         );
         // Sprint 26 / R3 / ADR-044 — reflection bind group binds the
         // SAME views/samplers at every slot, with only the uniform
-        // buffer swapped for the mirrored-view one.
+        // buffer swapped for the mirrored-view one. Sprint 28 / R2 —
+        // atmosphere uniform is shared (lighting + fog don't change
+        // between the main and mirror passes).
         self.reflection_bind_group = make_bind_group(
             device,
             &self.bind_group_layout,
@@ -1033,6 +1129,7 @@ impl RenderResources {
             &self.splat,
             &composite_view,
             &self.composite.mask_samp,
+            &self.atmosphere_uniform_buf,
         );
     }
 
@@ -1245,10 +1342,25 @@ fn bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
                 ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                 count: None,
             },
+            // 13: atmosphere uniforms (Sprint 28 / R2 / ADR-040). Sun
+            // colour, sky colour, fog parameters, wind state, cloud
+            // tint. Fragment-only visibility — only the fragment stage
+            // composes fog + sun ramp; the vertex stage stays oblivious.
+            wgpu::BindGroupLayoutEntry {
+                binding: 13,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
         ],
     })
 }
 
+#[allow(clippy::too_many_arguments)] // Mirrors the 14-binding terrain bind group; trimming would just hide layout coupling.
 fn make_bind_group(
     device: &wgpu::Device,
     bgl: &wgpu::BindGroupLayout,
@@ -1257,6 +1369,7 @@ fn make_bind_group(
     splat: &SplatResources,
     composite_view: &wgpu::TextureView,
     composite_samp: &wgpu::Sampler,
+    atmosphere_uniform_buf: &wgpu::Buffer,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("terrain.bg"),
@@ -1313,6 +1426,11 @@ fn make_bind_group(
             wgpu::BindGroupEntry {
                 binding: 12,
                 resource: wgpu::BindingResource::Sampler(&splat.specular_samp),
+            },
+            // Sprint 28 / R2 / ADR-040 — atmosphere block.
+            wgpu::BindGroupEntry {
+                binding: 13,
+                resource: atmosphere_uniform_buf.as_entire_binding(),
             },
         ],
     })
@@ -2383,6 +2501,25 @@ pub fn install(render_state: &egui_wgpu::RenderState) {
 
     let splat = install_splat_resources(device, queue);
     let composite = install_composite_resources(device, queue);
+
+    // Sprint 28 / R2 / ADR-040 — atmosphere uniform buffer. Pre-filled
+    // with `AtmosphereUniforms::default()` (BAR-default atmosphere)
+    // so a fresh app start renders fog + sky-coloured background even
+    // before the first `App::atmosphere_uniforms_for_render()` call
+    // lands a per-project value. Matches the same fail-safe pattern
+    // `install_splat_resources` uses for `SplatUniforms`.
+    let atmosphere_uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("terrain.atmosphere.uniforms"),
+        size: std::mem::size_of::<AtmosphereUniforms>() as u64,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    queue.write_buffer(
+        &atmosphere_uniform_buf,
+        0,
+        bytemuck::bytes_of(&AtmosphereUniforms::default()),
+    );
+
     let bind_group = make_bind_group(
         device,
         &bgl,
@@ -2391,6 +2528,7 @@ pub fn install(render_state: &egui_wgpu::RenderState) {
         &splat,
         &dummy_composite_view,
         &composite.mask_samp,
+        &atmosphere_uniform_buf,
     );
 
     let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -2465,6 +2603,7 @@ pub fn install(render_state: &egui_wgpu::RenderState) {
         &splat,
         &dummy_composite_view,
         &composite.mask_samp,
+        &atmosphere_uniform_buf,
     );
     let pipeline_reflection = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("terrain.pipeline.reflection"),
@@ -2529,6 +2668,7 @@ pub fn install(render_state: &egui_wgpu::RenderState) {
             pipeline_reflection,
             reflection_uniform_buf,
             reflection_bind_group,
+            atmosphere_uniform_buf,
         });
         // Sprint 26 / R3 / ADR-044 — finalize the water bind group now
         // that the reflection RT is owned by RenderResources. The
@@ -3778,6 +3918,12 @@ pub struct TerrainCallback {
     /// `Project.water_mode == WaterMode::None` (no water sub-table in
     /// the emitted mapinfo, no plane in the preview).
     pub water: Option<WaterDraw>,
+    /// Sprint 28 / R2 / ADR-040 — atmosphere block (sun, sky, fog,
+    /// wind, cloud tint). Composed on top of the Sprint 25 terrain
+    /// shader output. `prepare()` writes this into the atmosphere
+    /// uniform buffer; the fragment stage reads from group 0
+    /// binding 13.
+    pub atmosphere: AtmosphereUniforms,
 }
 
 impl TerrainCallback {
@@ -3796,6 +3942,7 @@ impl TerrainCallback {
         water: Option<WaterDraw>,
         composite: Option<CompositeU>,
         reflections_enabled: bool,
+        atmosphere: AtmosphereUniforms,
     ) -> Self {
         let aspect = (rect.width() / rect.height()).max(0.0001);
         let eye = camera.eye();
@@ -3816,6 +3963,7 @@ impl TerrainCallback {
             line_vertices,
             water,
             composite,
+            atmosphere,
         }
     }
 }
@@ -3880,6 +4028,12 @@ impl egui_wgpu::CallbackTrait for TerrainCallback {
             1.0,
         ];
         res.write_splat_uniforms(queue, &splat);
+
+        // Sprint 28 / R2 / ADR-040 — atmosphere block. Same buffer is
+        // bound by both the main and reflection bind groups (fog +
+        // sky + sun colour don't change between the passes), so a
+        // single write per frame covers both.
+        res.write_atmosphere_uniforms(queue, &self.atmosphere);
 
         // Step 1d — Sprint 16 / D9 / ADR-039 — encode the layered
         // composite pass into the composite RT. The terrain pass that
@@ -4345,6 +4499,57 @@ mod tests {
             std::mem::size_of::<SplatUniforms>(),
             128,
             "SplatUniforms layout drift — terrain.wgsl expects 128 bytes"
+        );
+    }
+
+    /// Sprint 28 / R2 / ADR-040 — `AtmosphereUniforms` MUST match the
+    /// WGSL `AtmosphereU` block layout exactly, otherwise the per-frame
+    /// uniform write uploads garbage into the shader's binding 13.
+    ///
+    /// Expected layout (8 × `vec4` = 8 × 16 B = 128 B):
+    /// - `sun_color`:      16 B
+    /// - `sky_color`:      16 B
+    /// - `fog_color`:      16 B
+    /// - `fog_start_end`:  16 B
+    /// - `cloud_color`:    16 B
+    /// - `wind`:           16 B
+    /// - `sky_axis_angle`: 16 B
+    /// - `flags`:          16 B (vec4<u32>)
+    #[test]
+    fn atmosphere_uniforms_size_matches_wgsl_layout() {
+        assert_eq!(
+            std::mem::size_of::<AtmosphereUniforms>(),
+            128,
+            "AtmosphereUniforms layout drift — terrain.wgsl expects 128 bytes"
+        );
+    }
+
+    /// Sprint 28 / R2 / ADR-040 — verify the GPU defaults match the
+    /// canonical `MapInfo::bar_default().atmosphere` block. A future
+    /// schema drift (e.g. someone bumping `fog_start` in `bar_default`
+    /// without updating the GPU fallback) fails this test rather than
+    /// shipping silently-divergent fog math.
+    #[test]
+    fn atmosphere_uniforms_default_matches_bar_default() {
+        use barme_core::mapinfo_schema::MapInfo;
+        let info = MapInfo::bar_default();
+        let au = AtmosphereUniforms::default();
+        // fog_start / fog_end / fog_color
+        assert!((au.fog_start_end[0] - info.atmosphere.fog_start.unwrap_or(0.1)).abs() < 1e-6);
+        assert!((au.fog_start_end[1] - info.atmosphere.fog_end.unwrap_or(1.0)).abs() < 1e-6);
+        let fog = info.atmosphere.fog_color.unwrap_or([0.7, 0.7, 0.8]);
+        assert!((au.fog_color[0] - fog[0]).abs() < 1e-6);
+        assert!((au.fog_color[1] - fog[1]).abs() < 1e-6);
+        assert!((au.fog_color[2] - fog[2]).abs() < 1e-6);
+        // sky_color
+        let sky = info.atmosphere.sky_color.unwrap_or([0.1, 0.15, 0.7]);
+        assert!((au.sky_color[0] - sky[0]).abs() < 1e-6);
+        assert!((au.sky_color[1] - sky[1]).abs() < 1e-6);
+        assert!((au.sky_color[2] - sky[2]).abs() < 1e-6);
+        // Skybox-deferred: has_skybox flag stays 0.
+        assert_eq!(
+            au.flags[0], 0,
+            "skybox deferred per ADR-040; flag must be 0"
         );
     }
 

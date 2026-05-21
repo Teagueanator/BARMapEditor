@@ -30,7 +30,8 @@ use eframe::egui_wgpu;
 use tracing::{error, info, trace, warn};
 
 use crate::render::{
-    CompositeLayerU, CompositeU, OrbitCamera, SplatUniforms, TerrainCallback, WaterDraw,
+    AtmosphereUniforms, CompositeLayerU, CompositeU, OrbitCamera, SplatUniforms, TerrainCallback,
+    WaterDraw,
 };
 
 /// wgpu/vulkan/naga emit a lot of INFO-level chatter at startup (adapter
@@ -2452,6 +2453,85 @@ impl App {
             // Camera eye lands at prepare() time via TerrainCallback —
             // see `render::TerrainCallback::prepare`.
             camera_pos: base.camera_pos,
+        }
+    }
+
+    /// Sprint 28 / R2 / ADR-040 — derive the per-frame `AtmosphereUniforms`
+    /// block from the project's MapInfo (atmosphere + lighting subtables).
+    /// Used by the terrain shader for fog + sky + sun-angle ramp + cloud
+    /// tint, and by the water shader (commit 5) for wind direction.
+    ///
+    /// Field provenance:
+    /// - `sun_color` ← `lighting.ground_diffuse_color` — the sun's
+    ///   contribution to ground shading. `atmosphere.sun_color` is the
+    ///   *sun disc* tint per FINDINGS §1.4 (a separate concern not
+    ///   rendered this sprint).
+    /// - `sky_color`, `fog_color`, `fog_start`, `fog_end`,
+    ///   `cloud_color`, `cloud_density` ← `atmosphere.*` (defaults
+    ///   from `MapInfo::bar_default()` when a field is `None`).
+    /// - `wind` ← deterministic ramp between `atmosphere.min_wind`
+    ///   and `max_wind`, rotated slowly so the direction shifts over
+    ///   time (PITFALL #7 — no seed-controlled noise; `sin(time × …)`
+    ///   keeps the parity fixtures reproducible).
+    /// - `sky_axis_angle` ← `atmosphere.sky_axis_angle` (reserved for
+    ///   the deferred-cubemap sprint).
+    /// - `flags[0] = has_skybox = 0` (cubemap deferred per ADR-040).
+    fn atmosphere_uniforms_for_render(&self) -> AtmosphereUniforms {
+        let project = self.snapshot_project();
+        let info: barme_core::MapInfo = (&project).into();
+
+        let sun_rgb = info
+            .lighting
+            .ground_diffuse_color
+            .unwrap_or([1.0, 1.0, 1.0]);
+        let sky_rgb = info.atmosphere.sky_color.unwrap_or([0.1, 0.15, 0.7]);
+        let fog_rgb = info.atmosphere.fog_color.unwrap_or([0.7, 0.7, 0.8]);
+        let cloud_rgb = info.atmosphere.cloud_color.unwrap_or([1.0, 1.0, 1.0]);
+        let cloud_density = info.atmosphere.cloud_density.unwrap_or(0.5).clamp(0.0, 1.0);
+        let fog_start = info.atmosphere.fog_start.unwrap_or(0.1);
+        let fog_end = info.atmosphere.fog_end.unwrap_or(1.0);
+        // Fog density: how thick the fog blend can get at the far
+        // plane. Sprint 21 lints `fog_start == fog_end` as a hard
+        // error; the shader stays defensive (smoothstep clamps), and
+        // here we cap density so a degenerate config still renders.
+        let fog_density = 0.6f32;
+        // Height falloff coefficient. BAR's Atmosphere.cpp uses an
+        // empirical `0.01..0.02` range tied to the map's height
+        // scale; pinning at 0.01 mirrors the engine's default knob.
+        let height_falloff = 0.01f32;
+
+        // Wind state: deterministic ramp + slow rotation so the
+        // direction shifts over time without an RNG seed. Magnitude
+        // blends between min_wind and max_wind at half-period; angle
+        // sweeps full 2π over `WIND_ROTATION_PERIOD_S` seconds.
+        let min_wind = info.atmosphere.min_wind.unwrap_or(5.0).max(0.0);
+        let max_wind = info.atmosphere.max_wind.unwrap_or(25.0).max(min_wind);
+        let time_s = self.water_time_seconds();
+        // 0.1 Hz magnitude oscillation; 0.0233 Hz direction rotation
+        // (~43 s per full sweep, slow enough that the wind feels
+        // ambient, not strobing).
+        let wind_magnitude_t = (time_s * 0.1).sin() * 0.5 + 0.5;
+        let wind_speed_world = min_wind + (max_wind - min_wind) * wind_magnitude_t;
+        let wind_angle = time_s * 0.0233 * std::f32::consts::TAU;
+        // Convert engine wind units (mapinfo.atmosphere range 0..20)
+        // to the editor's water-shader scalar (Sprint 26 used 0.05 as
+        // the hardcoded animation rate; we scale by `0.05 / 10` so
+        // the mid-range wind (15) produces a similar visual motion).
+        let wind_scale = 0.005f32;
+        let wind_x = wind_angle.cos() * wind_speed_world * wind_scale;
+        let wind_z = wind_angle.sin() * wind_speed_world * wind_scale;
+
+        AtmosphereUniforms {
+            sun_color: [sun_rgb[0], sun_rgb[1], sun_rgb[2], 1.0],
+            sky_color: [sky_rgb[0], sky_rgb[1], sky_rgb[2], 1.0],
+            fog_color: [fog_rgb[0], fog_rgb[1], fog_rgb[2], fog_density],
+            fog_start_end: [fog_start, fog_end, height_falloff, 0.0],
+            cloud_color: [cloud_rgb[0], cloud_rgb[1], cloud_rgb[2], cloud_density],
+            wind: [wind_x, wind_z, wind_speed_world, 0.0],
+            sky_axis_angle: info.atmosphere.sky_axis_angle,
+            // `has_skybox` deferred per ADR-040; future cubemap
+            // sprint will set bit 0 when a `.dds` cubemap loads.
+            flags: [0, 0, 0, 0],
         }
     }
 
@@ -10497,6 +10577,7 @@ impl App {
             if self.heightmap.is_some() {
                 let (ex, ez) = self.world_extents();
                 let splat_u = self.splat_uniforms_for_render();
+                let atmos_u = self.atmosphere_uniforms_for_render();
 
                 // Sort the batch back-to-front so translucent markers
                 // blend in correct camera-relative order, then encode
@@ -10552,6 +10633,7 @@ impl App {
                     water,
                     composite_uniforms,
                     self.water_reflections,
+                    atmos_u,
                 );
                 ui.painter()
                     .add(egui_wgpu::Callback::new_paint_callback(rect, cb));

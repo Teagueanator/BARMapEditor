@@ -113,6 +113,35 @@ struct SplatU {
     camera_pos: vec4<f32>,
 };
 
+// Sprint 28 / R2 / ADR-040 — atmosphere uniform block. Composes fog,
+// sky colour, sun-angle ramp, deterministic wind state, and cloud tint
+// on top of Sprint 25's terrain output. Field order MUST match the
+// CPU `AtmosphereUniforms` mirror (`render.rs::AtmosphereUniforms`)
+// exactly; the size-pin test in `render.rs::tests` catches drift.
+//
+//   sun_color:     lighting.sunColor (.w = intensity, reserved)
+//   sky_color:     atmosphere.skyColor (.w = ambient strength, reserved)
+//   fog_color:     atmosphere.fogColor + .w = fog density [0, 1]
+//   fog_start_end: (fog_start, fog_end, height_falloff, _)
+//   cloud_color:   atmosphere.cloudColor + .w = cloud density
+//   wind:          (wind_x, wind_z, wind_speed, _) — pre-rotated by
+//                  App-side deterministic sin/cos ramp (PITFALL #7)
+//   sky_axis_angle: atmosphere.skyAxisAngle (xyz axis, .w radians).
+//                   Reserved for the deferred-cubemap sprint.
+//   flags:         (has_skybox, sun_disc_size, _, _) — `has_skybox`
+//                  stays 0 for Sprint 28 (cubemap deferred per
+//                  ADR-040).
+struct AtmosphereU {
+    sun_color:     vec4<f32>,
+    sky_color:     vec4<f32>,
+    fog_color:     vec4<f32>,
+    fog_start_end: vec4<f32>,
+    cloud_color:   vec4<f32>,
+    wind:          vec4<f32>,
+    sky_axis_angle: vec4<f32>,
+    flags:         vec4<u32>,
+};
+
 @group(0) @binding(0)  var<uniform> u: Uniforms;
 @group(0) @binding(1)  var heightmap: texture_2d<u32>;
 @group(0) @binding(2)  var<uniform> sp: SplatU;
@@ -138,6 +167,8 @@ struct SplatU {
 // FINDINGS §7.6 — `specular_exp = sample.a × 16.0` per fragment.
 @group(0) @binding(11) var specular_tex: texture_2d<f32>;
 @group(0) @binding(12) var specular_samp: sampler;
+// Sprint 28 / R2 / ADR-040 — atmosphere block.
+@group(0) @binding(13) var<uniform> atmos: AtmosphereU;
 
 struct VsOut {
     @builtin(position) clip_pos: vec4<f32>,
