@@ -245,6 +245,13 @@ struct App {
     show_intro: bool,
     /// Whether the `?` cheat-sheet modal is open this frame.
     show_cheat_sheet: bool,
+    /// Sprint 22 / U2 — re-openable help center Window. Owned by
+    /// `App`, persisted state lives in [`config::EditorConfig`].
+    /// The cheat sheet is still reachable via `?`; the help center
+    /// is the principal entry point (top-bar Help icon + Ctrl+K
+    /// command palette + lint-panel `[Help…]` rows +
+    /// build-overlay `[What does this mean?]` button).
+    help_center: crate::ui::help_center::HelpCenter,
     /// Sprint 19 / U1 — is the lint-panel window open this frame? Driven by
     /// the top-bar validation chip and the status-strip issue-count label.
     lint_panel_open: bool,
@@ -1331,6 +1338,7 @@ impl App {
             editor_config,
             show_intro,
             show_cheat_sheet: false,
+            help_center: crate::ui::help_center::HelpCenter::default(),
             lint_panel_open: false,
             lint_panel_was_open: false,
             lint_summary: Vec::new(),
@@ -10499,6 +10507,9 @@ impl eframe::App for App {
 
         // `?` cheat-sheet modal (B3). Builds the per-tool entries from
         // `Tool::ALL` so a new variant in Phase 4 shows up automatically.
+        // Sprint 22 / U2: the help center subsumes the cheat sheet's
+        // role as the principal entry point but `?` stays alive as
+        // the keyboard backstop (critical pitfall #10).
         if self.show_cheat_sheet {
             let tool_entries: Vec<crate::ui::cheat_sheet::ToolBinding<'_>> =
                 Tool::ALL.iter().map(|t| (t.accel(), t.label())).collect();
@@ -10508,6 +10519,10 @@ impl eframe::App for App {
                 &tool_entries,
             );
         }
+
+        // Sprint 22 / U2: help center window. Independent of the
+        // cheat sheet — both can be open at once.
+        crate::ui::help_center::help_window(ctx, &mut self.help_center);
 
         // Sprint 21 / C8 — lint panel populated from
         // `App::lint_summary`. A Fix click returns a `MapInfoPatch`
@@ -10712,6 +10727,7 @@ mod tests {
             editor_config: config::EditorConfig::default(),
             show_intro: false,
             show_cheat_sheet: false,
+            help_center: crate::ui::help_center::HelpCenter::default(),
             lint_panel_open: false,
             lint_panel_was_open: false,
             lint_summary: Vec::new(),

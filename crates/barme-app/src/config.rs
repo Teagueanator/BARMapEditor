@@ -9,7 +9,7 @@
 //! replays the intro once by appending a new version string to
 //! [`EditorConfig::seen_intro_versions`].
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -40,6 +40,24 @@ pub struct EditorConfig {
     /// (`App::open_from` → [`EditorConfig::remove_recent`]).
     #[serde(default)]
     pub recent_projects: VecDeque<PathBuf>,
+
+    /// Sprint 22 / U2: editor version for which the guided tour has
+    /// been completed (or skipped). `None` = tour hasn't run for
+    /// this version → the first new project auto-triggers it; once
+    /// completed/skipped, the value is set to [`CURRENT_VERSION`].
+    /// A new editor release re-arms the tour by changing
+    /// [`CURRENT_VERSION`].
+    #[serde(default)]
+    pub tour_completed_for: Option<String>,
+
+    /// Sprint 22 / U2: set of tool keyboard accelerators (e.g.
+    /// `"B"`, `"L"`) whose per-tool intro overlay the user has
+    /// explicitly dismissed via the "Don't show again" checkbox.
+    /// Esc-dismiss does NOT add to this set — Esc means "I get it
+    /// for now; show me next time". `BTreeSet` for
+    /// deterministic TOML serialisation order.
+    #[serde(default)]
+    pub tool_intros_seen: BTreeSet<String>,
 }
 
 impl EditorConfig {
@@ -158,6 +176,69 @@ impl EditorConfig {
     /// projects > Clear menu item.
     pub fn clear_recent(&mut self) {
         self.recent_projects.clear();
+    }
+
+    /// Sprint 22 / U2: has the guided tour been completed (or
+    /// skipped) for `version`? Identity equality on the stored
+    /// string.
+    #[allow(dead_code)] // wired by App::update + tour::start in commit 2
+    pub fn tour_completed_for(&self, version: &str) -> bool {
+        self.tour_completed_for
+            .as_deref()
+            .map(|v| v == version)
+            .unwrap_or(false)
+    }
+
+    /// Convenience: has the tour been completed for the
+    /// *currently running* editor version?
+    #[allow(dead_code)] // wired by App::update in commit 2
+    pub fn tour_completed_for_current_version(&self) -> bool {
+        self.tour_completed_for(CURRENT_VERSION)
+    }
+
+    /// Sprint 22 / U2: record that the user finished the guided
+    /// tour (or hit "Skip tour") for `version`. Replays once on
+    /// the next version bump.
+    #[allow(dead_code)] // wired by tour completion in commit 2
+    pub fn mark_tour_completed_for(&mut self, version: &str) {
+        self.tour_completed_for = Some(version.to_string());
+    }
+
+    /// Convenience: mark current-editor-version tour as completed.
+    #[allow(dead_code)] // wired by tour completion in commit 2
+    pub fn mark_tour_completed_for_current_version(&mut self) {
+        self.mark_tour_completed_for(CURRENT_VERSION);
+    }
+
+    /// Sprint 22 / U2: re-arm the guided tour. Help menu's
+    /// "Start guided tour" item flips this so the next App
+    /// frame replays it from step 1.
+    #[allow(dead_code)] // wired by Help menu in commit 6
+    pub fn reset_tour_completion(&mut self) {
+        self.tour_completed_for = None;
+    }
+
+    /// Sprint 22 / U2: has the per-tool intro for `accel` been
+    /// dismissed via the explicit "Don't show again" checkbox?
+    /// Esc-dismiss returns `false` (intentional — Esc is "for
+    /// now", not "forever").
+    #[allow(dead_code)] // wired by tool-intro overlay in commit 3
+    pub fn tool_intro_seen(&self, accel: &str) -> bool {
+        self.tool_intros_seen.contains(accel)
+    }
+
+    /// Sprint 22 / U2: record that the user pinned `accel`'s
+    /// intro to "Don't show again".
+    #[allow(dead_code)] // wired by tool-intro overlay in commit 3
+    pub fn mark_tool_intro_seen(&mut self, accel: &str) {
+        self.tool_intros_seen.insert(accel.to_string());
+    }
+
+    /// Sprint 22 / U2: re-arm every per-tool intro. Help menu's
+    /// "Reset tool intros" item calls this.
+    #[allow(dead_code)] // wired by Help menu in commit 6
+    pub fn reset_tool_intros(&mut self) {
+        self.tool_intros_seen.clear();
     }
 }
 
@@ -364,5 +445,74 @@ mod tests {
         let loaded = EditorConfig::load_from(&path).expect("load");
         assert!(loaded.recent_projects.is_empty());
         assert_eq!(loaded.seen_intro_versions, vec!["0.0.1"]);
+    }
+
+    // ─── Sprint 22 / U2 — tour + tool-intro persistence ──────────────
+
+    #[test]
+    fn tour_completion_round_trips_through_disk() {
+        let mut cfg = EditorConfig::default();
+        assert!(!cfg.tour_completed_for_current_version());
+        cfg.mark_tour_completed_for("0.0.7");
+        assert!(cfg.tour_completed_for("0.0.7"));
+        assert!(!cfg.tour_completed_for("0.0.8"));
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("tour.toml");
+        cfg.save_to(&path).expect("save");
+        let loaded = EditorConfig::load_from(&path).expect("load");
+        assert!(loaded.tour_completed_for("0.0.7"));
+    }
+
+    #[test]
+    fn reset_tour_re_arms_the_walkthrough() {
+        let mut cfg = EditorConfig::default();
+        cfg.mark_tour_completed_for_current_version();
+        assert!(cfg.tour_completed_for_current_version());
+        cfg.reset_tour_completion();
+        assert!(!cfg.tour_completed_for_current_version());
+    }
+
+    #[test]
+    fn tool_intro_seen_records_and_resets() {
+        let mut cfg = EditorConfig::default();
+        assert!(!cfg.tool_intro_seen("L"));
+        cfg.mark_tool_intro_seen("L");
+        cfg.mark_tool_intro_seen("B");
+        assert!(cfg.tool_intro_seen("L"));
+        assert!(cfg.tool_intro_seen("B"));
+        assert!(!cfg.tool_intro_seen("Q"));
+        cfg.reset_tool_intros();
+        assert!(!cfg.tool_intro_seen("L"));
+    }
+
+    #[test]
+    fn tool_intros_round_trip_through_disk() {
+        let mut cfg = EditorConfig::default();
+        cfg.mark_tool_intro_seen("L");
+        cfg.mark_tool_intro_seen("B");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("intros.toml");
+        cfg.save_to(&path).expect("save");
+        let loaded = EditorConfig::load_from(&path).expect("load");
+        assert!(loaded.tool_intro_seen("L"));
+        assert!(loaded.tool_intro_seen("B"));
+    }
+
+    #[test]
+    fn legacy_config_without_tour_fields_loads_clean() {
+        // Sprint 21 and earlier wrote configs without
+        // `tour_completed_for` / `tool_intros_seen`. They must
+        // default cleanly under serde(default).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("preU2.toml");
+        std::fs::write(
+            &path,
+            "seen_intro_versions = [\"0.0.6\"]\nrecent_projects = []\n",
+        )
+        .unwrap();
+        let loaded = EditorConfig::load_from(&path).expect("load");
+        assert!(loaded.tour_completed_for.is_none());
+        assert!(loaded.tool_intros_seen.is_empty());
     }
 }
