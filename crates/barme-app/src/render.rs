@@ -782,6 +782,10 @@ pub struct WaterU {
     /// refraction + reflection samplers. Populated from the offscreen
     /// RT's physical size.
     pub screen: [f32; 4],
+    /// `[eye_x, eye_y, eye_z, _]` — world-space camera position for
+    /// the fresnel angle (`dot(view_dir, surface_normal)`). Sprint 26
+    /// / R3 / ADR-044 commit 4.
+    pub eye: [f32; 4],
 }
 
 /// GPU state for the Sprint-14 water plane pipeline (C9 / ADR-042;
@@ -4132,6 +4136,12 @@ impl egui_wgpu::CallbackTrait for TerrainCallback {
                         1.0 / offscreen.size.0.max(1) as f32,
                         1.0 / offscreen.size.1.max(1) as f32,
                     ],
+                    eye: [
+                        self.camera_pos[0],
+                        self.camera_pos[1],
+                        self.camera_pos[2],
+                        1.0,
+                    ],
                 }),
             );
             pass.set_pipeline(&res.water.pipeline);
@@ -4636,14 +4646,15 @@ mod tests {
     /// - `extent`: 16 B (f32×4)
     /// - `polish_a / b / c / d`: 4 × 16 B = 64 B (Sprint 26 / R3)
     /// - `screen`: 16 B (Sprint 26 / R3)
+    /// - `eye`: 16 B (Sprint 26 / R3 commit 4)
     ///
-    /// Total: 176 B.
+    /// Total: 192 B.
     #[test]
     fn water_uniform_size_matches_wgsl_layout() {
         assert_eq!(
             std::mem::size_of::<WaterU>(),
-            176,
-            "WaterU layout drift — water.wgsl expects 176 bytes (Sprint 26 polish layout)"
+            192,
+            "WaterU layout drift — water.wgsl expects 192 bytes (Sprint 26 polish layout)"
         );
     }
 
@@ -4756,7 +4767,7 @@ mod tests {
     }
 
     /// `WaterU` is `bytemuck::Pod`; constructing one and round-tripping
-    /// it through `bytemuck::bytes_of` produces a 176-byte slice whose
+    /// it through `bytemuck::bytes_of` produces a 192-byte slice whose
     /// f32 view matches the original (Sprint 26 / R3 polish layout).
     #[test]
     fn water_uniform_round_trips_through_pod() {
@@ -4774,9 +4785,10 @@ mod tests {
             polish_c: [0.2, 0.8, 4.0, 0.0],
             polish_d: [75.0, 0.08, 8.0, 0.9],
             screen: [2048.0, 2048.0, 0.000488, 0.000488],
+            eye: [1234.0, 567.0, 4321.0, 1.0],
         };
         let bytes = bytemuck::bytes_of(&u);
-        assert_eq!(bytes.len(), 176);
+        assert_eq!(bytes.len(), 192);
         let view: &[f32] = bytemuck::cast_slice(bytes);
         // Cell [3][3] of view_proj is at offset 15.
         assert_eq!(view[15], 1.0);
@@ -4787,9 +4799,12 @@ mod tests {
         assert_eq!(view[20], 8192.0);
         // polish_a starts at offset 24.
         assert_eq!(view[26], 12.5);
-        // polish_d starts at offset 36 (24 + 3 × 4 = 36).
+        // polish_d starts at offset 36.
         assert_eq!(view[36], 75.0);
-        // screen starts at offset 40 (36 + 4 = 40).
+        // screen starts at offset 40.
         assert_eq!(view[40], 2048.0);
+        // eye starts at offset 44.
+        assert_eq!(view[44], 1234.0);
+        assert_eq!(view[46], 4321.0);
     }
 }

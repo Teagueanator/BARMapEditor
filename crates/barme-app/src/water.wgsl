@@ -52,6 +52,8 @@ struct WaterU {
     polish_d: vec4<f32>,
     /// `[screen_w_px, screen_h_px, 1/w, 1/h]`.
     screen: vec4<f32>,
+    /// `[eye_x, eye_y, eye_z, _]` — world-space camera position.
+    eye: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> u: WaterU;
@@ -239,25 +241,80 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     );
     let refl_color = textureSample(reflection_tex, reflection_samp, refl_uv).rgb * refl_enabled;
 
-    // Sprint 26 / commit 2 — basic mix: refraction underneath, surface
-    // tint on top, reflection added at a fixed weight. Commit 4
-    // replaces the mix factor with the Schlick fresnel curve so
-    // grazing angles favour reflection and head-on angles favour
-    // refraction.
+    // ─── FRESNEL (Schlick's approximation) ─────────────────────────
+    //
+    // Engine `BumpWaterFS.glsl:246`:
+    //   fresnel = FresnelMin + FresnelMax × pow(angle, FresnelPower)
+    // where `angle = 1 - abs(dot(-view, normal))` — grazing angles
+    // approach 1, head-on approach 0. We clamp `dot` to `[0, 1]` to
+    // dodge the PITFALL-#6 NaN at backface (dot < 0 → pow blows up).
+    let view_dir = normalize(u.eye.xyz - in.world_pos);
+    let cos_view = clamp(dot(view_dir, surface_normal), 0.0, 1.0);
+    let angle = 1.0 - cos_view;
+    let fresnel_min = u.polish_c.x;
+    let fresnel_max = u.polish_c.y;
+    let fresnel_power = u.polish_c.z;
+    let fresnel = clamp(fresnel_min + fresnel_max * pow(angle, fresnel_power), 0.0, 1.0);
+
+    // ─── FOAM (refraction-brightness proxy) ────────────────────────
+    //
+    // The engine's foam reads a precomputed coastmap (BumpWaterCoast
+    // BlurFS produces a per-pixel "distance to shore" texture). We
+    // don't ship that bake yet — Sprint 27 candidate — so we proxy
+    // shoreline proximity through the brightness of the refraction
+    // sample. Where the refraction is bright, the terrain is shallow
+    // and probably near the shoreline → apply foam. Where dark, deep
+    // water → no foam. Imperfect but visually plausible at editor
+    // camera distances. `polish_b.w = foam_height` (elmos) is the
+    // smoothstep band width.
+    let foam_height = u.polish_b.w;
+    let refr_luma = dot(refr_color, vec3<f32>(0.299, 0.587, 0.114));
+    let foam_factor = smoothstep(0.45, 0.85, refr_luma)
+        * smoothstep(0.0, foam_height / 100.0, refr_luma - 0.5);
+
+    // ─── CAUSTICS (procedural sine pattern) ───────────────────────
+    //
+    // Engine samples 32 caustic JPEGs in a loop; we synthesise the
+    // same visual via two layered sine fields warped by the surface
+    // normal. Animated by `polish_a.z = time_s`. Modulated by the
+    // refraction-brightness proxy: caustics only shimmer in shallow
+    // water (matches BumpWaterFS.glsl:325 `if (waterdepth > 0)`).
+    let caust_res = u.polish_d.x;
+    let caust_str = u.polish_d.y;
+    let caust_uv = in.world_pos.xz / max(caust_res, 1.0)
+        + surface_normal.xz * 0.5
+        + vec2<f32>(u.polish_a.z * 0.05, u.polish_a.z * 0.03);
+    let c0 = sin(caust_uv.x * 6.2832 + u.polish_a.z * 0.5);
+    let c1 = sin(caust_uv.y * 6.2832 + u.polish_a.z * 0.4);
+    let caust = max(0.0, c0 * c1) * caust_str * smoothstep(0.0, 1.0, refr_luma);
+
+    // ─── COMPOSITE (BumpWaterFS-style) ─────────────────────────────
+    //
+    // Engine's GL_FragColor.rgb is:
+    //   refr_color   (refraction underneath)
+    //   × `mix(refr, water_surface, surfaceMix + 0.1)`
+    //   + caustics  (where shallow)
+    //   + shorewaves
+    //   then mixed with reflection via `mix(rgb, reflColor, fresnel)`.
+    // Our condensed translation: refr_color is the underwater base;
+    // surface tint composites on top with `surf_alpha`; foam adds
+    // brightness near the shoreline; caustics shimmer below; the
+    // reflection-vs-refraction mix uses `fresnel`. Reflection
+    // contribution gates on `polish_a.w` so disabled reflections
+    // produce a clean refractive-only image.
     let surf_premul = u.surface_rgba.rgb;
     let surf_alpha = u.surface_rgba.a;
     let alpha_scale = u.extent.w;
 
-    // Blend: refraction is the "below-water" base; surface tint is
-    // composited on top with its alpha; reflection layers above with
-    // a fixed 0.25 weight (commit 4's fresnel replaces the constant).
-    let below = refr_color * (1.0 - surf_alpha) + surf_premul;
-    let final_rgb = below + refl_color * 0.25 * refl_enabled;
+    let below = refr_color * (1.0 - surf_alpha)
+        + surf_premul
+        + vec3<f32>(caust)
+        + vec3<f32>(foam_factor);
+    let composite_with_reflection = mix(below, refl_color, fresnel * refl_enabled);
 
-    // Premultiplied output. The pipeline's blend state already
-    // multiplies by the alpha-write-through; we return RGB
-    // premultiplied by `alpha_scale × surf_alpha` so the blend
-    // equation reduces to `dst + src - src·dst·α`.
+    // Pre-multiplied output. The pipeline's blend state multiplies
+    // by alpha; we return RGB pre-multiplied by `alpha_scale × surf_alpha`
+    // so the blend equation reduces to `dst + src - src·dst·α`.
     let out_alpha = surf_alpha * alpha_scale;
-    return vec4<f32>(final_rgb * alpha_scale, out_alpha);
+    return vec4<f32>(composite_with_reflection * alpha_scale, out_alpha);
 }
