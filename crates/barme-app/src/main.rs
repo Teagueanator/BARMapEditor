@@ -4945,6 +4945,36 @@ impl App {
         };
     }
 
+    /// Sprint 20 / chunk 5: apply this frame's [build log panel]
+    /// clicks. Clear locks the ring buffer and truncates; Save writes
+    /// the current contents to a user-picked file (best-effort —
+    /// failure surfaces a single `last_error` toast).
+    ///
+    /// [build log panel]: crate::ui::build_log::render
+    fn apply_build_log_clicks(&mut self, clicks: crate::ui::build_log::LogPanelClicks) {
+        if clicks.clear
+            && let Some(log) = self.build_state.log()
+            && let Ok(mut guard) = log.lock()
+        {
+            info!("build_log: clearing ring buffer");
+            guard.clear();
+        }
+        if let Some(path) = clicks.save_as
+            && let Some(log) = self.build_state.log()
+            && let Ok(guard) = log.lock()
+        {
+            let text = crate::ui::build_log::render_log_as_text(&guard);
+            match std::fs::write(&path, text) {
+                Ok(()) => info!(?path, "build_log: saved to file"),
+                Err(e) => {
+                    let msg = format!("save log: {e:#}");
+                    error!("{msg}");
+                    self.last_error = Some(msg);
+                }
+            }
+        }
+    }
+
     /// Sprint 20: poll the worker thread + drain its event channel
     /// once per UI frame. Transitions Running → Done | Failed |
     /// Cancelled when the join handle is ready.
@@ -6258,6 +6288,18 @@ impl App {
             }
             if !enabled {
                 ui.label("(load a heightmap first)");
+            }
+            // Sprint 20 / chunk 5 — surface the build log panel.
+            if ui
+                .button("Show log…")
+                .on_hover_text(
+                    "Open the build log panel — shows live PyMapConv output during a build \
+                     and stays open until dismissed."
+                )
+                .clicked()
+            {
+                self.build_log_open = true;
+                ui.close();
             }
         });
     }
@@ -10145,6 +10187,14 @@ impl eframe::App for App {
         self.tool_strip(ctx);
         self.inspector(ctx, &mut action);
         self.central(ctx);
+
+        // Sprint 20 / chunk 5 — build log panel renders AFTER the
+        // central panel so the egui::Window floats on top. The
+        // `LogPanelClicks` it returns are applied below so the lock
+        // patterns stay inside the App layer.
+        let log_clicks =
+            crate::ui::build_log::render(ctx, &mut self.build_log_open, &self.build_state);
+        self.apply_build_log_clicks(log_clicks);
 
         self.drain_action(action);
         self.symmetry_popover(ctx);
