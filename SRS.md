@@ -797,6 +797,30 @@ A single-window, single-executable desktop app that produces a *playable* BAR ma
 ### 3.3 Non-functional requirements
 
 - **NFR-Performance:** Brush stroke latency ≤ 8 ms on a 16×16 map at 60 fps preview on a mid-range 2020 GPU.
+  - **STATUS UPDATE 2026-05-21 (Sprint 24 / T2):** procgen apply +
+    DNTS bake are now multithreaded via rayon (PROPOSAL §1 + §3).
+    `procgen::generate` at 16 SMU drops from ~440 ms serial → ~40
+    ms on a 12-core dev box (~11× speedup, parabolic-bowl preset)
+    and ~71 ms for cone-peak (`math::sqrt` adds per-pixel constant
+    cost). Pinned by `generate_16_smu_parabolic_parallel_under_400ms`
+    (CI ceiling) + `par_serial_byte_identical_across_presets`
+    (determinism contract). Dev-box numbers also tracked manually via
+    `cargo run --example bench-procgen --release -p barme-core`.
+    DNTS bake (`stage_splat_assets_from_layers`) is now a SCOPED
+    rayon pool capped at `min(num_cpus, 4)` so a 4-core dev box
+    isn't thrashed by 16 concurrent CompressonatorCLI subprocesses;
+    per-channel bakes run in parallel and per-bake completion fires
+    `BuildEvent::Progress(done/total)` into the Sprint 20 build
+    overlay. Dev-box: single = 80 ms, parallel(4) = 97 ms, ratio =
+    1.21× (target < 1.5×). The dnts cache write now uses
+    `tempfile + atomic rename` so two threads sharing a `cache_key`
+    are safe (PITFALL #29 callouts: an earlier iteration of the
+    parallel-bake test corrupted the vendored Compressonator binary
+    via a symlink-into-tools write; both `locate_compressonator`
+    helpers now reject zero-byte binaries so the failure mode is a
+    clean skip not an ENOEXEC panic). Brush kernels stay
+    single-threaded this sprint — TODO markers in raise/lower/smooth
+    document the one-line rayon lift for when the gate fires.
 - **NFR-Memory:** Resident set ≤ 4 GB editing a 16×16 map; ≤ 8 GB at 32×32.
   - **STATUS UPDATE 2026-05-18 (A1 / ADR-033):** undo history now obeys
     the 100 MB ring cap reliably. The prior per-stamp snapshot model

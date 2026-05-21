@@ -651,6 +651,59 @@ Implements SRS F1–F12. Ships a Windows `.exe` and a Linux AppImage.
       timing-sensitive `procgen` thumbnail test is flaky under load
       but pre-existing). Sprint 24 = multithreading (rayon procgen
       + parallel DNTS bake).
+- [x] **STATUS UPDATE 2026-05-21 (Sprint 24 / T2).** First
+      multithreading sprint — both PROPOSAL gates that crossed their
+      promotion thresholds (procgen apply + DNTS bake) are now
+      parallel. **4 commits on `main`**:
+      (1) `core: parallelise procgen apply via rayon` —
+      `procgen::generate` lifts to `par_chunks_mut` over rows; each
+      worker constructs its own `PixelContext`; the `evalexpr::Node`
+      is `Send + Sync + Clone` via the crate's `IsSendAndSync`
+      compile-time assertion (defence-in-depth: `procgen.rs` carries
+      a `const _: fn() = || { assert_send_sync::<…>() }` so an
+      upstream evalexpr API change that drops the bound fails the
+      build instead of silently regressing). NaN/Inf warn-once
+      gate collapses to `AtomicBool`. Dev-box (12 cores): 16 SMU
+      parabolic 440 ms → 40 ms (~11×), cone-peak 440 ms → 71 ms
+      (~6×). `generate_thumbnail` stays serial.
+      (2) `core: add bench-procgen example` —
+      `crates/barme-core/examples/bench_procgen.rs` reports 5-run
+      median wall-times at 4 / 8 / 12 / 16 SMU × parabolic / cone.
+      Manual run; not in CI.
+      (3) `pipeline: parallel DNTS bake + atomic cache write` —
+      `stage_splat_assets_from_layers` bakes up to 4 channels
+      concurrently inside a SCOPED rayon pool capped at
+      `min(num_cpus, 4)` (no pollution of the global pool that
+      procgen uses; no thrash on a 4-core dev box with 16 layers).
+      New `on_progress: impl Fn(usize, usize) + Sync` parameter
+      drives `BuildEvent::Progress(done/total)` into Sprint 20's
+      build overlay; per-bake completion (not start), unordered.
+      `dnts::bake_dnts_in_env` now writes the Compressonator output
+      to a `tempfile`-managed sibling of `cache_path` (suffix
+      `.dds` — `.tmp` triggers "Destination file type TMP is not
+      supported") and atomic-renames via `TempPath::persist`
+      (`fs::rename` POSIX, `MoveFileExW(REPLACE_EXISTING)` Windows).
+      Two parallel bakes sharing a `cache_key` are now safe —
+      last-writer-wins, but `cache_path` is never torn. Dev-box:
+      single = 80 ms, parallel(4) = 97 ms, ratio = 1.21× (target
+      < 1.5×). New PITFALL #29 documents the mid-sprint regression
+      where a synthetic-layout test helper symlink-wrote `b""` into
+      `tools/compressonator/compressonatorcli-bin`, corrupting the
+      vendored ELF; both `locate_compressonator` helpers now reject
+      zero-byte binaries so the failure surfaces as a clean skip
+      rather than an `ENOEXEC` panic.
+      (4) `brushes: TODO markers for deferred rayon lift` — brush
+      kernels stay single-threaded (0.79 ms baseline well under
+      8 ms NFR-Performance budget) but the inner loops in
+      `raise.rs::apply_radial_delta` + `smooth.rs::apply` carry the
+      one-line `par_chunks_mut`-per-row pattern in a TODO comment
+      so the future lift (when 32-SMU support arrives or a user
+      reports stroke lag) is mechanical. `lower.rs` is a one-line
+      pointer comment since it delegates to `apply_radial_delta`.
+      Tests: barme-core 277 → 279 (+2: par_serial determinism +
+      parallel perf budget); barme-pipeline 212 → 213 (+1:
+      parallel-bake regression). Sprint 25 = terrain shader parity
+      (port SMFFragProg.glsl).
 - [ ] Beherith (or active mapper) reviews `.sd7` byte-for-byte against PyMapConv
       reference output on three test maps
 - [ ] Listed on `beyondallreason.info/guide/mapmaking-resources` as beta
