@@ -830,6 +830,54 @@ Implements SRS F1–F12. Ships a Windows `.exe` and a Linux AppImage.
       **Renderer-parity arc: 2 / 8 done.** Sprint 27 = Inspector
       consistency refactor + brush-card lift (off-arc UX work).
       Next arc sprint is Sprint 28 (atmosphere + fog).
+- [x] **STATUS UPDATE 2026-05-21 (Sprint 27 / U5 — Inspector
+      consistency refactor).** Off-arc UX work; closes the
+      three-sprint UI polish wave begun in Sprint 19 (tooltips) and
+      Sprint 22 (onboarding). No new ADR — work fits inside ADR-030
+      (Phase 3 layout shell) + ADR-035 (widget contract). **6
+      commits on main**: (1) `ui(widgets): lift brush_card to
+      widgets.rs` — extract `App::brush_card` into
+      `widgets::brush_card(BrushCard)` with `label / icon / ring_color
+      / active / hover_help: HelpId` descriptor; both Sculpt and
+      PaintLayer call sites consume the same widget. (2)
+      `ui(widgets): lift sticky_chip_strip` — extract the symmetry +
+      map-size chip band from `App::inspector_sticky_chips` into
+      `widgets::sticky_chip_strip(&[ChipDesc])`; the App method is
+      now a thin wrapper that builds the two descriptors and
+      delegates. (3) `ui(widgets): standardise row delete buttons` —
+      new `widgets::row_delete_button(HelpId)` (16 px `Icon::X`,
+      muted by default and `t.red` on hover) replaces five
+      `small_button("×")` and one `small_button("delete group")`
+      across metal / geo / feature / start position / ally group
+      rows, plus the layers_panel layer delete; new
+      `HelpId::LayerRowDelete` covers the formerly-hardcoded
+      tooltip. (4) `ui(inspector): lift min_height to header` —
+      Inspector header HEIGHTMAP section gains `Min height` next to
+      `Max height` (new `HelpId::HeaderMinHeight` with the
+      `World Y at raw 0 …` text); Water inspector's duplicate
+      "Heightmap range" section retires. The Water FLOOD section's
+      "Sea-floor depth" stays because it's the load-bearing flood-
+      gesture input, not a redundant editor. (5) `ui(inspector):
+      enforce one-accent-section-per-tool` — `inspector_feature`'s
+      Category and Placed demoted from accent (Picker was already
+      accent: true), so the tool reads with a single primary
+      surface; new `tests/inspector_section_pattern.rs` audits the
+      pattern via source-file parsing (slices `main.rs` into per-fn
+      bodies, counts the 3rd positional `accent` arg of every
+      `widgets::section` call, and asserts ≤1 accent: true per tool
+      inspector). Companion test verifies the PaintLayer accent
+      lives in `layers_panel.rs` and that every tool inspector calls
+      `self.inspector_sticky_chips`. (6) `ui(inspector_select):
+      wrap info in 'Mode' accent section` — Select now joins the
+      canonical skeleton (sticky chip strip → one accent section);
+      pattern audit tightened from ≤1 to exactly 1 accent per tool
+      inspector and Select moved into the audit list.
+      Tests: barme-app 353 → 356 (+3: inspector_section_pattern.rs);
+      barme-core 279 unchanged; barme-pipeline 213 unchanged.
+      `cargo fmt && cargo clippy --workspace --all-targets -- -D
+      warnings && cargo test --workspace` green.
+      **Renderer-parity arc unchanged at 2 / 8 done** (Sprint 27
+      was off-arc). Next arc sprint is Sprint 28 (atmosphere + fog).
 - [ ] Beherith (or active mapper) reviews `.sd7` byte-for-byte against PyMapConv
       reference output on three test maps
 - [ ] Listed on `beyondallreason.info/guide/mapmaking-resources` as beta

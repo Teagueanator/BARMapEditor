@@ -200,6 +200,42 @@ PA's in-game system designer is the cited gold standard. It does the following w
     > arc is now **2 / 8 done**; Sprint 27 = Inspector consistency
     > refactor + brush-card lift (off-arc UX work), and the next
     > arc sprint is Sprint 28 (atmosphere + fog).
+    >
+    > **STATUS UPDATE 2026-05-21 (Sprint 27 / U5 — Inspector
+    > consistency refactor shipped):** the off-arc UX pass that closes
+    > the three-sprint UI polish wave (Sprint 19 tooltips, Sprint 22
+    > onboarding, Sprint 27 layout consistency). No new ADR — the
+    > work executes inside the existing ADR-030 (Phase 3 layout shell)
+    > + ADR-035 (widget contract) envelope. Five load-bearing
+    > changes: (a) `widgets::brush_card` + `BrushCard` descriptor
+    > lifts the 4-card brush picker out of `App::brush_card` into a
+    > shared widget — both Sculpt and PaintLayer call sites
+    > consume it; (b) `widgets::sticky_chip_strip` + `ChipDesc`
+    > replaces the per-tool `App::inspector_sticky_chips` body so
+    > the symmetry + map-size band reads identically across every
+    > inspector; (c) `widgets::row_delete_button` standardises the
+    > six row delete buttons (metal / geo / feature / start position /
+    > ally group / layer) as a 16 px `Icon::X` glyph that hovers
+    > `t.red`, with tooltip routed through `HelpId`; (d) the
+    > duplicate `min_height` / `height_scale` affordance collapses
+    > to the persistent Inspector header (the Water "Heightmap
+    > range" section is retired; FLOOD's "Sea-floor depth" stays
+    > because it's tool-context, not a sibling editor); (e) the
+    > inspector section-accent pattern is enforced — every tool
+    > inspector now emits exactly one accent: true section, with
+    > `inspector_feature`'s extra two (Category, Placed) demoted to
+    > false and `inspector_select` wrapped in a single "Mode"
+    > accent section so it joins the family. New
+    > `tests/inspector_section_pattern.rs` integration suite (3
+    > tests) parses `main.rs` + `layers_panel.rs` and pins the
+    > pattern: every tool inspector renders the sticky chip strip
+    > AND emits exactly one accent section (PaintLayer's accent
+    > lives in `layers_panel.rs::render`). 6 commits on `main`;
+    > `cargo fmt && cargo clippy --workspace --all-targets -- -D
+    > warnings && cargo test --workspace` green. Tests: barme-app
+    > 353 → 356 (+3 inspector_section_pattern). The renderer-parity
+    > arc is unchanged at **2 / 8 done** — Sprint 27 was off-arc
+    > UX work. Next arc sprint is Sprint 28 (atmosphere + fog).
 12. **Decompilation fidelity.** Round-tripping an existing `.sd7` loses information: the recovered diffuse PNG has been through DXT1 (color precision loss); heightmap, metal, and type maps are exact; mapinfo.lua is exact; auxiliary splat textures survive untouched. Reuse PyMapConv's decompile path.
 13. **GPU brush latency.** Spring/Recoil maps can theoretically reach 96×96 SMUs. Sub-millisecond brush response at 32×32+ requires the heightmap to live on the GPU as a storage texture, edited by compute shaders. Read-back to CPU happens only at save.
 
