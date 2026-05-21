@@ -1318,4 +1318,117 @@ mod tests {
         let r = dummy_resolver(None);
         let _erased: &dyn SlotResolver = &r;
     }
+
+    // ─── Sprint 23 / T1 — OOM regression harness ─────────────────────
+    //
+    // The original `Tool::PaintLayer` entry OOM on 16-SMU 4-layer
+    // projects had two CPU-side contracts that each had to stay
+    // honest: (1) the tiled-COW mask must keep a freshly-allocated
+    // layer down to ~16 KB regardless of map size, and (2) the
+    // `LayerStack::resident_mask_bytes` sum across 4 layers must fit
+    // in a small budget. The GPU-side composite RT + mask array land
+    // separately under the renderer fix; these tests pin the CPU
+    // half so a future "make masks dense again" regression fails
+    // here before it ever reaches RSS.
+
+    /// CPU layer-stack budget: a freshly-allocated 16-SMU 4-layer
+    /// stack must fit comfortably under 1 MB of resident mask bytes.
+    /// The tiled-COW design means uniform-fill layers stay at the
+    /// tile-metadata floor (~24 KB per layer for 32×32 tile grids).
+    #[test]
+    fn sixteen_smu_four_layer_stack_fits_cpu_budget() {
+        // Real-world entry: bottom layer at fill=255 (the biome
+        // base), three child layers at fill=0 (added on top by the
+        // user, mask=0 so reveal-brush has something to do).
+        let size = MapSize::square(16);
+        let mut stack = LayerStack {
+            layers: vec![TextureLayer::new(LayerSource::Slot { id: 0 }, size, 255)],
+        };
+        for slot_id in 1..=3u8 {
+            stack
+                .layers
+                .push(TextureLayer::new(LayerSource::Slot { id: slot_id }, size, 0));
+        }
+        let bytes = stack.resident_mask_bytes();
+        // 4 layers × ~24 KB tile metadata = ~96 KB. Generous budget
+        // at 1 MB so a future Tile-enum size change doesn't tip the
+        // test over without intent.
+        assert!(
+            bytes < 1024 * 1024,
+            "16-SMU 4-layer stack should fit under 1 MB CPU; got {} KB",
+            bytes / 1024
+        );
+    }
+
+    /// Sprint 23 investigation — characterisation of the cold-sync
+    /// dirty-tile count on a freshly-`filled` mask. **Pre-H2-fix**
+    /// the count equals every tile in the grid regardless of fill
+    /// (because [`mask::TileGrid::filled`] starts `current_version`
+    /// at 1 and seeds every per-tile version at 1; queries at
+    /// `since=0` therefore return everything). The H2 mitigation
+    /// commit flips the contract so `fill=0` returns empty (matches
+    /// wgpu's zero-init default).
+    ///
+    /// Kept in the investigation commit as a baseline; the H2-fix
+    /// commit promotes this into an assertion that `fill=0` returns
+    /// EMPTY (saves ~64 MB of useless cold-sync transfer per child
+    /// layer on 16-SMU projects).
+    #[test]
+    fn freshly_filled_mask_cold_sync_returns_every_tile_pre_h2_fix() {
+        let m = LayerMask::filled(MapSize::square(2), 0);
+        let dirty = m.dirty_tiles_since(0);
+        // Pre-fix contract: 2 SMU = 1024² → 4×4 tile grid = 16
+        // tiles, ALL dirty regardless of fill.
+        assert_eq!(
+            dirty.len(),
+            16,
+            "pre-H2-fix: every tile is reported dirty on cold sync"
+        );
+        let m255 = LayerMask::filled(MapSize::square(2), 255);
+        assert_eq!(
+            m255.dirty_tiles_since(0).len(),
+            16,
+            "pre-H2-fix: fill=255 also reports every tile dirty"
+        );
+    }
+
+    /// The harness itself: snapshot RSS before and after building a
+    /// realistic 4-layer 16-SMU stack. Pins the CPU delta at
+    /// < 10 MB. Linux-only because [`crate::rss::current`] returns
+    /// `None` on other targets. Skipped (not failed) when `/proc/`
+    /// is unavailable (sandboxed CI).
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn sixteen_smu_four_layer_stack_rss_delta_within_budget() {
+        let Some(before) = crate::rss::current("16smu-4layer-before") else {
+            // CI sandbox without /proc — skip silently. The
+            // non-Linux test path catches the function-return shape.
+            return;
+        };
+        let size = MapSize::square(16);
+        let mut stack = LayerStack {
+            layers: vec![TextureLayer::new(LayerSource::Slot { id: 0 }, size, 255)],
+        };
+        for slot_id in 1..=3u8 {
+            stack
+                .layers
+                .push(TextureLayer::new(LayerSource::Slot { id: slot_id }, size, 0));
+        }
+        let after = crate::rss::current("16smu-4layer-after").unwrap();
+        let delta_bytes = after.rss_bytes.saturating_sub(before.rss_bytes);
+        // 10 MB ceiling — generous for both `Vec<TextureLayer>` and
+        // the tile-grid metadata. The original (pre-Sprint-16) flat
+        // mask cost 4 × 64 MB = 256 MB here; the tiled-COW design
+        // makes this trivially pass.
+        assert!(
+            delta_bytes < 10 * 1024 * 1024,
+            "CPU stack alloc should be < 10 MB; got {} MB (before={} after={})",
+            delta_bytes / (1024 * 1024),
+            before.rss_mb(),
+            after.rss_mb(),
+        );
+        // Touch `stack` so the optimiser doesn't drop the alloc
+        // between the two snapshots.
+        std::hint::black_box(stack);
+    }
 }

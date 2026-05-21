@@ -12,6 +12,7 @@ pub mod map_size;
 pub mod mapinfo_schema;
 pub mod procgen;
 pub mod project;
+pub mod rss;
 pub mod splat;
 pub mod start_pos;
 pub mod symmetry;
