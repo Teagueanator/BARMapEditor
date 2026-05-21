@@ -30,6 +30,33 @@ impl Brush for Raise {
 
 /// Shared apply routine for raise/lower. `delta` is the signed u16-space
 /// magnitude at falloff=1; scales by falloff per pixel.
+//
+// TODO(sprint-MT-brushes): per-row parallelism via rayon. Promotion gate
+// per `docs/research/multithreading/PROPOSAL.md` §4 = "32-SMU support
+// arrives OR user reports stroke lag." The current 0.79 ms / radius-1024
+// stamp baseline (ADR-021) has 10× headroom under the 8 ms NFR.
+//
+// One-line lift when needed:
+//
+// ```rust
+// use rayon::iter::{IndexedParallelIterator, ParallelIterator};
+// use rayon::slice::ParallelSliceMut;
+// let row_slice = &mut data[(bbox.y * w) as usize
+//     ..((bbox.y + bbox.h) * w) as usize];
+// row_slice.par_chunks_mut(w as usize).enumerate().for_each(|(lz, row)| {
+//     let iz = bbox.y + lz as u32;
+//     let dz = iz as f32 - cz_px;
+//     for ix in bbox.x..bbox.x + bbox.w {
+//         // … existing inner-loop body, indexing row[ix as usize] …
+//     }
+// });
+// ```
+//
+// Per PROPOSAL §4: symmetric brush replication (ADR-019) writes N stamps
+// per stroke and stamps can overlap, so parallelism must be WITHIN a
+// stamp (this routine), not ACROSS stamps. The undo-snapshot bitset
+// (ADR-033) is shared mutable state — when lifting, either give each
+// row its own bitset and merge, or atomic-CAS at the u64 word level.
 pub(super) fn apply_radial_delta(
     hm: &mut Heightmap,
     stamp: BrushStamp,

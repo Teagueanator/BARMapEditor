@@ -1,4 +1,9 @@
 //! Lower brush — same kernel as raise with sign flipped.
+//
+// TODO(sprint-MT-brushes): Lower delegates to `raise::apply_radial_delta`,
+// so the parallelism lift only has to land in raise.rs. See the TODO
+// block above that function for the rayon `par_chunks_mut`-per-row
+// pattern and the symmetric-brush / undo-bitset caveats.
 
 use super::raise::apply_radial_delta;
 use super::{Brush, BrushStamp, DirtyRect, pixel_bbox};

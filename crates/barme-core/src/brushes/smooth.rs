@@ -48,6 +48,26 @@ impl Brush for Smooth {
             snap[lz * snap_w as usize + lx] as u32
         };
 
+        // TODO(sprint-MT-brushes): per-row parallelism via rayon.
+        // Promotion gate per `docs/research/multithreading/PROPOSAL.md`
+        // §4 = "32-SMU support arrives OR user reports stroke lag." The
+        // snapshot read above is already deferred from the parallel
+        // section (immutable `snap` is safe to share via `&` across
+        // rayon workers); only the writeback loop below needs lifting:
+        //
+        // ```rust
+        // use rayon::iter::{IndexedParallelIterator, ParallelIterator};
+        // use rayon::slice::ParallelSliceMut;
+        // let row_slice = &mut data[(bbox.y * w) as usize
+        //     ..((bbox.y + bbox.h) * w) as usize];
+        // row_slice.par_chunks_mut(w as usize).enumerate().for_each(|(lz, row)| {
+        //     let iz = bbox.y + lz as u32;
+        //     // … existing inner-loop body, reading `snap` (Sync), …
+        //     // … writing row[ix as usize] = next as u16; …
+        // });
+        // ```
+        //
+        // Same symmetric-brush / undo-bitset caveats as raise.rs.
         let data = hm.data_mut();
         for iz in bbox.y..bbox.y + bbox.h {
             let dz = iz as f32 - cz_px;
