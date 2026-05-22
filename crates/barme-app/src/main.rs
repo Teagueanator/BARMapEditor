@@ -1,5 +1,6 @@
 mod build_runner;
 mod config;
+mod feature_decals;
 mod launcher;
 mod parity_fixtures;
 mod render;
