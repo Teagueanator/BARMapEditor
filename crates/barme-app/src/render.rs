@@ -4004,16 +4004,48 @@ impl TerrainCallback {
     }
 }
 
-/// Clear colour for the offscreen colour attachment. Dark navy reads
-/// as a neutral 3D-viewport sky and produces enough contrast against
-/// both light and dark egui themes. Premultiplied — the alpha is 1.0
-/// so RGB = pre/post multiplied are identical for this opaque value.
+/// Fallback clear colour for the offscreen colour attachment. Used by
+/// the reflection pass (the mirrored-Y scene is sampled by the water
+/// shader; over-painting it with the project's sky colour would feed
+/// the wrong tone into the reflection mix). The main offscreen pass
+/// switched to a per-frame `atmosphere.sky_color`-driven clear in
+/// Sprint 28 / R2 / ADR-040 via [`atmosphere_clear_color`]; this
+/// constant stays as the reflection-RT fallback because the reflection
+/// is a "geometry only" pass — the sky background is composed
+/// separately on top of the main offscreen result, not into the
+/// reflection.
+///
+/// Dark navy reads as a neutral 3D-viewport sky and produces enough
+/// contrast against both light and dark egui themes. Premultiplied —
+/// the alpha is 1.0 so RGB = pre/post multiplied are identical for
+/// this opaque value.
 const OFFSCREEN_CLEAR_COLOR: wgpu::Color = wgpu::Color {
     r: 0.04,
     g: 0.05,
     b: 0.07,
     a: 1.0,
 };
+
+/// Sprint 28 / R2 / ADR-040 — derive the per-frame offscreen clear
+/// colour from the project's `atmosphere.sky_color`. The terrain
+/// rasteriser only covers the mesh footprint (~80 % of the viewport
+/// at default framing); the cleared background fills the rest. This
+/// is the cheapest "sky behind terrain" path — no dedicated sky
+/// pipeline, no fullscreen quad. The deferred-cubemap sprint will add
+/// a fullscreen-quad sky pass that supersedes this clear for skybox
+/// support; until then the solid sky colour matches the engine's
+/// "no skybox" branch (`Sky.cpp::DrawSky` clears with `sky_color`).
+///
+/// Premultiplied alpha = 1.0 (opaque); the cleared pixel doesn't pre-
+/// premultiply by `sky_color` rgb (alpha is 1, identical math).
+fn atmosphere_clear_color(atmos: &AtmosphereUniforms) -> wgpu::Color {
+    wgpu::Color {
+        r: atmos.sky_color[0] as f64,
+        g: atmos.sky_color[1] as f64,
+        b: atmos.sky_color[2] as f64,
+        a: 1.0,
+    }
+}
 
 impl egui_wgpu::CallbackTrait for TerrainCallback {
     fn prepare(
@@ -4228,7 +4260,11 @@ impl egui_wgpu::CallbackTrait for TerrainCallback {
                 view: offscreen.color_view(),
                 resolve_target: None,
                 ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(OFFSCREEN_CLEAR_COLOR),
+                    // Sprint 28 / R2 / ADR-040 — sky-colour clear.
+                    // Replaces the prior hardcoded navy. Pixels not
+                    // covered by the terrain rasteriser show the
+                    // configured `atmosphere.sky_color` instead.
+                    load: wgpu::LoadOp::Clear(atmosphere_clear_color(&self.atmosphere)),
                     store: wgpu::StoreOp::Store,
                 },
                 depth_slice: None,
