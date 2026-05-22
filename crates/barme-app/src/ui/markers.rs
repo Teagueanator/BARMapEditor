@@ -37,7 +37,13 @@ pub const MARKER_Y_LIFT_ELMOS: f32 = 32.0;
 /// IDs are mapped to the WGSL `Instance.shape_id` field by
 /// [`MarkerShape::shape_id`]; renumbering here MUST be mirrored in
 /// `markers.wgsl::fs_main`.
+///
+/// Sprint 29 / ADR-046 — `TexturedSprite` samples the per-family
+/// decal atlas (a `texture_2d_array` bound at `@group(0)
+/// @binding(2)`). The atlas layer is carried as a per-instance
+/// `u32` next to `shape_id`; see [`MarkerInstanceGpu::texture_layer`].
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[allow(dead_code)] // TexturedSprite is wired by resolved_visual() in the next commit
 pub enum MarkerShape {
     /// Anti-aliased filled disk.
     FilledCircle,
@@ -53,6 +59,14 @@ pub enum MarkerShape {
     /// so it stays screen-space sized — matches the primary Triangle's
     /// size at every camera distance.
     OutlineTriangle,
+    /// Sample the feature decal atlas at `layer`. The atlas is
+    /// uploaded by [`crate::feature_decals`] at app startup; the
+    /// per-family layer index is resolved by the
+    /// `FeatureDecalRegistry`. Unknown layers (e.g. when a family
+    /// has no upstream diffuse) fall back to the category glyph
+    /// before the marker is pushed — by the time the GPU sees a
+    /// `TexturedSprite` the layer is guaranteed to be populated.
+    TexturedSprite { layer: u32 },
 }
 
 impl MarkerShape {
@@ -63,6 +77,17 @@ impl MarkerShape {
             MarkerShape::FilledWithStroke => 2,
             MarkerShape::Triangle => 3,
             MarkerShape::OutlineTriangle => 4,
+            MarkerShape::TexturedSprite { .. } => 5,
+        }
+    }
+
+    /// Per-instance texture array layer. Non-`TexturedSprite`
+    /// shapes return 0 — the fragment shader's case for those
+    /// shapes never consults the field, so the value is inert.
+    pub fn texture_layer(self) -> u32 {
+        match self {
+            MarkerShape::TexturedSprite { layer } => layer,
+            _ => 0,
         }
     }
 }
@@ -95,7 +120,12 @@ pub struct MarkerBatch {
 
 /// GPU-layout instance struct. Must match `markers.wgsl::Instance`
 /// byte-for-byte. Storage-buffer layout (not std140) — vec3 + float
-/// = 16 B, vec4 = 16 B, u32 + 3 × u32 pad = 16 B.
+/// = 16 B, vec4 = 16 B, u32 + u32 + 2 × u32 pad = 16 B.
+///
+/// Sprint 29 / ADR-046 — `texture_layer` consumes one slot of the
+/// former 3-u32 pad. Struct size and alignment are unchanged (48 B);
+/// the WGSL `Instance` mirror at `markers.wgsl::Instance` follows
+/// the same renumbering.
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable, Debug)]
 pub struct MarkerInstanceGpu {
@@ -105,7 +135,10 @@ pub struct MarkerInstanceGpu {
     /// Premultiplied RGBA in `[0, 1]`.
     pub color: [f32; 4],
     pub shape_id: u32,
-    pub _pad: [u32; 3],
+    /// Layer index in the marker decal `texture_2d_array` — only
+    /// consulted when `shape_id == 5` (TexturedSprite).
+    pub texture_layer: u32,
+    pub _pad: [u32; 2],
 }
 
 impl MarkerBatch {
@@ -169,7 +202,8 @@ impl MarkerBatch {
                         a as f32 * inv,
                     ],
                     shape_id: m.shape.shape_id(),
-                    _pad: [0, 0, 0],
+                    texture_layer: m.shape.texture_layer(),
+                    _pad: [0, 0],
                 }
             })
             .collect()
@@ -333,6 +367,44 @@ mod tests {
         assert_eq!(MarkerShape::FilledWithStroke.shape_id(), 2);
         assert_eq!(MarkerShape::Triangle.shape_id(), 3);
         assert_eq!(MarkerShape::OutlineTriangle.shape_id(), 4);
+        assert_eq!(MarkerShape::TexturedSprite { layer: 0 }.shape_id(), 5);
+    }
+
+    #[test]
+    fn texture_layer_routing_only_for_textured_sprite() {
+        // Sprint 29 / ADR-046 — non-TexturedSprite shapes report
+        // texture_layer == 0 so the fragment shader's other branches
+        // ignore the field cleanly. TexturedSprite carries the array
+        // index through to the GPU.
+        assert_eq!(MarkerShape::FilledCircle.texture_layer(), 0);
+        assert_eq!(MarkerShape::OutlineRing.texture_layer(), 0);
+        assert_eq!(MarkerShape::Triangle.texture_layer(), 0);
+        assert_eq!(MarkerShape::TexturedSprite { layer: 7 }.texture_layer(), 7);
+        assert_eq!(
+            MarkerShape::TexturedSprite { layer: 31 }.texture_layer(),
+            31
+        );
+    }
+
+    #[test]
+    fn into_instances_routes_texture_layer_from_shape() {
+        let mut b = MarkerBatch::default();
+        b.push(Marker {
+            shape: MarkerShape::TexturedSprite { layer: 11 },
+            ..marker_at(Vec3::new(1.0, 0.0, 2.0))
+        });
+        b.push(Marker {
+            shape: MarkerShape::FilledCircle,
+            ..marker_at(Vec3::new(3.0, 0.0, 4.0))
+        });
+        let inst = b.into_instances();
+        assert_eq!(inst[0].shape_id, 5);
+        assert_eq!(inst[0].texture_layer, 11);
+        assert_eq!(inst[1].shape_id, 0);
+        assert_eq!(
+            inst[1].texture_layer, 0,
+            "non-TexturedSprite must zero the layer slot"
+        );
     }
 
     #[test]

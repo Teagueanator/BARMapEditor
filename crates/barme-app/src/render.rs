@@ -786,20 +786,86 @@ fn install_reflection_target(device: &wgpu::Device) -> ReflectionTarget {
     }
 }
 
-/// GPU state for the Sprint-13 marker pipeline (ADR-037). One bind
+/// Number of layers reserved in the marker decal `texture_2d_array`
+/// (Sprint 29 / ADR-046). Phase A populates 16 layers from the
+/// upstream-mapfeatures families; 32 leaves headroom for the BAR-
+/// side families that gain diffuses in later sprints without
+/// reallocating the texture at runtime. Memory: 32 × 128² × 4 B
+/// = 2 MB. Pinned by a unit test in `feature_decals.rs`.
+pub const MARKER_DECAL_LAYERS: u32 = 32;
+/// Side length of one decal sprite layer. MUST agree with
+/// `crate::feature_decals::SPRITE_SIZE`.
+pub const MARKER_DECAL_SIZE: u32 = 128;
+
+/// GPU state for the Sprint-13 marker pipeline (ADR-037; extended
+/// Sprint 29 / ADR-046 with the feature decal atlas). One bind
 /// group, one uniform buffer (`MarkerU`), one pre-allocated storage
-/// buffer for up to [`MARKER_INSTANCE_CAPACITY`] marker instances.
-/// The pipeline depth-tests against terrain (which writes depth) but
+/// buffer for up to [`MARKER_INSTANCE_CAPACITY`] marker instances,
+/// one `texture_2d_array` of `MARKER_DECAL_LAYERS` layers. The
+/// pipeline depth-tests against terrain (which writes depth) but
 /// doesn't write depth itself — translucent blending order is owned
 /// by the CPU-side back-to-front sort in
 /// `ui::markers::MarkerBatch::sort_back_to_front`.
-struct MarkerResources {
+pub(crate) struct MarkerResources {
     pipeline: wgpu::RenderPipeline,
     bind_group: wgpu::BindGroup,
     uniform_buf: wgpu::Buffer,
     /// 10 000 × 48 = 480 KB; sized for the foreseeable Sprint 13-24
     /// load. Storage-buffer layout matches `markers.wgsl::Instance`.
     instance_buf: wgpu::Buffer,
+    /// Atlas of feature decals. `FeatureDecalRegistry` writes one
+    /// layer per upstream-mapfeatures family at app startup. Layers
+    /// not written stay zero-filled (transparent black); the
+    /// registry guarantees marker pushes only land on populated
+    /// layers, so the shader never reads a hole.
+    decal_texture: wgpu::Texture,
+}
+
+impl MarkerResources {
+    /// Write one decal layer into the atlas. Called by
+    /// [`crate::feature_decals::FeatureDecalRegistry`] once per
+    /// family at app startup. `rgba` MUST be exactly
+    /// `MARKER_DECAL_SIZE² × 4` bytes; layer MUST be in
+    /// `[0, MARKER_DECAL_LAYERS)`.
+    #[allow(dead_code)] // wired by FeatureDecalRegistry in the next commit
+    pub fn write_decal_layer(&self, queue: &wgpu::Queue, layer: u32, rgba: &[u8]) {
+        let stride = MARKER_DECAL_SIZE * 4;
+        let expected = (stride * MARKER_DECAL_SIZE) as usize;
+        debug_assert_eq!(
+            rgba.len(),
+            expected,
+            "marker decal layer expects {expected} RGBA8 bytes, got {}",
+            rgba.len()
+        );
+        debug_assert!(
+            layer < MARKER_DECAL_LAYERS,
+            "decal layer {layer} out of [0, {}) range",
+            MARKER_DECAL_LAYERS,
+        );
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.decal_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: 0,
+                    y: 0,
+                    z: layer,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            rgba,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(stride),
+                rows_per_image: Some(MARKER_DECAL_SIZE),
+            },
+            wgpu::Extent3d {
+                width: MARKER_DECAL_SIZE,
+                height: MARKER_DECAL_SIZE,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
 }
 
 /// GPU state for the Sprint-13 line pipeline (ADR-037 / Phase 5).
@@ -1697,6 +1763,41 @@ fn install_marker_resources(device: &wgpu::Device) -> MarkerResources {
         mapped_at_creation: false,
     });
 
+    // Sprint 29 / ADR-046 — feature decal atlas + sampler. Allocated
+    // here at pipeline build; layers stay zero-filled until the
+    // FeatureDecalRegistry uploads via `MarkerResources::write_decal_layer`.
+    let decal_texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("markers.decals"),
+        size: wgpu::Extent3d {
+            width: MARKER_DECAL_SIZE,
+            height: MARKER_DECAL_SIZE,
+            depth_or_array_layers: MARKER_DECAL_LAYERS,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        // sRGB so the linear blend math in PREMULTIPLIED_ALPHA_BLENDING
+        // is correct against the upstream diffuses (TGA stores sRGB).
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let decal_view = decal_texture.create_view(&wgpu::TextureViewDescriptor {
+        label: Some("markers.decals.view"),
+        dimension: Some(wgpu::TextureViewDimension::D2Array),
+        ..Default::default()
+    });
+    let decal_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("markers.decals.sampler"),
+        address_mode_u: wgpu::AddressMode::ClampToEdge,
+        address_mode_v: wgpu::AddressMode::ClampToEdge,
+        address_mode_w: wgpu::AddressMode::ClampToEdge,
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        mipmap_filter: wgpu::FilterMode::Nearest,
+        ..Default::default()
+    });
+
     let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("markers.bgl"),
         entries: &[
@@ -1723,6 +1824,25 @@ fn install_marker_resources(device: &wgpu::Device) -> MarkerResources {
                 },
                 count: None,
             },
+            // 2: feature decal atlas (Sprint 29 / ADR-046). One layer
+            // per upstream-mapfeatures family.
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2Array,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            // 3: sampler for the atlas (linear filter, clamp-to-edge).
+            wgpu::BindGroupLayoutEntry {
+                binding: 3,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
         ],
     });
 
@@ -1737,6 +1857,14 @@ fn install_marker_resources(device: &wgpu::Device) -> MarkerResources {
             wgpu::BindGroupEntry {
                 binding: 1,
                 resource: instance_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::TextureView(&decal_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::Sampler(&decal_sampler),
             },
         ],
     });
@@ -1792,6 +1920,7 @@ fn install_marker_resources(device: &wgpu::Device) -> MarkerResources {
         bind_group,
         uniform_buf,
         instance_buf,
+        decal_texture,
     }
 }
 

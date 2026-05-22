@@ -27,13 +27,28 @@ struct Instance {
     /// `PREMULTIPLIED_ALPHA_BLENDING` (pitfall #6).
     color: vec4<f32>,
     /// 0 = filled circle, 1 = outline ring, 2 = filled-with-stroke,
-    /// 3 = upward triangle. Mapped from `ui::markers::MarkerShape`.
+    /// 3 = upward triangle, 4 = outline triangle, 5 = textured sprite.
+    /// Mapped from `ui::markers::MarkerShape`.
     shape_id: u32,
-    _pad: vec3<u32>,
+    /// Layer index into `decal_atlas` when shape_id == 5 (Sprint 29 /
+    /// ADR-046). Inert for every other shape.
+    texture_layer: u32,
+    _pad: vec2<u32>,
 };
 
 @group(0) @binding(0) var<uniform> u: MarkerU;
 @group(0) @binding(1) var<storage, read> instances: array<Instance>;
+
+// Sprint 29 / ADR-046 — per-family feature decal atlas. The host
+// allocates a fixed layer count at pipeline-build time (see
+// `MARKER_DECAL_LAYERS` in render.rs); the `FeatureDecalRegistry`
+// writes one layer per upstream-mapfeatures family at app startup.
+// Layers beyond the registry's populated count are zero-initialised
+// (transparent black) — marker pushes that would land on an
+// unpopulated layer are filtered to glyph fallback CPU-side, so the
+// shader never samples a hole at runtime.
+@group(0) @binding(2) var decal_atlas: texture_2d_array<f32>;
+@group(0) @binding(3) var decal_sampler: sampler;
 
 struct VsOut {
     @builtin(position) clip_pos: vec4<f32>,
@@ -126,6 +141,31 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
                 discard;
             }
             return inst.color;
+        }
+        case 5u: {
+            // Sprint 29 / ADR-046 — sample the feature decal atlas.
+            // Unit-quad uv is in [-1, 1]; convert to [0, 1] for texture
+            // coords. Flip Y because `image` decodes textures with the
+            // top row first while quad uv.y = +1 points up on screen.
+            let tex_uv = vec2<f32>(
+                in.uv.x * 0.5 + 0.5,
+                1.0 - (in.uv.y * 0.5 + 0.5),
+            );
+            // mipless: textureSampleLevel at LOD 0. Phase A pin (128²
+            // sprites; no mips). `inst.texture_layer` is bounded by
+            // the host's MARKER_DECAL_LAYERS — the CPU-side registry
+            // rejects out-of-range placements.
+            let texel = textureSampleLevel(
+                decal_atlas,
+                decal_sampler,
+                tex_uv,
+                i32(inst.texture_layer),
+                0.0,
+            );
+            // `inst.color` carries an authoring tint (default opaque
+            // white). Multiply so tinted families remain possible
+            // without a separate uniform.
+            return texel * inst.color;
         }
         default: {
             // Unknown shape — emit nothing rather than render garbage.

@@ -675,12 +675,25 @@ mod tests {
     /// The embedded catalogue loads at least one feature name; this
     /// guards against a malformed JSON breaking the lint pass
     /// silently.
+    ///
+    /// Sprint 29 / ADR-046 — catalogue v3 replaces the v2 synthetic
+    /// names (`pinetree`, `agorm_pine1`, …) with real upstream
+    /// `mapfeatures` names. The smoke check now pins one entry from
+    /// each major source — `geovent` (engine-internal),
+    /// `agorm_rock1` (mapfeatures rocks), `ad0_banyan_1`
+    /// (mapfeatures trees).
     #[test]
     fn stock_manifest_loads_non_empty() {
         let m = StockManifest::load();
-        // A few canonical names that exist in the Sprint 12 baseline.
         assert!(m.contains("geovent"), "stock manifest missing geovent");
-        assert!(m.contains("pinetree"), "stock manifest missing pinetree");
+        assert!(
+            m.contains("agorm_rock1"),
+            "stock manifest missing agorm_rock1 (catalog v3 upstream rocks)"
+        );
+        assert!(
+            m.contains("ad0_banyan_1"),
+            "stock manifest missing ad0_banyan_1 (catalog v3 upstream trees)"
+        );
     }
 
     /// A wizard-style fixture (one ally group with one start
