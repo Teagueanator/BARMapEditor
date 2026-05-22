@@ -31,7 +31,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.9"
-image = { version = "0.25", default-features = false, features = ["png", "bmp"] }
+image = { version = "0.25", default-features = false, features = ["png", "bmp", "tga"] }
+# BC1/BC3/BC5 DDS decode for feature decal sprites (Sprint 29 / ADR-046).
+# Phase A only exercises the TGA path; bcdec_rs is added early so Phase B
+# (S3O parsing, Sprint 29b) inherits a working decoder. Pure Rust, no
+# platform branches.
+bcdec_rs = "0.4"
 rfd = "0.15"
 
 # Subprocess plumbing
