@@ -787,12 +787,20 @@ fn install_reflection_target(device: &wgpu::Device) -> ReflectionTarget {
 }
 
 /// Number of layers reserved in the marker decal `texture_2d_array`
-/// (Sprint 29 / ADR-046). Phase A populates 16 layers from the
-/// upstream-mapfeatures families; 32 leaves headroom for the BAR-
-/// side families that gain diffuses in later sprints without
-/// reallocating the texture at runtime. Memory: 32 × 128² × 4 B
-/// = 2 MB. Pinned by a unit test in `feature_decals.rs`.
-pub const MARKER_DECAL_LAYERS: u32 = 32;
+/// (Sprint 29 / ADR-046; bumped Sprint 29b / ADR-047).
+///
+/// - Phase A (Sprint 29) populated 16 layers from per-family
+///   diffuse decals.
+/// - Phase B (Sprint 29b) populates one layer per CATALOG ENTRY
+///   that has a resolvable upstream .s3o — currently 85 entries
+///   (see `scripts/fetch-feature-s3o.sh`). 128 leaves ~43 layers
+///   of headroom for future variant additions without another
+///   atlas-reallocation sprint.
+///
+/// Memory: `128 × 128² × 4 B = 8 MB`. Still well inside PITFALLS
+/// §1's iGPU budget; the actual ceiling before mem pressure shows
+/// up on a 16-SMU project is somewhere around 512 layers (32 MB).
+pub const MARKER_DECAL_LAYERS: u32 = 128;
 /// Side length of one decal sprite layer. MUST agree with
 /// `crate::feature_decals::SPRITE_SIZE`.
 pub const MARKER_DECAL_SIZE: u32 = 128;
