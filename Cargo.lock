@@ -378,6 +378,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "barme-render-s3o"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "bytemuck",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
 name = "base64"
 version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

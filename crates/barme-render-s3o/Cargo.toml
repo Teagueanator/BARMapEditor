@@ -1,0 +1,17 @@
+[package]
+name = "barme-render-s3o"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "BAR map editor — Recoil S3O model parser + offscreen thumbnail render pass (Sprint 29b)"
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+bytemuck.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

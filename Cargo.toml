@@ -4,6 +4,7 @@ members = [
     "crates/barme-app",
     "crates/barme-core",
     "crates/barme-pipeline",
+    "crates/barme-render-s3o",
 ]
 
 [workspace.package]
@@ -67,6 +68,7 @@ fs2 = "0.4"
 # Workspace-internal
 barme-core = { path = "crates/barme-core" }
 barme-pipeline = { path = "crates/barme-pipeline" }
+barme-render-s3o = { path = "crates/barme-render-s3o" }
 
 [profile.dev]
 opt-level = 1            # debug builds are too slow with image/wgpu at opt-level 0
