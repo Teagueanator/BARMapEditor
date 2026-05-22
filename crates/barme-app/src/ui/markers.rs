@@ -43,7 +43,6 @@ pub const MARKER_Y_LIFT_ELMOS: f32 = 32.0;
 /// @binding(2)`). The atlas layer is carried as a per-instance
 /// `u32` next to `shape_id`; see [`MarkerInstanceGpu::texture_layer`].
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-#[allow(dead_code)] // TexturedSprite is wired by resolved_visual() in the next commit
 pub enum MarkerShape {
     /// Anti-aliased filled disk.
     FilledCircle,

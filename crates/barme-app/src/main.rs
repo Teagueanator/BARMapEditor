@@ -585,14 +585,23 @@ impl Default for FeatureState {
 }
 
 /// Parsed shape of `assets/mapfeatures_catalog.json` (C6 / Sprint 12;
-/// extended Sprint 19 with `category_visuals` + per-entry `metal`).
-/// Loaded once at App start; `Default` is the empty catalog.
+/// extended Sprint 19 with `category_visuals` + per-entry `metal`;
+/// Sprint 29 / ADR-046 added `families` + per-entry `family` for the
+/// decal sprite atlas). Loaded once at App start; `Default` is the
+/// empty catalog.
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 struct FeatureCatalog {
     #[serde(default)]
     categories: std::collections::BTreeMap<String, Vec<CatalogEntry>>,
     #[serde(default)]
     category_visuals: std::collections::BTreeMap<String, CategoryVisual>,
+    /// Per-family metadata used by the feature decal registry — one
+    /// diffuse texture per family, applied to every catalog entry
+    /// whose `family` points to it. Families with `diffuse_texture
+    /// = null` (kapok, rocks30, tombstone, xmascomwreck, geovent in
+    /// v3) fall through to the category glyph at runtime.
+    #[serde(default)]
+    families: std::collections::BTreeMap<String, FamilyDef>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -608,6 +617,38 @@ struct CatalogEntry {
     #[serde(default)]
     #[allow(dead_code)] // surfaced in inspector tooltip in a future polish pass
     tags: Vec<String>,
+    /// Sprint 29 / ADR-046 — references one of the keys in
+    /// [`FeatureCatalog::families`]. Drives decal-atlas lookup in
+    /// `resolved_visual`. `None` keeps the entry on the
+    /// category-glyph path (used by entries that pre-date v3 or by
+    /// engine-internal stubs like geovent).
+    #[serde(default)]
+    family: Option<String>,
+}
+
+/// Sprint 29 / ADR-046 — per-family metadata. Parsed from
+/// `families.<key>` in the catalog JSON; the `decal_layer` slot is
+/// filled at runtime by [`populate_feature_decal_registry`] when
+/// the corresponding `tools/feature-decals/<key>/diffuse.tga` is
+/// present + decodes successfully.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+struct FamilyDef {
+    #[serde(default)]
+    #[allow(dead_code)] // used by future inspector grouping / picker UX
+    category: String,
+    #[serde(default)]
+    #[allow(dead_code)] // surfaced in tooltips via future polish pass
+    label: String,
+    #[serde(default)]
+    diffuse_texture: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)] // catalog provenance — surfaced in help-center article
+    source: String,
+    /// Runtime-only: layer index in the marker decal atlas. `None`
+    /// until [`populate_feature_decal_registry`] uploads the
+    /// diffuse, or permanently `None` when no diffuse is available.
+    #[serde(skip)]
+    decal_layer: Option<u32>,
 }
 
 /// Per-category visual hint used by the marker batch + minimap.
@@ -720,10 +761,41 @@ impl FeatureCatalog {
     /// always has something to draw — orphaned features are common
     /// during round-trip with custom feature packs (engine logs +
     /// skips at game start; the editor should not).
+    ///
+    /// Sprint 29 / ADR-046 — when the entry's `family` references a
+    /// family with an uploaded decal layer, return
+    /// [`MarkerShape::TexturedSprite`] so the marker pipeline samples
+    /// the per-family sprite. Otherwise (missing family, missing
+    /// diffuse, or load failure) fall through to the category
+    /// glyph — unchanged Sprint 19 behaviour.
     fn resolved_visual(&self, name: &str) -> ResolvedFeatureVisual {
-        let Some((cat, _)) = self.lookup_entry(name) else {
+        let Some((cat, entry)) = self.lookup_entry(name) else {
             return FALLBACK_FEATURE_VISUAL;
         };
+        // Sprint 29 / ADR-046: TexturedSprite preferred when available.
+        if let Some(family_key) = entry.family.as_deref()
+            && let Some(family) = self.families.get(family_key)
+            && let Some(layer) = family.decal_layer
+        {
+            // Sprites are larger than glyphs so the family's diffuse
+            // is legible at typical camera distance — ~3x the glyph
+            // radius (Phase A tuning value; revisit when world-scaled
+            // rendering lands in Sprint 29b / Phase B).
+            let glyph_radius = self
+                .category_visuals
+                .get(cat)
+                .map(|v| v.radius_px)
+                .unwrap_or(FALLBACK_FEATURE_VISUAL.radius_px);
+            return ResolvedFeatureVisual {
+                shape: crate::ui::markers::MarkerShape::TexturedSprite { layer },
+                // Opaque white = sprite shows its own colour. Future
+                // tinting (e.g. "selected" highlight) can multiply
+                // through inst.color in the shader.
+                color: egui::Color32::WHITE,
+                radius_px: glyph_radius * 3.0,
+            };
+        }
+        // Pre-Sprint-29 path: category glyph.
         let Some(v) = self.category_visuals.get(cat) else {
             return FALLBACK_FEATURE_VISUAL;
         };
@@ -740,6 +812,82 @@ impl FeatureCatalog {
     /// miss-hit so the caller can distinguish "0 known" from "unknown".
     fn metal_for(&self, name: &str) -> Option<u32> {
         self.lookup_entry(name).map(|(_, e)| e.metal)
+    }
+
+    /// Sprint 29 / R5 / ADR-046 — scan `tools/feature-decals/<family>/
+    /// diffuse.tga` for every family with `diffuse_texture` set,
+    /// decode each via [`crate::feature_decals::load_decal`], upload
+    /// into the marker decal atlas, and stamp the assigned layer onto
+    /// the family. Idempotent at the layer-counter level: a second
+    /// call will reuse populated layers + assign new layers to any
+    /// newly-installed families. Families exceeding
+    /// `MARKER_DECAL_LAYERS` are skipped with a warning.
+    fn populate_decal_registry(&mut self, render_state: &egui_wgpu::RenderState, repo_root: &Path) {
+        let dir = repo_root.join("tools").join("feature-decals");
+        let max_layers = crate::render::MARKER_DECAL_LAYERS;
+        // Recover the next unassigned layer from any already-populated
+        // families so repeated calls don't re-stamp the same layer.
+        let mut next_layer: u32 = self
+            .families
+            .values()
+            .filter_map(|f| f.decal_layer.map(|l| l + 1))
+            .max()
+            .unwrap_or(0);
+
+        let mut loaded = 0u32;
+        let mut missing = 0u32;
+        let mut overflow = 0u32;
+        for (family_key, family) in self.families.iter_mut() {
+            if family.decal_layer.is_some() || family.diffuse_texture.is_none() {
+                continue;
+            }
+            let candidate = dir.join(family_key).join("diffuse.tga");
+            if !candidate.exists() {
+                missing += 1;
+                continue;
+            }
+            if next_layer >= max_layers {
+                overflow += 1;
+                continue;
+            }
+            match crate::feature_decals::load_decal(&candidate) {
+                Ok(decoded) => {
+                    crate::render::upload_feature_decal(render_state, next_layer, &decoded.rgba);
+                    family.decal_layer = Some(next_layer);
+                    info!(
+                        family = %family_key,
+                        layer = next_layer,
+                        bytes = decoded.rgba.len(),
+                        "feature decal loaded"
+                    );
+                    next_layer += 1;
+                    loaded += 1;
+                }
+                Err(e) => {
+                    warn!(
+                        family = %family_key,
+                        path = %candidate.display(),
+                        error = %e,
+                        "feature decal load failed; falling back to category glyph"
+                    );
+                }
+            }
+        }
+        info!(
+            loaded,
+            missing,
+            overflow,
+            atlas_layers_used = next_layer,
+            atlas_layers_total = max_layers,
+            "feature decal registry populated"
+        );
+        if overflow > 0 {
+            warn!(
+                overflow,
+                "feature decal atlas exhausted; \
+                 {overflow} families fell back to category glyphs"
+            );
+        }
     }
 }
 
@@ -1467,6 +1615,14 @@ impl App {
         // user to "+ Add" a layer first.
         app.seed_demo_accent_layer();
         app.reupload_layer_stack_diffuses();
+        // Sprint 29 / R5 / ADR-046 — populate the feature decal atlas
+        // from `tools/feature-decals/<family>/diffuse.tga`. Skipped
+        // when wgpu isn't available (test-only path).
+        if let Some(rs) = app.render_state.as_ref() {
+            app.feature_state
+                .manifest
+                .populate_decal_registry(rs, &repo_root());
+        }
         app
     }
 

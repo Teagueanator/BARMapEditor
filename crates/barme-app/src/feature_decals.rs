@@ -18,11 +18,6 @@
 //! corresponding revision to the bind-group resource and a fresh
 //! memory-budget audit.
 
-// Wired by FeatureDecalRegistry in the next commit; tests already
-// exercise every item. Allow keeps clippy `-D warnings` green during
-// the Sprint 29 staged landing.
-#![allow(dead_code)]
-
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow};
@@ -40,7 +35,11 @@ pub struct DecalImage {
 }
 
 impl DecalImage {
-    /// `SPRITE_SIZE * 4` bytes per row.
+    /// `SPRITE_SIZE * 4` bytes per row. Exported so downstream
+    /// callers can size scratch buffers without re-deriving from
+    /// [`SPRITE_SIZE`]; only used by tests today, kept as part of
+    /// the module's stable surface.
+    #[allow(dead_code)]
     pub const STRIDE_BYTES: usize = SPRITE_SIZE as usize * 4;
     /// Total RGBA8 byte count for one sprite.
     pub const TOTAL_BYTES: usize = SPRITE_SIZE as usize * SPRITE_SIZE as usize * 4;

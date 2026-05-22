@@ -823,11 +823,10 @@ pub(crate) struct MarkerResources {
 
 impl MarkerResources {
     /// Write one decal layer into the atlas. Called by
-    /// [`crate::feature_decals::FeatureDecalRegistry`] once per
-    /// family at app startup. `rgba` MUST be exactly
-    /// `MARKER_DECAL_SIZE² × 4` bytes; layer MUST be in
-    /// `[0, MARKER_DECAL_LAYERS)`.
-    #[allow(dead_code)] // wired by FeatureDecalRegistry in the next commit
+    /// [`crate::FeatureCatalog::populate_decal_registry`] once per
+    /// family at app startup via the public render::upload_feature_decal
+    /// shim. `rgba` MUST be exactly `MARKER_DECAL_SIZE² × 4` bytes;
+    /// `layer` MUST be in `[0, MARKER_DECAL_LAYERS)`.
     pub fn write_decal_layer(&self, queue: &wgpu::Queue, layer: u32, rgba: &[u8]) {
         let stride = MARKER_DECAL_SIZE * 4;
         let expected = (stride * MARKER_DECAL_SIZE) as usize;
@@ -2928,6 +2927,22 @@ pub fn upload_heightmap(render_state: &egui_wgpu::RenderState, heightmap: &Heigh
     if need_grid {
         res.grid = Some(build_index_buffer(device, dims));
     }
+}
+
+/// Upload one decoded feature decal into the marker pipeline's
+/// `texture_2d_array` (Sprint 29 / R5 / ADR-046). Called by
+/// [`crate::populate_feature_decal_registry`] once per family at
+/// app startup. `rgba` MUST be exactly `MARKER_DECAL_SIZE² × 4`
+/// bytes; `layer` MUST be `< MARKER_DECAL_LAYERS`. Both invariants
+/// are debug-asserted in `MarkerResources::write_decal_layer`.
+pub fn upload_feature_decal(render_state: &egui_wgpu::RenderState, layer: u32, rgba: &[u8]) {
+    let queue = &render_state.queue;
+    let renderer = render_state.renderer.read();
+    let Some(res) = renderer.callback_resources.get::<RenderResources>() else {
+        warn!("upload_feature_decal called before render::install — decal discarded");
+        return;
+    };
+    res.marker.write_decal_layer(queue, layer, rgba);
 }
 
 /// Allocate (or re-allocate) the Sprint-13 offscreen render target so it
