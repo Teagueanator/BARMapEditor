@@ -112,6 +112,11 @@ struct App {
     map_size: MapSize,
     heightmap: Option<HeightmapState>,
     last_error: Option<String>,
+    /// Sprint 31 / U4 — toast notification queue. Replaces the
+    /// single `last_error` slot in chunk 2; chunk 1 wires the
+    /// primitive alongside the legacy field so the migration is
+    /// mechanical.
+    toast_queue: crate::ui::toast::ToastQueue,
     render_state: Option<egui_wgpu::RenderState>,
     camera: OrbitCamera,
     height_scale: f32,
@@ -1787,6 +1792,7 @@ impl App {
             map_size: MapSize::square(16),
             heightmap: None,
             last_error: None,
+            toast_queue: crate::ui::toast::ToastQueue::default(),
             render_state,
             camera: OrbitCamera::framing(8192.0, 8192.0),
             height_scale: 256.0,
@@ -2336,6 +2342,83 @@ impl App {
     /// mutate any persisted field. Idempotent. ADR-035.
     fn mark_dirty(&mut self) {
         self.dirty = true;
+    }
+
+    /// Sprint 31 / U4 — spawn an info toast (auto-dismisses in
+    /// 3 s). Lifecycle confirmations: save ok, GC swept, install
+    /// landed. Routes through [`crate::ui::toast::ToastQueue::spawn`]
+    /// which coalesces identical text within 5 s.
+    #[allow(dead_code)] // wired by chunk 2 (last_error migration) + chunk 5 (build/lint surfaces)
+    fn toast_info(&mut self, text: impl Into<String>) {
+        self.toast_queue
+            .spawn(crate::ui::toast::ToastKind::Info, text.into(), None);
+    }
+
+    /// Sprint 31 / U4 — spawn a warning toast (auto-dismisses in
+    /// 6 s). Non-fatal degradation: downsample, lint count
+    /// landed, partial import.
+    #[allow(dead_code)] // wired by chunk 2 + chunk 5
+    fn toast_warn(&mut self, text: impl Into<String>) {
+        self.toast_queue
+            .spawn(crate::ui::toast::ToastKind::Warning, text.into(), None);
+    }
+
+    /// Sprint 31 / U4 — spawn a persistent error toast (no auto-
+    /// dismiss; user must click ×). Hard failures: save failed,
+    /// open failed, build gated, texture import refused.
+    #[allow(dead_code)] // wired by chunk 2 + chunk 5
+    fn toast_error(&mut self, text: impl Into<String>) {
+        self.toast_queue
+            .spawn(crate::ui::toast::ToastKind::Error, text.into(), None);
+    }
+
+    /// Sprint 31 / U4 — spawn a toast with an action button. The
+    /// caller picks the tone + the side-effect; the App's
+    /// update loop maps the [`ToastAction`] to its
+    /// state-mutation.
+    ///
+    /// [`ToastAction`]: crate::ui::toast::ToastAction
+    #[allow(dead_code)] // wired by chunk 2 + chunk 5
+    fn toast_with_action(
+        &mut self,
+        kind: crate::ui::toast::ToastKind,
+        text: impl Into<String>,
+        action: crate::ui::toast::ToastAction,
+    ) {
+        self.toast_queue.spawn(kind, text.into(), Some(action));
+    }
+
+    /// Sprint 31 / U4 — apply a single [`ToastInteraction`]
+    /// produced by [`crate::ui::toast::render`]. Dismiss removes
+    /// the toast at the given index; Action fires the side-effect
+    /// AND removes the toast (PITFALL #6 — the side-effect is
+    /// the explicit button, not an ambient click).
+    ///
+    /// [`ToastInteraction`]: crate::ui::toast::ToastInteraction
+    fn apply_toast_interaction(&mut self, interaction: crate::ui::toast::ToastInteraction) {
+        use crate::ui::toast::{ToastAction, ToastInteraction};
+        match interaction {
+            ToastInteraction::Dismiss(idx) => self.toast_queue.dismiss(idx),
+            ToastInteraction::Action(idx, action) => {
+                match action {
+                    ToastAction::OpenLintPanel => {
+                        self.lint_panel_open = true;
+                    }
+                    ToastAction::OpenBuildLog => {
+                        self.build_log_open = true;
+                    }
+                    ToastAction::OpenHelpArticle(article) => {
+                        self.help_center.open_at(article);
+                    }
+                    ToastAction::DismissMigrationToast => {
+                        self.migration_toast_dismissed = true;
+                        self.pending_migration_toast = false;
+                        self.mark_dirty();
+                    }
+                }
+                self.toast_queue.dismiss(idx);
+            }
+        }
     }
 
     /// Sprint 21 / C8 — recompute the lint pass against the current
@@ -11689,6 +11772,17 @@ impl eframe::App for App {
         // cheat sheet — both can be open at once.
         crate::ui::help_center::help_window(ctx, &mut self.help_center);
 
+        // Sprint 31 / U4: toast queue. Prune expired entries
+        // first so the next frame's render doesn't paint them
+        // through their fade-out tail. Then render and apply
+        // any × / action clicks in interaction order.
+        self.toast_queue.prune_expired(std::time::Instant::now());
+        let toast_interactions =
+            crate::ui::toast::render(ctx, &self.toast_queue, ctx.content_rect());
+        for it in toast_interactions {
+            self.apply_toast_interaction(it);
+        }
+
         // Sprint 22 / U2: per-tool intro overlay. `pending` is set
         // by `set_tool` on first entry; we render here so the tool
         // strip + inspector are already painted underneath.
@@ -11893,6 +11987,7 @@ mod tests {
             map_size: MapSize::square(2),
             heightmap: None,
             last_error: None,
+            toast_queue: crate::ui::toast::ToastQueue::default(),
             render_state: None,
             camera: OrbitCamera::framing(128.0, 128.0),
             height_scale: 256.0,
