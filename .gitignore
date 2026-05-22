@@ -20,6 +20,7 @@ Cargo.lock.bak
 /tools/textures/
 /tools/textures-cache/
 /tools/feature-decals/
+/tools/feature-s3o/
 
 # Test/scratch outputs
 /scratch/
