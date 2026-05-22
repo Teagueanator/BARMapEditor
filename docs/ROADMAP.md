@@ -878,6 +878,74 @@ Implements SRS F1–F12. Ships a Windows `.exe` and a Linux AppImage.
       warnings && cargo test --workspace` green.
       **Renderer-parity arc unchanged at 2 / 8 done** (Sprint 27
       was off-arc). Next arc sprint is Sprint 28 (atmosphere + fog).
+- [x] **STATUS UPDATE 2026-05-21 (Sprint 28 / R2, ADR-045 — atmosphere
+      + fog).** Third renderer-parity step. The cheapest sprint on the
+      arc as the prompt framed it ("most of the work is plumbing — the
+      shader math is one fog equation"). **7 commits on main**:
+      (1) `render(atmosphere): AtmosphereUniforms + bind group
+      plumbing` — new 144 B `#[repr(C)]` block (9 × vec4: sun_color,
+      sky_color, fog_color, fog_start_end, cloud_color, wind,
+      sky_axis_angle, sun_dir, flags) bound at terrain group 0 /
+      binding 13. `App::atmosphere_uniforms_for_render` populates each
+      frame from `MapInfo.atmosphere` + `lighting`. `TerrainCallback`
+      carries the new struct through `prepare()` (the `prepare()` site
+      writes both terrain + reflection-pass bind groups against the
+      same buffer — fog and sky don't change between the passes).
+      (2) `render(atmosphere): exponential height fog in terrain
+      fragment stage` — `smoothstep(fog_start, fog_end, dist_norm ×
+      exp(-y × falloff))` then `mix(lit, fog_color, fog_t ×
+      fog_color.a)`. Reuses §7's `to_eye` (WGSL flags redefinition;
+      smoothstep clamps defensively against `fog_start == fog_end`).
+      (3) `render(atmosphere): sun-colour angle ramp + cross-shader
+      sun_dir` — `mix(fog_color, ground_diffuse, clamp(sun_dir.y, 0,
+      1))` warms terrain at low sun; matching `daylight = pow(1 -
+      clamp(sun_dir.y, 0, 1), 0.7)` in `water.wgsl` resolves Sprint
+      26's hardcoded `0.5` placeholder. Atmosphere uniforms grew
+      sun_dir (9th vec4 → 144 B); size-pin test updated. Water bind
+      group adds a 5th binding to share the atmosphere buffer.
+      (4) `render(atmosphere): sky-colour offscreen clear` — main
+      offscreen `LoadOp::Clear` now reads `atmosphere.sky_color` per
+      frame via `atmosphere_clear_color(&self.atmosphere)`. Pixels not
+      covered by the terrain rasteriser show the project's configured
+      sky tone instead of the legacy navy. Reflection-pass clear
+      retains the navy fallback (over-painting the reflection RT with
+      sky_color would mis-tint the water reflection sampler).
+      (5) `render(atmosphere): wind direction from atmosphere block`
+      — `water_draw_for_frame` reads wind from the deterministic
+      `sin/cos` ramp; `water.wgsl` switches to `atmos.wind.xy` as the
+      canonical wind source (single point of truth shared with terrain
+      and the future grass shader). PITFALL #7 satisfied — no
+      seed-controlled noise, parity fixtures reproduce byte-for-byte.
+      (6) `docs(adr): ADR-045 atmosphere + fog` — the prompt's
+      "ADR-040" number was already taken (Sprint 16 paint viewport);
+      renumber to ADR-045. Documents seven decisions: sibling block
+      (not extension), exponential fog math, sky-as-clear (not a
+      dedicated pipeline), sun-angle ramp, deterministic wind, cubemap
+      deferral, fog_start == fog_end defensiveness. Operational
+      pitfalls for the deferred-cubemap sprint included.
+      (7) `assets(parity): foggy-map + sunset fixtures` — two
+      README-based parity fixtures matching the Sprint 26 lava-sample
+      pattern. foggy-map exercises dense fog + altitude thinning;
+      sunset exercises the warm-tinted ground at `sun_dir.y ≈ 0.2`
+      plus the matching lava daylight brightening.
+
+      **Skybox cubemap loading explicitly deferred** per user scope
+      decision (2026-05-21) — the prompt called it "the heaviest
+      engineering work" and the four shipped Sprint-28 effects (fog,
+      sun ramp, sky-as-clear, wind) don't depend on it. The follow-up
+      sprint lands `texture_cube<f32>` binding + PNG-folder loader +
+      content-addressed cache + dedicated `sky.wgsl` pipeline +
+      horizon gradient blend. `AtmosphereUniforms.flags[0] = has_skybox`
+      stays at 0 until then.
+
+      Tests: barme-app 356 → 360 (+4 atmosphere: size-pin,
+      defaults-match-MapInfo, MapInfo-round-trip, wind determinism);
+      barme-core 279 unchanged; barme-pipeline 213 unchanged. `cargo
+      fmt && cargo clippy --workspace --all-targets -- -D warnings &&
+      cargo test --workspace` green.
+
+      **Renderer-parity arc: 3 / 8 done.** Next arc sprint is Sprint
+      29 (feature asset decoding — S3O + decal sprites).
 - [ ] Beherith (or active mapper) reviews `.sd7` byte-for-byte against PyMapConv
       reference output on three test maps
 - [ ] Listed on `beyondallreason.info/guide/mapmaking-resources` as beta

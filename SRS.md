@@ -236,6 +236,44 @@ PA's in-game system designer is the cited gold standard. It does the following w
     > 353 → 356 (+3 inspector_section_pattern). The renderer-parity
     > arc is unchanged at **2 / 8 done** — Sprint 27 was off-arc
     > UX work. Next arc sprint is Sprint 28 (atmosphere + fog).
+    >
+    > **STATUS UPDATE 2026-05-21 (Sprint 28 / R2 / ADR-045 — atmosphere
+    > + fog shipped):** the third renderer-parity step. New
+    > `AtmosphereUniforms` (144 B / 9 vec4) lives in its own uniform
+    > buffer bound to both the terrain (group 0 / binding 13) and
+    > water (group 0 / binding 5) pipelines, populated each frame from
+    > `mapinfo.atmosphere` + `mapinfo.lighting` by
+    > `App::atmosphere_uniforms_for_render`. Terrain fragment shader
+    > applies exponential height fog
+    > (`smoothstep(fog_start, fog_end, dist_norm × exp(-y × falloff))
+    > → mix(lit, fog_color, fog_t × fog_density)`); the offscreen
+    > pass's `LoadOp::Clear` now reads `atmosphere.sky_color` per frame
+    > (the cheap "sky behind terrain" path — no dedicated pipeline).
+    > The sun-colour ramp `mix(fog_color, ground_diffuse, clamp(sun_dir.y,
+    > 0, 1))` warms terrain at low sun; the matching `daylight = pow(1 -
+    > clamp(sun_dir.y, 0, 1), 0.7)` resolves Sprint 26's hardcoded
+    > `0.5` placeholder so lava brightens at night and dims under
+    > direct sun. Wind direction is a deterministic
+    > `sin(time × 0.1) + cos(time × 0.0233)` ramp between
+    > `atmosphere.min_wind`/`max_wind` (PITFALL #7 — no seed-controlled
+    > noise; parity fixtures reproduce byte-for-byte); water's
+    > Sprint-26 `wind = 0.05` constant is gone. Skybox cubemap loading
+    > is **deferred** (per ADR-045 — the user's scope decision; the
+    > prompt itself called it "the heaviest engineering work" and
+    > none of the other Sprint 28 deliverables depended on it).
+    > `AtmosphereUniforms.flags[0] = has_skybox` stays at 0 until the
+    > follow-up sprint lands the `texture_cube<f32>` binding +
+    > PNG-folder loader + content-addressed cache + dedicated
+    > `sky.wgsl` pipeline. 7 commits on `main` (uniforms +
+    > bind plumbing → fog math → sun ramp → sky-colour clear → wind
+    > propagation → ADR-045 → parity fixtures). 4 new tests: size
+    > pin, defaults-match-MapInfo, MapInfo-round-trip, wind
+    > determinism. Two parity-fixture READMEs (`foggy-map/`,
+    > `sunset/`). `cargo fmt && cargo clippy --workspace --all-targets
+    > -- -D warnings && cargo test --workspace` green; barme-app 356
+    > → 360 tests (+4 atmosphere). The renderer-parity arc is now
+    > **3 / 8 done**. Next arc sprint is Sprint 29 (feature asset
+    > decoding — S3O + decal sprites).
 12. **Decompilation fidelity.** Round-tripping an existing `.sd7` loses information: the recovered diffuse PNG has been through DXT1 (color precision loss); heightmap, metal, and type maps are exact; mapinfo.lua is exact; auxiliary splat textures survive untouched. Reuse PyMapConv's decompile path.
 13. **GPU brush latency.** Spring/Recoil maps can theoretically reach 96×96 SMUs. Sub-millisecond brush response at 32×32+ requires the heightmap to live on the GPU as a storage texture, edited by compute shaders. Read-back to CPU happens only at save.
 
