@@ -624,6 +624,16 @@ struct CatalogEntry {
     /// engine-internal stubs like geovent).
     #[serde(default)]
     family: Option<String>,
+    /// Sprint 29b / ADR-047 — per-entry override of the family's
+    /// `s3o_pattern`. Used when the catalog entry name doesn't
+    /// match the .s3o filename (e.g. `agorm_rock1` → `rock1.s3o`,
+    /// `cycas1` → `fern1.s3o`). When set, the registry resolves
+    /// `tools/feature-s3o/<s3o>` directly; when `None`, falls
+    /// through to the family's pattern. Consumed by
+    /// `populate_decal_registry` in commit 8 of Sprint 29b.
+    #[serde(default)]
+    #[allow(dead_code)] // consumed by commit 8 (thumbnail registry wiring)
+    s3o: Option<String>,
 }
 
 /// Sprint 29 / ADR-046 — per-family metadata. Parsed from
@@ -644,6 +654,17 @@ struct FamilyDef {
     label: String,
     #[serde(default)]
     diffuse_texture: Option<String>,
+    /// Sprint 29b / ADR-047 — per-family `objects3d/...` path
+    /// template. `{name}` substitutes the [`CatalogEntry::name`]
+    /// (e.g. `"ad0_banyan/{name}.s3o"` → `ad0_banyan/ad0_banyan_3
+    /// .s3o`). `None` for families with no consistent pattern (per
+    /// entry `s3o` carries the literal path instead) or for
+    /// families whose models aren't in upstream mapfeatures
+    /// (rocks30 / tombstone / xmascomwreck / geovent — Phase C).
+    /// Consumed by `populate_decal_registry` in commit 8.
+    #[serde(default)]
+    #[allow(dead_code)] // consumed by commit 8 (thumbnail registry wiring)
+    s3o_pattern: Option<String>,
     #[serde(default)]
     #[allow(dead_code)] // catalog provenance — surfaced in help-center article
     source: String,
@@ -665,6 +686,7 @@ impl std::fmt::Debug for FamilyDef {
             .field("category", &self.category)
             .field("label", &self.label)
             .field("diffuse_texture", &self.diffuse_texture)
+            .field("s3o_pattern", &self.s3o_pattern)
             .field("source", &self.source)
             .field("decal_layer", &self.decal_layer)
             .field("egui_thumbnail_loaded", &self.egui_thumbnail.is_some())
