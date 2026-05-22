@@ -301,6 +301,12 @@ struct App {
     /// - [`crate::ui::lint_panel::tab_counts`] (F9 form tab dots),
     /// - [`App::build_and_install`] (hard-error gate).
     lint_summary: Vec<barme_pipeline::LintIssue>,
+    /// Sprint 31 / U4 — previous frame's hard-error count. The
+    /// toast surface fires only on the `0 → >0` transition so
+    /// the user gets a single nudge per fresh-error edge,
+    /// without spamming every frame the lint pass runs while
+    /// errors persist.
+    lint_prev_error_count: usize,
     /// Sprint 21 / C8 — cached stock-feature manifest used by the
     /// `FeatureNotInStockManifest` rule. Loaded once at startup
     /// (the JSON is `include_str!`d so loading is a JSON parse, not
@@ -1855,6 +1861,7 @@ impl App {
             lint_panel_open: false,
             lint_panel_was_open: false,
             lint_summary: Vec::new(),
+            lint_prev_error_count: 0,
             lint_stock_manifest: barme_pipeline::StockManifest::load(),
             nav_gizmo_drag_active: false,
             build_variant: BuildVariant::default(),
@@ -2481,6 +2488,27 @@ impl App {
         let project = self.snapshot_project();
         let info: barme_core::MapInfo = (&project).into();
         self.lint_summary = barme_pipeline::lint_with(&project, &info, &self.lint_stock_manifest);
+        // Sprint 31 / U4 — fire a one-shot toast on the
+        // `0 → >0` hard-error edge so the user gets a nudge
+        // toward the lint panel without flooding the queue.
+        // Steady-state errors stay quiet; transitions back
+        // to zero are silently accepted.
+        let current = self
+            .lint_summary
+            .iter()
+            .filter(|i| i.severity == barme_pipeline::LintSeverity::Error)
+            .count();
+        if current > 0 && self.lint_prev_error_count == 0 {
+            self.toast_with_action(
+                crate::ui::toast::ToastKind::Warning,
+                format!(
+                    "Lint detected {current} error{plural}.",
+                    plural = if current == 1 { "" } else { "s" },
+                ),
+                crate::ui::toast::ToastAction::OpenLintPanel,
+            );
+        }
+        self.lint_prev_error_count = current;
     }
 
     /// Top-bar validation chip's tone + label. Sprint 21 (C8): the
@@ -6122,6 +6150,36 @@ impl App {
             // tail of stderr without an extra click.
             if matches!(next, build_runner::BuildState::Failed { .. }) {
                 self.build_log_open = true;
+            }
+            // Sprint 31 / U4 — surface the terminal state as a
+            // toast. Done = info; Failed = error with the View
+            // log action; Cancelled = warn (the user asked for
+            // it, no need to escalate).
+            match &next {
+                build_runner::BuildState::Done {
+                    sd7_path, duration, ..
+                } => {
+                    let secs = duration.as_secs_f32();
+                    self.toast_info(format!(
+                        "Built {} in {secs:.1}s.",
+                        sd7_path
+                            .file_name()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("(sd7)")
+                    ));
+                }
+                build_runner::BuildState::Failed { .. } => {
+                    self.toast_with_action(
+                        crate::ui::toast::ToastKind::Error,
+                        "Build failed. Check the log for details.",
+                        crate::ui::toast::ToastAction::OpenBuildLog,
+                    );
+                }
+                build_runner::BuildState::Cancelled { duration, .. } => {
+                    let secs = duration.as_secs_f32();
+                    self.toast_warn(format!("Build cancelled after {secs:.1}s."));
+                }
+                _ => {}
             }
             self.build_state = next;
         }
@@ -12221,6 +12279,7 @@ mod tests {
             lint_panel_open: false,
             lint_panel_was_open: false,
             lint_summary: Vec::new(),
+            lint_prev_error_count: 0,
             lint_stock_manifest: barme_pipeline::StockManifest::load(),
             nav_gizmo_drag_active: false,
             build_variant: BuildVariant::default(),
@@ -12910,6 +12969,65 @@ mod tests {
         assert!(
             app.lint_panel_open,
             "lint panel should auto-open when build is gated"
+        );
+    }
+
+    /// Sprint 31 / U4 — `recompute_lint` fires the lint-edge
+    /// toast on the `0 → >0` hard-error transition only.
+    /// Subsequent recomputes with a non-zero count stay silent;
+    /// a fresh `0` count followed by `>0` re-fires.
+    #[test]
+    fn recompute_lint_fires_toast_once_on_error_edge() {
+        let mut app = make_test_app();
+        // Seed enough state that lint can find issues: a default
+        // empty-ally-groups project trips TeamsEmpty.
+        app.recompute_lint();
+        assert!(
+            app.lint_error_count() >= 1,
+            "test app should carry at least one hard error"
+        );
+        let count_after_first = app
+            .toast_queue
+            .toasts
+            .iter()
+            .filter(|t| t.text.contains("Lint detected"))
+            .count();
+        assert_eq!(
+            count_after_first, 1,
+            "first recompute with errors should spawn one lint toast"
+        );
+        // Second recompute (still errors, no transition) → no
+        // new toast. The dedup window would coalesce anyway, but
+        // the edge gate suppresses the spawn outright.
+        app.recompute_lint();
+        let count_after_second = app
+            .toast_queue
+            .toasts
+            .iter()
+            .filter(|t| t.text.contains("Lint detected"))
+            .count();
+        assert_eq!(
+            count_after_second, 1,
+            "steady-state errors should NOT respawn toasts"
+        );
+        // Now simulate a fix: clear lint_summary and reset the
+        // edge tracker, then re-introduce an error. The new
+        // spawn coalesces into the existing toast (identical
+        // text within the 5 s dedup window), so the queue length
+        // stays at 1 but the entry's `count` field bumps.
+        app.lint_summary.clear();
+        app.lint_prev_error_count = 0;
+        app.recompute_lint();
+        let edge_toasts: Vec<_> = app
+            .toast_queue
+            .toasts
+            .iter()
+            .filter(|t| t.text.contains("Lint detected"))
+            .collect();
+        assert_eq!(edge_toasts.len(), 1);
+        assert!(
+            edge_toasts[0].count >= 2,
+            "a re-fired edge should coalesce-bump the toast count"
         );
     }
 
