@@ -244,6 +244,24 @@ impl ToastQueue {
         true
     }
 
+    /// Spawn a toast that does NOT auto-dismiss regardless of
+    /// `kind`. Used by Sprint-17's `pending_migration_toast`
+    /// (`kind = Info` + `dismiss_at = None`) per PITFALL #1 — the
+    /// "Don't show again" action needs to be reachable without a
+    /// 3-second race. Coalesce + cap rules still apply.
+    pub fn spawn_persistent(
+        &mut self,
+        kind: ToastKind,
+        text: String,
+        action: Option<ToastAction>,
+    ) -> bool {
+        let added = self.spawn(kind, text, action);
+        if added && let Some(t) = self.toasts.back_mut() {
+            t.dismiss_at = None;
+        }
+        added
+    }
+
     /// Prune expired toasts (auto-dismiss). Called from
     /// [`render`] each frame before painting.
     pub fn prune_expired(&mut self, now: Instant) {
@@ -572,6 +590,22 @@ mod tests {
             "coalesce should bump the dismiss_at forward"
         );
         assert_eq!(q.toasts[0].count, 2);
+    }
+
+    /// PITFALL #1 — Sprint 17 migration toast survives the
+    /// auto-dismiss cycle. `spawn_persistent(Info, ...)`
+    /// produces a toast with `dismiss_at = None` (despite the
+    /// Info kind defaulting to a 3 s TTL).
+    #[test]
+    fn spawn_persistent_overrides_ttl() {
+        let mut q = ToastQueue::default();
+        q.spawn_persistent(ToastKind::Info, "migration".into(), None);
+        assert_eq!(q.toasts.len(), 1);
+        assert!(q.toasts[0].dismiss_at.is_none());
+        // Pruning at any future time leaves the toast in place.
+        let far = Instant::now() + Duration::from_secs(3600);
+        q.prune_expired(far);
+        assert_eq!(q.toasts.len(), 1);
     }
 
     #[test]

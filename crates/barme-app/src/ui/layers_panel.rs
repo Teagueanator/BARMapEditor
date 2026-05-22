@@ -388,7 +388,36 @@ fn apply_actions(app: &mut App, actions: Vec<LayerAction>) {
                 );
             }
             LayerAction::Delete(id) => {
-                app.delete_layer(&id);
+                // Sprint 31 / U4 — confirm before destroying a
+                // layer that carries painted mask data. A
+                // freshly-added layer (uniform mask) deletes
+                // immediately; one the user has painted into goes
+                // through the modal first. Ctrl+Z still restores
+                // the diff if needed.
+                let has_paint = app
+                    .layer_stack
+                    .layer_by_id(&id)
+                    .is_some_and(|l| l.mask.has_painted_tiles());
+                let layer_name = app
+                    .layer_stack
+                    .layer_by_id(&id)
+                    .map(|l| l.name.clone())
+                    .unwrap_or_else(|| "(unknown)".to_string());
+                if has_paint {
+                    app.request_confirm(
+                        crate::ui::confirm::ConfirmDialog::destructive(
+                            "Delete layer?",
+                            format!(
+                                "Delete layer \"{layer_name}\" — it contains painted \
+                                 mask data. This can be undone with Ctrl+Z."
+                            ),
+                            "Delete",
+                        ),
+                        crate::ConfirmIntent::DeleteLayer(id),
+                    );
+                } else {
+                    app.delete_layer(&id);
+                }
             }
             LayerAction::Reorder { from, to } => {
                 if from != to {

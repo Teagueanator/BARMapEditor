@@ -506,6 +506,16 @@ impl LayerMask {
         (self.grid.tiles_x, self.grid.tiles_y)
     }
 
+    /// Sprint 31 / U4 — returns `true` iff at least one tile has
+    /// been promoted from `Uniform` to `Pixels`. A freshly
+    /// allocated mask reports `false`; the first brush stamp
+    /// that touches a tile flips it to `true`. Drives the
+    /// "delete layer (contains painted data)" confirmation
+    /// modal.
+    pub fn has_painted_tiles(&self) -> bool {
+        self.grid.tiles.iter().any(|t| matches!(t, Tile::Pixels(_)))
+    }
+
     /// Test-only: count of `Pixels`-variant tiles in the grid. The
     /// Sprint-15 migration tests use this to assert that a flat-bytes
     /// all-uniform input collapses to zero allocated pixel buffers.
@@ -896,6 +906,28 @@ mod tests {
 
     fn two_smu() -> MapSize {
         MapSize::square(2)
+    }
+
+    /// Sprint 31 / U4 — `has_painted_tiles` reports false on a
+    /// fresh uniform mask, true once any tile gets promoted.
+    /// Drives the "delete layer (contains painted mask data)"
+    /// confirmation modal.
+    #[test]
+    fn has_painted_tiles_false_on_fresh_mask() {
+        let m = LayerMask::filled(two_smu(), 0);
+        assert!(!m.has_painted_tiles());
+        let m2 = LayerMask::filled(two_smu(), 255);
+        assert!(
+            !m2.has_painted_tiles(),
+            "uniform-fill (any byte) must report unpainted"
+        );
+    }
+
+    #[test]
+    fn has_painted_tiles_true_after_brush() {
+        let mut m = LayerMask::filled(two_smu(), 0);
+        m.set_pixel(10, 10, 200);
+        assert!(m.has_painted_tiles());
     }
 
     /// D10 / Sprint 17 (ADR-041): clone_tile + restore_tile round-trip.

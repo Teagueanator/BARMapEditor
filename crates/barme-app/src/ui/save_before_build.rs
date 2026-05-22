@@ -1,11 +1,13 @@
 //! Sprint 20 / chunk 8 — "Save before build?" confirmation modal.
 //!
-//! Stub `egui::Window` with three buttons (Save & build / Build
-//! without saving / Cancel). Sprint 31 promotes this to a proper
-//! modal primitive (with backdrop, escape key, etc.); the API here
-//! is intentionally minimal so the swap is mechanical.
+//! Sprint 31 / U4 dropped this stub's bespoke window-only shape
+//! and gave it the same backdrop + Esc-cancel keyboard that
+//! [`crate::ui::confirm::confirm_modal`] uses. The 3-button shape
+//! (Save & build / Build without saving / Cancel) is kept — the
+//! generic `confirm_modal` is the 2-button (Confirm / Cancel)
+//! variant.
 
-use eframe::egui;
+use eframe::egui::{self, Color32, CornerRadius, Sense};
 
 use crate::ui::theme::Tokens;
 
@@ -39,54 +41,91 @@ pub fn render(ctx: &egui::Context, open: &mut bool) -> SaveBeforeBuildChoice {
     }
     let t = Tokens::DARK;
     let mut choice = SaveBeforeBuildChoice::Dismissed;
-    let mut local_open = true;
-    egui::Window::new("Save before building?")
-        .open(&mut local_open)
-        .collapsible(false)
-        .resizable(false)
-        .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
-        .default_width(360.0)
+    let viewport = ctx.content_rect();
+
+    // Sprint 31 / U4 — click-eating backdrop. Same pattern as
+    // [`crate::ui::confirm::confirm_modal`].
+    egui::Area::new(egui::Id::new("save_before_build_backdrop"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(viewport.min)
+        .interactable(true)
         .show(ctx, |ui| {
-            ui.label(
-                egui::RichText::new(
-                    "This project has unsaved changes. The build uses your in-memory edits \
-                     regardless — but the .barmeproj on disk won't reflect them until you save.",
-                )
-                .color(t.muted)
-                .size(11.0),
+            let (rect, _) = ui.allocate_exact_size(viewport.size(), Sense::click());
+            ui.painter().rect_filled(
+                rect,
+                CornerRadius::same(0),
+                Color32::from_rgba_premultiplied(0, 0, 0, 0x90),
             );
-            ui.add_space(12.0);
-            ui.horizontal(|ui| {
-                if ui
-                    .button("Save & build")
-                    .on_hover_text("Save the project to its current path, then start the build.")
-                    .clicked()
-                {
-                    choice = SaveBeforeBuildChoice::SaveAndBuild;
-                }
-                if ui
-                    .button("Build without saving")
-                    .on_hover_text(
-                        "Skip save; build the in-memory snapshot directly. The on-disk \
-                         .barmeproj is unchanged.",
+        });
+
+    egui::Area::new(egui::Id::new("save_before_build_dialog"))
+        .order(egui::Order::Foreground)
+        .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+        .interactable(true)
+        .show(ctx, |ui| {
+            let frame = egui::Frame::new()
+                .fill(t.panel)
+                .stroke(egui::Stroke::new(1.0, t.border_hi))
+                .corner_radius(CornerRadius::same(8))
+                .inner_margin(egui::Margin::same(16));
+            frame.show(ui, |ui| {
+                ui.set_min_width(360.0);
+                ui.set_max_width(360.0);
+                ui.label(
+                    egui::RichText::new("Save before building?")
+                        .strong()
+                        .size(14.0)
+                        .color(t.text),
+                );
+                ui.add_space(8.0);
+                ui.label(
+                    egui::RichText::new(
+                        "This project has unsaved changes. The build uses your in-memory \
+                         edits regardless — but the .barmeproj on disk won't reflect them \
+                         until you save.",
                     )
-                    .clicked()
-                {
-                    choice = SaveBeforeBuildChoice::BuildWithoutSaving;
-                }
-                if ui
-                    .button("Cancel")
-                    .on_hover_text("Don't build. Return to the editor.")
-                    .clicked()
-                {
-                    choice = SaveBeforeBuildChoice::Cancel;
-                }
+                    .color(t.muted)
+                    .size(12.0),
+                );
+                ui.add_space(14.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .button("Save & build")
+                        .on_hover_text(
+                            "Save the project to its current path, then start the build.",
+                        )
+                        .clicked()
+                    {
+                        choice = SaveBeforeBuildChoice::SaveAndBuild;
+                    }
+                    if ui
+                        .button("Build without saving")
+                        .on_hover_text(
+                            "Skip save; build the in-memory snapshot directly. The on-disk \
+                             .barmeproj is unchanged.",
+                        )
+                        .clicked()
+                    {
+                        choice = SaveBeforeBuildChoice::BuildWithoutSaving;
+                    }
+                    if ui
+                        .button("Cancel")
+                        .on_hover_text("Don't build. Return to the editor.")
+                        .clicked()
+                    {
+                        choice = SaveBeforeBuildChoice::Cancel;
+                    }
+                });
             });
         });
-    if !local_open && choice == SaveBeforeBuildChoice::Dismissed {
-        // Close-X: treat as Cancel so the App clears its flag.
+
+    // Sprint 31 / U4 — Esc cancels (matches confirm_modal).
+    if choice == SaveBeforeBuildChoice::Dismissed
+        && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+    {
         choice = SaveBeforeBuildChoice::Cancel;
     }
+
     if choice != SaveBeforeBuildChoice::Dismissed {
         *open = false;
     }

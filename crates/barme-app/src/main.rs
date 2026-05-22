@@ -2429,7 +2429,6 @@ impl App {
     /// behind `intent`. Sets `pending_confirm` + the paired
     /// intent; the modal renders on the next frame and the
     /// `apply_confirm_result` handler dispatches on `Confirmed`.
-    #[allow(dead_code)] // wired by chunk 4 call sites
     fn request_confirm(
         &mut self,
         dialog: crate::ui::confirm::ConfirmDialog,
@@ -6866,7 +6865,6 @@ enum RunGcSource {
 /// undo-history contract stays in lock-step with the
 /// underlying handlers (`delete_ally_group`, `delete_layer`,
 /// etc.).
-#[allow(dead_code)] // wired by chunk 4 (destructive-action confirmations)
 #[derive(Debug, Clone)]
 enum ConfirmIntent {
     /// Delete an ally group whose `start_positions` are
@@ -10290,7 +10288,33 @@ impl App {
             self.delete_start_position(g_id, i);
         }
         if let Some(id) = to_delete_group {
-            self.delete_ally_group(id);
+            // Sprint 31 / U4 — confirm before destroying nested
+            // start positions. Empty groups delete immediately
+            // (no data loss), groups with positions go through
+            // the modal first.
+            let positions = self
+                .ally_groups
+                .iter()
+                .find(|g| g.id == id)
+                .map(|g| (g.name.clone(), g.start_positions.len()))
+                .unwrap_or_default();
+            if positions.1 > 0 {
+                let (name, n) = positions;
+                self.request_confirm(
+                    crate::ui::confirm::ConfirmDialog::destructive(
+                        "Delete ally group?",
+                        format!(
+                            "Delete ally group \"{name}\" AND its {n} start position{plural}? \
+                             This can be undone with Ctrl+Z.",
+                            plural = if n == 1 { "" } else { "s" },
+                        ),
+                        "Delete",
+                    ),
+                    ConfirmIntent::DeleteAllyGroup(id),
+                );
+            } else {
+                self.delete_ally_group(id);
+            }
         }
     }
 
@@ -11707,8 +11731,27 @@ impl App {
         match action {
             Some(FileAction::LoadHeightmap(p)) => self.load_heightmap(p),
             Some(FileAction::OpenWizard) => {
-                self.wizard = WizardState::default_for_new_project();
-                self.wizard_open = true;
+                // Sprint 31 / U4 — discard-unsaved-changes gate.
+                // The wizard wholesale-replaces the in-memory
+                // project; routing through the modal lets the
+                // user back out without losing edits.
+                if self.dirty {
+                    let name = self.project_name.clone();
+                    self.request_confirm(
+                        crate::ui::confirm::ConfirmDialog::destructive(
+                            "Discard unsaved changes?",
+                            format!(
+                                "\"{name}\" has unsaved changes. Opening the new-project \
+                                 wizard discards them — they cannot be recovered with Ctrl+Z."
+                            ),
+                            "Discard & open wizard",
+                        ),
+                        ConfirmIntent::NewProjectDiscardingChanges,
+                    );
+                } else {
+                    self.wizard = WizardState::default_for_new_project();
+                    self.wizard_open = true;
+                }
             }
             Some(FileAction::Save) => {
                 let target = self
@@ -11725,11 +11768,47 @@ impl App {
                 }
             }
             Some(FileAction::Open) => {
-                if let Some(p) = pick_open_path() {
+                // Sprint 31 / U4 — discard-unsaved-changes gate.
+                // Same rationale as the OpenWizard arm above.
+                if self.dirty {
+                    let name = self.project_name.clone();
+                    self.request_confirm(
+                        crate::ui::confirm::ConfirmDialog::destructive(
+                            "Discard unsaved changes?",
+                            format!(
+                                "\"{name}\" has unsaved changes. Opening another project \
+                                 discards them — they cannot be recovered with Ctrl+Z."
+                            ),
+                            "Discard & open",
+                        ),
+                        ConfirmIntent::OpenProjectDiscardingChanges,
+                    );
+                } else if let Some(p) = pick_open_path() {
                     self.open_from(p);
                 }
             }
-            Some(FileAction::OpenPath(p)) => self.open_from(p),
+            Some(FileAction::OpenPath(p)) => {
+                // Sprint 31 / U4 — discard-unsaved-changes gate
+                // for the Recent submenu / drag-drop path. Same
+                // rationale as Open above.
+                if self.dirty {
+                    let name = self.project_name.clone();
+                    self.request_confirm(
+                        crate::ui::confirm::ConfirmDialog::destructive(
+                            "Discard unsaved changes?",
+                            format!(
+                                "\"{name}\" has unsaved changes. Opening \"{}\" \
+                                 discards them — they cannot be recovered with Ctrl+Z.",
+                                p.display(),
+                            ),
+                            "Discard & open",
+                        ),
+                        ConfirmIntent::OpenPathDiscardingChanges(p),
+                    );
+                } else {
+                    self.open_from(p);
+                }
+            }
             Some(FileAction::BuildAndInstall) => {
                 // Sprint 20 / chunk 8 — dirty-state gate. If the
                 // project has unsaved changes, open the confirmation
@@ -12026,37 +12105,27 @@ impl eframe::App for App {
             }
         }
 
-        // D10 / Sprint 17 (ADR-041) — one-time migration toast for
-        // pre-Sprint-14 projects whose layer stack got seeded from
-        // the legacy `splat_config`. Persists across reopens via
-        // `Project.migration_toast_dismissed`.
+        // D10 / Sprint 17 (ADR-041), Sprint 31 / U4 PITFALL #1 —
+        // one-time migration toast for pre-Sprint-14 projects
+        // whose layer stack got seeded from the legacy
+        // `splat_config`. Lifted into the toast queue as a
+        // persistent Info entry with a "Don't show again" action;
+        // the per-project `Project.migration_toast_dismissed` flag
+        // persists the choice across reopens.
         if self.pending_migration_toast {
-            let mut still_open = true;
-            egui::Window::new("Splat layers migrated")
-                .id(egui::Id::new("sprint17_migration_toast"))
-                .open(&mut still_open)
-                .resizable(false)
-                .collapsible(false)
-                .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 60.0))
-                .show(ctx, |ui| {
-                    ui.set_max_width(420.0);
-                    ui.label(
-                        "Your project's splat layers were migrated to the new Layers panel.\n\
-                         The old painting wasn't carried over — re-paint into the layer masks.\n\
-                         (One-time prompt; dismissing stores the preference per project.)",
-                    );
-                    ui.add_space(6.0);
-                    if ui.button("Got it").clicked() {
-                        self.pending_migration_toast = false;
-                        self.migration_toast_dismissed = true;
-                        self.mark_dirty();
-                    }
-                });
-            if !still_open {
-                self.pending_migration_toast = false;
-                self.migration_toast_dismissed = true;
-                self.mark_dirty();
-            }
+            // One-shot spawn — clear the flag immediately so the
+            // `update` loop doesn't re-enqueue every frame. The
+            // toast queue's coalesce would absorb duplicates but
+            // we'd still pay the spawn-attempt cost; cheaper to
+            // gate up here.
+            self.pending_migration_toast = false;
+            self.toast_queue.spawn_persistent(
+                crate::ui::toast::ToastKind::Info,
+                "Your project's splat layers were migrated to the new Layers panel. \
+                 The old painting wasn't carried over — re-paint into the layer masks."
+                    .into(),
+                Some(crate::ui::toast::ToastAction::DismissMigrationToast),
+            );
         }
 
         // B8 Next-steps hint: shown after the wizard's Create, hidden

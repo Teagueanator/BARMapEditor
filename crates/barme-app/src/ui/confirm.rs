@@ -68,7 +68,6 @@ impl ConfirmDialog {
     /// Convenience constructor for a destructive prompt
     /// ("Delete", "Discard") — `confirm_label` defaults to the
     /// verb the caller passed; `cancel_label` is "Cancel".
-    #[allow(dead_code)] // wired by chunk 4 call sites
     pub fn destructive(
         title: &'static str,
         message: impl Into<String>,
