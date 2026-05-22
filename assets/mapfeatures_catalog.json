@@ -1,59 +1,158 @@
 {
-  "version": 2,
-  "source": "github.com/beyond-all-reason/mapfeatures",
-  "curated_at": "2026-05-20",
-  "curation_note": "Hand-curated baseline for Sprint 12 / C6, extended Sprint 19 with per-entry `metal` defaults + per-category visual hints. Metal values are coarse category defaults (trees=0, rocks=12, wreckage=120, props=0, geovent=0) — exact upstream values land when a future sprint imports the `mapfeatures` repo's lua definitions. `category_visuals` drives marker shape + colour in the 3D viewport + minimap; see `crates/barme-app/src/feature_catalog.rs`.",
+  "version": 3,
+  "source": "github.com/beyond-all-reason/mapfeatures @ 3b79163",
+  "bar_source": "github.com/beyond-all-reason/Beyond-All-Reason @ 3763840",
+  "curated_at": "2026-05-22",
+  "curation_note": "Sprint 29 / R5 / ADR-046 rewrite. v2's 34 synthetic names did not match any upstream featureDef (verified 2026-05-21 — 0 of 34). This v3 catalog enumerates representative variants from each upstream family: see `families` for the family→diffuse-texture mapping consumed by the feature decal registry. Per-entry `family` references that map. Phase A loads only diffuses; Phase B (Sprint 29b) will replace the decal sprites with 3D thumbnails from S3O parsing. Variant pruning: full enumeration is ~280 entries — this catalog picks ~3-8 reps per family to keep the F7 picker usable. Add more entries when a user reports a missing variant.",
   "category_visuals": {
-    "trees":    { "shape": "Triangle",         "color": "#65A30D", "radius_px": 6 },
-    "rocks":    { "shape": "FilledCircle",     "color": "#9CA3AF", "radius_px": 7 },
-    "wreckage": { "shape": "FilledWithStroke", "color": "#EA580C", "radius_px": 8 },
-    "props":    { "shape": "OutlineRing",      "color": "#3B82F6", "radius_px": 6 },
-    "geo":      { "shape": "Triangle",         "color": "#F59E0B", "radius_px": 9 }
+    "trees":     { "shape": "Triangle",         "color": "#65A30D", "radius_px": 7 },
+    "rocks":     { "shape": "FilledCircle",     "color": "#9CA3AF", "radius_px": 7 },
+    "wreckage":  { "shape": "FilledWithStroke", "color": "#EA580C", "radius_px": 8 },
+    "props":     { "shape": "OutlineRing",      "color": "#3B82F6", "radius_px": 6 },
+    "geo":       { "shape": "Triangle",         "color": "#F59E0B", "radius_px": 9 }
+  },
+  "families": {
+    "ad0_aleppo2":     { "category": "trees", "label": "Aleppo Pine",       "diffuse_texture": "ad0_aleppo2_1.tga",          "source": "mapfeatures", "license": "CC BY-SA-NC 3.0 (Beherith)" },
+    "ad0_banyan":      { "category": "trees", "label": "Banyan",            "diffuse_texture": "ad0_banyan_1.tga",           "source": "mapfeatures", "license": "unstated (upstream)" },
+    "ad0_cedar_atlas": { "category": "trees", "label": "Cedar",             "diffuse_texture": "ad0_cedar_atlas_1.tga",      "source": "mapfeatures", "license": "unstated (upstream)" },
+    "ad0_fir":         { "category": "trees", "label": "Fir",               "diffuse_texture": "ad0_fir_1.tga",              "source": "mapfeatures", "license": "unstated (upstream)" },
+    "ad0_senegal":     { "category": "trees", "label": "Senegal Palm",      "diffuse_texture": "ad0senegal_1.tga",           "source": "mapfeatures", "license": "unstated (upstream)" },
+    "agorm_rock":      { "category": "rocks", "label": "Agorm Rock",        "diffuse_texture": "rocks1a.tga",                "source": "mapfeatures", "license": "unstated (upstream)" },
+    "allpinesb_ad0":   { "category": "trees", "label": "Beherith Pine",     "diffuse_texture": "allpinesb_ad0_diffuse.tga",  "source": "mapfeatures", "license": "unstated (upstream)" },
+    "anemone":         { "category": "props", "label": "Giant Anemone",     "diffuse_texture": "anemone1_Color.tga",         "source": "mapfeatures", "license": "unstated (upstream)" },
+    "birchtree":       { "category": "trees", "label": "Euro Birch",        "diffuse_texture": "birch_tree_03_1.tga",        "source": "mapfeatures", "license": "unstated (upstream)" },
+    "cycas":           { "category": "props", "label": "Cycas Fern",        "diffuse_texture": "fernsa.tga",                 "source": "mapfeatures", "license": "unstated (upstream)" },
+    "kapok":           { "category": "trees", "label": "Kapok",             "diffuse_texture": null,                          "source": "mapfeatures", "license": "unstated (upstream)" },
+    "mushroom_orange": { "category": "props", "label": "Orange Mushroom",   "diffuse_texture": "shroomorange.tga",           "source": "mapfeatures", "license": "unstated (upstream)" },
+    "mushroom_purple": { "category": "props", "label": "Purple Mushroom",   "diffuse_texture": "shroompurple.tga",           "source": "mapfeatures", "license": "unstated (upstream)" },
+    "mushroom_tan":    { "category": "props", "label": "Tan Mushroom",      "diffuse_texture": "shroomtan.tga",              "source": "mapfeatures", "license": "unstated (upstream)" },
+    "pdrock":          { "category": "rocks", "label": "Beherith Rock",     "diffuse_texture": "pdrock_1.tga",               "source": "mapfeatures", "license": "unstated (upstream)" },
+    "pedro":           { "category": "props", "label": "San Pedro Cactus",  "diffuse_texture": "pedro-1.tga",                "source": "mapfeatures", "license": "unstated (upstream)" },
+    "peyote":          { "category": "props", "label": "Peyote Cactus",     "diffuse_texture": "peyote-1.tga",               "source": "mapfeatures", "license": "unstated (upstream)" },
+    "rocks30":         { "category": "rocks", "label": "Springboard Rock",  "diffuse_texture": null,                          "source": "bar",         "license": "GPL-2.0-or-later (BAR)" },
+    "tombstone":       { "category": "props", "label": "Tombstone",         "diffuse_texture": null,                          "source": "bar",         "license": "GPL-2.0-or-later (BAR)" },
+    "xmascomwreck":    { "category": "wreckage", "label": "Xmas Wreckage",  "diffuse_texture": null,                          "source": "bar",         "license": "GPL-2.0-or-later (BAR)" },
+    "geovent":         { "category": "geo",   "label": "Geo Vent",          "diffuse_texture": null,                          "source": "engine",      "license": "engine-internal" }
   },
   "categories": {
     "trees": [
-      { "name": "pinetree",        "display": "Pine tree",         "metal": 0,   "tags": ["tree", "conifer", "generic"] },
-      { "name": "agorm_pine1",     "display": "Agorm pine 1",      "metal": 0,   "tags": ["tree", "conifer", "agorm"] },
-      { "name": "agorm_pine2",     "display": "Agorm pine 2",      "metal": 0,   "tags": ["tree", "conifer", "agorm"] },
-      { "name": "agorm_pine3",     "display": "Agorm pine 3",      "metal": 0,   "tags": ["tree", "conifer", "agorm"] },
-      { "name": "agorm_pine4",     "display": "Agorm pine 4",      "metal": 0,   "tags": ["tree", "conifer", "agorm"] },
-      { "name": "agorm_talltree1", "display": "Agorm tall tree 1", "metal": 0,   "tags": ["tree", "deciduous", "agorm"] },
-      { "name": "agorm_talltree2", "display": "Agorm tall tree 2", "metal": 0,   "tags": ["tree", "deciduous", "agorm"] },
-      { "name": "agorm_talltree3", "display": "Agorm tall tree 3", "metal": 0,   "tags": ["tree", "deciduous", "agorm"] },
-      { "name": "agorm_talltree4", "display": "Agorm tall tree 4", "metal": 0,   "tags": ["tree", "deciduous", "agorm"] },
-      { "name": "agorm_talltree5", "display": "Agorm tall tree 5", "metal": 0,   "tags": ["tree", "deciduous", "agorm"] },
-      { "name": "agorm_talltree6", "display": "Agorm tall tree 6", "metal": 0,   "tags": ["tree", "deciduous", "agorm"] },
-      { "name": "btree",           "display": "Birch tree",        "metal": 0,   "tags": ["tree", "deciduous", "generic"] }
+      { "name": "ad0_aleppo2_sparse_med_m",        "display": "Aleppo (sparse, med, m)",   "family": "ad0_aleppo2",     "metal": 0, "tags": ["tree", "conifer", "aleppo", "small"] },
+      { "name": "ad0_aleppo2_dense_med_l",         "display": "Aleppo (dense, med, l)",    "family": "ad0_aleppo2",     "metal": 0, "tags": ["tree", "conifer", "aleppo", "medium"] },
+      { "name": "ad0_aleppo2_double_dark_xl",      "display": "Aleppo (double, dark, xl)", "family": "ad0_aleppo2",     "metal": 0, "tags": ["tree", "conifer", "aleppo", "large"] },
+      { "name": "ad0_aleppo2_dense_dead_l",        "display": "Aleppo (dead, l)",          "family": "ad0_aleppo2",     "metal": 0, "tags": ["tree", "conifer", "aleppo", "dead"] },
+
+      { "name": "ad0_banyan_1",                    "display": "Banyan 1",                  "family": "ad0_banyan",      "metal": 0, "tags": ["tree", "deciduous", "tropical"] },
+      { "name": "ad0_banyan_2",                    "display": "Banyan 2",                  "family": "ad0_banyan",      "metal": 0, "tags": ["tree", "deciduous", "tropical"] },
+      { "name": "ad0_banyan_3",                    "display": "Banyan 3",                  "family": "ad0_banyan",      "metal": 0, "tags": ["tree", "deciduous", "tropical"] },
+      { "name": "ad0_banyan_4",                    "display": "Banyan 4",                  "family": "ad0_banyan",      "metal": 0, "tags": ["tree", "deciduous", "tropical"] },
+      { "name": "ad0_banyan_5",                    "display": "Banyan 5",                  "family": "ad0_banyan",      "metal": 0, "tags": ["tree", "deciduous", "tropical"] },
+      { "name": "ad0_banyan_6",                    "display": "Banyan 6",                  "family": "ad0_banyan",      "metal": 0, "tags": ["tree", "deciduous", "tropical"] },
+
+      { "name": "cedar_atlas_1__cedar_atlas_1",    "display": "Cedar 1",                   "family": "ad0_cedar_atlas", "metal": 0, "tags": ["tree", "conifer", "cedar"] },
+      { "name": "cedar_atlas_2__cedar_atlas_2",    "display": "Cedar 2",                   "family": "ad0_cedar_atlas", "metal": 0, "tags": ["tree", "conifer", "cedar"] },
+      { "name": "cedar_atlas_3__cedar_atlas_dead", "display": "Cedar (dead)",              "family": "ad0_cedar_atlas", "metal": 0, "tags": ["tree", "conifer", "cedar", "dead"] },
+      { "name": "cedar_atlas_young_2__cedar_atlas_1", "display": "Cedar (young)",          "family": "ad0_cedar_atlas", "metal": 0, "tags": ["tree", "conifer", "cedar", "young"] },
+
+      { "name": "fir_tree_small_1__tree_fir_tall_1", "display": "Fir (small 1)",           "family": "ad0_fir",         "metal": 0, "tags": ["tree", "conifer", "fir", "small"] },
+      { "name": "fir_tree_small_2__tree_fir_tall_3", "display": "Fir (small 2)",           "family": "ad0_fir",         "metal": 0, "tags": ["tree", "conifer", "fir", "small"] },
+      { "name": "fir_tree_tall_1__tree_fir_tall_3",  "display": "Fir (tall 1)",            "family": "ad0_fir",         "metal": 0, "tags": ["tree", "conifer", "fir", "tall"] },
+      { "name": "fir_tree_tall_3__tree_fir_tall_5",  "display": "Fir (tall 3)",            "family": "ad0_fir",         "metal": 0, "tags": ["tree", "conifer", "fir", "tall"] },
+
+      { "name": "ad0_senegal_1",                   "display": "Palm 1",                    "family": "ad0_senegal",     "metal": 0, "tags": ["tree", "palm", "tropical"] },
+      { "name": "ad0_senegal_2",                   "display": "Palm 2",                    "family": "ad0_senegal",     "metal": 0, "tags": ["tree", "palm", "tropical"] },
+      { "name": "ad0_senegal_3",                   "display": "Palm 3",                    "family": "ad0_senegal",     "metal": 0, "tags": ["tree", "palm", "tropical"] },
+      { "name": "ad0_senegal_1_large",             "display": "Palm 1 (large)",            "family": "ad0_senegal",     "metal": 0, "tags": ["tree", "palm", "tropical", "large"] },
+      { "name": "ad0_senegal_2_large",             "display": "Palm 2 (large)",            "family": "ad0_senegal",     "metal": 0, "tags": ["tree", "palm", "tropical", "large"] },
+      { "name": "ad0_senegal_3_large",             "display": "Palm 3 (large)",            "family": "ad0_senegal",     "metal": 0, "tags": ["tree", "palm", "tropical", "large"] },
+
+      { "name": "allpinesb_ad0_green_b_m",         "display": "Pine (green, m)",           "family": "allpinesb_ad0",   "metal": 0, "tags": ["tree", "conifer", "pine", "green", "medium"] },
+      { "name": "allpinesb_ad0_green_c_l",         "display": "Pine (green, l)",           "family": "allpinesb_ad0",   "metal": 0, "tags": ["tree", "conifer", "pine", "green", "large"] },
+      { "name": "allpinesb_ad0_green_a_xl",        "display": "Pine (green, xl)",          "family": "allpinesb_ad0",   "metal": 0, "tags": ["tree", "conifer", "pine", "green", "xl"] },
+      { "name": "allpinesb_ad0_brown_b_l",         "display": "Pine (brown, l)",           "family": "allpinesb_ad0",   "metal": 0, "tags": ["tree", "conifer", "pine", "brown"] },
+      { "name": "allpinesb_ad0_snow_b_m",          "display": "Pine (snow, m)",            "family": "allpinesb_ad0",   "metal": 0, "tags": ["tree", "conifer", "pine", "snow"] },
+      { "name": "allpinesb_ad0_snowgreen_c_l",     "display": "Pine (snowgreen, l)",       "family": "allpinesb_ad0",   "metal": 0, "tags": ["tree", "conifer", "pine", "snowgreen"] },
+
+      { "name": "euro_birch_tree_01_1",            "display": "Birch 1 (var 1)",           "family": "birchtree",       "metal": 0, "tags": ["tree", "deciduous", "birch"] },
+      { "name": "euro_birch_tree_02_1",            "display": "Birch 2 (var 1)",           "family": "birchtree",       "metal": 0, "tags": ["tree", "deciduous", "birch"] },
+      { "name": "euro_birch_tree_03_1",            "display": "Birch 3 (var 1)",           "family": "birchtree",       "metal": 0, "tags": ["tree", "deciduous", "birch"] },
+      { "name": "euro_birch_tree_04_1",            "display": "Birch 4 (var 1)",           "family": "birchtree",       "metal": 0, "tags": ["tree", "deciduous", "birch"] },
+      { "name": "euro_birch_tree_01_4",            "display": "Birch 1 (var 4)",           "family": "birchtree",       "metal": 0, "tags": ["tree", "deciduous", "birch"] },
+      { "name": "euro_birch_tree_03_4",            "display": "Birch 3 (var 4)",           "family": "birchtree",       "metal": 0, "tags": ["tree", "deciduous", "birch"] },
+
+      { "name": "kapok1",                          "display": "Kapok 1",                   "family": "kapok",           "metal": 0, "tags": ["tree", "deciduous", "tropical"] },
+      { "name": "kapok2",                          "display": "Kapok 2",                   "family": "kapok",           "metal": 0, "tags": ["tree", "deciduous", "tropical"] },
+      { "name": "kapok3",                          "display": "Kapok 3",                   "family": "kapok",           "metal": 0, "tags": ["tree", "deciduous", "tropical"] },
+      { "name": "kapok4",                          "display": "Kapok 4",                   "family": "kapok",           "metal": 0, "tags": ["tree", "deciduous", "tropical"] }
     ],
     "rocks": [
-      { "name": "rock1",           "display": "Rock — small",      "metal": 8,   "tags": ["rock", "stone", "small"] },
-      { "name": "rock2",           "display": "Rock — medium",     "metal": 12,  "tags": ["rock", "stone", "medium"] },
-      { "name": "rock3",           "display": "Rock — large",      "metal": 18,  "tags": ["rock", "stone", "large"] },
-      { "name": "rock4",           "display": "Rock — boulder",    "metal": 25,  "tags": ["rock", "stone", "boulder"] },
-      { "name": "agorm_rock1",     "display": "Agorm rock 1",      "metal": 12,  "tags": ["rock", "stone", "agorm"] },
-      { "name": "agorm_rock2",     "display": "Agorm rock 2",      "metal": 12,  "tags": ["rock", "stone", "agorm"] },
-      { "name": "agorm_rock3",     "display": "Agorm rock 3",      "metal": 12,  "tags": ["rock", "stone", "agorm"] }
-    ],
-    "wreckage": [
-      { "name": "smallwreck",      "display": "Small wreck",       "metal": 60,  "tags": ["wreck", "rusted", "small"] },
-      { "name": "mediumwreck",     "display": "Medium wreck",      "metal": 150, "tags": ["wreck", "rusted", "medium"] },
-      { "name": "largewreck",      "display": "Large wreck",       "metal": 400, "tags": ["wreck", "rusted", "large"] },
-      { "name": "tankwreck",       "display": "Tank wreck",        "metal": 200, "tags": ["wreck", "vehicle"] },
-      { "name": "shipwreck",       "display": "Ship wreck",        "metal": 800, "tags": ["wreck", "naval"] },
-      { "name": "planewreck",      "display": "Plane wreck",       "metal": 120, "tags": ["wreck", "aircraft"] }
+      { "name": "agorm_rock1",                     "display": "Agorm rock 1",              "family": "agorm_rock",      "metal": 10, "tags": ["rock", "stone", "agorm", "small"] },
+      { "name": "agorm_rock2",                     "display": "Agorm rock 2",              "family": "agorm_rock",      "metal": 10, "tags": ["rock", "stone", "agorm"] },
+      { "name": "agorm_rock3",                     "display": "Agorm rock 3",              "family": "agorm_rock",      "metal": 10, "tags": ["rock", "stone", "agorm"] },
+      { "name": "agorm_rock4",                     "display": "Agorm rock 4",              "family": "agorm_rock",      "metal": 10, "tags": ["rock", "stone", "agorm"] },
+      { "name": "agorm_rock5",                     "display": "Agorm rock 5",              "family": "agorm_rock",      "metal": 10, "tags": ["rock", "stone", "agorm", "large"] },
+
+      { "name": "pdrock1",                         "display": "Beherith rock 1",           "family": "pdrock",          "metal": 12, "tags": ["rock", "stone", "small"] },
+      { "name": "pdrock2",                         "display": "Beherith rock 2",           "family": "pdrock",          "metal": 12, "tags": ["rock", "stone"] },
+      { "name": "pdrock3",                         "display": "Beherith rock 3",           "family": "pdrock",          "metal": 12, "tags": ["rock", "stone"] },
+      { "name": "pdrock4",                         "display": "Beherith rock 4",           "family": "pdrock",          "metal": 12, "tags": ["rock", "stone"] },
+      { "name": "pdrock5",                         "display": "Beherith rock 5",           "family": "pdrock",          "metal": 12, "tags": ["rock", "stone"] },
+      { "name": "pdrock6",                         "display": "Beherith rock 6",           "family": "pdrock",          "metal": 12, "tags": ["rock", "stone"] },
+      { "name": "pdrock7",                         "display": "Beherith rock 7",           "family": "pdrock",          "metal": 12, "tags": ["rock", "stone"] },
+      { "name": "pdrock8",                         "display": "Beherith rock 8",           "family": "pdrock",          "metal": 12, "tags": ["rock", "stone", "large"] },
+
+      { "name": "rocks30_green_01",                "display": "Springboard rock (green 01)", "family": "rocks30",       "metal": 12, "tags": ["rock", "stone", "biome"] },
+      { "name": "rocks30_green_02",                "display": "Springboard rock (green 02)", "family": "rocks30",       "metal": 12, "tags": ["rock", "stone", "biome"] }
     ],
     "props": [
-      { "name": "metalcrate",      "display": "Metal crate",       "metal": 30,  "tags": ["prop", "crate"] },
-      { "name": "ruin1",           "display": "Ruined building 1", "metal": 0,   "tags": ["prop", "ruin", "structure"] },
-      { "name": "ruin2",           "display": "Ruined building 2", "metal": 0,   "tags": ["prop", "ruin", "structure"] },
-      { "name": "deadtree1",       "display": "Dead tree 1",       "metal": 0,   "tags": ["prop", "deadtree"] },
-      { "name": "deadtree2",       "display": "Dead tree 2",       "metal": 0,   "tags": ["prop", "deadtree"] },
-      { "name": "antenna",         "display": "Comms antenna",     "metal": 0,   "tags": ["prop", "structure"] },
-      { "name": "barrel",          "display": "Fuel barrel",       "metal": 5,   "tags": ["prop", "container"] },
-      { "name": "pillar",          "display": "Stone pillar",      "metal": 0,   "tags": ["prop", "ruin"] }
+      { "name": "anemone1",                        "display": "Anemone 1",                 "family": "anemone",         "metal": 0, "tags": ["prop", "sea", "anemone"] },
+      { "name": "anemone2",                        "display": "Anemone 2",                 "family": "anemone",         "metal": 0, "tags": ["prop", "sea", "anemone"] },
+      { "name": "anemone3",                        "display": "Anemone 3",                 "family": "anemone",         "metal": 0, "tags": ["prop", "sea", "anemone"] },
+      { "name": "anemone4",                        "display": "Anemone 4",                 "family": "anemone",         "metal": 0, "tags": ["prop", "sea", "anemone"] },
+      { "name": "anemone5",                        "display": "Anemone 5",                 "family": "anemone",         "metal": 0, "tags": ["prop", "sea", "anemone"] },
+      { "name": "anemone6",                        "display": "Anemone 6",                 "family": "anemone",         "metal": 0, "tags": ["prop", "sea", "anemone"] },
+
+      { "name": "cycas1",                          "display": "Cycas fern 1",              "family": "cycas",           "metal": 0, "tags": ["prop", "fern", "cycas"] },
+      { "name": "cycas2",                          "display": "Cycas fern 2",              "family": "cycas",           "metal": 0, "tags": ["prop", "fern", "cycas"] },
+      { "name": "cycas4",                          "display": "Cycas fern 4",              "family": "cycas",           "metal": 0, "tags": ["prop", "fern", "cycas"] },
+      { "name": "cycas6",                          "display": "Cycas fern 6",              "family": "cycas",           "metal": 0, "tags": ["prop", "fern", "cycas"] },
+
+      { "name": "mushroom01",                      "display": "Orange mushroom 1",         "family": "mushroom_orange", "metal": 0, "tags": ["prop", "mushroom", "orange"] },
+      { "name": "mushroom03",                      "display": "Orange mushroom 3",         "family": "mushroom_orange", "metal": 0, "tags": ["prop", "mushroom", "orange"] },
+      { "name": "mushroom05",                      "display": "Orange mushroom 5",         "family": "mushroom_orange", "metal": 0, "tags": ["prop", "mushroom", "orange"] },
+      { "name": "mushroom07",                      "display": "Orange mushroom 7",         "family": "mushroom_orange", "metal": 0, "tags": ["prop", "mushroom", "orange"] },
+
+      { "name": "mushroom11",                      "display": "Purple mushroom 1",         "family": "mushroom_purple", "metal": 0, "tags": ["prop", "mushroom", "purple"] },
+      { "name": "mushroom13",                      "display": "Purple mushroom 3",         "family": "mushroom_purple", "metal": 0, "tags": ["prop", "mushroom", "purple"] },
+      { "name": "mushroom15",                      "display": "Purple mushroom 5",         "family": "mushroom_purple", "metal": 0, "tags": ["prop", "mushroom", "purple"] },
+      { "name": "mushroom17",                      "display": "Purple mushroom 7",         "family": "mushroom_purple", "metal": 0, "tags": ["prop", "mushroom", "purple"] },
+
+      { "name": "mushroom21",                      "display": "Tan mushroom 1",            "family": "mushroom_tan",    "metal": 0, "tags": ["prop", "mushroom", "tan"] },
+      { "name": "mushroom23",                      "display": "Tan mushroom 3",            "family": "mushroom_tan",    "metal": 0, "tags": ["prop", "mushroom", "tan"] },
+      { "name": "mushroom25",                      "display": "Tan mushroom 5",            "family": "mushroom_tan",    "metal": 0, "tags": ["prop", "mushroom", "tan"] },
+      { "name": "mushroom27",                      "display": "Tan mushroom 7",            "family": "mushroom_tan",    "metal": 0, "tags": ["prop", "mushroom", "tan"] },
+
+      { "name": "pedro1",                          "display": "Pedro cactus 1",            "family": "pedro",           "metal": 0, "tags": ["prop", "cactus", "pedro"] },
+      { "name": "pedro2",                          "display": "Pedro cactus 2",            "family": "pedro",           "metal": 0, "tags": ["prop", "cactus", "pedro"] },
+      { "name": "pedro3",                          "display": "Pedro cactus 3",            "family": "pedro",           "metal": 0, "tags": ["prop", "cactus", "pedro"] },
+      { "name": "pedro4",                          "display": "Pedro cactus 4",            "family": "pedro",           "metal": 0, "tags": ["prop", "cactus", "pedro"] },
+      { "name": "pedro5",                          "display": "Pedro cactus 5",            "family": "pedro",           "metal": 0, "tags": ["prop", "cactus", "pedro"] },
+      { "name": "pedro6",                          "display": "Pedro cactus 6",            "family": "pedro",           "metal": 0, "tags": ["prop", "cactus", "pedro"] },
+
+      { "name": "peyote1",                         "display": "Peyote 1",                  "family": "peyote",          "metal": 0, "tags": ["prop", "cactus", "peyote"] },
+      { "name": "peyote2",                         "display": "Peyote 2",                  "family": "peyote",          "metal": 0, "tags": ["prop", "cactus", "peyote"] },
+      { "name": "peyote3",                         "display": "Peyote 3",                  "family": "peyote",          "metal": 0, "tags": ["prop", "cactus", "peyote"] },
+      { "name": "peyote4",                         "display": "Peyote 4",                  "family": "peyote",          "metal": 0, "tags": ["prop", "cactus", "peyote"] },
+
+      { "name": "armstone",                        "display": "ARM tombstone",             "family": "tombstone",       "metal": 0, "tags": ["prop", "tombstone", "arm"] },
+      { "name": "corstone",                        "display": "COR tombstone",             "family": "tombstone",       "metal": 0, "tags": ["prop", "tombstone", "cor"] },
+      { "name": "legstone",                        "display": "LEG tombstone",             "family": "tombstone",       "metal": 0, "tags": ["prop", "tombstone", "leg"] }
+    ],
+    "wreckage": [
+      { "name": "xmascomwreck",                    "display": "Xmas com wreckage",         "family": "xmascomwreck",    "metal": 120, "tags": ["wreck", "xmas", "commander"] },
+      { "name": "gingerbread",                     "display": "Gingerbread wreck",         "family": "xmascomwreck",    "metal": 60,  "tags": ["wreck", "xmas"] }
     ],
     "geo": [
-      { "name": "geovent",         "display": "Geo vent",          "metal": 0,   "tags": ["geo", "vent", "thermal"] }
+      { "name": "geovent",                         "display": "Geo vent",                  "family": "geovent",         "metal": 0, "tags": ["geo", "vent", "thermal"] }
     ]
   }
 }
