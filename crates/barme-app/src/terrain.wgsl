@@ -139,6 +139,7 @@ struct AtmosphereU {
     cloud_color:   vec4<f32>,
     wind:          vec4<f32>,
     sky_axis_angle: vec4<f32>,
+    sun_dir:       vec4<f32>,
     flags:         vec4<u32>,
 };
 
@@ -412,11 +413,30 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let spec_pow = pow(cos_specular, max(spec_exp, 1.0));
     let specular_int = spec_col * spec_pow;
 
+    // Sprint 28 / R2 / ADR-040 — sun-colour angle ramp. The engine's
+    // `Atmosphere::DrawSun` modulates the effective sun colour by the
+    // sun's altitude: at the horizon (sun_dir.y → 0) the sun is
+    // tinted by `atmosphere.fog_color` (sunset/sunrise glow); at the
+    // zenith (sun_dir.y = 1) it's the full `lighting.ground_diffuse`
+    // colour. The ramp is `clamp(dot(sun_dir, +Y), 0, 1)`.
+    //
+    // Sprint 25 consumed `sp.ground_diffuse` flat; we keep the
+    // SplatU value as the "max altitude" endpoint and add the
+    // atmosphere's fog-tint as the horizon endpoint. The terrain
+    // gets warmer at sunrise/sunset matching BAR's sky.
+    let sun_world_up = atmos.sun_dir.y;
+    let sun_angle_factor = clamp(sun_world_up, 0.0, 1.0);
+    let sun_color_effective = mix(
+        atmos.fog_color.rgb,
+        sp.ground_diffuse.rgb,
+        sun_angle_factor,
+    );
+
     // SMFFragProg.glsl:205-206 — shadeInt.rgb = groundAmbientColor +
     // groundDiffuseColor * cosAngleDiffuse * shadowCoeff. Shadows
     // are deferred to Sprint 30; treat shadowCoeff = 1.0 here.
     let shade_int = sp.ground_ambient.rgb
-        + sp.ground_diffuse.rgb * cos_diffuse;
+        + sun_color_effective * cos_diffuse;
 
     // ─── 8. Final compose (SMFFragProg.glsl:381 + 422) ───────────
     // `fragColor.rgb = (diffuseCol.rgb + detailCol.rgb) * shadeInt.rgb;`

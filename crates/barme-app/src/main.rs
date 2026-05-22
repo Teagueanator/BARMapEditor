@@ -2521,6 +2521,16 @@ impl App {
         let wind_x = wind_angle.cos() * wind_speed_world * wind_scale;
         let wind_z = wind_angle.sin() * wind_speed_world * wind_scale;
 
+        // Sun direction: `lighting.sun_dir` is `[x, y, z, w]` where
+        // `.w` is the intensity scalar (PITFALL §18). Re-normalise
+        // `.xyz` so a hand-edited MapInfo with an unnormalised vector
+        // doesn't break the shader's `dot(sun, +Y)` ramp.
+        let sd = info.lighting.sun_dir;
+        let m = (sd[0] * sd[0] + sd[1] * sd[1] + sd[2] * sd[2])
+            .sqrt()
+            .max(1e-6);
+        let sun_dir = [sd[0] / m, sd[1] / m, sd[2] / m, sd[3]];
+
         AtmosphereUniforms {
             sun_color: [sun_rgb[0], sun_rgb[1], sun_rgb[2], 1.0],
             sky_color: [sky_rgb[0], sky_rgb[1], sky_rgb[2], 1.0],
@@ -2529,6 +2539,7 @@ impl App {
             cloud_color: [cloud_rgb[0], cloud_rgb[1], cloud_rgb[2], cloud_density],
             wind: [wind_x, wind_z, wind_speed_world, 0.0],
             sky_axis_angle: info.atmosphere.sky_axis_angle,
+            sun_dir,
             // `has_skybox` deferred per ADR-040; future cubemap
             // sprint will set bit 0 when a `.dds` cubemap loads.
             flags: [0, 0, 0, 0],

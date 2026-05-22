@@ -495,6 +495,11 @@ pub struct AtmosphereUniforms {
     pub cloud_color: [f32; 4],
     pub wind: [f32; 4],
     pub sky_axis_angle: [f32; 4],
+    /// World-space to-sun direction (normalised) — duplicated from
+    /// `SplatUniforms.sun_dir` so the water shader can compute its
+    /// own `daylight = dot(sun_dir, +Y)` without binding the
+    /// terrain-specific splat block. `.w` reserved.
+    pub sun_dir: [f32; 4],
     pub flags: [u32; 4],
 }
 
@@ -504,7 +509,9 @@ impl Default for AtmosphereUniforms {
     /// tint. Wind defaults to a mid-band value (`(5 + 25) / 2 / 20 ≈
     /// 0.75 elmos/s` — the same magnitude order the Sprint 26 stub
     /// used so a project without a per-frame `prepare()` write sees
-    /// a sensible animation).
+    /// a sensible animation). `sun_dir` matches `default_sun_dir()`
+    /// — keeps fallback rendering consistent with the SplatUniforms
+    /// block when no project is loaded.
     fn default() -> Self {
         Self {
             sun_color: [1.0, 1.0, 1.0, 1.0],
@@ -518,6 +525,7 @@ impl Default for AtmosphereUniforms {
             cloud_color: [1.0, 1.0, 1.0, 0.5],
             wind: [0.05, 0.035, 15.0, 0.0],
             sky_axis_angle: [0.0, 0.0, 1.0, 0.0],
+            sun_dir: default_sun_dir(),
             flags: [0, 0, 0, 0],
         }
     }
@@ -1166,6 +1174,11 @@ impl RenderResources {
                 wgpu::BindGroupEntry {
                     binding: 4,
                     resource: wgpu::BindingResource::Sampler(&self.reflection.sampler),
+                },
+                // Sprint 28 / R2 / ADR-040 — atmosphere uniform binding 5.
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: self.atmosphere_uniform_buf.as_entire_binding(),
                 },
             ],
         });
@@ -1907,7 +1920,11 @@ fn install_line_resources(
 ///   `out = src + (1 - src.a) × dst`.
 /// - Cull: `None` — the underside renders too when the camera orbits
 ///   below Y=0 (rare but possible).
-fn install_water_resources(device: &wgpu::Device, queue: &wgpu::Queue) -> WaterResources {
+fn install_water_resources(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    atmosphere_uniform_buf: &wgpu::Buffer,
+) -> WaterResources {
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("water.wgsl"),
         source: wgpu::ShaderSource::Wgsl(include_str!("water.wgsl").into()),
@@ -2026,6 +2043,19 @@ fn install_water_resources(device: &wgpu::Device, queue: &wgpu::Queue) -> WaterR
                 ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                 count: None,
             },
+            // 5: atmosphere uniform (Sprint 28 / R2 / ADR-040). The
+            // shader uses `sun_dir` for lava-emission daylight ramp
+            // and `wind` for surface motion direction (commit 5).
+            wgpu::BindGroupLayoutEntry {
+                binding: 5,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
         ],
     });
 
@@ -2033,7 +2063,9 @@ fn install_water_resources(device: &wgpu::Device, queue: &wgpu::Queue) -> WaterR
     // dummy reflection view (the real reflection RT is built later in
     // `install` — we'd race a circular dependency if we required it
     // here). `rebind_water` swaps both for the real views as soon as
-    // `install` finishes wiring up `RenderResources`.
+    // `install` finishes wiring up `RenderResources`. The atmosphere
+    // uniform is the real buffer from `install()` (no circular dep —
+    // atmosphere is allocated before water).
     let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("water.bg"),
         layout: &bgl,
@@ -2057,6 +2089,10 @@ fn install_water_resources(device: &wgpu::Device, queue: &wgpu::Queue) -> WaterR
             wgpu::BindGroupEntry {
                 binding: 4,
                 resource: wgpu::BindingResource::Sampler(&sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 5,
+                resource: atmosphere_uniform_buf.as_entire_binding(),
             },
         ],
     });
@@ -2585,7 +2621,7 @@ pub fn install(render_state: &egui_wgpu::RenderState) {
 
     let marker = install_marker_resources(device);
     let line = install_line_resources(device, &marker.uniform_buf);
-    let water = install_water_resources(device, queue);
+    let water = install_water_resources(device, queue, &atmosphere_uniform_buf);
 
     // ─── Sprint 26 / R3 / ADR-044 — reflection pass resources ──────
     let reflection = install_reflection_target(device);
@@ -4506,7 +4542,7 @@ mod tests {
     /// WGSL `AtmosphereU` block layout exactly, otherwise the per-frame
     /// uniform write uploads garbage into the shader's binding 13.
     ///
-    /// Expected layout (8 × `vec4` = 8 × 16 B = 128 B):
+    /// Expected layout (9 × `vec4` = 9 × 16 B = 144 B):
     /// - `sun_color`:      16 B
     /// - `sky_color`:      16 B
     /// - `fog_color`:      16 B
@@ -4514,13 +4550,14 @@ mod tests {
     /// - `cloud_color`:    16 B
     /// - `wind`:           16 B
     /// - `sky_axis_angle`: 16 B
+    /// - `sun_dir`:        16 B
     /// - `flags`:          16 B (vec4<u32>)
     #[test]
     fn atmosphere_uniforms_size_matches_wgsl_layout() {
         assert_eq!(
             std::mem::size_of::<AtmosphereUniforms>(),
-            128,
-            "AtmosphereUniforms layout drift — terrain.wgsl expects 128 bytes"
+            144,
+            "AtmosphereUniforms layout drift — terrain.wgsl expects 144 bytes"
         );
     }
 

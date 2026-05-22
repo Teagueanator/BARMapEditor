@@ -56,11 +56,32 @@ struct WaterU {
     eye: vec4<f32>,
 };
 
+// Sprint 28 / R2 / ADR-040 — atmosphere block (shared with the
+// terrain pipeline). Same struct shape as `terrain.wgsl::AtmosphereU`;
+// the CPU `AtmosphereUniforms` mirror is the source of truth. We
+// re-declare here because WGSL doesn't have cross-file `import`.
+struct AtmosphereU {
+    sun_color:     vec4<f32>,
+    sky_color:     vec4<f32>,
+    fog_color:     vec4<f32>,
+    fog_start_end: vec4<f32>,
+    cloud_color:   vec4<f32>,
+    wind:          vec4<f32>,
+    sky_axis_angle: vec4<f32>,
+    sun_dir:       vec4<f32>,
+    flags:         vec4<u32>,
+};
+
 @group(0) @binding(0) var<uniform> u: WaterU;
 @group(0) @binding(1) var refraction_tex: texture_2d<f32>;
 @group(0) @binding(2) var refraction_samp: sampler;
 @group(0) @binding(3) var reflection_tex: texture_2d<f32>;
 @group(0) @binding(4) var reflection_samp: sampler;
+// Sprint 28 / R2 / ADR-040 — atmosphere block bound from the same
+// uniform buffer the terrain shader reads. The water shader uses
+// `sun_dir` for the lava-emission daylight ramp (commits 3 of this
+// sprint) and `wind` for surface motion (commit 5).
+@group(0) @binding(5) var<uniform> atmos: AtmosphereU;
 
 struct VsOut {
     @builtin(position) clip_pos: vec4<f32>,
@@ -328,7 +349,16 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // means the shader stays uniform across preset switches — no
     // recompile cost when the user clicks between Ocean and Lava.
     let lava_emission_flag = u.polish_c.w;
-    let daylight = 0.5; // Sprint 28: dot(sun_dir, world_up).
+    // Sprint 28 / R2 / ADR-040 — real daylight ramp from atmosphere
+    // sun direction. `clamp(dot(sun_dir, +Y), 0, 1)` ranges 0 at
+    // horizon (sunset) to 1 at zenith (noon). The remapped curve
+    // `(1.0 - clamp_dot)^0.7` brightens lava at night (low sun)
+    // and dims under direct sun — matches BAR's `gadget_lava.lua`
+    // behaviour qualitatively without the gameplay coupling. The
+    // exponent < 1 keeps lava noticeable even at twilight rather
+    // than collapsing to "only visible at midnight".
+    let sun_world_up = clamp(atmos.sun_dir.y, 0.0, 1.0);
+    let daylight = pow(1.0 - sun_world_up, 0.7);
     let emission_strength = 0.8;
     // Take the un-premultiplied surface tint as the emission colour
     // (`surf_premul / surf_alpha`) so emission strength is independent
