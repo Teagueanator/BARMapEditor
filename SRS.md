@@ -361,6 +361,52 @@ PA's in-game system designer is the cited gold standard. It does the following w
     > warnings && cargo test --workspace` green. The renderer-
     > parity arc is now **5 / 8 done**. Next arc sprint is Sprint 30
     > (directional shadows).
+    >
+    > **STATUS UPDATE 2026-05-22 (Sprint 30 / R4 / ADR-048 —
+    > directional shadows shipped):** the sixth renderer-parity step
+    > closes the missing shadow gap. Where Sprints 25 / 28 lit the
+    > terrain and atmosphere'd it, tall hills still cast no shadow
+    > and the engine's `shadowCoeff` multiplier in `SMFFragProg.glsl:
+    > 362-372` + `:421` was unconsumed. Sprint 30 ships a single-
+    > cascade orthographic shadow-gen pipeline: new
+    > `crates/barme-app/src/shadow_gen.wgsl` (depth-only vertex stage,
+    > no fragment), 2048² `Depth32Float` shadow map at
+    > `SHADOW_MAP_SIZE` / `SHADOW_MAP_FORMAT`, comparison sampler
+    > (`LessEqual`) at terrain bind group binding 15, and a 3×3 PCF
+    > soft-edge filter inside `terrain.wgsl::sample_shadow`. The
+    > shadow camera is pure CPU math (`ShadowCamera::for_map`) — 8-
+    > corner AABB walk against the rotated view → tight-fit
+    > orthographic frustum that handles any sun angle without
+    > degenerate frustum collapse. `TerrainCallback::new` derives the
+    > shadow VP once and lands it in both the depth-only-pass uniform
+    > buffer AND the sampling-side uniform buffer, eliminating
+    > VP-drift acne. The depth-only pass encodes BEFORE the reflection
+    > + main offscreen passes so sample-from-and-write-to of the same
+    > depth texture is safe (Vulkan/D3D12 UB constraint, same shape
+    > as Sprint 26's refraction copy). New `ShadowUniforms` (80 B —
+    > mat4 VP + vec4 of bias / ground_density / unit_density /
+    > enabled) bound at terrain group 0 binding 16; the WGSL
+    > `sample_shadow` short-circuits to lit when `params.w < 0.5` so
+    > a future inspector toggle can disable shadows on weak hardware.
+    > `App::shadow_uniforms_for_render` reads
+    > `mapinfo.lighting.ground_shadow_density` /
+    > `unit_shadow_density` from MapInfo (default 0.8 each per
+    > `bar_default`). 5 commits on `main` (ShadowCamera → depth-only
+    > pipeline → terrain.wgsl sample → 3×3 PCF → ADR-048 + parity
+    > fixture). 12 new tests in barme-app (6 ShadowCamera math + 3
+    > ShadowUniforms layout / default / bias-pinned + WGSL naga
+    > parse + 2 TerrainCallback shadow VP derivation); barme-app 364
+    > → 376. `cargo fmt && cargo clippy --workspace --all-targets
+    > -- -D warnings && cargo test --workspace` green. New parity
+    > fixture `assets/parity-fixtures/shadow-test/README.md` with the
+    > 4-SMU + tall hill + sun (0.7, 0.5, 0.5) smoke procedure plus
+    > density endpoint tests (0.0 / 1.0). **Out of scope**: CSM,
+    > VSM, PCSS, slope-scaled bias, feature shadow CASTING (features
+    > already RECEIVE shadows through the terrain shader's per-
+    > fragment world-pos sample), shadow LOD, animated TOD. The
+    > renderer-parity arc is now **6 / 8 done**. Next arc sprint is
+    > Sprint 34 (grass rendering); Sprint 31 (toast queue +
+    > confirmation modals) is the next off-arc UX sprint.
 12. **Decompilation fidelity.** Round-tripping an existing `.sd7` loses information: the recovered diffuse PNG has been through DXT1 (color precision loss); heightmap, metal, and type maps are exact; mapinfo.lua is exact; auxiliary splat textures survive untouched. Reuse PyMapConv's decompile path.
 13. **GPU brush latency.** Spring/Recoil maps can theoretically reach 96×96 SMUs. Sub-millisecond brush response at 32×32+ requires the heightmap to live on the GPU as a storage texture, edited by compute shaders. Read-back to CPU happens only at save.
 

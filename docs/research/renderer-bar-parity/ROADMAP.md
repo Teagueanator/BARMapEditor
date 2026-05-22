@@ -169,6 +169,9 @@ to BAR's water render of the same.
 
 ### Sprint 19 — Directional shadows
 
+**Status:** **SHIPPED** as Sprint 30 / R4 / ADR-048 (renumbered by
+the planner-arc). 2026-05-22.
+
 **Goal:** cascaded shadow map pass for sun direction. Terrain
 fragment shader samples the shadow map; `mapinfo.lighting.groundShadowDensity`
 controls how dark shadows are. Features (Sprint 20+) also receive
@@ -193,6 +196,25 @@ is a polish item.
 **Test:** sculpt a tall hill. Sun direction at `(0.7, 0.5, 0.5, 1.0)`
 casts a shadow on the lee side of the hill. Verify in BAR-vs-editor
 side-by-side.
+
+**Shipped scope (Sprint 30 / R4 / ADR-048):**
+- Single-cascade orthographic shadow camera tight-fit to the map
+  AABB (`crates/barme-app/src/render.rs::ShadowCamera::for_map`).
+- 2048² `Depth32Float` shadow map (`SHADOW_MAP_SIZE` /
+  `SHADOW_MAP_FORMAT`).
+- Depth-only shadow-gen pipeline (`crates/barme-app/src/
+  shadow_gen.wgsl`) reusing the terrain `Uniforms` + heightmap
+  binding.
+- 3×3 PCF soft-edge sample in `terrain.wgsl::sample_shadow`.
+- Sampling-side `ShadowUniforms` (mat4 VP + bias + density +
+  enabled), bound at terrain group 0 binding 16.
+- `App::shadow_uniforms_for_render` reads
+  `mapinfo.lighting.ground_shadow_density` /
+  `unit_shadow_density` (default 0.8 each per `bar_default`).
+- Multi-cascade (CSM), VSM, PCSS, slope-scaled bias, feature
+  shadow CASTING (sprites already RECEIVE shadows through the
+  terrain shader's per-fragment world position) all deferred to
+  Stage-2 polish.
 
 ---
 
