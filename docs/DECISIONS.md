@@ -4577,6 +4577,169 @@ for Phase B: `rts/Rendering/Models/S3OParser.cpp` +
 `3DOParser.cpp` + `Models/ModelRenderer*.cpp`. Sprint devlog:
 `devlog/sprint-29-feature-asset-decoding/`.
 
+## ADR-047 — Feature thumbnail bake from upstream S3O, Phase B (Sprint 29b / R5)
+
+**Status:** Accepted (2026-05-22).
+
+**Context.** Sprint 29 / ADR-046 shipped Phase A — per-family
+diffuse decals on the marker pipeline. Phase A successfully
+closed the "what is this feature" gap for the 16 families with
+upstream diffuses, but each family showed ONE thumbnail across
+all variants, so a user picking between `pdrock1` (small
+rounded boulder) and `pdrock5` (larger sharp shard) saw the
+same icon for both. Phase B promises per-VARIANT visual cues by
+rendering each variant's actual `.s3o` mesh into the thumbnail
+slot. User scope-decision 2026-05-22 picked Path 1 (thumbnail-
+cache only, no live mesh rendering) from the Sprint 29b kickoff
+brief's three options.
+
+**Forces.**
+- Catalog v3.1 enumerates 93 entries across 21 families; 85 of
+  those entries have upstream .s3o files in `mapfeatures/
+  objects3d/`. The remaining 8 (rocks30 / tombstone / xmascom
+  wreck / geovent) live in BAR's `luarules/featureDefs/` or are
+  engine-internal — out of scope for Phase B.
+- The featureDef Lua → .s3o mapping isn't pattern-derivable in
+  all cases: `agorm_rock1` → `rock1.s3o` (no prefix) and
+  `cycas1` → `fern1.s3o` (different stem entirely). These need
+  explicit per-entry overrides in the catalog.
+- iGPU memory budget (PITFALLS §1) allows ~8 MB of atlas memory
+  comfortably; 85 entries × 64 KB = 5.4 MB, fits with headroom.
+- wgpu offscreen render passes need async device init at app
+  startup. A CPU-side rasteriser avoids that entirely and
+  produces deterministic byte-for-byte output, which makes the
+  cache key (sha256 of .s3o bytes) safe across machines and
+  driver versions.
+- Cold-launch bake time: 85 entries × ~2 ms / bake = ~170 ms
+  worst case on Vega 8 iGPU CPU side. Cache hit on second
+  launch is ~10× faster (PNG decode only).
+
+**Decisions.**
+
+1. **CPU rasteriser, not wgpu offscreen pass.** `barme_render_
+   s3o::thumbnail::bake_thumbnail` is a single-threaded software
+   rasteriser: ortho top-down projection, bilinear-filtered
+   diffuse sampling, two-sided Lambert lighting clamped to
+   `[0.35, 1.0]` ambient floor, pre-multiplied-alpha output.
+
+   **Alternatives considered.** (a) wgpu offscreen render pass —
+   rejected: async device handshake at startup adds complexity
+   and the deterministic-output property is harder to guarantee
+   across drivers (silent FP rounding differences ⇒ cache-key
+   instability). (b) `tiny_skia` — rejected: handles 2D affine
+   transforms but not 3D + depth test. (c) Defer to live mesh
+   rendering — rejected: 85 meshes × per-frame instance draw
+   cost overshoots the iGPU per-feature budget by ~6×; thumbnails
+   are sustainable, live meshes need LOD work.
+
+2. **Catalog v3.1 with `s3o_pattern` (family) + `s3o` (per-
+   entry override).** The fetch script reads these to know which
+   upstream file to vendor; at runtime the registry only checks
+   for `tools/feature-s3o/<entry.name>.s3o` (the fetch script
+   always copies to the entry-name path regardless of upstream
+   subfolder layout). The catalog fields document the mapping
+   without bloating runtime resolution logic.
+
+   **Alternatives considered.** (a) Single mapping table in code
+   — rejected: split the source of truth between code and JSON.
+   (b) Pure pattern (no per-entry override) — rejected: agorm
+   and cycas families need explicit overrides (9 entries
+   collectively); a "smart prefix-strip" heuristic would be
+   fragile. (c) Skip catalog change, store map in fetch script
+   only — rejected: future tooling (Sprint 36 parity automation)
+   would have to re-derive the mapping by reading the script.
+
+3. **One atlas layer per CATALOG ENTRY (Phase B), with Phase A
+   per-family decal as fallback.** `populate_decal_registry`
+   walks entries first, stamps `entry.decal_layer` +
+   `entry.egui_thumbnail`. After Phase B, any family that still
+   has uncovered entries AND has a `diffuse_texture` runs the
+   Phase A path with the family's diffuse decal — those entries
+   inherit the family layer via `resolved_visual`'s fallback
+   chain. Result: graceful degradation across mixed user state
+   (e.g. user ran `fetch-feature-decals.sh` but not `fetch-
+   feature-s3o.sh` → all Phase A, no Phase B; user ran both →
+   per-entry thumbnails everywhere they're available).
+
+   **Alternatives considered.** (a) Phase B only, drop Phase A —
+   rejected: a user with no .s3o vendored would lose all
+   feature visuals for what should be a transparent download
+   gap. (b) Phase A only with a "good enough" diffuse —
+   rejected: defeats the per-variant distinction Phase B
+   promises. (c) Skip the fallback chain, glyph-only when .s3o
+   missing — rejected: per-family decal is a strictly better
+   visual than a category glyph when available.
+
+4. **Content-addressed PNG cache, sha256(s3o_bytes) key.**
+   `$XDG_CACHE_HOME/barme/feature_thumbnails/<sha>.png`. Atomic
+   publish via `NamedTempFile + persist` so parallel bakes on
+   the same key don't corrupt each other. The cache contributes
+   ~5 KB per entry × 85 entries = ~430 KB on disk; cold-launch
+   bake cost (~170 ms) amortises to near-zero on second launch.
+
+   **Alternatives considered.** (a) In-memory cache only —
+   rejected: every app launch re-bakes 85 entries. (b) Bincode
+   serialisation — rejected: PNG-encoded thumbnails are
+   inspectable + the `image` crate already in deps. (c) Cache
+   key folds rasteriser version — rejected: the rasteriser
+   isn't expected to evolve mid-Sprint-29b; if it does, "delete
+   cache dir" is the supported migration.
+
+5. **MARKER_DECAL_LAYERS bumped 32 → 128.** 85 entries + ~16
+   Phase A fallback layers = ~101; 128 gives ~27 layers
+   headroom for future variant additions. Memory: 8 MB
+   (atlas) + ~1 MB (egui thumbnails for the 85 entries).
+   Inside PITFALLS §1 budget.
+
+   **Alternatives considered.** (a) Dynamic atlas (grow on
+   overflow) — rejected: bind groups would need rebuild on
+   every grow; complicates startup. (b) Smaller per-variant
+   subset to fit 32 — rejected: defeats Phase B's per-variant
+   premise.
+
+6. **New leaf crate `barme-render-s3o`.** Hosts the binary
+   parser, the CPU rasteriser, and the cache. No dependency on
+   barme-app, barme-core, or barme-pipeline; consumed by
+   barme-app as a workspace dep. Keeps the parser fuzz / test
+   surface independent of the editor.
+
+   **Alternatives considered.** (a) Add modules to barme-app —
+   rejected: would bloat the binary's compile time + tightly
+   couples low-level binary parsing to UI lifecycle. (b) Add to
+   barme-core — rejected: barme-core is the project-model crate
+   (heightmap, undo, mapinfo schema); S3O rendering is renderer
+   territory.
+
+**Consequence.**
+
+- **9 commits on `main`**: scaffold → parser → thumbnail → cache
+  → catalog v3.1 → fetch script + .gitignore → atlas bump →
+  populate_decal_registry rewrite → this ADR + STATUS UPDATEs.
+- New crate `barme-render-s3o` (~1100 LoC including tests; 20
+  unit tests passing).
+- New `scripts/fetch-feature-s3o.sh` + new `scripts/dev.sh`
+  cargo wrapper (the latter is dev ergonomics; not Phase B but
+  shipped same sprint).
+- `assets/mapfeatures_catalog.json` schema bump 3 → 3.1 (additive;
+  backwards-compatible since both new fields are optional).
+- 85 of 93 catalog entries now render with per-entry 3D
+  thumbnails. 8 entries (rocks30 / tombstone / xmascomwreck /
+  geovent — Phase C scope) keep category-glyph fallback.
+- Workspace tests grew: barme-app unchanged at 365; barme-core
+  279 unchanged; barme-pipeline 213 unchanged; barme-render-s3o
+  +20 new = +20 net. `cargo fmt && cargo clippy --workspace
+  --all-targets -- -D warnings && cargo test --workspace`
+  green.
+- **Renderer-parity arc: 5 / 8 done.** Next arc sprint is
+  Sprint 30 (directional shadows).
+
+**Reference.** Upstream parser: `RecoilEngine/rts/Rendering/
+Models/S3OParser.cpp` + `s3o.h` (GPL-2.0-or-later; we port not
+fork). Catalog: `assets/mapfeatures_catalog.json` v3.1.
+Fetch script: `scripts/fetch-feature-s3o.sh` (pinned to upstream
+commit `3b79163`, same as ADR-046). Devlog:
+`devlog/sprint-29b-s3o-features/`.
+
 ## ADR template
 
 ```

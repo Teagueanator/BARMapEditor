@@ -1,11 +1,12 @@
-# Feature-zoo — Sprint 29 / R5 / Phase A parity fixture
+# Feature-zoo — Sprint 29 / R5 / Phase A + Phase B parity fixture
 
-**Purpose:** Sprint 29 / R5 / ADR-046 reference for the feature
-decal sprite atlas. Verifies that each upstream-`mapfeatures`
-family lands on its own atlas layer + renders as a `TexturedSprite`
-in the viewport, with category-glyph fallback for the families
-that lack an upstream diffuse (kapok, rocks30, tombstone,
-xmascomwreck, geovent).
+**Purpose:** Sprint 29 / R5 reference for the feature decal sprite
+atlas. Sprint 29 / ADR-046 (Phase A) shipped per-family decal
+sprites; Sprint 29b / ADR-047 (Phase B) added per-entry 3D
+thumbnails baked from the upstream `.s3o` files. Verifies that
+both passes populate the atlas correctly and that
+`resolved_visual` walks the priority chain (per-entry thumbnail →
+per-family decal → category glyph → unknown fallback).
 
 ## What this fixture exercises
 
@@ -133,17 +134,61 @@ exercised.
   thumbnail textures ≈ 16 × 64 KB = 1 MB; the rest is per-
   instance MarkerInstanceGpu (33 × 48 B ≈ 2 KB; trivial).
 
-## Out of scope (deferred to Sprint 29b — Phase B)
+## Sprint 29b / Phase B addendum (2026-05-22)
 
-- **3D meshes** — S3O parsing + thumbnail render passes via a
-  new `barme-render-s3o` crate. Sprint 29b kickoff brief at the
-  end of this sprint's devlog rollup.
-- **Per-variant catalog** — upstream enumerates ~280 variants
-  across the 17 families; this fixture exercises the
-  representative subset. The "auto-catalog generation" sprint
-  (separate / deferred) expands variant coverage.
-- **Per-feature lighting** — Phase A sprites are unlit. Lambert
-  + shadows arrive in Sprint 30 / 32.
+Phase B replaced Phase A's per-FAMILY decals with per-ENTRY 3D
+thumbnails. Run `scripts/fetch-feature-s3o.sh` first; that
+vendors 85 catalog entries from upstream `mapfeatures/objects3d/`
+into `tools/feature-s3o/<entry>.s3o`. At app start
+`populate_decal_registry`:
+
+1. **Per-entry pass.** For every entry with a vendored .s3o:
+   - compute `sha256(s3o_bytes)` → cache lookup at
+     `$XDG_CACHE_HOME/barme/feature_thumbnails/<sha>.png`;
+   - on miss, parse via `barme_render_s3o::parser::parse_s3o`
+     and bake via `barme_render_s3o::thumbnail::bake_thumbnail`
+     (CPU rasteriser — top-down ortho, Lambert lighting, family
+     diffuse as the surface colour, or synthetic mid-grey when
+     the family has `diffuse_texture: null`);
+   - upload to next atlas layer + stamp `entry.decal_layer` +
+     `entry.egui_thumbnail`.
+2. **Per-family Phase A fallback.** For every family with
+   `diffuse_texture` that still has uncovered entries, run the
+   legacy Phase A decal upload (unchanged from Sprint 29).
+
+### Expected tracing on a fresh launch
+
+```
+feature decal registry populated
+  phase_b_loaded=85 phase_b_cache_hits=0 phase_b_missing_s3o=8
+  phase_b_parse_errors=0 phase_a_loaded=0 phase_a_missing=0
+  overflow=0 atlas_layers_used=85 atlas_layers_total=128
+```
+
+Second launch should show `phase_b_cache_hits=85`,
+`phase_b_loaded=0` — the cache PNGs make cold start ~10× faster.
+
+### Expected visual
+
+Each Phase A test entry now shows a SPECIFIC variant's 3D
+silhouette in the F7 picker thumbnail (e.g. `pdrock1` shows the
+small rock; `pdrock5` shows the larger one), and in the
+viewport each placed feature's sprite reflects its own
+geometry. Eight catalog entries (rocks30×2 + tombstone×3 +
+xmascomwreck×2 + geovent) still fall to category glyphs.
+
+### Out of scope (Phase B remains — Sprint 29c+)
+
+- **Live mesh rendering in the viewport** — per-feature 3D
+  meshes drawn at runtime with LOD-by-distance. The Sprint 29
+  brief's Path 2 option; deferred until the user requests it.
+- **BAR-side feature support** — rocks30, tombstone, xmascomwreck,
+  geovent live in BAR's `luarules/featureDefs/` or are engine-
+  internal. A Phase C fetch script + parser would lift them
+  onto the Phase B path.
+- **Per-feature lighting in the viewport** — Phase A/B sprites
+  are unlit (thumbnails baked with Lambert; viewport sprite is
+  flat texture). Shadows arrive in Sprint 30.
 - **Animated features** — none of the upstream families need
   animation; if Sprint 21+ ships a `cycas`-style sway pass, the
   fixture grows a verification step.

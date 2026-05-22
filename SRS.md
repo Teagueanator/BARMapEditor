@@ -321,6 +321,46 @@ PA's in-game system designer is the cited gold standard. It does the following w
     > done**. Next arc sprint is Sprint 30 (directional shadows;
     > Sprint 29b for Phase B feature meshes / thumbnails is the
     > feature-side follow-up).
+    >
+    > **STATUS UPDATE 2026-05-22 (Sprint 29b / R5 / ADR-047 — feature
+    > decal sprite atlas, Phase B shipped):** the fifth renderer-
+    > parity step closes the per-variant gap left by Phase A. Where
+    > Sprint 29 / ADR-046 stamped one diffuse decal per family
+    > (so `pdrock1` and `pdrock5` showed the same icon), Sprint 29b
+    > bakes ONE 128² thumbnail per CATALOG ENTRY from the upstream
+    > `.s3o` mesh via a new leaf crate `barme-render-s3o`. The crate
+    > hosts: (1) `parser::parse_s3o` — port of `RecoilEngine/rts/
+    > Rendering/Models/S3OParser.cpp` covering header read, recursive
+    > piece tree walk with offset accumulation, and triangulation
+    > of triangle-strip / quad primitives to a flat triangle list
+    > matching the engine's `Trianglize()` semantics byte-for-byte;
+    > (2) `thumbnail::bake_thumbnail` — CPU rasteriser (top-down
+    > ortho, bilinear-filtered diffuse, two-sided Lambert with 0.35
+    > ambient floor, pre-multiplied alpha out) chosen over a wgpu
+    > offscreen pass for determinism and async-init avoidance;
+    > (3) `cache::lookup` / `store` — atomic content-addressed PNG
+    > cache rooted at `$XDG_CACHE_HOME/barme/feature_thumbnails/<
+    > sha>.png`, keyed by `sha256(s3o_bytes)`. The catalog schema
+    > bumped 3 → 3.1 (additive): `families.<key>.s3o_pattern` and
+    > per-entry `s3o` overrides document the upstream mapping;
+    > `scripts/fetch-feature-s3o.sh` reads them to vendor 85 entries
+    > (of 93 catalog entries; 8 stay on Phase A glyph fallback —
+    > rocks30 / tombstone / xmascomwreck / geovent live in BAR or
+    > the engine, Phase C work). `MARKER_DECAL_LAYERS` bumped
+    > 32 → 128 (8 MB atlas; inside PITFALLS §1 budget) to fit the
+    > 85 entries plus headroom. The rewritten
+    > `FeatureCatalog::populate_decal_registry` runs in two passes:
+    > Phase B per-entry first (parse / cache / bake / upload),
+    > Phase A per-family second for families with uncovered entries.
+    > `resolved_visual` walks entry → family → category glyph →
+    > unknown fallback. 9 commits on `main` (scaffold → parser →
+    > thumbnail → cache → catalog v3.1 → fetch script + ignore →
+    > atlas bump → registry rewrite → ADR-047 + STATUS UPDATEs).
+    > 20 new tests in `barme-render-s3o`; workspace clippy clean;
+    > `cargo fmt && cargo clippy --workspace --all-targets -- -D
+    > warnings && cargo test --workspace` green. The renderer-
+    > parity arc is now **5 / 8 done**. Next arc sprint is Sprint 30
+    > (directional shadows).
 12. **Decompilation fidelity.** Round-tripping an existing `.sd7` loses information: the recovered diffuse PNG has been through DXT1 (color precision loss); heightmap, metal, and type maps are exact; mapinfo.lua is exact; auxiliary splat textures survive untouched. Reuse PyMapConv's decompile path.
 13. **GPU brush latency.** Spring/Recoil maps can theoretically reach 96×96 SMUs. Sub-millisecond brush response at 32×32+ requires the heightmap to live on the GPU as a storage texture, edited by compute shaders. Read-back to CPU happens only at save.
 

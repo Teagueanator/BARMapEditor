@@ -1058,6 +1058,105 @@ Implements SRS F1–F12. Ships a Windows `.exe` and a Linux AppImage.
       **Renderer-parity arc: 4 / 8 done.** Next arc sprint is
       Sprint 30 (directional shadows); Sprint 29b for Phase B
       feature meshes / thumbnails is the feature-side follow-up.
+- [x] **STATUS UPDATE 2026-05-22 (Sprint 29b / R5, ADR-047 — feature
+      thumbnail bake from S3O, Phase B).** Fifth renderer-parity
+      step. Closes the per-variant visual gap left by Phase A: where
+      Sprint 29 / ADR-046 only stamped per-FAMILY diffuse decals (so
+      `pdrock1` and `pdrock5` looked identical in the F7 picker and
+      the viewport), Sprint 29b bakes per-ENTRY 128² thumbnails
+      from the upstream `.s3o` mesh — each variant now shows its
+      actual geometry. **9 commits on main**:
+
+      (1) `crates(s3o): scaffold barme-render-s3o` — new leaf
+      crate hosts the parser / thumbnail bake / cache. Types +
+      stubs only so downstream wiring (catalog v3.1, registry
+      rewrite) lands in parallel.
+
+      (2) `render(s3o): binary parser port` — port of
+      `RecoilEngine/rts/Rendering/Models/S3OParser.cpp` covering
+      header read (52 B), recursive piece tree walk with offset
+      accumulation, and triangulation of triangle-strip / quad
+      primitives matching the engine's `Trianglize()` semantics
+      byte-for-byte. 7 unit tests + an opt-in upstream-fixture
+      test (auto-skipped when `~/code/Beyond-All-Reason/
+      mapfeatures` isn't cloned).
+
+      (3) `render(s3o): CPU rasteriser for thumbnail bake` —
+      top-down ortho 128² rasteriser with bilinear-filtered
+      diffuse, two-sided Lambert lighting (NdotL clamped to
+      `[0.35, 1.0]`), depth test, pre-multiplied-alpha output.
+      CPU not wgpu so cache keys are deterministic across
+      drivers and there's no async device handshake. 5 unit
+      tests including a real upstream pedro1.s3o bake.
+
+      (4) `render(s3o): content-addressed thumbnail cache` —
+      `$XDG_CACHE_HOME/barme/feature_thumbnails/<sha>.png` with
+      `sha256(s3o_bytes)` as key. Atomic publish via
+      `NamedTempFile + persist`. 6 unit tests including
+      round-trip and wrong-dimensions rejection.
+
+      (5) `assets(catalog): v3.1 schema` — adds
+      `families.<key>.s3o_pattern` (template like
+      `"ad0_banyan/{name}.s3o"`) and per-entry `s3o` (literal
+      override for the 9 entries where the entry name doesn't
+      match the .s3o filename — agorm_rock and cycas families).
+      Read only by the fetch script; runtime registry checks
+      `tools/feature-s3o/<entry.name>.s3o` directly.
+
+      (6) `scripts(s3o): fetch-feature-s3o.sh + tools/ ignore`
+      — mirrors `fetch-feature-decals.sh`'s pattern. 85 entries
+      hardcoded; first-run on a fresh checkout installs
+      ~3.2 MB. `--check` / `--refresh` / `BARME_MAPFEATURES_DIR`
+      env supported. License rationale matches ADR-046:
+      upstream has no LICENSE; `tools/feature-s3o/` is
+      gitignored.
+
+      (7) `render(markers): bump MARKER_DECAL_LAYERS 32 → 128`
+      — atlas memory 2 MB → 8 MB. Inside PITFALLS §1 budget.
+      Fits the 85 Phase B entries plus headroom (~27 layers).
+
+      (8) `app(decals): populate_decal_registry bakes per-entry
+      S3O thumbnails` — the big integration. Two-pass walk:
+      Phase B per-entry first (read .s3o → sha → cache hit OR
+      parse + bake_thumbnail + cache store → upload to atlas +
+      build egui handle), Phase A per-family second for any
+      family with `diffuse_texture` whose entries aren't all
+      Phase-B-covered. `resolved_visual` + `thumbnail_for` walk
+      entry → family → category glyph → unknown fallback.
+      `CatalogEntry` gains `decal_layer` + `egui_thumbnail`
+      runtime slots (serde-skipped, with a custom Debug impl
+      since `egui::TextureHandle` lacks one). Synthetic
+      mid-grey diffuse fallback for families with
+      `diffuse_texture: null` (kapok) — silhouette + Lambert
+      still produces a recognisable thumbnail.
+
+      (9) `docs(adr): ADR-047 + SRS/ROADMAP rollup` — this
+      block + the feature-zoo README addendum + ADR-047 in
+      `docs/DECISIONS.md` documenting the six decisions
+      (CPU rasteriser, catalog v3.1, per-entry baking, content-
+      addressed cache, atlas bump, new leaf crate).
+
+      **Mid-sprint dev ergonomics commit (not numbered):**
+      `scripts(dev): cargo wrapper sources rustup env then exec
+      cargo` — user-requested helper that eliminates the
+      `. "$HOME/.cargo/env" && cargo ...` boilerplate. All
+      cargo invocations now go through `./scripts/dev.sh`.
+
+      Tests: barme-render-s3o introduces 20 new tests (parser,
+      thumbnail bake, cache). barme-app unchanged at 365;
+      barme-core 279 unchanged; barme-pipeline 213 unchanged.
+      `cargo fmt && cargo clippy --workspace --all-targets --
+      -D warnings && cargo test --workspace` green.
+
+      Phase C (BAR-side feature .s3o vendoring for rocks30 /
+      tombstone / xmascomwreck / geovent) is the natural next
+      feature-asset sprint when the user wants those 8 entries
+      to also render as 3D thumbnails. Today they stay on Phase
+      A's category-glyph fallback (visible + correctly placed
+      in the viewport, just not 3D).
+
+      **Renderer-parity arc: 5 / 8 done.** Next arc sprint is
+      Sprint 30 (directional shadows).
 - [ ] Beherith (or active mapper) reviews `.sd7` byte-for-byte against PyMapConv
       reference output on three test maps
 - [ ] Listed on `beyondallreason.info/guide/mapmaking-resources` as beta
