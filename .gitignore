@@ -19,6 +19,7 @@ Cargo.lock.bak
 /tools/compressonator/
 /tools/textures/
 /tools/textures-cache/
+/tools/feature-decals/
 
 # Test/scratch outputs
 /scratch/
