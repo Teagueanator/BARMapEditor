@@ -383,6 +383,7 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "bytemuck",
+ "glam",
  "tempfile",
  "thiserror 2.0.18",
  "tracing",
