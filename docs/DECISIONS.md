@@ -4740,6 +4740,237 @@ Fetch script: `scripts/fetch-feature-s3o.sh` (pinned to upstream
 commit `3b79163`, same as ADR-046). Devlog:
 `devlog/sprint-29b-s3o-features/`.
 
+## ADR-048 — Directional shadows: single-cascade depth-only shadow map (Sprint 30 / R4)
+
+**Status:** Accepted (2026-05-22).
+
+**Context.** Sprint 25 / ADR-043 shipped the Recoil terrain shader
+port; Sprint 26 / ADR-044 shipped water polish; Sprint 28 / ADR-045
+shipped atmosphere + fog. The remaining renderer-parity gap visible
+at default editor framing is **shadows** — a tall hill in the
+editor casts no shadow on its lee side, and tall features don't
+shade the ground beneath them. The engine's `SMFFragProg.glsl`
+samples a depth texture via `shadow2DProj` and attenuates the
+diffuse + specular lighting contribution by `shadowCoeff = mix(1.0,
+sampled, groundShadowDensity)`. Sprint 30 reproduces that path with
+a single-cascade orthographic shadow map.
+
+**Forces.**
+- **Single-cascade vs multi-cascade.** Real-time renderers usually
+  use Cascaded Shadow Maps (CSM) — multiple shadow maps at
+  distance-banded resolutions — to focus depth precision on
+  visible terrain. CSM doubles or triples the per-frame shadow-
+  gen cost and adds frustum / cascade-split bookkeeping. The
+  editor's typical framing has the camera close to the centre of
+  the map at moderate orbit distance; a single cascade covering
+  the whole map AABB at 2048² gives ~2 elmos per shadow texel at
+  4-SMU and ~8 elmos per texel at 16-SMU — well within the
+  precision a tall-hill-on-lee-side test exercises. CSM stays on
+  the Stage-2 polish list.
+- **Shadow acne (PITFALL §1).** Without depth bias, surfaces
+  self-shadow randomly: a fragment's interpolated depth disagrees
+  with the shadow map's sampled depth by sub-texel noise, and the
+  comparison flickers between lit and shadowed. Standard
+  workaround: subtract a small `bias` from the comparison's
+  reference depth, loosening the test. Too much bias produces
+  **Peter-Panning** (PITFALL §2 — shadow detaches from caster);
+  the default 0.005 balances them.
+- **Vega 8 iGPU budget (PITFALL §3).** 3×3 PCF at 2048² shadow map
+  on a 16-SMU terrain is ~300M shadow-map fetches per frame.
+  Acceptable on mid-range desktop GPUs; tight on Vega 8. The
+  enabled-flag knob lets a future user-facing toggle disable
+  shadows entirely on weak hardware while keeping the depth-only
+  pass machinery in place.
+- **Shadow map texture format.** `Depth32Float` is universal on
+  wgpu (no extension feature required). 7 decimal digits of
+  precision at a 4096-elmo height range = ~0.5 mm per LSB; plenty
+  for the LessEqual comparison. `Depth24PlusStencil8` would save
+  ~25 % memory but requires a feature on some backends.
+- **mapinfo coupling.** `mapinfo.lighting.ground_shadow_density`
+  is already in the schema (Sprint 18's F9 form covers it). The
+  editor's shadow density routes through there without a
+  schema change.
+
+**Decisions.**
+
+1. **Single-cascade orthographic shadow camera tight-fit to the
+   map AABB.** `ShadowCamera::for_map(map_min, map_max, sun_dir)`
+   builds the view matrix from a virtual eye at `target + sun_dir
+   * diagonal` looking back at the map centre, then transforms all
+   8 AABB corners into view space and takes per-axis min/max as
+   the orthographic frustum bounds.
+
+   **Alternatives considered.** (a) CSM with 3 cascades —
+   rejected: doubles the shadow-pass cost on a Vega-8 budget
+   that's already tight (PITFALL §3) for the single-cascade case.
+   Deferred to a Stage-2 polish sprint if the editor camera ever
+   pans far enough that the single cascade's per-texel resolution
+   becomes inadequate. (b) Player-camera-following frustum
+   (Recoil's `ShadowProjectionMode = CAM_CENTER`) — rejected: the
+   editor camera doesn't move during a brush stroke, so a moving
+   shadow frustum would cause shadow shimmer on stationary
+   terrain.
+
+2. **2048² Depth32Float shadow map.** Matches Recoil's
+   `DEF_SHADOWMAP_SIZE` default; ~16 MB resident. Universal wgpu
+   format, no extension required.
+
+   **Alternatives considered.** (a) 4096² — rejected: 64 MB
+   resident is a noticeable iGPU memory hit and the perceived
+   shadow-edge softness from 3×3 PCF at 2048² already exceeds the
+   "tall hill on lee side" test's discriminating angle. (b) 1024²
+   — rejected: at 16-SMU that's ~16 elmos per texel; tall
+   features would alias visibly. (c) `Depth24Plus` —
+   rejected: not universally supported on wgpu's least-common
+   denominator (Vulkan + GL).
+
+3. **3×3 PCF for soft edges.** `sample_shadow` averages 9
+   `textureSampleCompareLevel` calls in a one-texel-wide
+   neighbourhood around the fragment's shadow UV. Each sample is
+   a hardware-level comparison + `LessEqual` compare; the average
+   produces a smooth in-between value at shadow edges.
+
+   **Alternatives considered.** (a) Single sample — rejected:
+   hard 1-bit edges look aliased on curved terrain. (b) 5×5 PCF
+   (25 samples) — rejected: tripling the fetch cost for a
+   marginal softness gain that PITFALL §3's budget can't
+   absorb. (c) Variance Shadow Maps (VSM) — rejected: requires a
+   moments texture + Chebyshev's-inequality computation that adds
+   complexity disproportionate to the soft-shadow gain. Deferred
+   to Stage 2 if light bleeding from PCF becomes objectionable.
+   (d) Percentage-Closer Soft Shadows (PCSS) — rejected: heavy
+   per-fragment work (blocker search) that PCF alone doesn't
+   need; deferred.
+
+4. **Reuse the terrain mesh + `vs_main` logic, no separate shadow
+   geometry.** `shadow_gen.wgsl` is a 60-line file with only the
+   vertex stage (depth-only pass = no fragment stage in wgpu); it
+   mirrors `terrain.wgsl::sample_y` byte-for-byte so the shadow
+   camera sees the same world Y as the main pass. Sharing the
+   mesh keeps shadow caster geometry and receiver geometry in
+   lock-step — if the heightmap edits, the shadow map updates
+   with the next frame's depth-only pass.
+
+   **Alternatives considered.** (a) A separate "shadow mesh" at
+   coarser resolution — rejected: would introduce mismatch
+   between shadow caster and receiver geometry; visible as
+   shadow drift on tall features. (b) Compute shader writing
+   directly to the depth texture — rejected: requires storage
+   binding on a depth-format texture which isn't universally
+   supported on wgpu backends. (c) GPU geometry shader for
+   silhouette extraction — rejected: wgpu doesn't expose
+   geometry shaders.
+
+5. **Subtract bias from `ref_depth` before the LessEqual
+   comparison; SHADOW_DEPTH_BIAS = 0.005.** Loosens the "fragment
+   depth ≤ stored depth" test so floating-point noise on flat
+   surfaces stops producing self-shadow speckle (PITFALL §1).
+   Surfaced via `ShadowUniforms.params.x` so a future F9-form
+   control can tune without recompiling the shader.
+
+   **Alternatives considered.** (a) Slope-scaled bias (engine
+   convention: `bias × max(1, dot(N, sun) × some_factor)`) —
+   rejected for the MVP: slope-scaled bias is the next polish
+   step but requires the fragment normal in the shadow sample
+   path, which adds plumbing. Deferred to Sprint 36 (parity
+   validation cleanup) once the visual fidelity is benchmarked.
+   (b) Pipeline polygon-offset bias — rejected: only available on
+   the SHADOW-GEN side, not the SAMPLING side. Manual subtraction
+   from `ref_depth` is the portable equivalent on wgpu.
+
+6. **`groundShadowDensity` blend, `unitShadowDensity` reserved.**
+   `ShadowUniforms.params.y` carries `mapinfo.lighting.
+   ground_shadow_density` (default 0.8). `params.z` carries
+   `unit_shadow_density` (default 0.8) for a future feature-
+   shadow path; terrain ignores it but plumbing it now avoids
+   widening the struct later. `params.w` is an enabled flag —
+   a future inspector toggle can disable shadows without
+   reconfiguring the bind group.
+
+7. **Shadow VP fed from the same source for both the shadow-gen
+   pass and the terrain sampling pass.** `TerrainCallback::new`
+   derives the VP once via `ShadowCamera::for_map`, stores it on
+   the callback as `shadow_view_proj`, and writes it to both the
+   shadow-gen uniform buffer (`res.shadow.uniform_buf`) AND the
+   sampling-side uniform buffer (`res.shadow.sampling_uniform_
+   buf`) in `prepare()`. Single source of truth eliminates the
+   "VP drift between caster and receiver" failure mode that
+   produces universal shadow acne.
+
+8. **Sampling-side and shadow-pass-side uniforms in separate
+   buffers.** The shadow-pass-side uniform carries the standard
+   terrain `Uniforms` shape (mat4 view_proj + 2 vec4 params for
+   the heightmap sample); the sampling-side uniform is the
+   `ShadowU` shape (mat4 VP + vec4 of bias/density/enabled).
+   Separate buffers keep the vertex-stage write and the
+   fragment-stage write independent — the shadow-gen pass'
+   queue write doesn't share a barrier with the terrain pass'
+   queue write, so the GPU can schedule them in parallel.
+
+**Consequence.**
+
+- **5 commits on `main`**: ShadowCamera + frustum →
+  depth-only shadow-gen pipeline → terrain.wgsl sample call →
+  3×3 PCF → this ADR + parity fixture.
+- New WGSL shader `crates/barme-app/src/shadow_gen.wgsl`
+  (~50 LoC). Terrain WGSL extended with 3 bindings (14, 15, 16)
+  + `sample_shadow` PCF function.
+- `crates/barme-app/src/render.rs` grows `ShadowCamera`
+  (pure-CPU math, 5 unit tests), `ShadowUniforms` (Pod mirror
+  of `terrain.wgsl::ShadowU`, 80 B), `ShadowResources` (GPU
+  pipeline + 2048² Depth32Float texture + comparison sampler +
+  two uniform buffers).
+- `App::shadow_uniforms_for_render` reads
+  `mapinfo.lighting.ground_shadow_density` /
+  `unit_shadow_density` from MapInfo (defaults to 0.8 each per
+  `bar_default`).
+- Workspace tests grew: barme-app 364 → 376 (+12 — 6 ShadowCamera
+  + 3 ShadowUniforms + WGSL parse + 2 TerrainCallback shadow VP).
+  Other crates unchanged. `cargo fmt && cargo clippy --workspace
+  --all-targets -- -D warnings && cargo test --workspace` green.
+- New parity fixture `assets/parity-fixtures/shadow-test/`
+  documenting the smoke procedure (tall hill + sun (0.7, 0.5,
+  0.5) + density endpoints).
+- **Renderer-parity arc: 6 / 8 done.** Next arc sprint is
+  Sprint 34 (grass rendering) per the renumbered ROADMAP, with
+  Sprint 31 (toast queue + confirmation modals) as the next
+  off-arc UX sprint.
+
+**Out of scope.**
+
+- **Multi-cascade shadow maps (CSM).** Single cascade only this
+  sprint. Stage-2 polish.
+- **Variance / Exponential / Moment shadow maps.** Standard
+  depth-comparison only.
+- **Soft shadows via PCSS.** Basic 3×3 PCF only.
+- **Slope-scaled bias.** Constant 0.005; per-fragment slope
+  scaling is Sprint 36 territory.
+- **Feature shadow casting.** Sprint 29's decal sprites are 2D
+  billboards facing the camera; they don't cast shadows in the
+  geometric sense. A future Phase C with S3O instance rendering
+  would extend the depth-only pass to also rasterise feature
+  meshes. Features RECEIVE shadows already (the terrain shader's
+  shadow sample is per-fragment world position, which features
+  could plug into trivially when they share the shader pipeline).
+- **Shadow LOD.** Fixed 2048² resolution.
+- **Animated time-of-day shadows.** `mapinfo.lighting.sun_dir`
+  is static per project per the SRS.
+
+**ADR number selection.** The Sprint 30 prompt suggested
+"ADR-041", but that slot was taken by Sprint 17 (Layers panel +
+DNTS hybrid emission). The next free ADR after ADR-047
+(Sprint 29b) is **ADR-048**, which is what Sprint 30 ships under.
+Commits use `Sprint 30 / R4 / ADR-048` consistently.
+
+**Reference.** Engine sources:
+`cont/base/springcontent/shaders/GLSL/SMFFragProg.glsl:362-372`
+(the shadowCoeff blend) + `:421` (`specularInt *= shadowCoeff`),
+`cont/base/springcontent/shaders/GLSL/ShadowGenVertMapProg.glsl`
+(the depth-only vertex stage we port from), and
+`rts/Rendering/ShadowHandler.cpp::InitFBOAndTextures` (depth-format
++ sampler-state setup). Devlog:
+`devlog/sprint-30-directional-shadows/`.
+
 ## ADR template
 
 ```
