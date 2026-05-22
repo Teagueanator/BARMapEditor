@@ -113,6 +113,22 @@ struct SplatU {
     camera_pos: vec4<f32>,
 };
 
+// Sprint 30 / R4 / ADR-048 — shadow sampling uniform block. View-proj
+// matrix from `ShadowCamera::view_proj_matrix` (Commit 1) plus bias +
+// `mapinfo.lighting.ground_shadow_density` + enabled flag. Field
+// order MUST match the CPU `ShadowUniforms` mirror exactly.
+//
+//   view_proj: shadow camera VP, transforms world_pos into shadow
+//              NDC ([-1,1] xy, [0,1] z per wgpu/D3D/Vulkan convention)
+//   params:    (bias, ground_shadow_density, unit_shadow_density,
+//              enabled). Engine `groundShadowDensity` is the blend
+//              factor between "always lit" (density=0) and "sampled
+//              shadow" (density=1).
+struct ShadowU {
+    view_proj: mat4x4<f32>,
+    params:    vec4<f32>,
+};
+
 // Sprint 28 / R2 / ADR-045 — atmosphere uniform block. Composes fog,
 // sky colour, sun-angle ramp, deterministic wind state, and cloud tint
 // on top of Sprint 25's terrain output. Field order MUST match the
@@ -170,6 +186,14 @@ struct AtmosphereU {
 @group(0) @binding(12) var specular_samp: sampler;
 // Sprint 28 / R2 / ADR-045 — atmosphere block.
 @group(0) @binding(13) var<uniform> atmos: AtmosphereU;
+// Sprint 30 / R4 / ADR-048 — directional shadow sampling. The depth
+// texture is the output of the depth-only shadow-gen pass (`shadow_gen.
+// wgsl`); the comparison sampler does the hardware-PCF / depth-test
+// for us. `textureSampleCompareLevel` is well-supported on every wgpu
+// backend (Vulkan / Metal / D3D12 / GL).
+@group(0) @binding(14) var shadow_map: texture_depth_2d;
+@group(0) @binding(15) var shadow_sampler: sampler_comparison;
+@group(0) @binding(16) var<uniform> shadow: ShadowU;
 
 struct VsOut {
     @builtin(position) clip_pos: vec4<f32>,
@@ -235,6 +259,60 @@ fn vs_main(@builtin(vertex_index) vid: u32) -> VsOut {
     out.world_normal = world_normal;
     out.uv_norm = uv_norm;
     return out;
+}
+
+// Sprint 30 / R4 / ADR-048 — sample the directional shadow map.
+//
+// Returns the engine's `shadowCoeff` value: 1.0 = fully lit, lower =
+// darker. Math mirrors `SMFFragProg.glsl:362-372`:
+//   shadowCoeff = mix(1.0, sampled, groundShadowDensity)
+//
+// PITFALL §1 (shadow acne): we subtract a depth bias from the
+// fragment's shadow-space Z BEFORE the comparison, loosening the
+// "fragment depth ≤ stored depth" test by `bias` so floating-point
+// noise on flat surfaces stops producing self-shadow speckle.
+// PITFALL §2 (Peter-Panning): with too much bias the shadow detaches
+// from the caster. The default 0.005 (= `SHADOW_DEPTH_BIAS`) balances
+// the two; per-surface slope-scaled bias is a Stage-2 polish.
+// PITFALL §8: WGSL `texture_depth_2d` pairs with `sampler_comparison`
+// (not regular `sampler`); compare-function is `LessEqual` (set CPU-
+// side in `install_shadow_resources`).
+//
+// NDC convention reminder: glam's `Mat4::orthographic_lh` outputs
+// `x, y ∈ [-1, 1]` (y-up) and `z ∈ [0, 1]` (0 = near, 1 = far) —
+// matches wgpu's clip space. Texture UVs are y-DOWN, so the y axis
+// flips during the NDC → UV conversion.
+fn sample_shadow(world_pos: vec3<f32>) -> f32 {
+    // Shadow disabled → no shadow attenuation at all.
+    if (shadow.params.w < 0.5) {
+        return 1.0;
+    }
+    let clip = shadow.view_proj * vec4<f32>(world_pos, 1.0);
+    let ndc = clip.xyz / clip.w;
+    // Outside the shadow camera's frustum → return lit. Without this
+    // bounds check, fragments past the AABB would sample the
+    // ClampToEdge border of the depth texture (which would itself
+    // depend on what the depth-only pass left there last frame).
+    if (ndc.x < -1.0 || ndc.x > 1.0
+     || ndc.y < -1.0 || ndc.y > 1.0
+     || ndc.z < 0.0 || ndc.z > 1.0) {
+        return 1.0;
+    }
+    // NDC → texture UV. wgpu/D3D: NDC y is up; texture v is down.
+    let uv = vec2<f32>(ndc.x * 0.5 + 0.5, ndc.y * -0.5 + 0.5);
+    // Subtract bias from the reference depth — loosens the
+    // LessEqual comparison so flat surfaces don't self-shadow.
+    let bias = shadow.params.x;
+    let ref_depth = ndc.z - bias;
+    // textureSampleCompareLevel: returns 1.0 when ref_depth <=
+    // sampled_depth (fragment is in front of the recorded occluder,
+    // i.e. lit), 0.0 otherwise. Level 0 — shadow maps don't have
+    // mipmaps.
+    let s = textureSampleCompareLevel(shadow_map, shadow_sampler, uv, ref_depth);
+    // Engine convention: shadowCoeff = mix(1, sampled, density).
+    // density = 0 → no shadow visible. density = 1 → full sampled
+    // shadow. Default is 0.8 per `MapInfo::bar_default`.
+    return mix(1.0, s, shadow.params.y);
 }
 
 // Heightmap → biome gradient. Mirrors `crates/barme-app/src/ui/minimap.rs`
@@ -432,16 +510,22 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         sun_angle_factor,
     );
 
+    // Sprint 30 / R4 / ADR-048 — sample directional shadow. The
+    // engine multiplies shadowCoeff into both the diffuse contribution
+    // (line 205) and the specular contribution (line 420 — `specularInt
+    // *= shadowCoeff;`). Ambient is preserved so shadowed terrain
+    // still reads as "lit by the sky" rather than going black.
+    let shadow_factor = sample_shadow(in.world_pos);
+
     // SMFFragProg.glsl:205-206 — shadeInt.rgb = groundAmbientColor +
-    // groundDiffuseColor * cosAngleDiffuse * shadowCoeff. Shadows
-    // are deferred to Sprint 30; treat shadowCoeff = 1.0 here.
+    // groundDiffuseColor * cosAngleDiffuse * shadowCoeff.
     let shade_int = sp.ground_ambient.rgb
-        + sun_color_effective * cos_diffuse;
+        + sun_color_effective * (cos_diffuse * shadow_factor);
 
     // ─── 8. Final compose (SMFFragProg.glsl:381 + 422) ───────────
     // `fragColor.rgb = (diffuseCol.rgb + detailCol.rgb) * shadeInt.rgb;`
-    // `fragColor.rgb += specularInt;`
-    var lit = (diffuse_rgb + detail_rgb) * shade_int + specular_int;
+    // `fragColor.rgb += specularInt * shadowCoeff;`
+    var lit = (diffuse_rgb + detail_rgb) * shade_int + specular_int * shadow_factor;
 
     // Buildable-area overlay (Sprint 11 hotfix follow-up). When
     // `flags.z == 1`, mix red into the composite where the surface is

@@ -31,8 +31,8 @@ use eframe::egui_wgpu;
 use tracing::{error, info, trace, warn};
 
 use crate::render::{
-    AtmosphereUniforms, CompositeLayerU, CompositeU, OrbitCamera, SplatUniforms, TerrainCallback,
-    WaterDraw,
+    AtmosphereUniforms, CompositeLayerU, CompositeU, OrbitCamera, SHADOW_DEPTH_BIAS,
+    ShadowUniforms, SplatUniforms, TerrainCallback, WaterDraw,
 };
 
 /// wgpu/vulkan/naga emit a lot of INFO-level chatter at startup (adapter
@@ -3005,6 +3005,46 @@ impl App {
             // `has_skybox` deferred per ADR-045; future cubemap
             // sprint will set bit 0 when a `.dds` cubemap loads.
             flags: [0, 0, 0, 0],
+        }
+    }
+
+    /// Sprint 30 / R4 / ADR-048 — produce the sampling-side shadow
+    /// uniforms (density + bias + enabled flag). The view-projection
+    /// is filled by `TerrainCallback::new` from the same map AABB +
+    /// sun direction the depth-only pass uses, so the matrices stay
+    /// in lock-step. We only fill `params` here:
+    ///
+    /// - `params.x = bias`: tuneable depth bias to avoid acne;
+    ///   pinned to [`SHADOW_DEPTH_BIAS`] for the Sprint 30 MVP.
+    /// - `params.y = ground_shadow_density`: from
+    ///   `mapinfo.lighting.ground_shadow_density` (default 0.8 per
+    ///   `MapInfo::bar_default`). Engine `groundShadowDensity` knob
+    ///   blends between "always lit" (density = 0) and "sampled
+    ///   shadow" (density = 1).
+    /// - `params.z = unit_shadow_density`: from
+    ///   `mapinfo.lighting.unit_shadow_density` (default 0.8). Used by
+    ///   the future feature-shadow path; terrain ignores it. Plumbed
+    ///   now so a future sprint doesn't have to widen the struct.
+    /// - `params.w = enabled` flag: 1.0 = shadow sample produces real
+    ///   shadow, 0.0 = `sample_shadow` short-circuits to 1.0. The
+    ///   Sprint 30 MVP ships with shadows always on; a future
+    ///   inspector toggle can route to this flag.
+    fn shadow_uniforms_for_render(&self) -> ShadowUniforms {
+        let project = self.snapshot_project();
+        let info: barme_core::MapInfo = (&project).into();
+        let ground_density = info
+            .lighting
+            .ground_shadow_density
+            .unwrap_or(0.8)
+            .clamp(0.0, 1.0);
+        let unit_density = info
+            .lighting
+            .unit_shadow_density
+            .unwrap_or(0.8)
+            .clamp(0.0, 1.0);
+        ShadowUniforms {
+            view_proj: glam::Mat4::IDENTITY.to_cols_array_2d(),
+            params: [SHADOW_DEPTH_BIAS, ground_density, unit_density, 1.0],
         }
     }
 
@@ -11140,6 +11180,7 @@ impl App {
                     self.sync_composite_mask_tiles();
                 }
 
+                let shadow_u = self.shadow_uniforms_for_render();
                 let cb = TerrainCallback::new(
                     &self.camera,
                     rect,
@@ -11155,6 +11196,7 @@ impl App {
                     composite_uniforms,
                     self.water_reflections,
                     atmos_u,
+                    shadow_u,
                 );
                 ui.painter()
                     .add(egui_wgpu::Callback::new_paint_callback(rect, cb));
