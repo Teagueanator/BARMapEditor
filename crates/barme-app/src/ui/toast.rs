@@ -86,7 +86,11 @@ pub enum ToastKind {
 /// clicked. The App's update loop maps each variant to a
 /// concrete state mutation; the toast module stays free of
 /// `&mut App`.
-#[allow(dead_code)] // wired site-by-site through chunks 2 + 5
+///
+/// `OpenHelpArticle` is only wired by chunk 5's
+/// surface-system-events pass; the other variants land in
+/// chunks 2 + 4.
+#[allow(dead_code)] // OpenHelpArticle lands in chunk 5
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToastAction {
     /// Open the Sprint-19 lint panel. Used by the "N issues" toast

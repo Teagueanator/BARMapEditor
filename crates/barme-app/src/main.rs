@@ -111,11 +111,10 @@ struct App {
     /// edits the two axes independently; the F1 wizard sets both on confirm.
     map_size: MapSize,
     heightmap: Option<HeightmapState>,
-    last_error: Option<String>,
-    /// Sprint 31 / U4 — toast notification queue. Replaces the
-    /// single `last_error` slot in chunk 2; chunk 1 wires the
-    /// primitive alongside the legacy field so the migration is
-    /// mechanical.
+    /// Sprint 31 / U4 — toast notification queue. Replaced the
+    /// pre-Sprint-31 `last_error: Option<String>` slot. Every
+    /// edge that used to set `last_error` now spawns through
+    /// `App::toast_info / toast_warn / toast_error`.
     toast_queue: crate::ui::toast::ToastQueue,
     render_state: Option<egui_wgpu::RenderState>,
     camera: OrbitCamera,
@@ -1791,7 +1790,6 @@ impl App {
             project_name: "untitled".to_string(),
             map_size: MapSize::square(16),
             heightmap: None,
-            last_error: None,
             toast_queue: crate::ui::toast::ToastQueue::default(),
             render_state,
             camera: OrbitCamera::framing(8192.0, 8192.0),
@@ -1938,7 +1936,6 @@ impl App {
     }
 
     fn load_heightmap(&mut self, path: PathBuf) {
-        self.last_error = None;
         // Wholesale replacement — undoing across it would require a full-map
         // pre-snapshot. ADR-022 barriers the history instead.
         self.end_stroke();
@@ -1984,7 +1981,7 @@ impl App {
             }
             Err(e) => {
                 error!(path = %path.display(), error = %format!("{e:#}"), "heightmap load failed");
-                self.last_error = Some(format!("{e:#}"));
+                self.toast_error(format!("Heightmap load failed: {e:#}"));
             }
         }
     }
@@ -1999,7 +1996,6 @@ impl App {
         self.height_scale = 256.0;
         self.min_height = 0.0;
         self.camera = OrbitCamera::framing(8192.0, 8192.0);
-        self.last_error = None;
         self.last_install = None;
         self.ally_groups.clear();
         self.active_ally_group_id = 0;
@@ -2261,7 +2257,6 @@ impl App {
                     path.display()
                 );
                 self.current_project_path = Some(path.clone());
-                self.last_error = None;
                 self.dirty = false;
                 // Sprint 20 / chunk 7 — record in recent projects.
                 self.editor_config.push_recent(path.clone());
@@ -2270,13 +2265,13 @@ impl App {
                 // imported-texture files no longer referenced by the
                 // layer stack. Quiet (no toast) when there's nothing
                 // to do; on success surfaces the freed-bytes total
-                // via `last_error` so the user knows the disk
-                // footprint changed.
+                // via a toast so the user knows the disk footprint
+                // changed.
                 self.run_orphan_texture_gc(&path, RunGcSource::AutoSave);
             }
             Err(e) => {
                 error!(path = %path.display(), error = %format!("{e:#}"), "project save failed");
-                self.last_error = Some(format!("save: {e:#}"));
+                self.toast_error(format!("Save failed: {e:#}"));
             }
         }
     }
@@ -2302,7 +2297,7 @@ impl App {
         let report = match barme_core::garbage_collect_textures(&snap, root) {
             Ok(r) => r,
             Err(e) => {
-                self.last_error = Some(format!("Texture GC failed at {}: {}", root.display(), e));
+                self.toast_error(format!("Texture GC failed at {}: {}", root.display(), e));
                 return;
             }
         };
@@ -2318,10 +2313,10 @@ impl App {
         );
         match (source, removed) {
             (RunGcSource::Manual, 0) => {
-                self.last_error = Some("GC: no orphan textures found.".into());
+                self.toast_info("GC: no orphan textures found.");
             }
             (RunGcSource::Manual, n) | (RunGcSource::AutoSave, n) if n > 0 => {
-                self.last_error = Some(format!(
+                self.toast_info(format!(
                     "Garbage-collected {n} orphan texture{plural} (~{mb:.1} MB).",
                     plural = if n == 1 { "" } else { "s" },
                 ));
@@ -2348,7 +2343,6 @@ impl App {
     /// 3 s). Lifecycle confirmations: save ok, GC swept, install
     /// landed. Routes through [`crate::ui::toast::ToastQueue::spawn`]
     /// which coalesces identical text within 5 s.
-    #[allow(dead_code)] // wired by chunk 2 (last_error migration) + chunk 5 (build/lint surfaces)
     fn toast_info(&mut self, text: impl Into<String>) {
         self.toast_queue
             .spawn(crate::ui::toast::ToastKind::Info, text.into(), None);
@@ -2357,7 +2351,6 @@ impl App {
     /// Sprint 31 / U4 — spawn a warning toast (auto-dismisses in
     /// 6 s). Non-fatal degradation: downsample, lint count
     /// landed, partial import.
-    #[allow(dead_code)] // wired by chunk 2 + chunk 5
     fn toast_warn(&mut self, text: impl Into<String>) {
         self.toast_queue
             .spawn(crate::ui::toast::ToastKind::Warning, text.into(), None);
@@ -2366,7 +2359,6 @@ impl App {
     /// Sprint 31 / U4 — spawn a persistent error toast (no auto-
     /// dismiss; user must click ×). Hard failures: save failed,
     /// open failed, build gated, texture import refused.
-    #[allow(dead_code)] // wired by chunk 2 + chunk 5
     fn toast_error(&mut self, text: impl Into<String>) {
         self.toast_queue
             .spawn(crate::ui::toast::ToastKind::Error, text.into(), None);
@@ -2378,7 +2370,6 @@ impl App {
     /// state-mutation.
     ///
     /// [`ToastAction`]: crate::ui::toast::ToastAction
-    #[allow(dead_code)] // wired by chunk 2 + chunk 5
     fn toast_with_action(
         &mut self,
         kind: crate::ui::toast::ToastKind,
@@ -3680,7 +3671,7 @@ impl App {
     ///    layer's vec index.
     /// 6. Push `ProjectDiff::SetLayerProperty(Source)` for undo.
     ///
-    /// Bails with a `last_error` toast when the project hasn't been
+    /// Bails with an error toast when the project hasn't been
     /// saved yet (no `<project>/textures/` directory to write into).
     fn import_layer_texture(&mut self, layer_id: &str, path: PathBuf) {
         use barme_core::LayerSource;
@@ -3699,10 +3690,9 @@ impl App {
         // to write into. PITFALL §17.4 — imports MUST live under the
         // project, otherwise a project move dangles the layer.
         let Some(project_path) = self.current_project_path.clone() else {
-            self.last_error = Some(
+            self.toast_error(
                 "Save the project before importing textures (textures live next to the \
-                 .barmeproj)."
-                    .into(),
+                 .barmeproj).",
             );
             warn!("Sprint 17 Layers: import refused — project not yet saved (no textures sidecar)");
             return;
@@ -3720,13 +3710,13 @@ impl App {
                     error = %e,
                     "Sprint 17 Layers: import failed; layer unchanged"
                 );
-                self.last_error = Some(format!("Texture import failed: {e:#}"));
+                self.toast_error(format!("Texture import failed: {e:#}"));
                 return;
             }
         };
         let (orig_w, orig_h) = (img.width(), img.height());
         if orig_w < 16 || orig_h < 16 {
-            self.last_error = Some(format!(
+            self.toast_error(format!(
                 "Imported texture too small ({orig_w}×{orig_h}); must be at least 16×16.",
             ));
             return;
@@ -3746,14 +3736,14 @@ impl App {
         // Sidecar directory + UUID-named PNG + meta.toml.
         let textures_dir = project_root.join("textures");
         if let Err(e) = std::fs::create_dir_all(&textures_dir) {
-            self.last_error = Some(format!("Could not create textures dir: {e}"));
+            self.toast_error(format!("Could not create textures dir: {e}"));
             return;
         }
         let uuid = barme_core::alloc_layer_id();
         let dest_filename = format!("{uuid}.png");
         let dest_disk = textures_dir.join(&dest_filename);
         if let Err(e) = rgba.save(&dest_disk) {
-            self.last_error = Some(format!("Could not save imported texture: {e}"));
+            self.toast_error(format!("Could not save imported texture: {e}"));
             return;
         }
         let source_filename = path
@@ -3822,7 +3812,7 @@ impl App {
                 to: LayerPropertyValue::Source(new_source),
             });
         if did_downsample {
-            self.last_error = Some(format!(
+            self.toast_warn(format!(
                 "Imported {orig_w}×{orig_h} → downsampled to {final_w}×{final_h} (8192² cap).",
             ));
         }
@@ -5785,20 +5775,23 @@ impl App {
                 .map(|i| i.rule.title().to_string())
                 .collect();
             let msg = format!(
-                "Build blocked by {errors} lint error(s): {}. Open the lint panel for details.",
+                "Build blocked by {errors} lint error(s): {}.",
                 top.join(", ")
             );
             warn!(errors, "build & install gated by lint errors: {msg}");
-            self.last_error = Some(msg);
+            self.toast_with_action(
+                crate::ui::toast::ToastKind::Error,
+                msg,
+                crate::ui::toast::ToastAction::OpenLintPanel,
+            );
             self.lint_panel_open = true;
             return;
         }
 
         self.last_install = None;
-        self.last_error = None;
         let Some(hm) = self.heightmap.as_ref() else {
             warn!("build & install requested with no heightmap loaded");
-            self.last_error = Some("load a heightmap first".into());
+            self.toast_error("Load a heightmap first.");
             return;
         };
         // The CPU-side heightmap is authoritative (may include unsaved
@@ -5811,7 +5804,7 @@ impl App {
             Err(e) => {
                 let msg = format!("tempdir: {e:#}");
                 error!("build & install tempdir failed: {msg}");
-                self.last_error = Some(msg);
+                self.toast_error(msg);
                 return;
             }
         };
@@ -5819,14 +5812,14 @@ impl App {
         if let Err(e) = hm.data.save_png(&hm_path) {
             let msg = format!("write heightmap: {e:#}");
             error!("build & install snapshot failed: {msg}");
-            self.last_error = Some(msg);
+            self.toast_error(msg);
             return;
         }
         let Some(dst_dir) = launcher::bar_maps_dir() else {
             let msg =
                 "could not locate BAR maps dir on this platform — pick one manually (Stage 1)";
             warn!("{msg}");
-            self.last_error = Some(msg.into());
+            self.toast_error(msg);
             return;
         };
         let repo_root = repo_root();
@@ -5835,7 +5828,7 @@ impl App {
             Err(e) => {
                 let msg = format!("{e:#}");
                 error!("pymapconv unavailable: {msg}");
-                self.last_error = Some(msg);
+                self.toast_error(msg);
                 return;
             }
         };
@@ -5901,7 +5894,7 @@ impl App {
             Ok(h) => h,
             Err(msg) => {
                 error!("{msg}");
-                self.last_error = Some(msg);
+                self.toast_error(msg);
                 return;
             }
         };
@@ -5921,7 +5914,7 @@ impl App {
     /// Sprint 20 / chunk 5: apply this frame's [build log panel]
     /// clicks. Clear locks the ring buffer and truncates; Save writes
     /// the current contents to a user-picked file (best-effort —
-    /// failure surfaces a single `last_error` toast).
+    /// failure surfaces a single error toast).
     ///
     /// [build log panel]: crate::ui::build_log::render
     fn apply_build_log_clicks(&mut self, clicks: crate::ui::build_log::LogPanelClicks) {
@@ -5932,17 +5925,23 @@ impl App {
             info!("build_log: clearing ring buffer");
             guard.clear();
         }
-        if let Some(path) = clicks.save_as
-            && let Some(log) = self.build_state.log()
-            && let Ok(guard) = log.lock()
-        {
-            let text = crate::ui::build_log::render_log_as_text(&guard);
-            match std::fs::write(&path, text) {
-                Ok(()) => info!(?path, "build_log: saved to file"),
-                Err(e) => {
-                    let msg = format!("save log: {e:#}");
-                    error!("{msg}");
-                    self.last_error = Some(msg);
+        if let Some(path) = clicks.save_as {
+            // Snapshot the log text under the guard, then drop the
+            // mutex + the build_state borrow before calling
+            // toast_error (which needs `&mut self`).
+            let text = self
+                .build_state
+                .log()
+                .and_then(|log| log.lock().ok())
+                .map(|guard| crate::ui::build_log::render_log_as_text(&guard));
+            if let Some(text) = text {
+                match std::fs::write(&path, text) {
+                    Ok(()) => info!(?path, "build_log: saved to file"),
+                    Err(e) => {
+                        let msg = format!("save log: {e:#}");
+                        error!("{msg}");
+                        self.toast_error(msg);
+                    }
                 }
             }
         }
@@ -6101,7 +6100,6 @@ impl App {
                 self.min_height = p.min_height;
                 self.heightmap = None;
                 self.current_project_path = Some(path);
-                self.last_error = None;
                 self.dirty = false;
                 let (ex, ez) = self.map_size.elmo_extents();
                 self.camera = OrbitCamera::framing(ex as f32, ez as f32);
@@ -6204,8 +6202,7 @@ impl App {
                             "project references heightmap {} but file is missing",
                             hm_path.display()
                         );
-                        self.last_error =
-                            Some(format!("heightmap not found: {}", hm_path.display()));
+                        self.toast_warn(format!("Heightmap not found: {}", hm_path.display()));
                     }
                 }
                 // Sprint 20 / chunk 7 — record in recent projects. The
@@ -6218,12 +6215,12 @@ impl App {
             }
             Err(e) => {
                 error!(path = %path.display(), error = %format!("{e:#}"), "project open failed");
-                self.last_error = Some(format!("open: {e:#}"));
+                self.toast_error(format!("Open failed: {e:#}"));
                 // Sprint 20 / chunk 7 — silently drop missing entries
                 // from recent projects so the submenu stays cleanly
                 // navigable. PITFALL #8 in the sprint prompt: never
-                // pop a dialog per missing entry; the single
-                // `last_error` toast above carries the news.
+                // pop a dialog per missing entry; the toast above
+                // carries the news.
                 self.editor_config.remove_recent(&path);
                 self.editor_config.save();
             }
@@ -7992,9 +7989,33 @@ impl App {
                 if open_build_log {
                     self.build_log_open = true;
                 }
-                if let Some(err) = &self.last_error {
+                // Sprint 31 / U4 — toast count chip. Replaces the
+                // pre-Sprint-31 `last_error` red line; the counter
+                // colour reflects the most-severe active toast so
+                // the user sees errors at a glance.
+                let (info_n, warn_n, err_n) = self.toast_queue.counts();
+                let total = info_n + warn_n + err_n;
+                if total > 0 {
                     ui.separator();
-                    ui.colored_label(egui::Color32::RED, err);
+                    let tone = if err_n > 0 {
+                        crate::ui::theme::ChipTone::Err
+                    } else if warn_n > 0 {
+                        crate::ui::theme::ChipTone::Warn
+                    } else {
+                        crate::ui::theme::ChipTone::Ok
+                    };
+                    crate::ui::widgets::chip(
+                        ui,
+                        tone,
+                        format!(
+                            "{total} notification{plural}",
+                            plural = if total == 1 { "" } else { "s" }
+                        ),
+                    )
+                    .on_hover_text(
+                        "Recent notifications stack above the status \
+                             strip. Click × on each to dismiss.",
+                    );
                 }
                 // Sprint 19 — brush readout chip (right-aligned).
                 // Surfaces brush radius + strength for the active
@@ -11639,10 +11660,9 @@ impl App {
                 // Bails with a toast if the project hasn't been
                 // saved (no <project>/textures/ to sweep yet).
                 let Some(project_path) = self.current_project_path.clone() else {
-                    self.last_error = Some(
+                    self.toast_warn(
                         "Save the project before garbage-collecting textures \
-                         (the textures live next to the .barmeproj)."
-                            .into(),
+                         (the textures live next to the .barmeproj).",
                     );
                     return;
                 };
@@ -11986,7 +12006,6 @@ mod tests {
             project_name: "test".to_string(),
             map_size: MapSize::square(2),
             heightmap: None,
-            last_error: None,
             toast_queue: crate::ui::toast::ToastQueue::default(),
             render_state: None,
             camera: OrbitCamera::framing(128.0, 128.0),
@@ -12679,10 +12698,11 @@ mod tests {
         );
     }
 
-    /// Sprint 21 / C8 — `build_and_install` refuses to start when
-    /// `lint_summary` carries hard errors. Asserted by inspecting
-    /// `last_error` after the call: the gate writes a human-readable
-    /// summary there instead of spinning up the worker.
+    /// Sprint 21 / C8 (Sprint 31 migration) — `build_and_install`
+    /// refuses to start when `lint_summary` carries hard errors. The
+    /// gate now surfaces the block through the toast queue (with an
+    /// `OpenLintPanel` action) instead of the retired `last_error`
+    /// slot.
     #[test]
     fn build_and_install_refuses_with_hard_errors() {
         let mut app = make_test_app();
@@ -12700,11 +12720,22 @@ mod tests {
             matches!(app.build_state, build_runner::BuildState::Idle),
             "build_state should stay Idle when lint gates the build"
         );
-        // last_error should describe the lint block.
-        let err = app.last_error.as_deref().unwrap_or("");
+        // Toast queue should carry an error toast that mentions the
+        // lint block and exposes the OpenLintPanel action.
+        let lint_toast = app
+            .toast_queue
+            .toasts
+            .iter()
+            .find(|t| t.text.contains("lint error"));
+        let toast = lint_toast.expect("gate should spawn a toast mentioning lint errors");
         assert!(
-            err.contains("lint error"),
-            "last_error should mention lint gate; got: {err:?}"
+            matches!(toast.kind, crate::ui::toast::ToastKind::Error),
+            "lint-gate toast should be the Error tone"
+        );
+        assert_eq!(
+            toast.action,
+            Some(crate::ui::toast::ToastAction::OpenLintPanel),
+            "lint-gate toast should offer the OpenLintPanel action"
         );
         // Lint panel should auto-open so the user sees the issues.
         assert!(
