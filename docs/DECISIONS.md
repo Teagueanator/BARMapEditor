@@ -4386,6 +4386,197 @@ explicitly deferred.
 `docs/research/source-audit-2026-05-18/FINDINGS.md` §1.3. Sprint
 devlog: `devlog/sprint-28-atmosphere-and-fog/`.
 
+## ADR-046 — Feature decal sprite atlas, Phase A (Sprint 29 / R5)
+
+**Status:** Accepted (2026-05-22).
+
+**Context.** Sprints 25-28 closed the renderer-parity gap for the
+terrain surface itself (DNTS shader, water, atmosphere + fog).
+Placed features still rendered as flat category glyphs from
+Sprint 13 / ADR-037 — the user could see WHERE each feature sat
+on the map + its METAL value, but not WHAT it looked like.
+Sprint 29 / R5 closes that gap. The kickoff brief offered two
+paths: Phase A (decal sprites — billboard texture per feature
+family) and Phase B (S3O parser + 3D rendering or thumbnail
+render passes). The user scope-decision (2026-05-21) selected
+Phase A only this sprint, with Sprint 29b deferred for Phase B.
+
+**Forces.**
+- Catalog v2's 34 synthetic names matched zero upstream
+  featureDefs (verified by grep against
+  `beyond-all-reason/mapfeatures @ 3b79163` +
+  `beyond-all-reason/Beyond-All-Reason @ 3763840`). Phase A
+  on the v2 catalog would have vendored zero diffuses — the
+  pipeline would ship but with no visible effect. The user
+  approved the breaking-change pivot to a v3 catalog using real
+  upstream names (`AskUserQuestion` 2026-05-21).
+- Upstream `mapfeatures` has `AI_POLICY.md` but no `LICENSE` —
+  the per-feature `customparams.author` field credits Beherith /
+  0 A.D. / aGorm / Lathan / Nikuksis, and one feature
+  (`ad0_aleppo2`) carries an explicit `CC BY-SA-NC 3.0 @
+  Beherith` header. None of the others declare a license.
+  Vendoring inside this repo would assume implicit consent we
+  do not have.
+- BAR's `unittextures/decals_features/*.dds` contains 680 unit
+  footprint decals — none correspond to mapfeature names. The
+  brief's "BAR decals" premise was incorrect; the real source
+  is upstream `mapfeatures/unittextures/*.tga`.
+- All 16 confirmed-vendored upstream diffuses are TGA. The
+  brief's `bcdec_rs` requirement for DDS BC1/BC3 decode is
+  Phase B work (S3O texture refs); Phase A doesn't exercise
+  any DDS code path.
+- 16-SMU iGPU budget (PITFALLS §1): 128² × 32 layers × 4 B =
+  2 MB atlas — well inside budget. 512² mipmapped sprites would
+  blow it.
+
+**Decisions.**
+
+1. **v3 catalog with real upstream family names + per-family
+   diffuse mapping.** `assets/mapfeatures_catalog.json` v3
+   replaces v2's 34 synthetic entries with ~85 representative
+   variants across 21 families. Each entry references a family
+   key via `family: String`; each family carries a `diffuse_
+   texture: Option<String>` + `source: String` (one of
+   "mapfeatures", "bar", "engine"). The runtime
+   `FamilyDef::decal_layer: Option<u32>` slot is filled at
+   startup by the registry.
+
+   **Alternatives considered.** (a) Keep v2, vendor placeholder
+   sprites for synthetic names — rejected; would ship a
+   permanently-fake catalog. (b) Additive catalog (v2 + new
+   entries) — rejected; would surface unsupported names in F7
+   and confuse map authors. The clean break is honest and
+   matches the engine's behaviour (unrecognised featureDef →
+   silently dropped at game load).
+
+2. **Fetch-script pattern + gitignored `tools/feature-decals/`,
+   not in-repo redistribution.** `scripts/fetch-feature-decals.sh`
+   clones (or refreshes) the user's local `~/code/Beyond-All-
+   Reason/mapfeatures` clone and copies the family diffuses into
+   `tools/feature-decals/<family>/diffuse.tga`. Pinned to the
+   audited upstream commit (`3b79163`) with a soft warning on
+   drift. Mirrors the existing `fetch-textures.sh` /
+   `fetch-pymapconv.sh` pattern. The editor binary contains no
+   upstream content; the .sd7 output references features by
+   name and the engine resolves textures at game-time.
+
+   **Alternatives considered.** (a) Vendor inside the repo —
+   rejected; license unclear. (b) Embedded `include_bytes!` —
+   same license problem + bloats binary by 30+ MB. (c) Runtime
+   HTTP fetch — rejected; offline-hostile + complicates CI.
+
+3. **`MarkerShape::TexturedSprite { layer: u32 }` as shape_id
+   5 in the existing Sprint 13 / ADR-037 marker pipeline.** Adds
+   one variant to the enum and one slot
+   (`MarkerInstanceGpu::texture_layer`) to the GPU instance
+   struct, consuming one slot of the former 3-u32 pad. Struct
+   stays 48 B / 16 B-aligned. WGSL `Instance` mirrors the
+   layout; fragment shader case 5u samples `decal_atlas` at LOD
+   0 (mipless; 128² is the Phase A pin).
+
+   **Alternatives considered.** New marker pipeline for sprites
+   — rejected; doubles the per-frame draw cost (one for glyphs,
+   one for sprites) and complicates the depth-test invariant.
+   The existing pipeline's back-to-front sort + premultiplied-
+   alpha blend already handle transparent quad layering
+   correctly.
+
+4. **`texture_2d_array` of 32 fixed layers, sRGB diffuse,
+   linear-clamp sampler.** 16 layers populated today (one per
+   upstream-mapfeatures family with a diffuse); 16 reserved for
+   future families without reallocating. Memory: 2 MB.
+   `Rgba8UnormSrgb` so the linear blend math under
+   `PREMULTIPLIED_ALPHA_BLENDING` produces correct colours —
+   TGA stores sRGB, sampler auto-decodes to linear.
+
+   **Alternatives considered.** Per-family standalone textures
+   — rejected; 16 separate bind groups + dispatch calls per
+   frame is wasteful. Variable-size atlas — rejected; would
+   re-allocate at runtime + invalidate bind groups during
+   normal authoring flow.
+
+5. **Per-decode buffer feeds both GPU atlas AND egui thumbnail
+   handle in one pass.** `populate_decal_registry` calls
+   `feature_decals::load_decal` once per family, passes the
+   RGBA8 buffer to both `render::upload_feature_decal` (wgpu
+   atlas) and `egui_ctx.load_texture` (egui texture cache).
+   `FamilyDef::egui_thumbnail: Option<TextureHandle>` outlives
+   the function call; the F7 picker consults it for the 32²
+   row preview.
+
+   **Alternatives considered.** Decode twice (once at startup,
+   once on first F7 open) — rejected; doubles cold-load I/O for
+   no benefit since the picker is opened immediately by typical
+   workflows. Lazy egui handle on first request — adds runtime
+   complexity for negligible win.
+
+6. **Sprite radius = `category_glyph_radius × 3`.** The marker
+   pipeline keeps `radius_px` screen-space — sprites stay
+   pixel-sized regardless of camera distance. Phase A multiplies
+   the category-glyph radius by 3 so sprites are legibly larger
+   than glyphs (a 7 px tree glyph becomes a 21 px sprite,
+   roughly a 42×42 quad). World-scaled rendering — sprites
+   sized in elmos so a tree LOOKS tree-sized at a given camera
+   distance — is Phase B (Sprint 29b) work via S3O thumbnails
+   or full meshes.
+
+   **Alternatives considered.** Per-family explicit
+   `radius_px` in the catalog JSON — rejected; the category-
+   relative scaling stays consistent if a future polish pass
+   adjusts category glyph sizes globally. Hardcoded 24 px for
+   all sprites — works but hard-couples sprite scaling to a
+   single number across categories.
+
+7. **DDS path stubbed (`DecalError::DdsUnsupported`), not
+   implemented.** `feature_decals.rs` dispatches by extension;
+   `.tga` / `.png` / `.bmp` route through `image::open`, `.dds`
+   returns a typed error. Phase A doesn't load any DDS files
+   (every confirmed-vendored upstream diffuse is TGA);
+   `bcdec_rs` lands as a workspace dep so Sprint 29b's S3O
+   texture-ref resolver inherits a working integration point.
+
+   **Alternatives considered.** Skip `bcdec_rs` entirely until
+   needed — rejected; Sprint 29b's first PR shouldn't have to
+   relitigate the workspace-dep addition. Implement BC1 in
+   Phase A even without exercise — rejected; YAGNI + the BC3 /
+   BC5 paths are non-trivial without a fixture to verify
+   against.
+
+**Consequence.**
+
+- 7 commits on `main`: v3 catalog (1) → workspace deps (2) →
+  fetch script + gitignore (3) → feature_decals module (4) →
+  marker pipeline extension (5) → registry wiring (6) →
+  inspector polish (7). Plus the feature-zoo parity fixture
+  README + this ADR + the SRS/ROADMAP rollup.
+- 16 vendored decal sprites populate atlas layers 0..15;
+  5 fallback families (kapok / rocks30 / tombstone /
+  xmascomwreck / geovent) fall through to category glyphs. The
+  fixture exercises both paths.
+- `BREAKING`: any project still referencing v2's synthetic
+  names (`pinetree`, `agorm_pine1`, …) shows the unknown-
+  feature `FALLBACK_FEATURE_VISUAL` glyph at load. No data
+  loss — the entries persist in the project; only the visual
+  hint defaults to the unknown-feature glyph until the user
+  re-selects from v3's families.
+- Tests: barme-app 360 → 365 (+5 feature_decals + 2 marker;
+  net +5 after removing dead-code allows accounted in the
+  numbers). barme-pipeline lint test pinned to v3 catalog
+  names. Full workspace test count unchanged in shape.
+- **Renderer-parity arc: 4 / 8 done.** Next arc sprint is
+  Sprint 30 (directional shadows) per the original sub-roadmap;
+  Sprint 29b (Phase B — S3O parsing + 3D rendering) is the
+  feature-side follow-up to this sprint.
+
+**Reference.** Upstream: `github.com/beyond-all-reason/
+mapfeatures @ 3b79163` (cloned to `~/code/Beyond-All-Reason/
+mapfeatures`, ~120 MB). `AI_POLICY.md` — disclosure
+requirements (not a redistribution license). README.MD —
+enumerates the 17 certified families. RecoilEngine reference
+for Phase B: `rts/Rendering/Models/S3OParser.cpp` +
+`3DOParser.cpp` + `Models/ModelRenderer*.cpp`. Sprint devlog:
+`devlog/sprint-29-feature-asset-decoding/`.
+
 ## ADR template
 
 ```

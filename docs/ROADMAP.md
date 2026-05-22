@@ -946,6 +946,118 @@ Implements SRS F1–F12. Ships a Windows `.exe` and a Linux AppImage.
 
       **Renderer-parity arc: 3 / 8 done.** Next arc sprint is Sprint
       29 (feature asset decoding — S3O + decal sprites).
+- [x] **STATUS UPDATE 2026-05-22 (Sprint 29 / R5, ADR-046 — feature
+      decal sprite atlas, Phase A).** Fourth renderer-parity step.
+      Closes the visual gap on placed features: where Sprint 13 /
+      ADR-037 only emitted category-coded glyphs (filled circles for
+      rocks, triangles for trees / geo vents, outline rings for
+      props, filled-with-stroke for wreckage), Sprint 29 / Phase A
+      adds a `MarkerShape::TexturedSprite { layer: u32 }` variant
+      that samples a per-family diffuse from a new 32-layer
+      `texture_2d_array<f32>` bound at `markers.wgsl @group(0)
+      @binding(2)`. **8 commits on main**:
+
+      (1) `assets(catalog): v3 catalog from upstream mapfeatures
+      families` — v2's 34 synthetic names matched zero upstream
+      featureDefs (`beyond-all-reason/mapfeatures @ 3b79163` +
+      `Beyond-All-Reason @ 3763840` were both grepped). v3 lists
+      ~85 representative variants across 21 families with a new
+      `families` map carrying per-family diffuse path + source
+      ("mapfeatures" / "bar" / "engine"). Per-entry `family: Option
+      <String>` references the map. BREAKING change for any project
+      using v2 synthetic names → those entries fall through to
+      `FALLBACK_FEATURE_VISUAL`, matching engine behaviour on map
+      load. User scope-decision 2026-05-21 picked this path over
+      "additive" or "ship pipeline only" alternatives.
+
+      (2) `deps: image[tga] + bcdec_rs workspace dep` — upstream
+      diffuses ship as TGA; `image` needs the feature enabled.
+      `bcdec_rs` lands now as the BC1/BC3/BC5 decoder so Sprint
+      29b's S3O texture-ref resolver inherits a working integration
+      point. Phase A doesn't exercise the DDS code path.
+
+      (3) `scripts(decals): fetch-feature-decals.sh + tools/ ignore`
+      — idempotent shell script clones / refreshes the user's local
+      `~/code/Beyond-All-Reason/mapfeatures` and copies diffuses
+      into `tools/feature-decals/<family>/diffuse.tga`. Pinned to
+      the audited upstream commit with soft drift warnings. `--check`
+      mode verifies state without copying. `--refresh` force-
+      overwrites. Mirrors the existing `fetch-textures.sh` /
+      `fetch-pymapconv.sh` pattern. License rationale per ADR-046:
+      upstream has `AI_POLICY.md` but no `LICENSE` — the editor
+      binary contains no redistributed content; the .sd7 output
+      references features by name and the engine resolves textures
+      at game-time. `tools/feature-decals/` is gitignored.
+
+      (4) `app(decals): feature_decals module — TGA/PNG/BMP -> 128²
+      RGBA8` — thin wrapper that decodes a feature decal diffuse
+      and resizes to the fixed `SPRITE_SIZE = 128` consumed by the
+      atlas. Dispatch by extension: TGA/PNG/BMP via the `image`
+      crate; DDS returns `DecalError::DdsUnsupported` (typed error,
+      not silent skip — the registry warns loudly on the gap).
+      5 unit tests pin the size constants + fixture round-trip +
+      each error branch.
+
+      (5) `render(markers): TexturedSprite shape + decal texture
+      array` — `MarkerShape::TexturedSprite { layer: u32 }` adds
+      shape_id 5; `MarkerInstanceGpu::texture_layer: u32` consumes
+      one slot of the former 3-u32 pad (struct stays 48 B / 16 B-
+      aligned). `markers.wgsl` Instance mirror updated; fragment
+      shader `case 5u:` samples `decal_atlas` at LOD 0 with
+      `tex_uv = (uv + 1) × 0.5` and Y-flip (image-crate output is
+      top-row-first; quad uv.y = +1 points up on screen).
+      `MarkerResources` gains a 32-layer 128² Rgba8UnormSrgb
+      texture + linear-clamp sampler + bind group entries 2 + 3.
+      `write_decal_layer` is the host-side upload API consumed by
+      the registry. Memory: 2 MB.
+
+      (6) `app(decals): FeatureDecalRegistry wires v3 catalog
+      families to GPU atlas` — `FeatureCatalog` parses the v3
+      `families` map; `FamilyDef::decal_layer: Option<u32>` is the
+      runtime slot. `populate_decal_registry` scans
+      `tools/feature-decals/<family>/diffuse.tga` for every family
+      with `diffuse_texture` set, decodes, uploads, and stamps the
+      assigned layer. `resolved_visual()` prefers `TexturedSprite`
+      when the entry's family has a populated layer (radius 3× the
+      category glyph); fallback to the existing glyph path
+      otherwise. Removes the staged dead-code allows from the
+      Sprint 29 / R5 staged landing.
+
+      (7) `app(inspector): 32x32 thumbnail per family in F7 picker`
+      — `FamilyDef::egui_thumbnail: Option<TextureHandle>`
+      populated alongside `decal_layer` from the same decoded RGBA
+      buffer; the same egui `Context::load_texture` call that fills
+      it lives inside `populate_decal_registry` so one decode pass
+      fills both the GPU atlas and the egui texture cache.
+      `inspector_feature`'s picker row gains a horizontal slot
+      with the thumbnail (or a category-tinted glyph fallback) to
+      the left of display/name labels. Custom `Debug` impl on
+      `FamilyDef` since `egui::TextureHandle` isn't Debug.
+
+      (8) `assets(parity): feature-zoo fixture` — 33-feature 4-SMU
+      smoke fixture exercising both the TexturedSprite path (16
+      vendored mapfeatures families) and the glyph fallback path
+      (5 families lacking upstream diffuse: kapok / rocks30 /
+      tombstone / xmascomwreck / geovent). README-based manual
+      smoke procedure until Sprint 36's parity-validation harness
+      automates ΔE comparison.
+
+      **Phase B (S3O parsing + 3D thumbnail render passes)
+      explicitly deferred to Sprint 29b** per user scope decision
+      2026-05-21. Phase B needs a new `barme-render-s3o` crate
+      (parser + thumbnail render pass + content-addressed cache);
+      the kickoff brief draft lives at the end of
+      `devlog/sprint-29-feature-asset-decoding/`.
+
+      Tests: barme-app 360 → 365 (+5 feature_decals + 2 marker;
+      lint test pinned to v3 catalog names); barme-core 279
+      unchanged; barme-pipeline 213 unchanged. `cargo fmt && cargo
+      clippy --workspace --all-targets -- -D warnings && cargo test
+      --workspace` green.
+
+      **Renderer-parity arc: 4 / 8 done.** Next arc sprint is
+      Sprint 30 (directional shadows); Sprint 29b for Phase B
+      feature meshes / thumbnails is the feature-side follow-up.
 - [ ] Beherith (or active mapper) reviews `.sd7` byte-for-byte against PyMapConv
       reference output on three test maps
 - [ ] Listed on `beyondallreason.info/guide/mapmaking-resources` as beta

@@ -274,6 +274,53 @@ PA's in-game system designer is the cited gold standard. It does the following w
     > → 360 tests (+4 atmosphere). The renderer-parity arc is now
     > **3 / 8 done**. Next arc sprint is Sprint 29 (feature asset
     > decoding — S3O + decal sprites).
+    >
+    > **STATUS UPDATE 2026-05-22 (Sprint 29 / R5 / ADR-046 — feature
+    > decal sprite atlas, Phase A shipped):** the fourth renderer-
+    > parity step closes the visual gap on placed features. Previously
+    > trees / rocks / wreckage / props rendered as flat category
+    > glyphs from Sprint 13 / ADR-037; now ~16 upstream-`mapfeatures`
+    > families render as diffuse-textured sprites via a new
+    > `MarkerShape::TexturedSprite { layer }` variant that samples a
+    > `texture_2d_array<f32>` of 32 fixed 128² Rgba8UnormSrgb layers
+    > bound at `markers.wgsl @group(0) @binding(2)`. Per-instance
+    > `texture_layer: u32` rides next to `shape_id` in
+    > `MarkerInstanceGpu` (consumes one slot of the former 3-u32
+    > pad; struct stays 48 B). The catalog rewrite (v3) replaces v2's
+    > 34 synthetic names with ~85 real upstream variants across 21
+    > families — the v2 names matched zero upstream featureDefs
+    > (verified by grep against `beyond-all-reason/mapfeatures @
+    > 3b79163` + `Beyond-All-Reason @ 3763840`); user scope-decision
+    > 2026-05-21 picked the breaking-change path. `scripts/fetch-
+    > feature-decals.sh` clones the user's local upstream and copies
+    > diffuses into gitignored `tools/feature-decals/<family>/` —
+    > upstream has no LICENSE so the editor binary contains no
+    > redistributed content (same pattern as `fetch-textures.sh` +
+    > `fetch-pymapconv.sh`). At app startup
+    > `FeatureCatalog::populate_decal_registry` decodes each found
+    > diffuse via the new `feature_decals` module
+    > (TGA/PNG/BMP through the `image` crate; DDS returns
+    > `DecalError::DdsUnsupported` reserved for Phase B), uploads to
+    > the next free atlas layer, AND loads an egui `TextureHandle` for
+    > the F7 picker's 32² thumbnail row. `resolved_visual()` prefers
+    > `TexturedSprite { layer }` when the entry's family has a
+    > populated layer (radius 3× the category glyph), falls back to
+    > the existing category glyph otherwise. 5 families (kapok,
+    > rocks30, tombstone, xmascomwreck, geovent) lack an upstream
+    > diffuse and stay on the glyph path. **Phase B (S3O parsing +
+    > 3D thumbnail render passes) deferred to Sprint 29b** per user
+    > scope decision; the kickoff brief lives at the end of
+    > `devlog/sprint-29-feature-asset-decoding/`. 7 commits on `main`
+    > (v3 catalog → workspace deps `image[tga]` + `bcdec_rs` → fetch
+    > script + gitignore → feature_decals module → marker pipeline
+    > extension → registry wiring → inspector polish) + ADR-046 +
+    > parity-fixture `feature-zoo/README.md`. 5 new feature_decals
+    > tests + 2 new marker tests. `cargo fmt && cargo clippy
+    > --workspace --all-targets -- -D warnings && cargo test
+    > --workspace` green. The renderer-parity arc is now **4 / 8
+    > done**. Next arc sprint is Sprint 30 (directional shadows;
+    > Sprint 29b for Phase B feature meshes / thumbnails is the
+    > feature-side follow-up).
 12. **Decompilation fidelity.** Round-tripping an existing `.sd7` loses information: the recovered diffuse PNG has been through DXT1 (color precision loss); heightmap, metal, and type maps are exact; mapinfo.lua is exact; auxiliary splat textures survive untouched. Reuse PyMapConv's decompile path.
 13. **GPU brush latency.** Spring/Recoil maps can theoretically reach 96×96 SMUs. Sub-millisecond brush response at 32×32+ requires the heightmap to live on the GPU as a storage texture, edited by compute shaders. Read-back to CPU happens only at save.
 
