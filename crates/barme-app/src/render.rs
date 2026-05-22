@@ -980,6 +980,54 @@ pub struct WaterU {
 /// refraction-copy view + sampler, reflection RT view + sampler. The
 /// refraction view changes on offscreen RT resize, so the bind group
 /// gets rebuilt via [`RenderResources::rebind_water`].
+/// GPU state for the Sprint 30 / R4 / ADR-048 directional shadow pass.
+///
+/// One render pipeline (depth-only, no fragment stage) renders the
+/// terrain mesh from the sun's perspective into a [`SHADOW_MAP_SIZE`]²
+/// `Depth32Float` texture. The terrain / water / feature fragment
+/// stages sample the resulting depth map via a comparison sampler to
+/// decide which fragments are occluded from the sun.
+///
+/// Lifetimes: the `_tex` field keeps the depth texture alive while the
+/// `view` is bound to the main terrain bind group (Commit 3 wires
+/// it). The bind group layout / pipeline are immutable across the
+/// app's lifetime; the texture is allocated once at install time and
+/// reused per frame (clear-on-load each pass).
+///
+/// Commit 2 of Sprint 30 lands the pipeline + storage + per-frame
+/// depth-only encode. Commit 3 of Sprint 30 wires the terrain shader
+/// to sample the produced shadow map. The `view` + `sampler` fields
+/// stay behind `#[allow(dead_code)]` until that commit consumes them.
+struct ShadowResources {
+    pipeline: wgpu::RenderPipeline,
+    /// Bind group containing the shadow-pass uniform buffer + the
+    /// heightmap texture. Re-bound when the heightmap dims change
+    /// (same trigger as the main terrain bind group's
+    /// [`RenderResources::rebind`] call).
+    bind_group_layout: wgpu::BindGroupLayout,
+    bind_group: wgpu::BindGroup,
+    /// Mirror of the main terrain `Uniforms` shape — view_proj is the
+    /// shadow camera's, NOT the player camera's. params / params2
+    /// carry the same map dims so the vertex stage's heightmap sample
+    /// reproduces the main pass byte-for-byte.
+    uniform_buf: wgpu::Buffer,
+    /// `SHADOW_MAP_SIZE`² `Depth32Float` depth texture. Cleared to 1.0
+    /// every frame; the depth-only pass writes occluder depths into
+    /// it. Consumed by the terrain bind group in Commit 3.
+    #[allow(dead_code)]
+    depth_tex: wgpu::Texture,
+    /// Depth view bound at the main terrain bind group's shadow slot
+    /// (Commit 3). Sampled via a comparison sampler.
+    #[allow(dead_code)]
+    depth_view: wgpu::TextureView,
+    /// `sampler_comparison` for shadow sampling — Commit 3 binds this
+    /// to the main terrain bind group. `LessEqual` compare matches the
+    /// engine's `shadow2DProj`-style "fragment depth vs shadow depth"
+    /// test (PITFALL §8).
+    #[allow(dead_code)]
+    sampler: wgpu::Sampler,
+}
+
 struct WaterResources {
     pipeline: wgpu::RenderPipeline,
     bind_group_layout: wgpu::BindGroupLayout,
@@ -1158,6 +1206,12 @@ pub struct RenderResources {
     /// reflection passes (the planar mirror only swaps view-proj,
     /// not lighting).
     atmosphere_uniform_buf: wgpu::Buffer,
+    /// Sprint 30 / R4 / ADR-048 — depth-only directional shadow pass.
+    /// Render pipeline + 2048² shadow map + comparison sampler. The
+    /// pipeline runs BEFORE the main offscreen pass each frame to
+    /// produce the shadow map terrain (and water, features) sample
+    /// in Commit 3.
+    shadow: ShadowResources,
 }
 
 impl RenderResources {
@@ -1236,6 +1290,24 @@ impl RenderResources {
             &self.composite.mask_samp,
             &self.atmosphere_uniform_buf,
         );
+        // Sprint 30 / R4 / ADR-048 — shadow bind group binds the same
+        // heightmap view so the depth-only vertex stage samples the
+        // same texture as the main pass. Rebuilt alongside the main
+        // bind group whenever the heightmap dims change.
+        self.shadow.bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("shadow.bg"),
+            layout: &self.shadow.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.shadow.uniform_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&heightmap_view),
+                },
+            ],
+        });
     }
 
     /// Sprint 26 / R3 / ADR-044 — rebuild the water bind group to point
@@ -2310,6 +2382,226 @@ fn install_water_resources(
     }
 }
 
+/// Build the Sprint 30 / R4 / ADR-048 directional shadow pass.
+///
+/// Allocates the [`SHADOW_MAP_SIZE`]² `Depth32Float` shadow map, the
+/// per-frame uniform buffer (shadow camera VP + map dims), the depth-
+/// only render pipeline reusing `shadow_gen.wgsl::vs_main`, and a
+/// `sampler_comparison` the main terrain shader binds in Commit 3.
+///
+/// The pipeline shares the terrain's `Uniforms` shape (mat4 view_proj +
+/// 2 vec4 params) — only the matrix differs (shadow camera vs player
+/// camera). A single Rust struct drives both buffers; the per-frame
+/// writes happen in [`TerrainCallback::prepare`].
+///
+/// Engine reference: `cont/base/springcontent/shaders/GLSL/
+/// ShadowGenVertMapProg.glsl` (terrain shadow-gen vertex stage) plus
+/// `rts/Rendering/ShadowHandler.cpp::InitFBOAndTextures` (depth-format
+/// and clamp-to-border setup; the editor uses ClampToEdge with a
+/// bounds-check in WGSL because wgpu's portability lint rejects
+/// `texture_2d_array` with border colours on some backends).
+fn install_shadow_resources(device: &wgpu::Device, queue: &wgpu::Queue) -> ShadowResources {
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("shadow_gen.wgsl"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("shadow_gen.wgsl").into()),
+    });
+
+    let uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("shadow.uniforms"),
+        size: std::mem::size_of::<Uniforms>() as u64,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    // Pre-seed with an identity VP so the bind group is valid before
+    // the first `prepare()` write lands.
+    queue.write_buffer(
+        &uniform_buf,
+        0,
+        bytemuck::bytes_of(&Uniforms {
+            view_proj: Mat4::IDENTITY.to_cols_array_2d(),
+            params: [1.0, ELMOS_PER_PIXEL, 1.0, 1.0],
+            params2: [0.0, 0.0, 0.0, 0.0],
+        }),
+    );
+
+    let depth_tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("shadow.depth"),
+        size: wgpu::Extent3d {
+            width: SHADOW_MAP_SIZE,
+            height: SHADOW_MAP_SIZE,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: SHADOW_MAP_FORMAT,
+        // RENDER_ATTACHMENT for the depth-only pass to write into;
+        // TEXTURE_BINDING for Commit 3's main-pass sampling.
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let depth_view = depth_tex.create_view(&wgpu::TextureViewDescriptor::default());
+
+    // `sampler_comparison` — the WGSL `textureSampleCompare` call
+    // performs the per-fragment depth comparison the engine's
+    // `shadow2DProj` GLSL equivalent does. `CompareFunction::LessEqual`
+    // matches the "fragment depth ≤ shadow depth → lit" semantic
+    // (PITFALL §8). Linear filter lets the hardware-PCF path produce
+    // smoother 2x2 fetches even before Sprint 30's WGSL 3×3 PCF
+    // expansion lands.
+    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("shadow.sampler"),
+        address_mode_u: wgpu::AddressMode::ClampToEdge,
+        address_mode_v: wgpu::AddressMode::ClampToEdge,
+        address_mode_w: wgpu::AddressMode::ClampToEdge,
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        mipmap_filter: wgpu::FilterMode::Nearest,
+        compare: Some(wgpu::CompareFunction::LessEqual),
+        ..Default::default()
+    });
+
+    let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("shadow.bgl"),
+        entries: &[
+            // 0: shadow-pass uniforms (mat4 view_proj + params + params2).
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            // 1: heightmap (vertex-only — shadow stage has no fragment).
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Uint,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+        ],
+    });
+
+    // Bind group is built with a 1×1 dummy heightmap view; the real
+    // heightmap binding rotates through `RenderResources::rebind` /
+    // `rebind_shadow` once a project loads. Same pattern as the main
+    // terrain bind group's dummy.
+    let dummy_tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("shadow.heightmap.dummy"),
+        size: wgpu::Extent3d {
+            width: 1,
+            height: 1,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: HEIGHTMAP_FORMAT,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &dummy_tex,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        bytemuck::cast_slice(&[0u16]),
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(2),
+            rows_per_image: Some(1),
+        },
+        wgpu::Extent3d {
+            width: 1,
+            height: 1,
+            depth_or_array_layers: 1,
+        },
+    );
+    let dummy_view = dummy_tex.create_view(&wgpu::TextureViewDescriptor::default());
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("shadow.bg.initial"),
+        layout: &bgl,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: uniform_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(&dummy_view),
+            },
+        ],
+    });
+
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("shadow.pl"),
+        bind_group_layouts: &[&bgl],
+        push_constant_ranges: &[],
+    });
+    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("shadow.pipeline"),
+        layout: Some(&pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_main"),
+            compilation_options: Default::default(),
+            buffers: &[],
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            front_face: wgpu::FrontFace::Cw,
+            // Engine's `DrawShadowPasses` originally tried `Face::Front`
+            // for terrain (the comment at ShadowHandler.cpp:463-471
+            // explains the trade-off and notes it was disabled because
+            // border geometry now hides oblique back-faces). The editor
+            // doesn't have that border geometry, so we keep `Face::Back`
+            // and rely on the WGSL depth bias to handle the acne
+            // PITFALL §1 covers.
+            cull_mode: Some(wgpu::Face::Back),
+            ..Default::default()
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: SHADOW_MAP_FORMAT,
+            depth_write_enabled: true,
+            depth_compare: wgpu::CompareFunction::Less,
+            stencil: wgpu::StencilState::default(),
+            // Per-pipeline polygon-offset bias would shift only the
+            // depth values written here; the WGSL sampling side adds
+            // a matching bias when reading. Starting with zero
+            // pipeline bias + WGSL `bias = 0.005` (PITFALL §1) — Commit
+            // 3 tunes if acne shows on the parity fixture.
+            bias: wgpu::DepthBiasState::default(),
+        }),
+        multisample: wgpu::MultisampleState::default(),
+        // No fragment stage — depth-only pass. wgpu allows omitting
+        // `fragment` entirely; with no color attachments either, the
+        // hardware path skips the rasterizer's colour write and saves
+        // bandwidth.
+        fragment: None,
+        multiview: None,
+        cache: None,
+    });
+
+    ShadowResources {
+        pipeline,
+        bind_group_layout: bgl,
+        bind_group,
+        uniform_buf,
+        depth_tex,
+        depth_view,
+        sampler,
+    }
+}
+
 /// Build the composite pipeline + bind-group layout + slot-array
 /// texture + mask sampler. Called once at install time; the per-frame
 /// RT + mask array allocate later via [`ensure_composite_rt`] once
@@ -2782,6 +3074,13 @@ pub fn install(render_state: &egui_wgpu::RenderState) {
     let marker = install_marker_resources(device);
     let line = install_line_resources(device, &marker.uniform_buf);
     let water = install_water_resources(device, queue, &atmosphere_uniform_buf);
+    // Sprint 30 / R4 / ADR-048 — shadow pass resources.
+    info!(
+        size = SHADOW_MAP_SIZE,
+        format = ?SHADOW_MAP_FORMAT,
+        "installing shadow pass"
+    );
+    let shadow = install_shadow_resources(device, queue);
 
     // ─── Sprint 26 / R3 / ADR-044 — reflection pass resources ──────
     let reflection = install_reflection_target(device);
@@ -2865,6 +3164,7 @@ pub fn install(render_state: &egui_wgpu::RenderState) {
             reflection_uniform_buf,
             reflection_bind_group,
             atmosphere_uniform_buf,
+            shadow,
         });
         // Sprint 26 / R3 / ADR-044 — finalize the water bind group now
         // that the reflection RT is owned by RenderResources. The
@@ -4288,6 +4588,12 @@ pub struct TerrainCallback {
     /// uniform buffer; the fragment stage reads from group 0
     /// binding 13.
     pub atmosphere: AtmosphereUniforms,
+    /// Sprint 30 / R4 / ADR-048 — shadow camera view-projection matrix.
+    /// Pre-computed in [`TerrainCallback::new`] from the map AABB +
+    /// atmosphere sun direction so the depth-only shadow pass encodes
+    /// without re-deriving the camera each frame. The same matrix lands
+    /// in the main terrain shader's shadow-sampling uniform in Commit 3.
+    pub shadow_view_proj: [[f32; 4]; 4],
 }
 
 impl TerrainCallback {
@@ -4310,6 +4616,20 @@ impl TerrainCallback {
     ) -> Self {
         let aspect = (rect.width() / rect.height()).max(0.0001);
         let eye = camera.eye();
+        // Sprint 30 / R4 / ADR-048 — derive the shadow camera from the
+        // map AABB + the atmosphere's sun direction. The atmosphere
+        // sun_dir is normalised by `App::atmosphere_uniforms_for_render`
+        // upstream of this constructor (PITFALL §9); we still
+        // defensively normalise inside `ShadowCamera::for_map`.
+        let sun_dir = Vec3::new(
+            atmosphere.sun_dir[0],
+            atmosphere.sun_dir[1],
+            atmosphere.sun_dir[2],
+        );
+        let map_min = Vec3::new(0.0, min_height, 0.0);
+        let map_max = Vec3::new(world_extent_x, max_height, world_extent_z);
+        let shadow_cam = ShadowCamera::for_map(map_min, map_max, sun_dir);
+        let shadow_view_proj = shadow_cam.view_proj_matrix().to_cols_array_2d();
         Self {
             view_proj: camera.view_proj_matrix(aspect).to_cols_array_2d(),
             reflection_view_proj: camera
@@ -4328,6 +4648,7 @@ impl TerrainCallback {
             water,
             composite,
             atmosphere,
+            shadow_view_proj,
         }
     }
 }
@@ -4514,6 +4835,60 @@ impl egui_wgpu::CallbackTrait for TerrainCallback {
         if res.heightmap.is_none() {
             return Vec::new();
         }
+
+        // Sprint 30 / R4 / ADR-048 — depth-only shadow pass. Renders
+        // the terrain mesh from the sun's POV into the 2048² shadow
+        // map at `res.shadow.depth_tex`. Runs BEFORE the reflection +
+        // main offscreen passes so Commit 3's terrain-side sampling
+        // sees a fully-written shadow map (sample-from-and-write-to of
+        // the same depth texture is UB on Vulkan / D3D12, same
+        // constraint as the Sprint 26 refraction copy).
+        //
+        // Writes the per-frame shadow uniforms (VP + map dims) into
+        // `res.shadow.uniform_buf`, then encodes a single indexed draw
+        // covering the terrain grid. No color attachments; depth-only.
+        queue.write_buffer(
+            &res.shadow.uniform_buf,
+            0,
+            bytemuck::bytes_of(&Uniforms {
+                view_proj: self.shadow_view_proj,
+                params: [
+                    self.max_height.max(1.0),
+                    ELMOS_PER_PIXEL,
+                    self.world_extent_x.max(1.0),
+                    self.world_extent_z.max(1.0),
+                ],
+                params2: [
+                    self.min_height,
+                    // params2.y is the use_composite_rt flag in the
+                    // main shader; the shadow vertex stage ignores it.
+                    0.0,
+                    0.0,
+                    0.0,
+                ],
+            }),
+        );
+        {
+            let mut spass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("shadow.depth"),
+                color_attachments: &[],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &res.shadow.depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            spass.set_pipeline(&res.shadow.pipeline);
+            spass.set_bind_group(0, &res.shadow.bind_group, &[]);
+            spass.set_index_buffer(grid.index_buf.slice(..), wgpu::IndexFormat::Uint32);
+            spass.draw_indexed(0..grid.index_count, 0, 0..1);
+        }
+        trace!(shadow_size = SHADOW_MAP_SIZE, "shadow pass encoded");
 
         // Sprint 26 / R3 / ADR-044 — planar reflection pass. Renders
         // the terrain into `res.reflection` with a mirrored-Y view-proj
@@ -5554,5 +5929,106 @@ mod tests {
     fn shadow_map_constants_pinned() {
         assert_eq!(SHADOW_MAP_SIZE, 2048);
         assert_eq!(SHADOW_MAP_FORMAT, wgpu::TextureFormat::Depth32Float);
+    }
+
+    /// `shadow_gen.wgsl` parses cleanly through naga. Catches WGSL
+    /// drift at `cargo test` time without needing a GPU. Sprint 30
+    /// Commit 2 — same pattern as the Sprint 25 terrain shader
+    /// validation; Commit 3 adds a separate test for terrain.wgsl's
+    /// extended bindings.
+    #[test]
+    fn shadow_gen_wgsl_parses_and_validates() {
+        use wgpu::naga::front::wgsl;
+        use wgpu::naga::valid::{Capabilities, ValidationFlags, Validator};
+
+        let src = include_str!("shadow_gen.wgsl");
+        let module = match wgsl::parse_str(src) {
+            Ok(m) => m,
+            Err(e) => panic!("shadow_gen.wgsl parse failed:\n{}", e.emit_to_string(src)),
+        };
+        let mut validator = Validator::new(ValidationFlags::all(), Capabilities::all());
+        if let Err(e) = validator.validate(&module) {
+            panic!("shadow_gen.wgsl validate failed:\n{e:?}");
+        }
+    }
+
+    /// `TerrainCallback::new` derives the shadow camera VP from the
+    /// map AABB + atmosphere sun direction. The matrix is non-identity
+    /// (otherwise the shadow pass would render with the wrong
+    /// projection and shadow-side fragments would all project to
+    /// 0,0,0). Two contrasting cases pin the contract.
+    #[test]
+    fn terrain_callback_derives_non_identity_shadow_vp() {
+        let camera = OrbitCamera::framing(4096.0, 4096.0);
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let atmosphere = AtmosphereUniforms {
+            sun_dir: [0.7, 0.5, 0.5, 1.0],
+            ..AtmosphereUniforms::default()
+        };
+        let cb = TerrainCallback::new(
+            &camera,
+            rect,
+            1024.0,
+            0.0,
+            4096.0,
+            4096.0,
+            SplatUniforms::default(),
+            Vec::new(),
+            [800.0, 600.0],
+            Vec::new(),
+            None,
+            None,
+            false,
+            atmosphere,
+        );
+        let identity = Mat4::IDENTITY.to_cols_array_2d();
+        assert_ne!(
+            cb.shadow_view_proj, identity,
+            "shadow VP should be derived, not identity"
+        );
+        // All entries must be finite — no NaN from the cross-product
+        // basis or near/far range collapse.
+        for col in cb.shadow_view_proj {
+            for v in col {
+                assert!(v.is_finite(), "shadow VP has non-finite entry: {v}");
+            }
+        }
+    }
+
+    /// Different sun directions produce different shadow VP matrices —
+    /// confirms the constructor consumes `atmosphere.sun_dir` rather
+    /// than e.g. hard-coding a default.
+    #[test]
+    fn terrain_callback_shadow_vp_changes_with_sun_dir() {
+        let camera = OrbitCamera::framing(4096.0, 4096.0);
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let make_callback = |sun: [f32; 4]| {
+            let atmosphere = AtmosphereUniforms {
+                sun_dir: sun,
+                ..AtmosphereUniforms::default()
+            };
+            TerrainCallback::new(
+                &camera,
+                rect,
+                1024.0,
+                0.0,
+                4096.0,
+                4096.0,
+                SplatUniforms::default(),
+                Vec::new(),
+                [800.0, 600.0],
+                Vec::new(),
+                None,
+                None,
+                false,
+                atmosphere,
+            )
+        };
+        let east = make_callback([0.7, 0.5, 0.0, 1.0]);
+        let south = make_callback([0.0, 0.5, 0.7, 1.0]);
+        assert_ne!(
+            east.shadow_view_proj, south.shadow_view_proj,
+            "shadow VP must depend on sun direction"
+        );
     }
 }
