@@ -170,6 +170,30 @@ pub const COMPOSITE_MASK_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R8Un
 /// minor pixel loss is invisible under the refractionDistortion blur.
 pub const REFLECTION_RT_SIZE: u32 = 1024;
 
+// ─── Sprint 30 / R4 / ADR-048 — directional shadow constants ────────
+
+/// Side of the Sprint 30 directional shadow map. 2048² `Depth32Float`
+/// (~16 MB) covers the full map AABB at one cascade. Engine
+/// `ShadowHandler::DEF_SHADOWMAP_SIZE` defaults to 2048 too — keeps the
+/// editor's preview visually comparable to BAR's mid-quality default.
+/// Future multi-cascade work could go to 4096² + 3 cascades for
+/// distance bands; the single-cascade MVP keeps the per-frame budget
+/// inside the Vega-8 ~16 ms ceiling per PITFALLS §3.
+///
+/// Consumed by `ShadowResources::install` in Commit 2 of Sprint 30.
+#[allow(dead_code)]
+pub const SHADOW_MAP_SIZE: u32 = 2048;
+
+/// Depth format for the shadow map. `Depth32Float` gives ~7 decimal
+/// digits of precision — at a 4096-elmo height range that's ~0.5 mm per
+/// LSB, plenty for the per-fragment `<` comparison the WGSL shadow
+/// sample does. Universal wgpu support, no need for the
+/// `Depth32FloatStencil8` feature.
+///
+/// Consumed by `ShadowResources::install` in Commit 2 of Sprint 30.
+#[allow(dead_code)]
+pub const SHADOW_MAP_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
 struct Uniforms {
@@ -3147,6 +3171,158 @@ impl OrbitCamera {
     }
 }
 
+/// Sprint 30 / R4 / ADR-048 — orthographic shadow camera.
+///
+/// The sun is treated as infinitely far away; rays are parallel and
+/// directed along `-sun_dir` (light travels FROM the sun toward the
+/// map; `sun_dir` is the "to-sun" direction per the engine + Sprint 25
+/// terrain shader convention). The shadow camera's job is to render
+/// the scene from this perspective into a depth texture, which the
+/// terrain / water / feature fragment stages sample to decide which
+/// fragments are occluded from the sun.
+///
+/// Construction is pure / GPU-free: [`ShadowCamera::for_map`] takes
+/// the map AABB plus the sun direction and computes a tight-fit
+/// orthographic frustum that just contains every map corner. Sloped
+/// sun angles produce wider frustums; a vertical sun (`sun_dir.y ≈ 1`)
+/// gives the narrowest frustum (exact map XZ footprint).
+///
+/// **Engine reference:** RecoilEngine's
+/// `rts/Rendering/ShadowHandler.cpp::SetShadowCamera` +
+/// `rts/Rendering/GL/ShadowFrustumLocker.cpp`. Recoil also computes a
+/// player-camera-following sub-frustum to focus depth precision on the
+/// visible terrain region; for the editor's single-cascade MVP we
+/// cover the full map AABB unconditionally — the editor camera is
+/// usually framing the whole map anyway.
+///
+/// **Depth convention.** `Mat4::orthographic_lh` produces a matrix
+/// whose `near` plane maps to NDC `z = 0` and `far` plane to NDC
+/// `z = 1`. Matches wgpu/D3D/Vulkan natively (no GL-style -1..1 flip).
+/// The WGSL shadow sample's bounds check is `0.0..=1.0` on z, `-1..=1`
+/// on xy.
+///
+/// Commit 1 of Sprint 30 lands the struct + tests; Commit 2 wires it
+/// to the depth-only shadow-gen pipeline. The `dead_code` allows on
+/// the methods are removed in Commit 2 when the pipeline consumes
+/// them.
+#[allow(dead_code)]
+pub struct ShadowCamera {
+    /// World-space "light eye" — the virtual position from which the
+    /// orthographic camera looks at the map. Placed along `+sun_dir`
+    /// from `target` at a distance equal to the map's diagonal so the
+    /// near plane sits well in front of the map and back-faces don't
+    /// sneak in.
+    pub eye: Vec3,
+    /// World-space point the camera looks at — the map AABB centre.
+    pub target: Vec3,
+    /// World-space up vector for `look_at_lh`. Chosen perpendicular to
+    /// `sun_dir` so the cross-product basis stays well-conditioned
+    /// even for near-vertical sun angles (PITFALL §4 — sun_dir.y ≈ 1
+    /// would otherwise produce a degenerate basis with world +Y).
+    pub up: Vec3,
+    /// Orthographic frustum bounds in light-view space:
+    /// `(left, right, bottom, top, near, far)`. Tight-fit to the
+    /// 8-corner map AABB after transformation into view space.
+    pub ortho: (f32, f32, f32, f32, f32, f32),
+}
+
+#[allow(dead_code)] // Methods consumed by Commit 2's depth-only pipeline.
+impl ShadowCamera {
+    /// Build a shadow camera that just contains the map AABB defined by
+    /// `(map_min, map_max)`, viewed from the direction `sun_dir` (the
+    /// "to-sun" vector per Sprint 25 terrain conventions).
+    ///
+    /// The result is pure / GPU-free — no wgpu device required, so this
+    /// is unit-testable. Defensive against degenerate inputs:
+    /// - Zero-length `sun_dir` falls back to world +Y (light overhead,
+    ///   shadows directly under terrain).
+    /// - Near-vertical sun directions (|y| > 0.99) swap to world +Z as
+    ///   the view-up vector so the `look_at_lh` cross product stays
+    ///   well-defined.
+    pub fn for_map(map_min: Vec3, map_max: Vec3, sun_dir: Vec3) -> Self {
+        // Normalise + fall back to +Y for a degenerate sun (PITFALL #4).
+        let sun = if sun_dir.length_squared() > 1e-6 {
+            sun_dir.normalize()
+        } else {
+            Vec3::Y
+        };
+        // World +Y is the natural up for BAR (Y-up convention) but the
+        // cross product `look_at_lh` runs degenerates when `sun ≈ ±Y`.
+        // Switch to +Z in that case — the orthographic frustum still
+        // captures the map; only the basis rotation changes.
+        let up = if sun.y.abs() > 0.99 { Vec3::Z } else { Vec3::Y };
+
+        let target = (map_min + map_max) * 0.5;
+        let map_size = map_max - map_min;
+        // Diagonal of the map AABB — guarantees the eye is far enough
+        // from `target` that every map corner lands at positive view-
+        // space Z. The 1.0 floor protects against degenerate (0-size)
+        // AABB inputs in tests.
+        let diagonal = map_size.length().max(1.0);
+        let eye = target + sun * diagonal;
+
+        // Transform every AABB corner into light-view space and pick
+        // axis-aligned min/max bounds — that's the tight-fit ortho
+        // frustum. 8-corner walk handles arbitrary sun angles
+        // correctly (a sloped sun rotates the AABB; sampling the
+        // rotated corners gives the new XY extent).
+        let view = Mat4::look_at_lh(eye, target, up);
+        let corners = [
+            Vec3::new(map_min.x, map_min.y, map_min.z),
+            Vec3::new(map_max.x, map_min.y, map_min.z),
+            Vec3::new(map_min.x, map_max.y, map_min.z),
+            Vec3::new(map_max.x, map_max.y, map_min.z),
+            Vec3::new(map_min.x, map_min.y, map_max.z),
+            Vec3::new(map_max.x, map_min.y, map_max.z),
+            Vec3::new(map_min.x, map_max.y, map_max.z),
+            Vec3::new(map_max.x, map_max.y, map_max.z),
+        ];
+        let mut min_v = Vec3::splat(f32::MAX);
+        let mut max_v = Vec3::splat(f32::MIN);
+        for c in &corners {
+            let v = view.transform_point3(*c);
+            min_v = min_v.min(v);
+            max_v = max_v.max(v);
+        }
+
+        // Z grows AWAY from the camera in left-handed view space; the
+        // eye sits at `target + sun * diagonal` so map corners land at
+        // *positive* view Z (closer corner = smaller Z, farther = larger
+        // Z). Use those directly — no flip needed for the wgpu/D3D
+        // 0..1 depth convention. Small epsilon expansion on near/far
+        // (PITFALL §1 — shadow acne is partly avoided by a non-zero
+        // near plane, partly by the WGSL `bias` constant).
+        let near = (min_v.z - 1.0).max(0.1);
+        let far = max_v.z + 1.0;
+
+        Self {
+            eye,
+            target,
+            up,
+            ortho: (min_v.x, max_v.x, min_v.y, max_v.y, near, far),
+        }
+    }
+
+    /// Left-handed view matrix from the sun's POV.
+    pub fn view_matrix(&self) -> Mat4 {
+        Mat4::look_at_lh(self.eye, self.target, self.up)
+    }
+
+    /// Orthographic projection from the tight-fit `ortho` bounds. Uses
+    /// `Mat4::orthographic_lh` (0..1 depth, matching wgpu/D3D/Vulkan).
+    pub fn proj_matrix(&self) -> Mat4 {
+        let (l, r, b, t, n, f) = self.ortho;
+        Mat4::orthographic_lh(l, r, b, t, n, f)
+    }
+
+    /// Combined view-projection — what the shadow-gen vertex stage
+    /// multiplies world-space positions by, and what the main terrain
+    /// fragment stage uses to convert world position → shadow-map UV.
+    pub fn view_proj_matrix(&self) -> Mat4 {
+        self.proj_matrix() * self.view_matrix()
+    }
+}
+
 /// Unproject a cursor position (relative to a screen rect) onto the y=0
 /// world plane. Used for brush picking — accurate enough at moderate map
 /// inclinations, sloppy when the camera looks edge-on. Real ray-vs-
@@ -5236,5 +5412,147 @@ mod tests {
         // eye starts at offset 44.
         assert_eq!(view[44], 1234.0);
         assert_eq!(view[46], 4321.0);
+    }
+
+    // ─── Sprint 30 / R4 / ADR-048 — ShadowCamera tests ──────────────
+
+    /// `for_map` accepts an unnormalised sun direction and produces the
+    /// same camera as a pre-normalised input. The "eye is at target +
+    /// sun × diagonal" rule depends on a unit-length sun.
+    #[test]
+    fn shadow_camera_normalises_sun_dir() {
+        let map_min = Vec3::new(0.0, 0.0, 0.0);
+        let map_max = Vec3::new(4096.0, 1024.0, 4096.0);
+        let unnormalised = Vec3::new(0.7, 0.5, 0.5) * 7.0;
+        let normalised = Vec3::new(0.7, 0.5, 0.5).normalize();
+        let cam_a = ShadowCamera::for_map(map_min, map_max, unnormalised);
+        let cam_b = ShadowCamera::for_map(map_min, map_max, normalised);
+        // Eye position depends on `sun × diagonal` after normalisation;
+        // both calls produce the same eye to within float precision.
+        assert!(
+            (cam_a.eye - cam_b.eye).length() < 1e-3,
+            "eye drift: {:?} vs {:?}",
+            cam_a.eye,
+            cam_b.eye
+        );
+    }
+
+    /// The eye position is along `+sun_dir` from the map centre. Light
+    /// travels from the eye toward the target along `-sun_dir`.
+    #[test]
+    fn shadow_camera_eye_along_sun_dir_from_target() {
+        let map_min = Vec3::new(0.0, 0.0, 0.0);
+        let map_max = Vec3::new(4096.0, 1024.0, 4096.0);
+        let sun = Vec3::new(0.7, 0.5, 0.5).normalize();
+        let cam = ShadowCamera::for_map(map_min, map_max, sun);
+        let expected_target = (map_min + map_max) * 0.5;
+        assert!(
+            (cam.target - expected_target).length() < 1e-3,
+            "target = map centre; got {:?}",
+            cam.target
+        );
+        let eye_offset = cam.eye - cam.target;
+        let eye_dir = eye_offset.normalize();
+        // Dot product = 1.0 → eye_dir is parallel to sun (positive).
+        let parallelism = eye_dir.dot(sun);
+        assert!(
+            (parallelism - 1.0).abs() < 1e-3,
+            "eye offset not parallel to sun: dot = {parallelism}"
+        );
+    }
+
+    /// All 8 map corners project inside the clip cube `[-1, 1]^2` × `[0, 1]`.
+    /// The frustum is *tight-fit*, so each axis touches the [-1, 1]
+    /// (or [0, 1]) boundary at at least one corner.
+    #[test]
+    fn shadow_camera_frustum_contains_all_corners() {
+        let map_min = Vec3::new(0.0, -100.0, 0.0);
+        let map_max = Vec3::new(4096.0, 1024.0, 4096.0);
+        let sun = Vec3::new(0.7, 0.5, 0.5).normalize();
+        let cam = ShadowCamera::for_map(map_min, map_max, sun);
+        let vp = cam.view_proj_matrix();
+        let corners = [
+            Vec3::new(map_min.x, map_min.y, map_min.z),
+            Vec3::new(map_max.x, map_min.y, map_min.z),
+            Vec3::new(map_min.x, map_max.y, map_min.z),
+            Vec3::new(map_max.x, map_max.y, map_min.z),
+            Vec3::new(map_min.x, map_min.y, map_max.z),
+            Vec3::new(map_max.x, map_min.y, map_max.z),
+            Vec3::new(map_min.x, map_max.y, map_max.z),
+            Vec3::new(map_max.x, map_max.y, map_max.z),
+        ];
+        // Allow a tiny epsilon for the 1.0 elmo near/far expansion in
+        // `for_map`. xy bounds are exact; z gets the expansion.
+        let eps_xy = 1e-3;
+        let eps_z = 0.05;
+        for c in &corners {
+            let clip = vp * c.extend(1.0);
+            // Orthographic projection: w should stay 1.0.
+            assert!(
+                (clip.w - 1.0).abs() < 1e-3,
+                "orthographic w drifted: {}",
+                clip.w
+            );
+            let ndc = clip.truncate() / clip.w;
+            assert!(
+                ndc.x.abs() <= 1.0 + eps_xy,
+                "corner {c:?} NDC.x = {} out of bounds",
+                ndc.x
+            );
+            assert!(
+                ndc.y.abs() <= 1.0 + eps_xy,
+                "corner {c:?} NDC.y = {} out of bounds",
+                ndc.y
+            );
+            assert!(
+                ndc.z >= -eps_z && ndc.z <= 1.0 + eps_z,
+                "corner {c:?} NDC.z = {} out of 0..1",
+                ndc.z
+            );
+        }
+    }
+
+    /// Zero-length sun direction falls back to world +Y so the camera
+    /// stays well-defined (PITFALL §4 — don't NaN on degenerate input).
+    #[test]
+    fn shadow_camera_zero_sun_falls_back_to_y_up() {
+        let map_min = Vec3::new(0.0, 0.0, 0.0);
+        let map_max = Vec3::new(4096.0, 1024.0, 4096.0);
+        let cam = ShadowCamera::for_map(map_min, map_max, Vec3::ZERO);
+        // Eye must be above the map (sun fell back to +Y → eye lifts).
+        assert!(cam.eye.y > cam.target.y, "eye should be above target");
+        // Matrix must be finite — no NaN or Inf entries.
+        for col in cam.view_proj_matrix().to_cols_array_2d() {
+            for v in col {
+                assert!(v.is_finite(), "non-finite VP matrix entry: {v}");
+            }
+        }
+    }
+
+    /// Near-vertical sun direction picks +Z as the up vector so the
+    /// `look_at_lh` cross product stays well-conditioned (PITFALL §4
+    /// — sun_dir.y ≈ ±1 would otherwise degenerate the basis with
+    /// world +Y up).
+    #[test]
+    fn shadow_camera_vertical_sun_uses_z_up() {
+        let map_min = Vec3::new(0.0, 0.0, 0.0);
+        let map_max = Vec3::new(4096.0, 1024.0, 4096.0);
+        // Sun straight overhead (degenerate for +Y up).
+        let cam = ShadowCamera::for_map(map_min, map_max, Vec3::Y);
+        assert_eq!(cam.up, Vec3::Z, "vertical sun should pick +Z up");
+        // VP matrix must still be finite.
+        for col in cam.view_proj_matrix().to_cols_array_2d() {
+            for v in col {
+                assert!(v.is_finite(), "non-finite VP matrix entry: {v}");
+            }
+        }
+    }
+
+    /// Shadow map constants are pinned — bumping either is a memory-
+    /// budget + WGSL coordination event, not a routine edit.
+    #[test]
+    fn shadow_map_constants_pinned() {
+        assert_eq!(SHADOW_MAP_SIZE, 2048);
+        assert_eq!(SHADOW_MAP_FORMAT, wgpu::TextureFormat::Depth32Float);
     }
 }
