@@ -630,8 +630,11 @@ struct CatalogEntry {
 /// `families.<key>` in the catalog JSON; the `decal_layer` slot is
 /// filled at runtime by [`populate_feature_decal_registry`] when
 /// the corresponding `tools/feature-decals/<key>/diffuse.tga` is
-/// present + decodes successfully.
-#[derive(Debug, Clone, Default, serde::Deserialize)]
+/// present + decodes successfully. Custom Debug skips
+/// `egui_thumbnail` because [`egui::TextureHandle`] doesn't
+/// implement Debug; the field's presence is summarised as a
+/// boolean instead.
+#[derive(Clone, Default, serde::Deserialize)]
 struct FamilyDef {
     #[serde(default)]
     #[allow(dead_code)] // used by future inspector grouping / picker UX
@@ -649,6 +652,24 @@ struct FamilyDef {
     /// diffuse, or permanently `None` when no diffuse is available.
     #[serde(skip)]
     decal_layer: Option<u32>,
+    /// Runtime-only: 128² thumbnail surfaced by the F7 picker. Shares
+    /// the decoded RGBA buffer with the GPU upload — both produced
+    /// in one decode pass to avoid double-reading the source TGA.
+    #[serde(skip)]
+    egui_thumbnail: Option<egui::TextureHandle>,
+}
+
+impl std::fmt::Debug for FamilyDef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FamilyDef")
+            .field("category", &self.category)
+            .field("label", &self.label)
+            .field("diffuse_texture", &self.diffuse_texture)
+            .field("source", &self.source)
+            .field("decal_layer", &self.decal_layer)
+            .field("egui_thumbnail_loaded", &self.egui_thumbnail.is_some())
+            .finish()
+    }
 }
 
 /// Per-category visual hint used by the marker batch + minimap.
@@ -814,15 +835,33 @@ impl FeatureCatalog {
         self.lookup_entry(name).map(|(_, e)| e.metal)
     }
 
+    /// Sprint 29 / R5 / ADR-046 — per-family thumbnail for the F7
+    /// picker preview. `None` when the entry's family doesn't have a
+    /// loaded diffuse (vendoring miss, missing file, decode failure,
+    /// or families like geovent / kapok that lack an upstream
+    /// diffuse). Callers fall back to a category-coloured swatch.
+    fn thumbnail_for(&self, name: &str) -> Option<&egui::TextureHandle> {
+        let (_, entry) = self.lookup_entry(name)?;
+        let family_key = entry.family.as_deref()?;
+        let family = self.families.get(family_key)?;
+        family.egui_thumbnail.as_ref()
+    }
+
     /// Sprint 29 / R5 / ADR-046 — scan `tools/feature-decals/<family>/
     /// diffuse.tga` for every family with `diffuse_texture` set,
     /// decode each via [`crate::feature_decals::load_decal`], upload
     /// into the marker decal atlas, and stamp the assigned layer onto
-    /// the family. Idempotent at the layer-counter level: a second
-    /// call will reuse populated layers + assign new layers to any
-    /// newly-installed families. Families exceeding
+    /// the family. Each decoded buffer also feeds an egui thumbnail
+    /// handle for the F7 picker. Idempotent at the layer-counter
+    /// level: a second call will reuse populated layers + assign new
+    /// layers to any newly-installed families. Families exceeding
     /// `MARKER_DECAL_LAYERS` are skipped with a warning.
-    fn populate_decal_registry(&mut self, render_state: &egui_wgpu::RenderState, repo_root: &Path) {
+    fn populate_decal_registry(
+        &mut self,
+        render_state: &egui_wgpu::RenderState,
+        egui_ctx: &egui::Context,
+        repo_root: &Path,
+    ) {
         let dir = repo_root.join("tools").join("feature-decals");
         let max_layers = crate::render::MARKER_DECAL_LAYERS;
         // Recover the next unassigned layer from any already-populated
@@ -853,7 +892,19 @@ impl FeatureCatalog {
             match crate::feature_decals::load_decal(&candidate) {
                 Ok(decoded) => {
                     crate::render::upload_feature_decal(render_state, next_layer, &decoded.rgba);
+                    // Build the egui thumbnail from the same decoded
+                    // buffer so the F7 picker preview matches the
+                    // marker pipeline's atlas sample byte-for-byte.
+                    let size = crate::feature_decals::SPRITE_SIZE as usize;
+                    let color_image =
+                        egui::ColorImage::from_rgba_unmultiplied([size, size], &decoded.rgba);
+                    let handle = egui_ctx.load_texture(
+                        format!("feature_decal_{family_key}"),
+                        color_image,
+                        egui::TextureOptions::LINEAR,
+                    );
                     family.decal_layer = Some(next_layer);
+                    family.egui_thumbnail = Some(handle);
                     info!(
                         family = %family_key,
                         layer = next_layer,
@@ -1621,7 +1672,7 @@ impl App {
         if let Some(rs) = app.render_state.as_ref() {
             app.feature_state
                 .manifest
-                .populate_decal_registry(rs, &repo_root());
+                .populate_decal_registry(rs, &cc.egui_ctx, &repo_root());
         }
         app
     }
@@ -8416,6 +8467,23 @@ impl App {
                         for entry in &filtered {
                             let is_sel = self.feature_state.selected_feature.as_deref()
                                 == Some(entry.name.as_str());
+                            // Sprint 29 / ADR-046 — clone the handle
+                            // up-front so the borrow on self.manifest
+                            // doesn't outlive the row body (the click
+                            // handler needs mutable access to
+                            // self.feature_state).
+                            let thumb = self
+                                .feature_state
+                                .manifest
+                                .thumbnail_for(&entry.name)
+                                .cloned();
+                            let cat_color = self
+                                .feature_state
+                                .manifest
+                                .category_visuals
+                                .get(&category)
+                                .and_then(|v| parse_hex_color(&v.color))
+                                .unwrap_or(t.dim);
                             let row = egui::Frame::new()
                                 .fill(if is_sel { t.hover } else { t.bg })
                                 .stroke(egui::Stroke::new(
@@ -8425,18 +8493,40 @@ impl App {
                                 .corner_radius(egui::CornerRadius::same(3))
                                 .inner_margin(egui::Margin::symmetric(8, 4))
                                 .show(ui, |ui| {
-                                    ui.vertical(|ui| {
-                                        ui.label(
-                                            egui::RichText::new(&entry.display)
-                                                .color(t.text)
-                                                .size(12.0),
-                                        );
-                                        ui.label(
-                                            egui::RichText::new(&entry.name)
-                                                .color(t.muted)
-                                                .monospace()
-                                                .size(10.0),
-                                        );
+                                    ui.horizontal(|ui| {
+                                        let thumb_size = egui::vec2(32.0, 32.0);
+                                        if let Some(h) = thumb.as_ref() {
+                                            ui.add(
+                                                egui::Image::new((h.id(), thumb_size))
+                                                    .corner_radius(3.0),
+                                            );
+                                        } else {
+                                            // Glyph fallback — category-tinted
+                                            // square at the same 32px slot to keep
+                                            // row heights uniform.
+                                            let (rect, _) = ui.allocate_exact_size(
+                                                thumb_size,
+                                                egui::Sense::hover(),
+                                            );
+                                            ui.painter().rect_filled(
+                                                rect,
+                                                3.0,
+                                                cat_color.gamma_multiply(0.35),
+                                            );
+                                        }
+                                        ui.vertical(|ui| {
+                                            ui.label(
+                                                egui::RichText::new(&entry.display)
+                                                    .color(t.text)
+                                                    .size(12.0),
+                                            );
+                                            ui.label(
+                                                egui::RichText::new(&entry.name)
+                                                    .color(t.muted)
+                                                    .monospace()
+                                                    .size(10.0),
+                                            );
+                                        });
                                     });
                                 })
                                 .response
