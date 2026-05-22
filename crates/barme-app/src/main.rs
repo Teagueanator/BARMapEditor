@@ -357,6 +357,17 @@ struct App {
     /// pre-Sprint-14 `splat_config`. Drives the one-frame info toast
     /// surfaced in `App::update`; cleared on dismiss.
     pending_migration_toast: bool,
+    /// Sprint 31 / U4 — staged destructive-action confirm. `Some`
+    /// means an `egui` modal blocks the editor until the user
+    /// picks Confirm / Cancel; the paired
+    /// [`ConfirmIntent`] tells the App which destructive action
+    /// to run on Confirm. `None` = no modal open.
+    pending_confirm: Option<crate::ui::confirm::ConfirmDialog>,
+    /// Sprint 31 / U4 — what to do when `pending_confirm` resolves
+    /// to `Confirmed`. The variant carries any state the action
+    /// needs (e.g. ally_group_id to delete). Cleared together
+    /// with `pending_confirm` on resolution.
+    pending_confirm_intent: Option<ConfirmIntent>,
     /// ADR-035: best-effort dirty flag for the top-bar Save chip.
     /// Set by [`Self::mark_dirty`] (called from edit sites); cleared
     /// by `save_to` / `new_project` / `open_from`. Not durable across
@@ -1855,6 +1866,8 @@ impl App {
             mapinfo_form_tab: crate::ui::inspector_mapinfo::MapInfoTab::default(),
             migration_toast_dismissed: false,
             pending_migration_toast: false,
+            pending_confirm: None,
+            pending_confirm_intent: None,
             dirty: false,
             last_non_none_symmetry: SymmetryAxis::Horizontal,
             grid_overlay_on: false,
@@ -2408,6 +2421,52 @@ impl App {
                     }
                 }
                 self.toast_queue.dismiss(idx);
+            }
+        }
+    }
+
+    /// Sprint 31 / U4 — open a confirmation modal staged
+    /// behind `intent`. Sets `pending_confirm` + the paired
+    /// intent; the modal renders on the next frame and the
+    /// `apply_confirm_result` handler dispatches on `Confirmed`.
+    #[allow(dead_code)] // wired by chunk 4 call sites
+    fn request_confirm(
+        &mut self,
+        dialog: crate::ui::confirm::ConfirmDialog,
+        intent: ConfirmIntent,
+    ) {
+        self.pending_confirm = Some(dialog);
+        self.pending_confirm_intent = Some(intent);
+    }
+
+    /// Sprint 31 / U4 — apply the modal's resolution. `Confirmed`
+    /// runs the queued intent; `Cancelled` is a pure no-op. Both
+    /// paths clear the paired intent so a stale intent never
+    /// fires on a future modal that didn't queue one.
+    fn apply_confirm_result(&mut self, result: crate::ui::confirm::ConfirmResult) {
+        use crate::ui::confirm::ConfirmResult;
+        let intent = self.pending_confirm_intent.take();
+        match (result, intent) {
+            (ConfirmResult::Cancelled, _) => {}
+            (ConfirmResult::Confirmed, None) => {}
+            (ConfirmResult::Confirmed, Some(ConfirmIntent::DeleteAllyGroup(id))) => {
+                self.delete_ally_group(id);
+                self.mark_dirty();
+            }
+            (ConfirmResult::Confirmed, Some(ConfirmIntent::DeleteLayer(id))) => {
+                self.delete_layer(&id);
+            }
+            (ConfirmResult::Confirmed, Some(ConfirmIntent::NewProjectDiscardingChanges)) => {
+                self.wizard = WizardState::default_for_new_project();
+                self.wizard_open = true;
+            }
+            (ConfirmResult::Confirmed, Some(ConfirmIntent::OpenProjectDiscardingChanges)) => {
+                if let Some(p) = pick_open_path() {
+                    self.open_from(p);
+                }
+            }
+            (ConfirmResult::Confirmed, Some(ConfirmIntent::OpenPathDiscardingChanges(p))) => {
+                self.open_from(p);
             }
         }
     }
@@ -6794,6 +6853,37 @@ fn short_error(msg: &str) -> String {
 enum RunGcSource {
     AutoSave,
     Manual,
+}
+
+/// Sprint 31 / U4 — destructive intents queued behind a
+/// confirmation modal. The App writes one of these alongside
+/// `App::pending_confirm` when the user requests a destructive
+/// path; the modal's `Confirmed` resolution dispatches the
+/// matching action, `Cancelled` is a no-op.
+///
+/// Variants are intentionally specific (not generic
+/// "run-this-closure") so the action set is auditable and the
+/// undo-history contract stays in lock-step with the
+/// underlying handlers (`delete_ally_group`, `delete_layer`,
+/// etc.).
+#[allow(dead_code)] // wired by chunk 4 (destructive-action confirmations)
+#[derive(Debug, Clone)]
+enum ConfirmIntent {
+    /// Delete an ally group whose `start_positions` are
+    /// non-empty. Carries the group's `id`.
+    DeleteAllyGroup(u8),
+    /// Delete a layer that has painted (non-uniform) mask data.
+    /// Carries the layer's stable id.
+    DeleteLayer(String),
+    /// Open the new-project wizard, discarding unsaved changes.
+    /// Resolves into `FileAction::OpenWizard` on confirm.
+    NewProjectDiscardingChanges,
+    /// Open a project from disk (with file dialog), discarding
+    /// unsaved changes.
+    OpenProjectDiscardingChanges,
+    /// Open a specific project path (Recent submenu / drag-drop
+    /// future), discarding unsaved changes.
+    OpenPathDiscardingChanges(PathBuf),
 }
 
 enum FileAction {
@@ -11803,6 +11893,14 @@ impl eframe::App for App {
             self.apply_toast_interaction(it);
         }
 
+        // Sprint 31 / U4: confirmation modal for destructive
+        // actions. Render returns Some(result) on the resolving
+        // frame; we dispatch by `apply_confirm_result`, which
+        // routes through `pending_confirm_intent`.
+        if let Some(result) = crate::ui::confirm::confirm_modal(ctx, &mut self.pending_confirm) {
+            self.apply_confirm_result(result);
+        }
+
         // Sprint 22 / U2: per-tool intro overlay. `pending` is set
         // by `set_tool` on first entry; we render here so the tool
         // strip + inspector are already painted underneath.
@@ -12065,6 +12163,8 @@ mod tests {
             mapinfo_form_tab: crate::ui::inspector_mapinfo::MapInfoTab::default(),
             migration_toast_dismissed: false,
             pending_migration_toast: false,
+            pending_confirm: None,
+            pending_confirm_intent: None,
             dirty: false,
             last_non_none_symmetry: SymmetryAxis::Horizontal,
             grid_overlay_on: false,
