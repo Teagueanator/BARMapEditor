@@ -113,7 +113,7 @@ struct SplatU {
     camera_pos: vec4<f32>,
 };
 
-// Sprint 28 / R2 / ADR-040 — atmosphere uniform block. Composes fog,
+// Sprint 28 / R2 / ADR-045 — atmosphere uniform block. Composes fog,
 // sky colour, sun-angle ramp, deterministic wind state, and cloud tint
 // on top of Sprint 25's terrain output. Field order MUST match the
 // CPU `AtmosphereUniforms` mirror (`render.rs::AtmosphereUniforms`)
@@ -130,7 +130,7 @@ struct SplatU {
 //                   Reserved for the deferred-cubemap sprint.
 //   flags:         (has_skybox, sun_disc_size, _, _) — `has_skybox`
 //                  stays 0 for Sprint 28 (cubemap deferred per
-//                  ADR-040).
+//                  ADR-045).
 struct AtmosphereU {
     sun_color:     vec4<f32>,
     sky_color:     vec4<f32>,
@@ -168,7 +168,7 @@ struct AtmosphereU {
 // FINDINGS §7.6 — `specular_exp = sample.a × 16.0` per fragment.
 @group(0) @binding(11) var specular_tex: texture_2d<f32>;
 @group(0) @binding(12) var specular_samp: sampler;
-// Sprint 28 / R2 / ADR-040 — atmosphere block.
+// Sprint 28 / R2 / ADR-045 — atmosphere block.
 @group(0) @binding(13) var<uniform> atmos: AtmosphereU;
 
 struct VsOut {
@@ -413,7 +413,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let spec_pow = pow(cos_specular, max(spec_exp, 1.0));
     let specular_int = spec_col * spec_pow;
 
-    // Sprint 28 / R2 / ADR-040 — sun-colour angle ramp. The engine's
+    // Sprint 28 / R2 / ADR-045 — sun-colour angle ramp. The engine's
     // `Atmosphere::DrawSun` modulates the effective sun colour by the
     // sun's altitude: at the horizon (sun_dir.y → 0) the sun is
     // tinted by `atmosphere.fog_color` (sunset/sunrise glow); at the
@@ -459,7 +459,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         }
     }
 
-    // ─── 9. Exponential height fog (Sprint 28 / R2 / ADR-040) ────
+    // ─── 9. Exponential height fog (Sprint 28 / R2 / ADR-045) ────
     //
     // BAR's `Atmosphere.cpp::DrawFog` shapes terrain fog as a function
     // of distance from the camera AND fragment altitude — atmospheres

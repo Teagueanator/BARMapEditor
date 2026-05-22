@@ -56,7 +56,7 @@ struct WaterU {
     eye: vec4<f32>,
 };
 
-// Sprint 28 / R2 / ADR-040 — atmosphere block (shared with the
+// Sprint 28 / R2 / ADR-045 — atmosphere block (shared with the
 // terrain pipeline). Same struct shape as `terrain.wgsl::AtmosphereU`;
 // the CPU `AtmosphereUniforms` mirror is the source of truth. We
 // re-declare here because WGSL doesn't have cross-file `import`.
@@ -77,7 +77,7 @@ struct AtmosphereU {
 @group(0) @binding(2) var refraction_samp: sampler;
 @group(0) @binding(3) var reflection_tex: texture_2d<f32>;
 @group(0) @binding(4) var reflection_samp: sampler;
-// Sprint 28 / R2 / ADR-040 — atmosphere block bound from the same
+// Sprint 28 / R2 / ADR-045 — atmosphere block bound from the same
 // uniform buffer the terrain shader reads. The water shader uses
 // `sun_dir` for the lava-emission daylight ramp (commits 3 of this
 // sprint) and `wind` for surface motion (commit 5).
@@ -225,7 +225,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // reflection UV perturbation, fresnel angle (commit 4), and
     // shorewave foam tap (commit 4) all read from this single normal,
     // so the visual coherence holds across the per-effect work.
-    // Sprint 28 / R2 / ADR-040 — wind direction reads from the shared
+    // Sprint 28 / R2 / ADR-045 — wind direction reads from the shared
     // atmosphere binding (single source of truth across terrain +
     // water + future grass). `polish_b.xy` keeps the same value for
     // CPU-side debug visibility, but the shader reads from `atmos`.
@@ -353,7 +353,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // means the shader stays uniform across preset switches — no
     // recompile cost when the user clicks between Ocean and Lava.
     let lava_emission_flag = u.polish_c.w;
-    // Sprint 28 / R2 / ADR-040 — real daylight ramp from atmosphere
+    // Sprint 28 / R2 / ADR-045 — real daylight ramp from atmosphere
     // sun direction. `clamp(dot(sun_dir, +Y), 0, 1)` ranges 0 at
     // horizon (sunset) to 1 at zenith (noon). The remapped curve
     // `(1.0 - clamp_dot)^0.7` brightens lava at night (low sun)

@@ -2456,7 +2456,7 @@ impl App {
         }
     }
 
-    /// Sprint 28 / R2 / ADR-040 — derive the per-frame `AtmosphereUniforms`
+    /// Sprint 28 / R2 / ADR-045 — derive the per-frame `AtmosphereUniforms`
     /// block from the project's MapInfo (atmosphere + lighting subtables).
     /// Used by the terrain shader for fog + sky + sun-angle ramp + cloud
     /// tint, and by the water shader (commit 5) for wind direction.
@@ -2475,7 +2475,7 @@ impl App {
     ///   keeps the parity fixtures reproducible).
     /// - `sky_axis_angle` ← `atmosphere.sky_axis_angle` (reserved for
     ///   the deferred-cubemap sprint).
-    /// - `flags[0] = has_skybox = 0` (cubemap deferred per ADR-040).
+    /// - `flags[0] = has_skybox = 0` (cubemap deferred per ADR-045).
     fn atmosphere_uniforms_for_render(&self) -> AtmosphereUniforms {
         let project = self.snapshot_project();
         let info: barme_core::MapInfo = (&project).into();
@@ -2540,7 +2540,7 @@ impl App {
             wind: [wind_x, wind_z, wind_speed_world, 0.0],
             sky_axis_angle: info.atmosphere.sky_axis_angle,
             sun_dir,
-            // `has_skybox` deferred per ADR-040; future cubemap
+            // `has_skybox` deferred per ADR-045; future cubemap
             // sprint will set bit 0 when a `.dds` cubemap loads.
             flags: [0, 0, 0, 0],
         }
@@ -2598,7 +2598,7 @@ impl App {
         let time_s = self.water_time_seconds();
         let reflections_on = if self.water_reflections { 1.0 } else { 0.0 };
 
-        // Sprint 28 / R2 / ADR-040 — wind direction propagates from
+        // Sprint 28 / R2 / ADR-045 — wind direction propagates from
         // `atmosphere.min_wind`/`max_wind` via
         // `atmosphere_uniforms_for_render`. Both shaders read from
         // the same atmosphere binding (terrain group 0 / 13, water
@@ -12171,7 +12171,7 @@ mod tests {
         assert_eq!(su.flags[2], 0);
     }
 
-    /// Sprint 28 / R2 / ADR-040 — atmosphere uniforms reflect the
+    /// Sprint 28 / R2 / ADR-045 — atmosphere uniforms reflect the
     /// project's MapInfo block. A fresh app from [`make_test_app`]
     /// carries `MapInfo::bar_default().atmosphere`; the GPU mirror
     /// should match field-for-field.
@@ -12197,11 +12197,11 @@ mod tests {
         assert!((au.sun_dir[2] - (-0.2) / m).abs() < 1e-6);
         // sky_axis_angle defaults `[0, 0, 1, 0]` (PITFALL §12).
         assert_eq!(au.sky_axis_angle, [0.0, 0.0, 1.0, 0.0]);
-        // Skybox deferred per ADR-040.
+        // Skybox deferred per ADR-045.
         assert_eq!(au.flags[0], 0);
     }
 
-    /// Sprint 28 / R2 / ADR-040 — wind state is a deterministic
+    /// Sprint 28 / R2 / ADR-045 — wind state is a deterministic
     /// function of clock time + min/max wind from the atmosphere
     /// block. Two back-to-back calls hit the same time bucket and
     /// must produce identical vectors (PITFALL #7 — no seed-controlled

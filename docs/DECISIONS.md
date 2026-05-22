@@ -4203,6 +4203,189 @@ Engine state: `rts/Rendering/Env/BumpWater.cpp`. Schema reference:
 `devlog/research-water-lava/`. Sprint devlog:
 `devlog/sprint-26-water-polish/`.
 
+## ADR-045 — Atmosphere + fog: exponential height fog, sky-as-clear, deterministic wind, sun-angle ramp (Sprint 28 / R2)
+
+**Status:** Accepted (2026-05-21).
+**Context.** Sprint 25 (ADR-043) shipped the terrain shader; Sprint 26
+(ADR-044) shipped the water shader. The remaining renderer-parity
+items that compose on top of both surfaces — fog, sky, sun-angle
+modulation, and wind — were the cheapest sprint on the
+renderer-parity arc (per the prompt: "Most of the work is plumbing —
+the shader math is one fog equation"). Sprint 28 lands all four; the
+single non-trivial engineering surface (skybox cubemap loading) is
+explicitly deferred.
+
+**Forces.**
+- The shader math is straightforward (one smoothstep + one mix per
+  effect) but the binding surface is large — atmosphere data lives in
+  `mapinfo.atmosphere`, sun direction in `mapinfo.lighting`, and both
+  the terrain and water shaders need the same values. A single shared
+  uniform block keeps the CPU mapping in one place and avoids drift.
+- The Sprint 26 water shader stubbed `daylight = 0.5` with a comment
+  pointing at Sprint 28; that placeholder needs to resolve to the
+  real `dot(sun_dir, +Y)` ramp.
+- The Sprint 26 water shader also hardcoded `wind = 0.05`; needs to
+  be derived from `atmosphere.min_wind`/`max_wind`.
+- BAR maps configure `atmosphere.sky_color` distinct from `fog_color`
+  (sky is brighter; fog is duller). The terrain rasteriser doesn't
+  fill the offscreen RT past the mesh edges, so the cleared
+  background needs to be the sky tone, not the legacy navy.
+- Skybox cubemap loading is the only meaningful engineering work
+  this sprint *could* contain — a new pipeline, a `texture_cube<f32>`
+  binding, a PNG-folder loader, a content-addressed cache. The user
+  scope-decision (2026-05-21) defers it; this ADR captures the
+  deferral so the next sprint doesn't have to re-litigate.
+
+**Decisions.**
+
+1. **`AtmosphereUniforms` is a sibling block to `SplatUniforms`, not
+   an extension.** A new 144-byte (9 × vec4) repr(C) struct lives in
+   its own uniform buffer, bound at terrain group 0 binding 13 AND
+   water group 0 binding 5. SplatUniforms stays 128 B and continues
+   to carry sun_dir for the terrain-specific Blinn-Phong path
+   (cheaper than restructuring Sprint 25); the atmosphere block
+   duplicates sun_dir so the water shader doesn't have to bind
+   SplatUniforms. The duplication is intentional — one normalisation
+   point CPU-side (`atmosphere_uniforms_for_render`), reads from the
+   block stay cheap.
+
+   **Alternative considered.** Extend SplatUniforms in-place. Rejected:
+   breaks the Sprint 25 size-pin test (`SplatUniforms` is fixed at
+   128 B for layout-drift detection); intermingles
+   atmosphere-as-cross-shader-concern with splat-as-terrain-specific.
+
+2. **Fog math: exponential height + smoothstep.** Following BAR's
+   `Atmosphere.cpp::DrawFog`:
+   `fog_t = smoothstep(fog_start, fog_end, dist_norm × exp(-y × falloff))`,
+   then `mix(lit, fog_color.rgb, fog_t × fog_density)`. Height
+   falloff (engine's `0.01..0.02`) thins fog at altitude — a mountain
+   peak reads sharper than a valley floor at the same horizontal
+   distance.
+
+   **Alternative considered.** Linear fog (`clamp((dist - fog_start)
+   / (fog_end - fog_start))`). Rejected: BAR uses exponential, parity
+   is the sprint goal.
+
+3. **Sky as clear-colour (not a dedicated pipeline).** The main
+   offscreen pass's `LoadOp::Clear` reads from a runtime
+   `atmosphere_clear_color(atmos)` instead of the constant
+   `OFFSCREEN_CLEAR_COLOR`. The terrain rasteriser only covers ~80 %
+   of the viewport at default framing; the cleared background fills
+   the rest. This is the "no skybox" branch of BAR's
+   `Sky.cpp::DrawSky` (which clears with `sky_color` when no cubemap
+   loads).
+
+   **Alternative considered.** Dedicated fullscreen-quad `sky.wgsl`
+   pipeline with horizon gradient. Rejected for Sprint 28: the
+   horizon gradient is only visually meaningful next to a cubemap
+   (without it the gradient and the fog blend look like two competing
+   horizon effects). The cubemap-aware pipeline lands with the
+   deferred-cubemap sprint, at which point the gradient becomes
+   load-bearing.
+
+4. **Sun-colour angle ramp.** Replace Sprint 25's flat
+   `sp.ground_diffuse` consumption with
+   `mix(atmos.fog_color, sp.ground_diffuse, clamp(sun_dir.y, 0, 1))`.
+   At low sun (horizon), lit terrain takes on the fog tint
+   (sunset/sunrise glow). At zenith, full daylight. The water shader
+   shares the same factor for its lava-emission daylight ramp:
+   `daylight = pow(1 - clamp(sun_dir.y, 0, 1), 0.7)` — lava brightens
+   at night, dims under direct sun. The `0.7` exponent keeps lava
+   noticeable at twilight rather than collapsing to "only visible at
+   midnight".
+
+5. **Deterministic wind state — no seed.** `App::atmosphere_uniforms_for_render`
+   computes wind as
+   `magnitude = lerp(min_wind, max_wind, sin(time × 0.1) × 0.5 + 0.5)`,
+   `angle = time × 0.0233 × TAU`, then `(wind_x, wind_z) = (cos(angle)
+   × magnitude, sin(angle) × magnitude) × scale`. The slow ~43 s
+   rotation period feels ambient. PITFALL #7 forbids seeded noise so
+   parity fixtures reproduce byte-for-byte across runs.
+
+   **Alternative considered.** Per-tick RNG (rand + per-project seed).
+   Rejected: parity fixtures need bit-for-bit reproducibility, and a
+   periodic sin/cos ramp visually matches the engine's wind feel.
+
+6. **Skybox cubemap loading: deferred.** No `texture_cube<f32>`
+   binding, no PNG-folder loader, no dedicated `sky.wgsl` pipeline,
+   no content-addressed cache. `AtmosphereUniforms.flags[0] =
+   has_skybox` stays 0 for Sprint 28; `sky_axis_angle` is plumbed
+   through the uniform but unused. The future cubemap sprint extends
+   binding 13 (terrain) / 5 (water) layouts with a sibling cubemap
+   binding + sky pipeline; the uniform layout doesn't change.
+
+   **Why defer.** The prompt itself called this "the heaviest
+   engineering work." Shipping fog + sun ramp + sky colour + wind
+   without cubemap still hits the ROADMAP's renderer-parity bullet
+   (R2). The next sprint can land cubemap + horizon gradient in a
+   focused pair of commits.
+
+7. **`fog_start == fog_end` defensiveness.** Sprint 21 (C8) lints
+   this as a hard error, so a saved project can't transit it. But a
+   freshly-typed F9 form value can. The shader's `smoothstep`
+   clamps to [0, 1] without producing NaN even at the degenerate
+   input (returns 0 below the range, 1 above), so the worst case is
+   a binary step instead of a smooth blend — visible but not a
+   crash.
+
+**Consequences.**
+
+- `AtmosphereUniforms` (144 B / 9 vec4) lands in `render.rs` with a
+  size-pin test, a defaults-match-MapInfo test, and a wind-determinism
+  test. Both the terrain and water bind groups grow by one binding.
+- `App::atmosphere_uniforms_for_render` is the single CPU mapping
+  point — pulls from `Project → MapInfo`, normalises `sun_dir`,
+  computes wind. Used twice per frame (once for the terrain
+  callback, once inside `water_draw_for_frame`); ~no cost.
+- `OFFSCREEN_CLEAR_COLOR` constant survives as the reflection-pass
+  fallback only. The main offscreen clear is per-frame.
+- Sprint 26's `daylight = 0.5` placeholder is replaced; lava reads
+  correctly across BAR's day/night cycle.
+- Sprint 26's hardcoded `wind = 0.05` is replaced; water motion now
+  responds to the F9 form's `min_wind` / `max_wind` sliders.
+- 4 new tests (size pin, default-match-MapInfo, MapInfo round-trip
+  through `atmosphere_uniforms_for_render`, wind determinism). Both
+  shader naga validators pass.
+- Parity fixtures (`foggy-map`, `sunset`) exercise the fog and the
+  sun-angle ramp respectively. Skybox fixture deferred to the next
+  sprint.
+
+**Pitfalls (operational notes for follow-up sprints).**
+
+- Cubemap loading sprint MUST keep `AtmosphereUniforms` at 144 B
+  (or extend deliberately + update the size-pin test). The
+  cubemap texture is a separate binding, not a uniform field.
+- The reflection pass clear stays at the legacy navy
+  `OFFSCREEN_CLEAR_COLOR`. Over-painting it with `sky_color` would
+  mis-tint the water reflection sampler (the reflection RT is a
+  "geometry only" scene, sampled by perturbed UV; we composite the
+  sky on top of the main offscreen, not into the reflection RT).
+- The shader's height-fog falloff coefficient (`0.01`) is hardcoded
+  in `atmosphere_uniforms_for_render`. BAR's engine reads it from a
+  map property the editor doesn't model yet; if a parity-validation
+  test fails on a foggy-map fixture, the lift surface is small (one
+  field).
+- Skybox rotation (`sky_axis_angle`) is plumbed through but
+  unconsumed. The deferred-cubemap sprint adds the Rodrigues-formula
+  `rotate_axis_angle` helper and feeds the rotated direction into
+  the cubemap sampler.
+- `cloud_density` ships in the uniform but the shader doesn't
+  modulate by it (flat sky this sprint). The deferred-cubemap
+  sprint or Sprint 35 (parallax + emission + sky-reflect) can wire
+  it.
+- `atmosphere.sun_color` (the engine's "sun disc" tint) is NOT the
+  ramp's zenith colour — that's `lighting.ground_diffuse`. The
+  CPU mapper deliberately reads from `lighting` not `atmosphere` for
+  this field. A future sun-disc rendering pass will read from
+  `atmosphere.sun_color`.
+
+**Reference.** Engine shader:
+`/home/teague/code/RecoilEngine/cont/base/springcontent/shaders/GLSL/Atmosphere.glsl`,
+`Sky*.glsl`. Engine state: `rts/Rendering/Env/Atmosphere.cpp`,
+`SkyLight.cpp`, `Sky.cpp`. Schema reference:
+`docs/research/source-audit-2026-05-18/FINDINGS.md` §1.3. Sprint
+devlog: `devlog/sprint-28-atmosphere-and-fog/`.
+
 ## ADR template
 
 ```

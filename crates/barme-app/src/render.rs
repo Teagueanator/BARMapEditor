@@ -448,7 +448,7 @@ fn default_ground_specular() -> [f32; 4] {
 }
 
 /// CPU mirror of the WGSL `AtmosphereU` block (Sprint 28 / R2 /
-/// ADR-040). Field order MUST match `terrain.wgsl::AtmosphereU`
+/// ADR-045). Field order MUST match `terrain.wgsl::AtmosphereU`
 /// exactly. `bytemuck::Pod` enforces no-padding sanity at compile time;
 /// the [`atmosphere_uniforms_size_matches_wgsl_layout`] test pins the
 /// total byte count so a future field-shape drift fails fast instead
@@ -1052,7 +1052,7 @@ pub struct RenderResources {
     /// specular) shares with the main bind group. Rebuilt by
     /// [`Self::rebind`] alongside the main one.
     reflection_bind_group: wgpu::BindGroup,
-    /// Sprint 28 / R2 / ADR-040 — atmosphere + fog uniform buffer.
+    /// Sprint 28 / R2 / ADR-045 — atmosphere + fog uniform buffer.
     /// Sized to `AtmosphereUniforms` (128 B). Lifetime: created in
     /// [`install`], outlives the bind group it's bound into (the
     /// bind group holds an entire-buffer binding handle, not a
@@ -1076,7 +1076,7 @@ impl RenderResources {
         queue.write_buffer(&self.composite.uniform_buf, 0, bytemuck::bytes_of(cu));
     }
 
-    /// Sprint 28 / R2 / ADR-040 — push the per-frame atmosphere block
+    /// Sprint 28 / R2 / ADR-045 — push the per-frame atmosphere block
     /// (sun colour, sky colour, fog parameters, deterministic wind,
     /// cloud colour) to the uniform buffer bound at terrain group 0
     /// binding 13.
@@ -1175,7 +1175,7 @@ impl RenderResources {
                     binding: 4,
                     resource: wgpu::BindingResource::Sampler(&self.reflection.sampler),
                 },
-                // Sprint 28 / R2 / ADR-040 — atmosphere uniform binding 5.
+                // Sprint 28 / R2 / ADR-045 — atmosphere uniform binding 5.
                 wgpu::BindGroupEntry {
                     binding: 5,
                     resource: self.atmosphere_uniform_buf.as_entire_binding(),
@@ -1355,7 +1355,7 @@ fn bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
                 ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                 count: None,
             },
-            // 13: atmosphere uniforms (Sprint 28 / R2 / ADR-040). Sun
+            // 13: atmosphere uniforms (Sprint 28 / R2 / ADR-045). Sun
             // colour, sky colour, fog parameters, wind state, cloud
             // tint. Fragment-only visibility — only the fragment stage
             // composes fog + sun ramp; the vertex stage stays oblivious.
@@ -1440,7 +1440,7 @@ fn make_bind_group(
                 binding: 12,
                 resource: wgpu::BindingResource::Sampler(&splat.specular_samp),
             },
-            // Sprint 28 / R2 / ADR-040 — atmosphere block.
+            // Sprint 28 / R2 / ADR-045 — atmosphere block.
             wgpu::BindGroupEntry {
                 binding: 13,
                 resource: atmosphere_uniform_buf.as_entire_binding(),
@@ -2043,7 +2043,7 @@ fn install_water_resources(
                 ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                 count: None,
             },
-            // 5: atmosphere uniform (Sprint 28 / R2 / ADR-040). The
+            // 5: atmosphere uniform (Sprint 28 / R2 / ADR-045). The
             // shader uses `sun_dir` for lava-emission daylight ramp
             // and `wind` for surface motion direction (commit 5).
             wgpu::BindGroupLayoutEntry {
@@ -2538,7 +2538,7 @@ pub fn install(render_state: &egui_wgpu::RenderState) {
     let splat = install_splat_resources(device, queue);
     let composite = install_composite_resources(device, queue);
 
-    // Sprint 28 / R2 / ADR-040 — atmosphere uniform buffer. Pre-filled
+    // Sprint 28 / R2 / ADR-045 — atmosphere uniform buffer. Pre-filled
     // with `AtmosphereUniforms::default()` (BAR-default atmosphere)
     // so a fresh app start renders fog + sky-coloured background even
     // before the first `App::atmosphere_uniforms_for_render()` call
@@ -3954,7 +3954,7 @@ pub struct TerrainCallback {
     /// `Project.water_mode == WaterMode::None` (no water sub-table in
     /// the emitted mapinfo, no plane in the preview).
     pub water: Option<WaterDraw>,
-    /// Sprint 28 / R2 / ADR-040 — atmosphere block (sun, sky, fog,
+    /// Sprint 28 / R2 / ADR-045 — atmosphere block (sun, sky, fog,
     /// wind, cloud tint). Composed on top of the Sprint 25 terrain
     /// shader output. `prepare()` writes this into the atmosphere
     /// uniform buffer; the fragment stage reads from group 0
@@ -4009,7 +4009,7 @@ impl TerrainCallback {
 /// shader; over-painting it with the project's sky colour would feed
 /// the wrong tone into the reflection mix). The main offscreen pass
 /// switched to a per-frame `atmosphere.sky_color`-driven clear in
-/// Sprint 28 / R2 / ADR-040 via [`atmosphere_clear_color`]; this
+/// Sprint 28 / R2 / ADR-045 via [`atmosphere_clear_color`]; this
 /// constant stays as the reflection-RT fallback because the reflection
 /// is a "geometry only" pass — the sky background is composed
 /// separately on top of the main offscreen result, not into the
@@ -4026,7 +4026,7 @@ const OFFSCREEN_CLEAR_COLOR: wgpu::Color = wgpu::Color {
     a: 1.0,
 };
 
-/// Sprint 28 / R2 / ADR-040 — derive the per-frame offscreen clear
+/// Sprint 28 / R2 / ADR-045 — derive the per-frame offscreen clear
 /// colour from the project's `atmosphere.sky_color`. The terrain
 /// rasteriser only covers the mesh footprint (~80 % of the viewport
 /// at default framing); the cleared background fills the rest. This
@@ -4097,7 +4097,7 @@ impl egui_wgpu::CallbackTrait for TerrainCallback {
         ];
         res.write_splat_uniforms(queue, &splat);
 
-        // Sprint 28 / R2 / ADR-040 — atmosphere block. Same buffer is
+        // Sprint 28 / R2 / ADR-045 — atmosphere block. Same buffer is
         // bound by both the main and reflection bind groups (fog +
         // sky + sun colour don't change between the passes), so a
         // single write per frame covers both.
@@ -4260,7 +4260,7 @@ impl egui_wgpu::CallbackTrait for TerrainCallback {
                 view: offscreen.color_view(),
                 resolve_target: None,
                 ops: wgpu::Operations {
-                    // Sprint 28 / R2 / ADR-040 — sky-colour clear.
+                    // Sprint 28 / R2 / ADR-045 — sky-colour clear.
                     // Replaces the prior hardcoded navy. Pixels not
                     // covered by the terrain rasteriser show the
                     // configured `atmosphere.sky_color` instead.
@@ -4574,7 +4574,7 @@ mod tests {
         );
     }
 
-    /// Sprint 28 / R2 / ADR-040 — `AtmosphereUniforms` MUST match the
+    /// Sprint 28 / R2 / ADR-045 — `AtmosphereUniforms` MUST match the
     /// WGSL `AtmosphereU` block layout exactly, otherwise the per-frame
     /// uniform write uploads garbage into the shader's binding 13.
     ///
@@ -4597,7 +4597,7 @@ mod tests {
         );
     }
 
-    /// Sprint 28 / R2 / ADR-040 — verify the GPU defaults match the
+    /// Sprint 28 / R2 / ADR-045 — verify the GPU defaults match the
     /// canonical `MapInfo::bar_default().atmosphere` block. A future
     /// schema drift (e.g. someone bumping `fog_start` in `bar_default`
     /// without updating the GPU fallback) fails this test rather than
@@ -4622,7 +4622,7 @@ mod tests {
         // Skybox-deferred: has_skybox flag stays 0.
         assert_eq!(
             au.flags[0], 0,
-            "skybox deferred per ADR-040; flag must be 0"
+            "skybox deferred per ADR-045; flag must be 0"
         );
     }
 
