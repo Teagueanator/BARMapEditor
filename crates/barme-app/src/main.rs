@@ -604,7 +604,7 @@ struct FeatureCatalog {
     families: std::collections::BTreeMap<String, FamilyDef>,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Clone, serde::Deserialize)]
 struct CatalogEntry {
     name: String,
     display: String,
@@ -627,13 +627,40 @@ struct CatalogEntry {
     /// Sprint 29b / ADR-047 — per-entry override of the family's
     /// `s3o_pattern`. Used when the catalog entry name doesn't
     /// match the .s3o filename (e.g. `agorm_rock1` → `rock1.s3o`,
-    /// `cycas1` → `fern1.s3o`). When set, the registry resolves
-    /// `tools/feature-s3o/<s3o>` directly; when `None`, falls
-    /// through to the family's pattern. Consumed by
-    /// `populate_decal_registry` in commit 8 of Sprint 29b.
+    /// `cycas1` → `fern1.s3o`). Read by `scripts/fetch-feature-s3o
+    /// .sh` to know which file to install; the runtime registry
+    /// itself only checks for `tools/feature-s3o/<entry.name>.s3o`
+    /// (the fetch script always copies to the entry-name path).
     #[serde(default)]
-    #[allow(dead_code)] // consumed by commit 8 (thumbnail registry wiring)
+    #[allow(dead_code)] // documents fetch script's lookup; runtime uses entry.name directly
     s3o: Option<String>,
+    /// Runtime-only: per-entry decal-atlas layer assigned by
+    /// [`FeatureCatalog::populate_decal_registry`] when the entry's
+    /// `.s3o` is vendored and its thumbnail bake succeeds. Sprint 29b
+    /// / ADR-047. Falls back to the family's [`FamilyDef::decal_layer`]
+    /// when `None`.
+    #[serde(skip)]
+    decal_layer: Option<u32>,
+    /// Runtime-only: 128² thumbnail handle for the F7 picker, shared
+    /// with the atlas upload byte-for-byte so the picker preview
+    /// matches what the marker pipeline draws. Sprint 29b / ADR-047.
+    #[serde(skip)]
+    egui_thumbnail: Option<egui::TextureHandle>,
+}
+
+impl std::fmt::Debug for CatalogEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CatalogEntry")
+            .field("name", &self.name)
+            .field("display", &self.display)
+            .field("metal", &self.metal)
+            .field("tags", &self.tags)
+            .field("family", &self.family)
+            .field("s3o", &self.s3o)
+            .field("decal_layer", &self.decal_layer)
+            .field("egui_thumbnail_loaded", &self.egui_thumbnail.is_some())
+            .finish()
+    }
 }
 
 /// Sprint 29 / ADR-046 — per-family metadata. Parsed from
@@ -655,15 +682,13 @@ struct FamilyDef {
     #[serde(default)]
     diffuse_texture: Option<String>,
     /// Sprint 29b / ADR-047 — per-family `objects3d/...` path
-    /// template. `{name}` substitutes the [`CatalogEntry::name`]
-    /// (e.g. `"ad0_banyan/{name}.s3o"` → `ad0_banyan/ad0_banyan_3
-    /// .s3o`). `None` for families with no consistent pattern (per
-    /// entry `s3o` carries the literal path instead) or for
-    /// families whose models aren't in upstream mapfeatures
-    /// (rocks30 / tombstone / xmascomwreck / geovent — Phase C).
-    /// Consumed by `populate_decal_registry` in commit 8.
+    /// template, e.g. `"ad0_banyan/{name}.s3o"`. Read by
+    /// `scripts/fetch-feature-s3o.sh` to know which upstream file
+    /// to install for each catalog entry under this family. The
+    /// runtime registry doesn't consult this field — every vendored
+    /// .s3o lands at `tools/feature-s3o/<entry.name>.s3o` regardless
+    /// of upstream subfolder layout.
     #[serde(default)]
-    #[allow(dead_code)] // consumed by commit 8 (thumbnail registry wiring)
     s3o_pattern: Option<String>,
     #[serde(default)]
     #[allow(dead_code)] // catalog provenance — surfaced in help-center article
@@ -805,25 +830,34 @@ impl FeatureCatalog {
     /// during round-trip with custom feature packs (engine logs +
     /// skips at game start; the editor should not).
     ///
-    /// Sprint 29 / ADR-046 — when the entry's `family` references a
-    /// family with an uploaded decal layer, return
-    /// [`MarkerShape::TexturedSprite`] so the marker pipeline samples
-    /// the per-family sprite. Otherwise (missing family, missing
-    /// diffuse, or load failure) fall through to the category
-    /// glyph — unchanged Sprint 19 behaviour.
+    /// Sprint 29 / ADR-046 → Sprint 29b / ADR-047 — TexturedSprite
+    /// preferred when available. Resolution chain:
+    /// 1. **Per-entry baked thumbnail** (Phase B / ADR-047) — set by
+    ///    [`Self::populate_decal_registry`] for catalog entries whose
+    ///    `.s3o` was vendored and parsed successfully.
+    /// 2. **Per-family Phase A decal** (ADR-046) — set for families
+    ///    with a `diffuse_texture` whose decal was loaded.
+    /// 3. **Category glyph** — flat coloured shape (`Triangle`,
+    ///    `FilledCircle`, …) from `category_visuals`.
+    /// 4. **`FALLBACK_FEATURE_VISUAL`** — unknown-feature ring; only
+    ///    when the catalog has no entry of this name.
     fn resolved_visual(&self, name: &str) -> ResolvedFeatureVisual {
         let Some((cat, entry)) = self.lookup_entry(name) else {
             return FALLBACK_FEATURE_VISUAL;
         };
-        // Sprint 29 / ADR-046: TexturedSprite preferred when available.
-        if let Some(family_key) = entry.family.as_deref()
-            && let Some(family) = self.families.get(family_key)
-            && let Some(layer) = family.decal_layer
-        {
-            // Sprites are larger than glyphs so the family's diffuse
-            // is legible at typical camera distance — ~3x the glyph
-            // radius (Phase A tuning value; revisit when world-scaled
-            // rendering lands in Sprint 29b / Phase B).
+        // Priority 1+2: textured sprite — entry-level beats family-level.
+        let sprite_layer = entry.decal_layer.or_else(|| {
+            entry
+                .family
+                .as_deref()
+                .and_then(|fk| self.families.get(fk))
+                .and_then(|f| f.decal_layer)
+        });
+        if let Some(layer) = sprite_layer {
+            // Sprites are larger than glyphs so the per-entry / per-
+            // family diffuse is legible at typical camera distance —
+            // ~3× the glyph radius. (Carried forward from Phase A
+            // tuning; world-scaled rendering remains future work.)
             let glyph_radius = self
                 .category_visuals
                 .get(cat)
@@ -838,7 +872,7 @@ impl FeatureCatalog {
                 radius_px: glyph_radius * 3.0,
             };
         }
-        // Pre-Sprint-29 path: category glyph.
+        // Priority 3: category glyph fallback (pre-Sprint-29).
         let Some(v) = self.category_visuals.get(cat) else {
             return FALLBACK_FEATURE_VISUAL;
         };
@@ -857,66 +891,245 @@ impl FeatureCatalog {
         self.lookup_entry(name).map(|(_, e)| e.metal)
     }
 
-    /// Sprint 29 / R5 / ADR-046 — per-family thumbnail for the F7
-    /// picker preview. `None` when the entry's family doesn't have a
-    /// loaded diffuse (vendoring miss, missing file, decode failure,
-    /// or families like geovent / kapok that lack an upstream
+    /// Sprint 29b / R5 / ADR-047 — per-entry (preferred) or per-family
+    /// (Phase A fallback) 128² thumbnail for the F7 picker preview.
+    /// `None` when neither path resolved (e.g. rocks30 / tombstone /
+    /// xmascomwreck / geovent — no upstream model, no upstream
     /// diffuse). Callers fall back to a category-coloured swatch.
     fn thumbnail_for(&self, name: &str) -> Option<&egui::TextureHandle> {
         let (_, entry) = self.lookup_entry(name)?;
+        if let Some(h) = entry.egui_thumbnail.as_ref() {
+            return Some(h);
+        }
+        // Phase A fallback to the family-level decal sprite.
         let family_key = entry.family.as_deref()?;
         let family = self.families.get(family_key)?;
         family.egui_thumbnail.as_ref()
     }
 
-    /// Sprint 29 / R5 / ADR-046 — scan `tools/feature-decals/<family>/
-    /// diffuse.tga` for every family with `diffuse_texture` set,
-    /// decode each via [`crate::feature_decals::load_decal`], upload
-    /// into the marker decal atlas, and stamp the assigned layer onto
-    /// the family. Each decoded buffer also feeds an egui thumbnail
-    /// handle for the F7 picker. Idempotent at the layer-counter
-    /// level: a second call will reuse populated layers + assign new
-    /// layers to any newly-installed families. Families exceeding
-    /// `MARKER_DECAL_LAYERS` are skipped with a warning.
+    /// Sprint 29 / ADR-046 → Sprint 29b / ADR-047 — populate the
+    /// marker decal atlas with one layer per available source:
+    ///
+    /// 1. **Phase B per-entry pass.** For each catalog entry whose
+    ///    `tools/feature-s3o/<entry.name>.s3o` is present, parse the
+    ///    .s3o, bake a 128² thumbnail via `barme_render_s3o::thumbnail
+    ///    ::bake_thumbnail`, content-address the result, upload to the
+    ///    atlas, and stamp `entry.decal_layer` + `entry.egui_thumbnail`.
+    ///    Cache hits skip the bake; cold misses store to the cache
+    ///    for next launch.
+    /// 2. **Phase A per-family pass.** For each family with a
+    ///    `diffuse_texture` that has NO per-entry layer covering it
+    ///    yet, load the Phase A decal sprite and stamp the family's
+    ///    `decal_layer` + `egui_thumbnail`. This is the fallback when
+    ///    the user has only run `fetch-feature-decals.sh` (not
+    ///    `fetch-feature-s3o.sh`) for a given family.
+    ///
+    /// Idempotent: any entry / family already carrying a layer is
+    /// skipped. Layer counter resumes from `max(populated) + 1` so
+    /// repeated calls land new entries / families in fresh slots.
+    /// Atlas-exhausted entries / families fall back to the category
+    /// glyph (logged at `warn!`).
     fn populate_decal_registry(
         &mut self,
         render_state: &egui_wgpu::RenderState,
         egui_ctx: &egui::Context,
         repo_root: &Path,
     ) {
-        let dir = repo_root.join("tools").join("feature-decals");
+        let s3o_dir = repo_root.join("tools").join("feature-s3o");
+        let decal_dir = repo_root.join("tools").join("feature-decals");
         let max_layers = crate::render::MARKER_DECAL_LAYERS;
-        // Recover the next unassigned layer from any already-populated
-        // families so repeated calls don't re-stamp the same layer.
-        let mut next_layer: u32 = self
-            .families
-            .values()
-            .filter_map(|f| f.decal_layer.map(|l| l + 1))
-            .max()
-            .unwrap_or(0);
 
-        let mut loaded = 0u32;
-        let mut missing = 0u32;
+        let next_layer_seed = {
+            let from_families = self
+                .families
+                .values()
+                .filter_map(|f| f.decal_layer.map(|l| l + 1))
+                .max()
+                .unwrap_or(0);
+            let from_entries = self
+                .categories
+                .values()
+                .flat_map(|v| v.iter())
+                .filter_map(|e| e.decal_layer.map(|l| l + 1))
+                .max()
+                .unwrap_or(0);
+            from_families.max(from_entries)
+        };
+        let mut next_layer = next_layer_seed;
+
+        let mut phase_b_loaded = 0u32;
+        let mut phase_b_cache_hits = 0u32;
+        let mut phase_b_missing_s3o = 0u32;
+        let mut phase_b_parse_errors = 0u32;
+        let mut phase_a_loaded = 0u32;
+        let mut phase_a_missing = 0u32;
         let mut overflow = 0u32;
-        for (family_key, family) in self.families.iter_mut() {
-            if family.decal_layer.is_some() || family.diffuse_texture.is_none() {
-                continue;
+
+        // ─── Phase B per-entry — load + bake + cache + upload ───────
+        //
+        // Two-phase walk to keep the borrow checker happy: collect
+        // (entry_name, s3o_path, family_diffuse) tuples first, then
+        // apply assignments back into `self.categories` in a second
+        // pass. Egui texture handles flow through a side-map.
+        let entry_plans: Vec<(
+            String,
+            String,
+            std::path::PathBuf,
+            Option<std::path::PathBuf>,
+        )> = {
+            let mut plans = Vec::new();
+            for (cat, entries) in &self.categories {
+                for entry in entries {
+                    if entry.decal_layer.is_some() {
+                        continue;
+                    }
+                    let s3o_path = s3o_dir.join(format!("{}.s3o", entry.name));
+                    if !s3o_path.exists() {
+                        continue;
+                    }
+                    let diffuse_path = entry.family.as_deref().and_then(|fk| {
+                        self.families.get(fk).and_then(|f| {
+                            f.diffuse_texture
+                                .as_ref()
+                                .map(|_| decal_dir.join(fk).join("diffuse.tga"))
+                        })
+                    });
+                    plans.push((cat.clone(), entry.name.clone(), s3o_path, diffuse_path));
+                }
             }
-            let candidate = dir.join(family_key).join("diffuse.tga");
-            if !candidate.exists() {
-                missing += 1;
-                continue;
-            }
+            plans
+        };
+
+        let mut assignments: std::collections::HashMap<String, (u32, egui::TextureHandle)> =
+            std::collections::HashMap::new();
+        for (_cat, entry_name, s3o_path, diffuse_path) in entry_plans {
             if next_layer >= max_layers {
                 overflow += 1;
+                continue;
+            }
+            let s3o_bytes = match std::fs::read(&s3o_path) {
+                Ok(b) => b,
+                Err(e) => {
+                    warn!(
+                        entry = %entry_name,
+                        path = %s3o_path.display(),
+                        error = %e,
+                        "s3o read failed; falling back to family diffuse"
+                    );
+                    phase_b_missing_s3o += 1;
+                    continue;
+                }
+            };
+            let sha = barme_render_s3o::cache::compute_sha(&s3o_bytes);
+            let rgba = if let Some(cached) = barme_render_s3o::cache::lookup(&sha) {
+                phase_b_cache_hits += 1;
+                cached
+            } else {
+                let model = match barme_render_s3o::parser::parse_s3o(&s3o_bytes) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        warn!(
+                            entry = %entry_name,
+                            path = %s3o_path.display(),
+                            error = %e,
+                            "s3o parse failed; falling back to family diffuse"
+                        );
+                        phase_b_parse_errors += 1;
+                        continue;
+                    }
+                };
+                // Resolve diffuse: family Phase A texture if available,
+                // else a flat mid-grey. Kapok / other families with
+                // null `diffuse_texture` produce grey-shaded thumbnails
+                // — the silhouette + Lambert lighting still reads
+                // as a recognisable mesh.
+                let diffuse_rgba = match &diffuse_path {
+                    Some(p) if p.exists() => match crate::feature_decals::load_decal(p) {
+                        Ok(d) => d.rgba,
+                        Err(_) => synthetic_diffuse(),
+                    },
+                    _ => synthetic_diffuse(),
+                };
+                let thumb = barme_render_s3o::thumbnail::bake_thumbnail(&model, &diffuse_rgba);
+                if let Err(e) = barme_render_s3o::cache::store(&sha, &thumb.rgba) {
+                    warn!(
+                        entry = %entry_name,
+                        sha = %sha,
+                        error = %e,
+                        "thumbnail cache store failed; runtime keeps in-memory copy"
+                    );
+                }
+                phase_b_loaded += 1;
+                thumb.rgba
+            };
+            crate::render::upload_feature_decal(render_state, next_layer, &rgba);
+            let size = crate::feature_decals::SPRITE_SIZE as usize;
+            let color_image = egui::ColorImage::from_rgba_unmultiplied([size, size], &rgba);
+            let handle = egui_ctx.load_texture(
+                format!("feature_thumb_{entry_name}"),
+                color_image,
+                egui::TextureOptions::LINEAR,
+            );
+            info!(
+                entry = %entry_name,
+                layer = next_layer,
+                sha = %&sha[..8],
+                "phase-b thumbnail uploaded"
+            );
+            assignments.insert(entry_name, (next_layer, handle));
+            next_layer += 1;
+        }
+
+        // Apply Phase B assignments back into self.categories.
+        for (_, entries) in self.categories.iter_mut() {
+            for e in entries.iter_mut() {
+                if let Some((layer, handle)) = assignments.remove(&e.name) {
+                    e.decal_layer = Some(layer);
+                    e.egui_thumbnail = Some(handle);
+                }
+            }
+        }
+
+        // ─── Phase A per-family — legacy decal sprite fallback ──────
+        //
+        // Walk every family with a diffuse_texture. If the family is
+        // ALREADY fully covered by per-entry Phase B layers (every
+        // catalog entry under it has decal_layer.is_some()), skip —
+        // the family-level decal would be wasted atlas space. Else
+        // assign one family layer that the unresolved entries inherit
+        // via `resolved_visual`'s fallback chain.
+        let families_to_cover: Vec<String> = {
+            let mut keys = Vec::new();
+            for (fk, fdef) in &self.families {
+                if fdef.decal_layer.is_some() || fdef.diffuse_texture.is_none() {
+                    continue;
+                }
+                let any_uncovered = self
+                    .categories
+                    .values()
+                    .flat_map(|v| v.iter())
+                    .filter(|e| e.family.as_deref() == Some(fk.as_str()))
+                    .any(|e| e.decal_layer.is_none());
+                if any_uncovered {
+                    keys.push(fk.clone());
+                }
+            }
+            keys
+        };
+
+        for family_key in families_to_cover {
+            if next_layer >= max_layers {
+                overflow += 1;
+                continue;
+            }
+            let candidate = decal_dir.join(&family_key).join("diffuse.tga");
+            if !candidate.exists() {
+                phase_a_missing += 1;
                 continue;
             }
             match crate::feature_decals::load_decal(&candidate) {
                 Ok(decoded) => {
                     crate::render::upload_feature_decal(render_state, next_layer, &decoded.rgba);
-                    // Build the egui thumbnail from the same decoded
-                    // buffer so the F7 picker preview matches the
-                    // marker pipeline's atlas sample byte-for-byte.
                     let size = crate::feature_decals::SPRITE_SIZE as usize;
                     let color_image =
                         egui::ColorImage::from_rgba_unmultiplied([size, size], &decoded.rgba);
@@ -925,30 +1138,36 @@ impl FeatureCatalog {
                         color_image,
                         egui::TextureOptions::LINEAR,
                     );
-                    family.decal_layer = Some(next_layer);
-                    family.egui_thumbnail = Some(handle);
+                    if let Some(family) = self.families.get_mut(&family_key) {
+                        family.decal_layer = Some(next_layer);
+                        family.egui_thumbnail = Some(handle);
+                    }
                     info!(
                         family = %family_key,
                         layer = next_layer,
-                        bytes = decoded.rgba.len(),
-                        "feature decal loaded"
+                        "phase-a family decal uploaded"
                     );
                     next_layer += 1;
-                    loaded += 1;
+                    phase_a_loaded += 1;
                 }
                 Err(e) => {
                     warn!(
                         family = %family_key,
                         path = %candidate.display(),
                         error = %e,
-                        "feature decal load failed; falling back to category glyph"
+                        "phase-a family decal load failed; falling back to category glyph"
                     );
                 }
             }
         }
+
         info!(
-            loaded,
-            missing,
+            phase_b_loaded,
+            phase_b_cache_hits,
+            phase_b_missing_s3o,
+            phase_b_parse_errors,
+            phase_a_loaded,
+            phase_a_missing,
             overflow,
             atlas_layers_used = next_layer,
             atlas_layers_total = max_layers,
@@ -958,10 +1177,23 @@ impl FeatureCatalog {
             warn!(
                 overflow,
                 "feature decal atlas exhausted; \
-                 {overflow} families fell back to category glyphs"
+                 {overflow} entries/families fell back to category glyphs"
             );
         }
     }
+}
+
+/// 128² flat mid-grey RGBA8 buffer, used when a thumbnail bake has
+/// no resolvable family diffuse. The silhouette + Lambert lighting
+/// still produce a usable thumbnail (the mesh shape is the dominant
+/// signal at 128² preview size). Sprint 29b / ADR-047.
+fn synthetic_diffuse() -> Vec<u8> {
+    let side = crate::feature_decals::SPRITE_SIZE as usize;
+    let mut out = Vec::with_capacity(side * side * 4);
+    for _ in 0..(side * side) {
+        out.extend_from_slice(&[128, 128, 128, 255]);
+    }
+    out
 }
 
 /// D9 / Sprint 16 (ADR-040): per-session view state for the top-

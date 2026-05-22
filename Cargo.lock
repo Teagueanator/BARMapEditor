@@ -321,6 +321,7 @@ dependencies = [
  "anyhow",
  "barme-core",
  "barme-pipeline",
+ "barme-render-s3o",
  "bytemuck",
  "directories",
  "eframe",
