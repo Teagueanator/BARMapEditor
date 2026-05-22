@@ -2598,10 +2598,19 @@ impl App {
         let time_s = self.water_time_seconds();
         let reflections_on = if self.water_reflections { 1.0 } else { 0.0 };
 
-        // Wind direction — engine reads `mapinfo.water.windSpeed`
-        // (FINDINGS §1.5). Sprint 26 splits into X and Z magnitudes;
-        // Sprint 28 ties direction to atmosphere wind.
-        let wind = 0.05; // engine default 1.0 scaled to "elmos per second" by 20×
+        // Sprint 28 / R2 / ADR-040 — wind direction propagates from
+        // `atmosphere.min_wind`/`max_wind` via
+        // `atmosphere_uniforms_for_render`. Both shaders read from
+        // the same atmosphere binding (terrain group 0 / 13, water
+        // group 0 / 5), so the value here is just the X/Z magnitude
+        // packed into `polish_b` so the existing Sprint-26 shader
+        // arithmetic (which dots polish_b.xy with time) doesn't need
+        // restructuring. The atmosphere binding's `wind` carries the
+        // same pair plus the world-magnitude scalar — future grass
+        // (Sprint 34) reads from there.
+        let atmos = self.atmosphere_uniforms_for_render();
+        let wind_x = atmos.wind[0];
+        let wind_z = atmos.wind[1];
         let normal_scale = 1.0 / 128.0; // 1 normal-map repeat per 128 elmos
         let foam_height = 8.0; // elmos band over which shore foam fades
 
@@ -2629,7 +2638,7 @@ impl App {
             extent_z,
             alpha_scale,
             polish_a: [refr_distort, refl_distort, time_s, reflections_on],
-            polish_b: [wind, wind * 0.7, normal_scale, foam_height],
+            polish_b: [wind_x, wind_z, normal_scale, foam_height],
             polish_c: [fresnel_min, fresnel_max, fresnel_power, lava_emission],
             polish_d: [caustics_res, caustics_str, perlin_start, perlin_amp],
         })
@@ -12160,6 +12169,61 @@ mod tests {
         assert_eq!(su.flags[1], 1);
         // buildable_overlay_on defaults to false.
         assert_eq!(su.flags[2], 0);
+    }
+
+    /// Sprint 28 / R2 / ADR-040 — atmosphere uniforms reflect the
+    /// project's MapInfo block. A fresh app from [`make_test_app`]
+    /// carries `MapInfo::bar_default().atmosphere`; the GPU mirror
+    /// should match field-for-field.
+    #[test]
+    fn atmosphere_uniforms_for_render_reflect_mapinfo_defaults() {
+        let app = make_test_app();
+        let au = app.atmosphere_uniforms_for_render();
+        // Fog from `bar_default()`: start 0.1, end 1.0, color
+        // (0.7, 0.7, 0.8).
+        assert!((au.fog_start_end[0] - 0.1).abs() < 1e-6);
+        assert!((au.fog_start_end[1] - 1.0).abs() < 1e-6);
+        assert!((au.fog_color[0] - 0.7).abs() < 1e-6);
+        assert!((au.fog_color[1] - 0.7).abs() < 1e-6);
+        assert!((au.fog_color[2] - 0.8).abs() < 1e-6);
+        // Sky from `bar_default()`: (0.1, 0.15, 0.7).
+        assert!((au.sky_color[0] - 0.1).abs() < 1e-6);
+        assert!((au.sky_color[1] - 0.15).abs() < 1e-6);
+        assert!((au.sky_color[2] - 0.7).abs() < 1e-6);
+        // Sun dir from `bar_default()`: normalised (0.3, 1.0, -0.2).
+        let m = (0.3f32 * 0.3 + 1.0 * 1.0 + (-0.2f32) * (-0.2)).sqrt();
+        assert!((au.sun_dir[0] - 0.3 / m).abs() < 1e-6);
+        assert!((au.sun_dir[1] - 1.0 / m).abs() < 1e-6);
+        assert!((au.sun_dir[2] - (-0.2) / m).abs() < 1e-6);
+        // sky_axis_angle defaults `[0, 0, 1, 0]` (PITFALL §12).
+        assert_eq!(au.sky_axis_angle, [0.0, 0.0, 1.0, 0.0]);
+        // Skybox deferred per ADR-040.
+        assert_eq!(au.flags[0], 0);
+    }
+
+    /// Sprint 28 / R2 / ADR-040 — wind state is a deterministic
+    /// function of clock time + min/max wind from the atmosphere
+    /// block. Two back-to-back calls hit the same time bucket and
+    /// must produce identical vectors (PITFALL #7 — no seed-controlled
+    /// noise; the parity fixtures rely on reproducible output).
+    #[test]
+    fn atmosphere_uniforms_wind_state_deterministic_per_tick() {
+        let app = make_test_app();
+        let a = app.atmosphere_uniforms_for_render();
+        let b = app.atmosphere_uniforms_for_render();
+        // `water_time_seconds` resolution is sub-second, but in the
+        // same test invocation the two calls should hit within micros
+        // — close enough that the sin/cos values are equal to f32
+        // precision.
+        assert!((a.wind[0] - b.wind[0]).abs() < 1e-4);
+        assert!((a.wind[1] - b.wind[1]).abs() < 1e-4);
+        // Wind magnitude lives in `.z`; should be in the band
+        // [min_wind, max_wind] = [5, 25] for `bar_default()`.
+        assert!(
+            a.wind[2] >= 5.0 - 1e-3 && a.wind[2] <= 25.0 + 1e-3,
+            "wind speed {} out of [5, 25] band",
+            a.wind[2]
+        );
     }
 
     /// Buildable-area toggle propagates to `splat_uniforms.flags.z`

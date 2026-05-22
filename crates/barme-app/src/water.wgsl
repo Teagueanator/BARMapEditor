@@ -225,7 +225,11 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // reflection UV perturbation, fresnel angle (commit 4), and
     // shorewave foam tap (commit 4) all read from this single normal,
     // so the visual coherence holds across the per-effect work.
-    let wind = vec2<f32>(u.polish_b.x, u.polish_b.y);
+    // Sprint 28 / R2 / ADR-040 — wind direction reads from the shared
+    // atmosphere binding (single source of truth across terrain +
+    // water + future grass). `polish_b.xy` keeps the same value for
+    // CPU-side debug visibility, but the shader reads from `atmos`.
+    let wind = atmos.wind.xy;
     let normal_scale = u.polish_b.z;
     let perlin_start = u.polish_d.z;
     let perlin_amp = u.polish_d.w;
