@@ -407,6 +407,49 @@ PA's in-game system designer is the cited gold standard. It does the following w
     > renderer-parity arc is now **6 / 8 done**. Next arc sprint is
     > Sprint 34 (grass rendering); Sprint 31 (toast queue +
     > confirmation modals) is the next off-arc UX sprint.
+    >
+    > **STATUS UPDATE 2026-05-22 (Sprint 31 / U4 — toast queue +
+    > confirmation modal):** the 2026-05-20 UX audit's #4 finding
+    > closed. Where the editor used a single `App.last_error:
+    > Option<String>` slot for every status message (info, warn,
+    > and error all overwriting each other in the status strip's
+    > red label), Sprint 31 ships a proper notification queue +
+    > destructive-action modal primitive. New
+    > `crates/barme-app/src/ui/toast.rs` (`Toast`, `ToastQueue`,
+    > `ToastKind`, `ToastAction`) and
+    > `crates/barme-app/src/ui/confirm.rs` (`ConfirmDialog`,
+    > `ConfirmResult`, `confirm_modal`). Toast policy: Info auto-
+    > dismisses at 3 s, Warn at 6 s, Error is persistent (PITFALL
+    > #9 — user must click ×). 5-second duplicate-text coalesce
+    > collapses repeats into "(×N)" suffixes; hard cap at 10
+    > toasts drops the oldest non-error first; trailing 500 ms
+    > fade-out animation. Confirm modal: fullscreen click-eating
+    > backdrop at `egui::Order::Foreground`, centred 360 px
+    > dialog, Esc cancels + Enter confirms (no other keys
+    > consumed), destructive flag tints the confirm button
+    > `t.red`. **6 commits on `main`**: (1) toast primitive +
+    > App helpers, (2) migrate 12 `last_error` call sites + drop
+    > the field + status-strip count chip, (3) confirm primitive
+    > + intent dispatch, (4) wire destructive paths (ally-group
+    > with positions / layer with painted mask / dirty
+    > New-project / dirty Open-project / OpenPath) + Sprint-17
+    > migration toast lifted to the queue + Sprint-20 save-
+    > before-build picks up the backdrop, (5) surface build /
+    > lint / GC as toasts (Done → info with sd7+duration; Failed
+    > → error with OpenBuildLog; Cancelled → warn; lint 0→>0
+    > error edge → warn with OpenLintPanel), (6) rollup. **22
+    > new tests** (toast queue: spawn / coalesce / cap / fade
+    > × 13; confirm modal: Enter/Esc/A-key/idle/persist × 6;
+    > LayerMask::has_painted_tiles × 2; build_and_install lint
+    > gate migrated to toast + action assertion;
+    > recompute_lint_fires_toast_once_on_error_edge × 1).
+    > barme-app 364 → 397, barme-core 279 → 281. `cargo fmt &&
+    > cargo clippy --workspace --all-targets -- -D warnings &&
+    > cargo test --workspace` green. **Out of scope**:
+    > programmatic toast dismissal from background tasks,
+    > persistent toast log across editor sessions,
+    > notification sounds, swipe-to-dismiss gestures, undo of
+    > toast actions (the underlying ProjectDiff handles undo).
 12. **Decompilation fidelity.** Round-tripping an existing `.sd7` loses information: the recovered diffuse PNG has been through DXT1 (color precision loss); heightmap, metal, and type maps are exact; mapinfo.lua is exact; auxiliary splat textures survive untouched. Reuse PyMapConv's decompile path.
 13. **GPU brush latency.** Spring/Recoil maps can theoretically reach 96×96 SMUs. Sub-millisecond brush response at 32×32+ requires the heightmap to live on the GPU as a storage texture, edited by compute shaders. Read-back to CPU happens only at save.
 

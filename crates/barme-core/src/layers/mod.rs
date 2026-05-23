@@ -904,7 +904,7 @@ fn read_legacy_f32_array(splat: &toml::Value, key: &str, default: f32) -> [f32; 
 ///
 /// `orphans_removed` carries the on-disk paths the GC unlinked;
 /// `orphans_removed_bytes` is the total stat'd size before unlink
-/// (reported via the `last_error` toast so users see "Removed N
+/// (reported via the toast queue so users see "Removed N
 /// orphans (~M MB)").
 /// `orphans_in_use_count` is the count of files the GC inspected
 /// and LEFT alone because their UUID is still referenced by a live

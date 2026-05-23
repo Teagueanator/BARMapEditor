@@ -1157,6 +1157,91 @@ Implements SRS F1–F12. Ships a Windows `.exe` and a Linux AppImage.
 
       **Renderer-parity arc: 5 / 8 done.** Next arc sprint is
       Sprint 30 (directional shadows).
+- [x] **STATUS UPDATE 2026-05-22 (Sprint 31 / U4 — toast queue +
+      confirmation modal).** Closes the 2026-05-20 UX audit's
+      finding #4: the editor's single `App.last_error:
+      Option<String>` slot in the status strip is replaced by a
+      proper notification queue (Info/Warn/Error with
+      auto-dismiss + coalesce + cap) and the destructive-action
+      paths (delete ally group, delete layer, new/open project
+      while dirty) pick up a confirmation modal primitive. **6
+      commits on `main`**:
+
+      (1) `ui(toast): ToastQueue + App helpers` — new
+      `crates/barme-app/src/ui/toast.rs` ships `Toast`,
+      `ToastQueue`, `ToastKind` (Info / Warning / Error),
+      `ToastAction` (`OpenLintPanel` / `OpenBuildLog` /
+      `OpenHelpArticle` / `DismissMigrationToast`) +
+      `App::toast_info / toast_warn / toast_error /
+      toast_with_action`. Render via `egui::Area` anchored
+      bottom-right, non-blocking; 500 ms fade-out tail; hard
+      cap at 10 with oldest-non-error eviction; 5 s dedup-
+      coalesce. 13 unit tests.
+
+      (2) `ui(toast): retire last_error; migrate 12 sites` —
+      drops `App::last_error: Option<String>`. Every call site
+      (save / open / heightmap load failures, texture import
+      and downsample, GC outcomes, build-gated-by-lint with
+      `OpenLintPanel` action) now spawns through the matching
+      toast helper. Status-strip's red `last_error` line
+      replaced by a tone-coloured count chip
+      ("N notifications" — green / amber / red by worst
+      tone). Lint-gate test migrated to assert on the toast
+      queue + the OpenLintPanel action.
+
+      (3) `ui(confirm): modal primitive + intent dispatch` —
+      new `crates/barme-app/src/ui/confirm.rs` ships
+      `ConfirmDialog` / `ConfirmResult` / `confirm_modal()`.
+      Fullscreen click-eating backdrop at
+      `egui::Order::Foreground`, centred 360 px dialog, Esc
+      cancels + Enter confirms (other keys pass through —
+      PITFALL #4), destructive flag tints the confirm button
+      `t.red`. App gains `pending_confirm` +
+      `pending_confirm_intent` + a `ConfirmIntent` enum
+      (DeleteAllyGroup / DeleteLayer /
+      NewProjectDiscardingChanges /
+      OpenProjectDiscardingChanges /
+      OpenPathDiscardingChanges). 6 unit tests.
+
+      (4) `ui(confirm): wire destructive paths` — the four
+      destructive paths now route through the modal. Empty /
+      clean cases bypass (delete an ally group with zero
+      positions, delete a layer that's never been painted into).
+      Sprint-17 migration toast lifts from its bespoke
+      `egui::Window` to the new toast queue with a persistent
+      Info entry + DismissMigrationToast action — per-project
+      `Project.migration_toast_dismissed` flag preserved (PITFALL
+      #1). Sprint-20's save-before-build stub picks up the
+      backdrop + Esc-cancel (kept its 3-button shape).
+      `LayerMask::has_painted_tiles()` added to `barme-core`
+      with 2 tests.
+
+      (5) `ui(toast): surface build + lint events as toasts` —
+      `poll_build_state` toasts on the terminal transition:
+      Done → info(name + duration); Failed → error_with_action
+      (OpenBuildLog); Cancelled → warn(duration). `recompute_lint`
+      fires a single Warning + OpenLintPanel action on the
+      `0 → >0` hard-error edge; steady-state errors stay quiet;
+      re-fires coalesce via the dedup window into the existing
+      entry's count. 1 new test.
+
+      (6) `docs(srs+roadmap): rollup` — this STATUS UPDATE +
+      the SRS §2.1 mirror.
+
+      Test counts: barme-app 364 → 397 (+33, of which 22 are
+      new), barme-core 279 → 281. `cargo fmt && cargo clippy
+      --workspace --all-targets -- -D warnings && cargo test
+      --workspace` green. **Out of scope**: programmatic toast
+      dismissal from worker threads (visual-only surface; the
+      worker uses tracing for diagnostics), persistent toast
+      log across editor sessions (the queue is in-memory),
+      notification sounds, swipe-to-dismiss, undo of toast
+      actions (the underlying `ProjectDiff` handles undo —
+      modal + toast are transient state).
+
+      Next off-arc UX sprint is Sprint 32 (F12 Launch in BAR
+      + autosave); the renderer-parity arc resumes at Sprint
+      34 (grass).
 - [ ] Beherith (or active mapper) reviews `.sd7` byte-for-byte against PyMapConv
       reference output on three test maps
 - [ ] Listed on `beyondallreason.info/guide/mapmaking-resources` as beta
