@@ -1,0 +1,117 @@
+# BAR Map Editor — multi-OS release builds (Sprint 33 / T6 / ADR-049).
+#
+# NFR-Portability: every tagged release ships a Linux AppImage + a
+# Windows .exe bundle + an (experimental) macOS .app. Pushing a `v*`
+# tag builds all three and attaches them to the GitHub release. The
+# matrix also runs on workflow_dispatch so the build path is exercised
+# without cutting a release.
+#
+# Toolchain note: we rely on the runner's preinstalled rustup honouring
+# `rust-toolchain.toml` (pins stable 1.96). No matrix here — releases
+# build on stable only; MSRV is gated in ci.yml.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write # needed to attach artifacts to the release
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact: BARMapEditor-x86_64.AppImage
+          - os: windows-latest
+            artifact: BARMapEditor-windows-x86_64.zip
+          - os: macos-latest
+            artifact: BARMapEditor-macos.zip
+            experimental: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # --- Linux: build deps for eframe/wgpu + AppImage tooling --------
+      - name: Install Linux build deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-3-dev libxcb-render0-dev libxcb-shape0-dev \
+            libxcb-xfixes0-dev libxkbcommon-dev libssl-dev \
+            libwayland-dev 7zip wget file desktop-file-utils
+
+      - name: Build release binary
+        run: cargo build --release -p barme-app
+
+      # --- Vendor the sidecar toolchain (Linux only; upstream win/mac
+      #     PyMapConv binaries are tracked for Stage-2, see ADR-049) ----
+      - name: Vendor PyMapConv + Compressonator (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          ./scripts/fetch-pymapconv.sh
+          ./scripts/fetch-compressonator.sh
+
+      # --- Package per-OS ---------------------------------------------
+      - name: Build AppImage (Linux)
+        if: runner.os == 'Linux'
+        run: ./scripts/build-appimage.sh
+
+      - name: Package Windows bundle
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $stage = "BARMapEditor"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item target/release/barme-app.exe $stage/
+          if (Test-Path assets) { Copy-Item -Recurse assets $stage/assets }
+          # PyMapConv/Compressonator Windows binaries are vendored at
+          # install time (Stage-2 installer); README documents the gap.
+          Copy-Item README.md $stage/ -ErrorAction SilentlyContinue
+          Compress-Archive -Path $stage/* -DestinationPath ${{ matrix.artifact }}
+
+      - name: Package macOS .app (experimental)
+        if: runner.os == 'macOS'
+        run: |
+          APP="BARMapEditor.app"
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+          cp target/release/barme-app "$APP/Contents/MacOS/barme-app"
+          cat > "$APP/Contents/Info.plist" <<'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+            "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>CFBundleName</key><string>BARMapEditor</string>
+            <key>CFBundleExecutable</key><string>barme-app</string>
+            <key>CFBundleIdentifier</key><string>info.beyondallreason.barme</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleShortVersionString</key><string>0.0.1</string>
+          </dict></plist>
+          PLIST
+          # EXPERIMENTAL: wgpu/Metal unattested before Sprint 33; ships
+          # unsigned (no notarisation) — Gatekeeper will warn.
+          zip -ry "${{ matrix.artifact }}" "$APP"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}
+
+      - name: Attach to release (on tag)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.artifact }}
+          fail_on_unmatched_files: false

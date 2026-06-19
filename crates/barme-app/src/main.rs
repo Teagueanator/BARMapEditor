@@ -6870,7 +6870,20 @@ fn pick_open_path() -> Option<PathBuf> {
         .pick_file()
 }
 
+/// Root under which the bundled `tools/` (PyMapConv, Compressonator,
+/// textures) and `assets/` live.
+///
+/// Sprint 33 (T6 / ADR-049 / NFR-Portability): packaged builds (AppImage,
+/// Windows `.exe`) are not run from the source tree, so the compile-time
+/// `CARGO_MANIFEST_DIR` path doesn't exist on an end-user's machine. The
+/// `BARME_ROOT` env override lets a packaged launcher point at the bundle:
+/// the AppImage's `AppRun` exports `BARME_ROOT="$APPDIR"`. Dev builds
+/// (`cargo run`) set nothing and fall back to the workspace root, so local
+/// behaviour is unchanged.
 fn repo_root() -> PathBuf {
+    if let Some(root) = std::env::var_os("BARME_ROOT") {
+        return PathBuf::from(root);
+    }
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(|p| p.parent())
