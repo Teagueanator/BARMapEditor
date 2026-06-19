@@ -77,7 +77,6 @@ const EMISSION_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 /// Engine `skyReflectModTex`; `.rgb` per-channel reflectivity. The 1×1
 /// fallback packs `(0, 0, 0, 0)` (no reflection) so the shader's
 /// `mix(diffuse, sky, reflectMod)` is a no-op until a real map uploads.
-#[allow(dead_code)] // Wired in Commit 2 (sky-reflect modulation).
 const SKY_REFLECT_MOD_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 
 /// Sprint 35 / R7 / ADR-044 — parallax-height map format. Engine
@@ -1230,6 +1229,14 @@ struct SplatResources {
     emission_tex: wgpu::Texture,
     emission_view: wgpu::TextureView,
     emission_samp: wgpu::Sampler,
+    /// Sprint 35 / R7 / ADR-044 — sky-reflection modulation map. Engine
+    /// `skyReflectModTex`; `.rgb` per-channel reflectivity. Defaults to
+    /// a 1×1 black `(0,0,0,0)` so `mix(diffuse, sky, 0) = diffuse` until
+    /// `upload_sky_reflect_mod` binds a real wet-surface mask.
+    #[allow(dead_code)]
+    sky_reflect_mod_tex: wgpu::Texture,
+    sky_reflect_mod_view: wgpu::TextureView,
+    sky_reflect_mod_samp: wgpu::Sampler,
     uniform_buf: wgpu::Buffer,
 }
 
@@ -1757,11 +1764,30 @@ fn bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
                 ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                 count: None,
             },
+            // 19: sky-reflection modulation map (Sprint 35 / R7 /
+            // ADR-044). Engine `skyReflectModTex`. Fragment-only.
+            wgpu::BindGroupLayoutEntry {
+                binding: 19,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            // 20: sky-reflect-mod sampler. ClampToEdge.
+            wgpu::BindGroupLayoutEntry {
+                binding: 20,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
         ],
     })
 }
 
-#[allow(clippy::too_many_arguments)] // Mirrors the 19-binding terrain bind group; trimming would just hide layout coupling.
+#[allow(clippy::too_many_arguments)] // Mirrors the 21-binding terrain bind group; trimming would just hide layout coupling.
 fn make_bind_group(
     device: &wgpu::Device,
     bgl: &wgpu::BindGroupLayout,
@@ -1857,6 +1883,15 @@ fn make_bind_group(
             wgpu::BindGroupEntry {
                 binding: 18,
                 resource: wgpu::BindingResource::Sampler(&splat.emission_samp),
+            },
+            // Sprint 35 / R7 / ADR-044 — sky-reflect-mod map + sampler.
+            wgpu::BindGroupEntry {
+                binding: 19,
+                resource: wgpu::BindingResource::TextureView(&splat.sky_reflect_mod_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 20,
+                resource: wgpu::BindingResource::Sampler(&splat.sky_reflect_mod_samp),
             },
         ],
     })
@@ -2004,6 +2039,19 @@ fn install_splat_resources(device: &wgpu::Device, queue: &wgpu::Queue) -> SplatR
         wgpu::AddressMode::ClampToEdge,
     );
 
+    // Sprint 35 / R7 / ADR-044 — sky-reflect modulation map. 1×1 black
+    // `(0,0,0,0)`: zero reflectivity, so `mix(diffuse, sky, 0) =
+    // diffuse` until `upload_sky_reflect_mod` binds a real wet mask.
+    let (sky_reflect_mod_tex, sky_reflect_mod_view, sky_reflect_mod_samp) =
+        install_default_2d_texture(
+            device,
+            queue,
+            "terrain.sky_reflect_mod",
+            SKY_REFLECT_MOD_FORMAT,
+            &[0x00, 0x00, 0x00, 0x00],
+            wgpu::AddressMode::ClampToEdge,
+        );
+
     let uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("terrain.splat.uniforms"),
         size: std::mem::size_of::<SplatUniforms>() as u64,
@@ -2033,6 +2081,9 @@ fn install_splat_resources(device: &wgpu::Device, queue: &wgpu::Queue) -> SplatR
         emission_tex,
         emission_view,
         emission_samp,
+        sky_reflect_mod_tex,
+        sky_reflect_mod_view,
+        sky_reflect_mod_samp,
         uniform_buf,
     }
 }
@@ -4575,6 +4626,49 @@ pub fn upload_emission(
     res.splat.emission_view = view;
     res.rebind(device);
     info!(width, height, "upload_emission: bound");
+}
+
+/// Upload a sky-reflection modulation map into the terrain bind group
+/// (Sprint 35 / R7 / ADR-044). Engine `skyReflectModTex`: `Rgba8Unorm`
+/// where `.rgb` is the per-channel reflectivity weight
+/// (SMFFragProg.glsl:346). Same shape contract as [`upload_emission`].
+/// No presence-bit gate — the 1×1 black fallback self-gates
+/// (`mix(diffuse, sky, 0) = diffuse`).
+#[allow(dead_code)] // Wired by the parity-fixture loader (wet-rocks).
+pub fn upload_sky_reflect_mod(
+    render_state: &egui_wgpu::RenderState,
+    width: u32,
+    height: u32,
+    rgba: &[u8],
+) {
+    let expected = (width as usize) * (height as usize) * 4;
+    if rgba.len() != expected {
+        warn!(
+            got = rgba.len(),
+            expected, "upload_sky_reflect_mod: byte length mismatch"
+        );
+        return;
+    }
+    let device = &render_state.device;
+    let queue = &render_state.queue;
+    let mut renderer = render_state.renderer.write();
+    let Some(res) = renderer.callback_resources.get_mut::<RenderResources>() else {
+        warn!("upload_sky_reflect_mod: no RenderResources (install() not run)");
+        return;
+    };
+    let (tex, view) = make_rgba8_terrain_texture(
+        device,
+        queue,
+        "terrain.sky_reflect_mod",
+        SKY_REFLECT_MOD_FORMAT,
+        width,
+        height,
+        rgba,
+    );
+    res.splat.sky_reflect_mod_tex = tex;
+    res.splat.sky_reflect_mod_view = view;
+    res.rebind(device);
+    info!(width, height, "upload_sky_reflect_mod: bound");
 }
 
 /// Allocate an `Rgba8Unorm`-family 2D texture sized to `(width,

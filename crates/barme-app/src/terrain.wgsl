@@ -202,6 +202,16 @@ struct AtmosphereU {
 // self-illumination is NOT masked by shadow (pitfall #1).
 @group(0) @binding(17) var emission_tex: texture_2d<f32>;
 @group(0) @binding(18) var emission_samp: sampler;
+// Sprint 35 / R7 / ADR-044 — sky-reflection modulation texture.
+// Engine `skyReflectModTex` (SMFFragProg.glsl:98, sampled :346). The
+// `.rgb` is a per-channel reflectivity weight: 0 = matte (no sky in
+// the surface), 1 = mirror. The 1×1 black fallback (0,0,0,0) self-
+// gates — `mix(diffuse, sky, 0) = diffuse`. The engine samples a
+// `skyReflectTex` CUBEMAP for the reflected colour; Sprint 28 deferred
+// the cubemap (ADR-045), so we use the uniform sky colour instead
+// (pitfall #7). No sampler/texture of its own beyond the mod map.
+@group(0) @binding(19) var sky_reflect_mod_tex: texture_2d<f32>;
+@group(0) @binding(20) var sky_reflect_mod_samp: sampler;
 
 // Editor-side tuning scalar for emission. The engine has NO
 // emission-strength uniform — emission is a straight `rgb*(1-a)+rgb`
@@ -375,6 +385,19 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let max_h = u.params.x;
     let min_h = u.params2.x;
 
+    // View vector toward the camera in world space. Hoisted to the top
+    // (Sprint 35 / R7) because sky-reflection (§6.5) and parallax
+    // (§3.5) both need it before the diffuse / normal samples; §7
+    // lighting and §9 fog reuse the same `to_eye` / `view_dir`. Falls
+    // back to world +Y when the eye sits exactly on the fragment
+    // (degenerate — safer than a NaN normalize).
+    let to_eye = sp.camera_pos.xyz - in.world_pos;
+    let view_dir = select(
+        vec3<f32>(0.0, 1.0, 0.0),
+        normalize(to_eye),
+        dot(to_eye, to_eye) > 1e-6,
+    );
+
     // ─── 1. Texture-presence bits (FINDINGS §7.2) ────────────────
     // Engine's `SMF_DETAIL_NORMAL_TEXTURE_SPLATTING` gate is
     // `splatDistrTex && HaveSplatNormalTexture()` per
@@ -506,7 +529,31 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let fallback_rgb = biome_ramp(height_t);
     let composite_rgb = textureSample(composite_rt, composite_samp, in.uv_norm).rgb;
     let use_composite = step(0.5, u.params2.y);
-    let diffuse_rgb = mix(fallback_rgb, composite_rgb, use_composite);
+    var diffuse_rgb = mix(fallback_rgb, composite_rgb, use_composite);
+
+    // ─── 6.5 Sky-reflection modulation (Sprint 35 / R7 / ADR-044) ─
+    // Engine `SMFFragProg.glsl:341-350`:
+    //   reflectDir = reflect(cameraDir, normal);
+    //   reflectCol = textureCube(skyReflectTex, reflectDir).rgb;   // slot 9
+    //   reflectMod = texture2D(skyReflectModTex, specTexCoords).rgb; // slot 10
+    //   diffuseCol.rgb = mix(diffuseCol.rgb, reflectCol, reflectMod);
+    // Note the mix factor is `reflectMod` DIRECTLY (no `*0.5` as the
+    // Sprint-35 prompt suggested), and it's applied to the diffuse base
+    // BEFORE lighting so the reflected sky is lit + shadowed like the
+    // ground — we mirror the engine exactly.
+    //
+    // The engine's `reflectCol` is a skybox CUBEMAP sample. Sprint 28
+    // (ADR-045) deferred the cubemap, so per pitfall #7 we substitute
+    // the uniform sky colour (`atmos.sky_color.rgb`) as the reflected
+    // environment. The reflection DIRECTION is therefore irrelevant to
+    // the colour today; when a real cubemap binding lands, replace
+    // `sky_col` with `textureCube(skybox, reflect_dir)` where
+    //   reflect_dir = reflect(-view_dir, normal) with .y clamped ≥ 0
+    // (pitfall #2 — grazing angles must not sample below the horizon).
+    let reflect_mod = textureSample(sky_reflect_mod_tex, sky_reflect_mod_samp, surf_uv).rgb;
+    let sky_col = atmos.sky_color.rgb;
+    diffuse_rgb = mix(diffuse_rgb, sky_col, reflect_mod);
+
     // SMFFragProg.glsl:323 — detailCol is `vec4(splatDetailStrength.y)`,
     // a single greyscale value added to the diffuse colour.
     let detail_rgb = vec3<f32>(detail_strength_y);
@@ -519,15 +566,8 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // so the fragment stage doesn't repeat the dim.
     let sun = normalize(sp.sun_dir.xyz);
     let cos_diffuse = clamp(dot(sun, normal), 0.0, 1.0);
-    // View direction toward the camera, in world space. Falling back
-    // to the world's +Y axis when the eye sits exactly on the
-    // fragment (degenerate, but safer than a NaN normalize).
-    let to_eye = sp.camera_pos.xyz - in.world_pos;
-    let view_dir = select(
-        vec3<f32>(0.0, 1.0, 0.0),
-        normalize(to_eye),
-        dot(to_eye, to_eye) > 1e-6,
-    );
+    // `view_dir` / `to_eye` were hoisted to the top of fs_main (Sprint
+    // 35) so sky-reflection + parallax can use them; reuse here.
     let half_dir = normalize(sun + view_dir);
     let cos_specular = clamp(dot(half_dir, normal), 0.001, 1.0);
 
