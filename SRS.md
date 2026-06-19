@@ -450,6 +450,55 @@ PA's in-game system designer is the cited gold standard. It does the following w
     > persistent toast log across editor sessions,
     > notification sounds, swipe-to-dismiss gestures, undo of
     > toast actions (the underlying ProjectDiff handles undo).
+    >
+    > **STATUS UPDATE 2026-06-18 (Sprint 34 / R6 / ADR-050 — grass
+    > rendering shipped):** the seventh renderer-parity step, and the
+    > last common BAR aesthetic the preview was missing. Grass renders
+    > as instanced camera-billboard quads anchored on the terrain,
+    > swaying in the wind and receiving shadows. New
+    > `crates/barme-core/src/grass.rs` (CPU density bake — one
+    > normalised coverage byte per heightmap texel from a logistic
+    > slope falloff; terrain-type-0 mask is uniform 1.0 until F15
+    > ships the type-map editor; persists to
+    > `<project>/.barme-cache/grass-density.png`), new
+    > `crates/barme-app/src/grass.rs` (deterministic per-blade scatter
+    > — `count = coverage × maxStrawsPerTurf × density_scale` over a
+    > 16-elmo turf grid, `fmix32`-hashed jitter keyed on the turf cell
+    > so blades never shimmer on camera move, two-pass global scale to
+    > hold the 100k-blade Vega 8 budget), and new
+    > `crates/barme-app/src/grass.wgsl` (billboard vertex stage + wind
+    > sway sharing the `atmosphere.wind` block + `water_time_seconds`
+    > with the water plane, 3×3 PCF shadow RECEIVE via the shared
+    > Sprint-30 shadow map, leaf-edge taper, smooth LOD alpha fade to
+    > 200 elmos). The grass pipeline (`GrassResources`; depth-test on /
+    > write off, `ALPHA_BLENDING`, cull None) draws first in the
+    > overlay pass (terrain → grass → water → lines → markers).
+    > **Schema gap closed (house rule #1):** the engine's `ReadGrass`
+    > (`MapInfo.cpp:190-195`) carries six grass keys but `GrassBlock`
+    > modelled only four — `maxStrawsPerTurf` (default 150) and
+    > `bladeWaveScale` (default 1.0) were added with engine-default
+    > constants + emitter coverage. `View > Grass` toggle + `Grass
+    > density` slider throttle the per-frame cost on weak iGPUs
+    > (default ON). **8 commits on `main`** (schema → density bake →
+    > instance scatter → shader + pipeline → App wiring → ADR + fixture
+    > → rollup). **+12 tests** (barme-app 397 → 404: 5 instance scatter
+    > + WGSL naga parse + GPU layout pin; barme-core +4 density bake;
+    > barme-pipeline +1 grass emitter). `cargo fmt && cargo clippy
+    > --workspace --all-targets -- -D warnings && cargo test
+    > --workspace` green. New parity fixture
+    > `assets/parity-fixtures/grass-field/README.md` (4-SMU flat field,
+    > `maxStrawsPerTurf = 64`). **Validation boundary:** the CPU bake,
+    > scatter, WGSL validity, and CPU/GPU layout contract are unit-
+    > tested in headless CI; the live visual match and the 100k-blade
+    > < 4 ms Vega 8 frame budget need a GPU session and are NOT verified
+    > in CI (hardware-pending, tracked in the devlog). **Out of scope**:
+    > per-feature grass types, unit-kicked dust, grass biomes / multi-
+    > layer density, GPU-driven culling, the engine `grassBladeTex`
+    > silhouette (Sprint 35's resource pass), grass CASTING shadows.
+    > The renderer-parity arc is now **7 / 8 done**. The prompt called
+    > this "ADR-043" but that's taken (Sprint 25 terrain shader); grass
+    > ships as **ADR-050**. Next arc sprint is Sprint 35 (emission +
+    > sky-reflect + parallax).
 12. **Decompilation fidelity.** Round-tripping an existing `.sd7` loses information: the recovered diffuse PNG has been through DXT1 (color precision loss); heightmap, metal, and type maps are exact; mapinfo.lua is exact; auxiliary splat textures survive untouched. Reuse PyMapConv's decompile path.
 13. **GPU brush latency.** Spring/Recoil maps can theoretically reach 96×96 SMUs. Sub-millisecond brush response at 32×32+ requires the heightmap to live on the GPU as a storage texture, edited by compute shaders. Read-back to CPU happens only at save.
 

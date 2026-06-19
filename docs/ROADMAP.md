@@ -1269,6 +1269,34 @@ Implements SRS F1–F12. Ships a Windows `.exe` and a Linux AppImage.
       is a disabled stub, no autosave). The CI gates are independent of
       that feature work. The renderer-parity arc resumes at **Sprint 34
       (grass rendering)**.
+- [x] **STATUS UPDATE 2026-06-18 (Sprint 34 / R6 — ADR-050 — grass
+      rendering).** Seventh renderer-parity step; the renderer-parity
+      arc is now **7 / 8 done**. Grass renders as instanced
+      camera-billboard quads on the terrain, swaying in the wind and
+      receiving shadows. New `barme-core::grass` (CPU density bake — a
+      logistic slope falloff → one coverage byte per heightmap texel;
+      persists to `<project>/.barme-cache/grass-density.png`; type-0
+      mask uniform until F15), new `barme-app::grass` (deterministic
+      per-blade scatter over a 16-elmo turf grid; `fmix32`-hashed
+      jitter keyed on the turf cell so blades don't shimmer; two-pass
+      global scale holds the 100k-blade Vega 8 budget; 200-elmo LOD),
+      new `grass.wgsl` (billboard vertex + wind sway sharing the
+      atmosphere wind + `water_time_seconds` with water, 3×3 PCF shadow
+      RECEIVE, leaf-edge taper, smooth LOD fade). Schema gap closed
+      (house rule #1): `maxStrawsPerTurf` + `bladeWaveScale` added to
+      `GrassBlock` (were missing vs engine `ReadGrass`). `View > Grass`
+      toggle + `Grass density` slider (iGPU throttle). 8 commits
+      (schema → density → scatter → shader+pipeline → app wiring → ADR
+      +fixture → rollup); +12 tests (barme-app 397→404, barme-core +4,
+      barme-pipeline +1). `cargo fmt && cargo clippy --workspace
+      --all-targets -- -D warnings && cargo test --workspace` green.
+      New fixture `assets/parity-fixtures/grass-field/`. **Validation
+      boundary:** CPU bake / scatter / WGSL / GPU-layout unit-tested in
+      headless CI; live visual match + the 100k-blade <4 ms Vega 8
+      budget need a GPU session (hardware-pending; devlog
+      `sprint-34-grass-rendering/`). The prompt called this "ADR-043"
+      but that's taken; grass ships as ADR-050. Next arc sprint:
+      Sprint 35 (emission + sky-reflect + parallax).
 - [ ] Beherith (or active mapper) reviews `.sd7` byte-for-byte against PyMapConv
       reference output on three test maps
 - [ ] Listed on `beyondallreason.info/guide/mapmaking-resources` as beta

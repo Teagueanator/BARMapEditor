@@ -247,6 +247,42 @@ the BAR render of the same features.
 
 ### Sprint 21 — Grass rendering
 
+**Status:** **SHIPPED** as Sprint 34 / R6 / ADR-050 (renumbered by
+the live sprint-prompt sequence; the prompt's "ADR-043" was taken by
+the Sprint 25 terrain shader, so grass ships under ADR-050).
+
+**Shipped scope:**
+- CPU density bake (`barme-core::grass::bake_grass_density`) — one
+  normalised coverage byte per heightmap texel from a logistic slope
+  falloff; persists to `<project>/.barme-cache/grass-density.png`.
+  The terrain-type-0 mask is uniform 1.0 until F15 (Sprint 36) ships
+  the type-map editor.
+- Deterministic per-blade scatter (`barme-app::grass::
+  generate_grass_instances`) over a 16-elmo turf grid; `fmix32`-hashed
+  jitter keyed on the turf cell (no shimmer on camera move); two-pass
+  global scale holds the 100k-blade Vega 8 budget; LOD within 200
+  elmos of the camera.
+- `grass.wgsl` instanced billboard pipeline — wind sway sharing the
+  atmosphere wind + `water_time_seconds` with water, 3×3 PCF shadow
+  RECEIVE (shared shadow map), leaf-edge taper, smooth LOD fade.
+- Schema gap closed: `maxStrawsPerTurf` + `bladeWaveScale` added to
+  `GrassBlock` (were missing vs engine `ReadGrass`).
+- `View > Grass` toggle + `Grass density` slider (iGPU throttle).
+
+**Validation boundary:** CPU bake / scatter / WGSL / GPU-layout are
+unit-tested in headless CI; the live visual match + 100k-blade < 4 ms
+Vega 8 budget need a GPU session (hardware-pending; tracked in
+`devlog/sprint-34-grass-rendering/`).
+
+**Out of scope (deferred):** the engine `grassBladeTex` silhouette
+(Sprint 35's resource pass — Sprint 34 ships a procedural quad),
+per-feature grass types, unit-kicked dust, grass biomes / multi-layer
+density, GPU-driven culling, grass CASTING shadows.
+
+---
+
+#### Original Sprint 21 plan (for reference)
+
 **Goal:** grass blades render as instanced quads with wind animation.
 Parameters from `mapinfo.grass.{bladeWidth, bladeHeight, bladeColor,
 bladeAngle, maxStrawsPerTurf, bladeWaveScale}`.
