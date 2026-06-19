@@ -5738,7 +5738,8 @@ impl App {
                     | P::ResourcesDetailNormalTex(s)
                     | P::ResourcesLightEmissionTex(s)
                     | P::ResourcesSkyReflectModTex(s)
-                    | P::ResourcesParallaxHeightTex(s) => s.clone().map(toml::Value::String),
+                    | P::ResourcesParallaxHeightTex(s)
+                    | P::ResourcesGrassBladeTex(s) => s.clone().map(toml::Value::String),
                     P::Maphardness(v)
                     | P::Gravity(v)
                     | P::MaxMetal(v)
@@ -5923,6 +5924,9 @@ impl App {
             }
             P::ResourcesParallaxHeightTex(_) => {
                 P::ResourcesParallaxHeightTex(info.resources.parallax_height_tex.clone())
+            }
+            P::ResourcesGrassBladeTex(_) => {
+                P::ResourcesGrassBladeTex(info.resources.grass_blade_tex.clone())
             }
             P::TerrainTypes(_) => P::TerrainTypes(info.terrain_types.clone()),
             P::CustomField { key, .. } => P::CustomField {

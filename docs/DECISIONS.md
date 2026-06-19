@@ -5098,6 +5098,118 @@ sky-reflect + parallax remain → Sprint 35). The prompt called this
 is the latest; grass ships as **ADR-050**. Devlog:
 `devlog/sprint-34-grass-rendering/`.
 
+## ADR-051 — Final shader bindings: emission, sky-reflect, parallax, grass-blade (Sprint 35 / R7)
+
+**Status:** Accepted
+
+**Context.** Sprint 35 wires the last four `mapinfo.resources` texture
+bindings the renderer-parity arc hadn't consumed:
+`lightEmissionTex`, `skyReflectModTex`, `parallaxHeightTex`,
+`grassBladeTex`. This is the final renderer **feature** sprint; Sprint
+36 is parity validation only. Engine reference (audited at the
+RecoilEngine clone HEAD): `SMFFragProg.glsl` +
+`SMFRenderState.cpp` + `SMFReadMap.{h,cpp}`.
+
+**ADR number.** The Sprint-35 prompt called this "ADR-044", but ADR-044
+is taken (Sprint 26 water polish) and ADR-050 is the latest (Sprint 34
+grass) — same collision the grass ADR hit. Sprint 35 ships as
+**ADR-051**, the next free number. All Sprint-35 code comments use
+`Sprint 35 / R7 / ADR-051`.
+
+**Decision — emission (`lightEmissionTex`).** Ported the engine's
+**alpha-masked** composite (`SMFFragProg.glsl:392-401`):
+`lit = lit·(1 − emission.a) + emission.rgb`. The prompt's pseudocode
+said additive (`final_color += emission`); the engine — source of truth
+(house rule #1) — masks by `.a`, so we shipped the engine form. Applied
+AFTER the `lit·shadow` lighting compose, so emission is NOT darkened by
+shadow (pitfall #1) and carries NO day/night ramp (pitfall #6 — volcanic
+ground self-illuminates regardless of sun angle). The 1×1 black
+`(0,0,0,0)` fallback self-gates.
+
+**Decision — sky-reflect (`skyReflectModTex`).** Ported
+`SMFFragProg.glsl:341-350`:
+`diffuse = mix(diffuse, reflectCol, reflectMod)`, applied to the diffuse
+base BEFORE lighting. The mix factor is `reflectMod` directly (the
+prompt suggested `× 0.5`; the engine has no such factor, so we matched
+the engine). **Contradiction flagged (house rule #1):** the prompt's
+prerequisites claim "Sprint 28's skybox cubemap is the sky-reflect
+source," but Sprint 28 / ADR-045 explicitly **deferred** the skybox
+cubemap (`AtmosphereU.flags.has_skybox` stays 0; no cubemap binding
+exists). The engine's `reflectCol` is a `skyReflectTex` cubemap sample
+we don't have. Resolution: the prompt's own **pitfall #7** fallback —
+sample the sky as a uniform colour. We use `atmos.sky_color.rgb` as the
+reflected environment. Forward-compatible: when a real cubemap binding
+ships, swap `sky_color` for `textureCube(skybox, reflect_dir)` with the
+`.y`-clamp (pitfall #2 — grazing rays must not sample below the
+horizon). The 1×1 black fallback self-gates (`mix(d, sky, 0) = d`).
+
+**Decision — parallax (`parallaxHeightTex`): INCLUDED, not deferred.**
+The prompt said "engine MAY not consume this; verify before porting."
+It **does**: `SMFRenderState.cpp:120` sets `SMF_PARALLAX_MAPPING`
+whenever the texture is bound, and `SMFFragProg.glsl:124-141 + 282-296`
+sample it and offset the UVs. So this is a real port.
+`get_parallax_uv_offset` mirrors the engine decode (RG = 16-bit height,
+B = scale, A = bias−0.5; `offset = (dir.xy / dir.z) · heightOffset` in
+tangent space). The offset feeds the base-normal re-fetch + the
+composite-diffuse + specular + emission + sky-reflect-mod samples
+(matching the engine's diff/norm/spec offset; DNTS detail tiling +
+splat distribution stay un-parallaxed — high-frequency, negligible,
+out of scope). Gated by a new `has_parallax` flag bit
+(`SplatUniforms.flags.w & 8`), NOT the fallback pixel, because a zero
+parallax texel decodes to a non-zero bias (`A−0.5 = −0.5`). Added a
+grazing-angle divide guard (`|dir.z| ≥ 1e-3`) not in the engine, to
+stop a viewport blow-up at silhouettes.
+
+**Decision — grass blade (`grassBladeTex`).** `grass.wgsl` multiplies
+the quad alpha by the texture's `.a`. The 1×1 white fallback keeps
+Sprint 34's procedural taper as the silhouette. Loaded via the same
+default-texture path as the terrain slots; missing / renamed files fall
+back to white, never a pink map (pitfall #8 / PITFALLS §11). The grass
+bind group grew to 7 bindings (blade tex + sampler at 5/6).
+
+**Strength/scale knobs are shader constants, not uniforms.** The prompt
+wanted `uniforms.emission_strength` / `uniforms.parallax_scale`. The
+engine has NO such scalars, so default 1.0 is exact parity. We kept
+`EMISSION_STRENGTH` / `PARALLAX_SCALE` as WGSL consts (= 1.0) to (a)
+avoid threading 3 `Uniforms` construction sites (main / reflection /
+shadow draws) and risking emission/parallax divergence between passes,
+and (b) keep the composite math byte-identical to the engine. A future
+sprint can promote them to uniforms + F9 fields for per-map lava
+amplification.
+
+**F9 form gap closed.** Verifying the prompt's Step-3 #5 ("all four
+fields accept input") surfaced that `grassBladeTex` had a schema field +
+emitter coverage but NO `MapInfoPatch` variant and NO F9 input (the
+other three shipped in Sprint 18). Added `ResourcesGrassBladeTex` +
+wired it through apply / inverse / undo-accounting + an `opt_text_input`
+in the Resources tab.
+
+**Bind-group bloat (pitfall #5) — checked.** The terrain bind group
+grew from 17 to 23 bindings (0-22). Fragment-stage sampled-texture
+count is 10 (heightmap, distr, slot_normals, composite, base normal,
+specular, shadow-depth, emission, sky-reflect-mod, parallax) — under
+wgpu's default `max_sampled_textures_per_shader_stage = 16`. Samplers ≈
+9, under 16. No limit bump or bind-group split needed.
+
+**Alternatives.** (1) Additive emission (prompt) — rejected; not engine
+parity. (2) Real skybox cubemap for sky-reflect — blocked on the
+deferred Sprint-28 cubemap; uniform-sky fallback used. (3) Deferring
+parallax — rejected; the engine genuinely consumes it. (4) Uniform
+strength/scale knobs — deferred to keep parity + avoid multi-pass
+threading.
+
+**Validation.** All four WGSL shaders pass naga validation in headless
+CI (`*_wgsl_parses_and_validates`). The live visual smoke (lava cracks
+glow; wet rocks reflect sky; grass uses the blade texture or procedural
+fallback) needs a GPU session — tracked in
+`devlog/sprint-35-emission-skybox-reflect-parallax/` as
+hardware-pending, with `assets/parity-fixtures/{lava-emission,wet-rocks}`
+smoke procedures.
+
+**Consequence.** Renderer parity reaches **8/8** feature-complete;
+Sprint 36 is parity validation + SRS §2.1 #11 closeout only. Devlog:
+`devlog/sprint-35-emission-skybox-reflect-parallax/`.
+
 ## ADR template
 
 ```

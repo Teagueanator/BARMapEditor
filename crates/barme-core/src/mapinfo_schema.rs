@@ -1003,6 +1003,10 @@ pub enum MapInfoPatch {
     ResourcesLightEmissionTex(Option<String>),
     ResourcesSkyReflectModTex(Option<String>),
     ResourcesParallaxHeightTex(Option<String>),
+    /// Sprint 35 / R7 / ADR-051 — the grass blade silhouette texture
+    /// (engine `grassBladeTex`). The emitter already serialised this
+    /// field; Sprint 35 closes the F9-form gap so the user can set it.
+    ResourcesGrassBladeTex(Option<String>),
 
     // ─── Terrain types — table-level replace (whole vec) ───
     /// Terrain-types are usually edited as a whole table (add /
@@ -1076,6 +1080,7 @@ impl MapInfoPatch {
             Self::ResourcesLightEmissionTex(_) => "resources.lightEmissionTex",
             Self::ResourcesSkyReflectModTex(_) => "resources.skyReflectModTex",
             Self::ResourcesParallaxHeightTex(_) => "resources.parallaxHeightTex",
+            Self::ResourcesGrassBladeTex(_) => "resources.grassBladeTex",
             Self::TerrainTypes(_) => "terrainTypes",
             Self::CustomField { .. } => "custom.*",
             Self::MinimapOverride(_) => "minimap_override",

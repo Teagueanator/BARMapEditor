@@ -450,9 +450,8 @@ fn mapinfo_patch_bytes(p: &MapInfoPatch) -> usize {
         | MapInfoPatch::ResourcesDetailNormalTex(s)
         | MapInfoPatch::ResourcesLightEmissionTex(s)
         | MapInfoPatch::ResourcesSkyReflectModTex(s)
-        | MapInfoPatch::ResourcesParallaxHeightTex(s) => {
-            s.as_ref().map(String::capacity).unwrap_or(0)
-        }
+        | MapInfoPatch::ResourcesParallaxHeightTex(s)
+        | MapInfoPatch::ResourcesGrassBladeTex(s) => s.as_ref().map(String::capacity).unwrap_or(0),
         MapInfoPatch::TerrainTypes(v) => {
             // Per-row name + per-row TerrainMoveSpeeds inline. Names
             // are ≤ ~16 chars in practice; bound at 32 B / row plus

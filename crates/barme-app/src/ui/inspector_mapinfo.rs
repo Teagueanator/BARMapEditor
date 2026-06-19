@@ -919,6 +919,15 @@ fn resources_tab(ui: &mut egui::Ui, form: &FormCtx<'_>, out: &mut Vec<MapInfoPat
                  cost is high; profile before shipping.",
                 |v| out.push(MapInfoPatch::ResourcesParallaxHeightTex(v)),
             );
+            opt_text_input(
+                ui,
+                "grassBladeTex",
+                r.grass_blade_tex.as_deref(),
+                "Blade silhouette texture for grass rendering (engine `grassBladeTex`). \
+                 The `.a` channel masks the blade quad. Empty = the procedural blade \
+                 shape (Sprint 34). Typically a 64×64 PNG.",
+                |v| out.push(MapInfoPatch::ResourcesGrassBladeTex(v)),
+            );
         },
     );
     widgets::section(
@@ -1707,6 +1716,7 @@ mod tests {
                 | MapInfoPatch::ResourcesLightEmissionTex(_)
                 | MapInfoPatch::ResourcesSkyReflectModTex(_)
                 | MapInfoPatch::ResourcesParallaxHeightTex(_)
+                | MapInfoPatch::ResourcesGrassBladeTex(_)
                 | MapInfoPatch::TerrainTypes(_)
                 | MapInfoPatch::CustomField { .. }
                 | MapInfoPatch::MinimapOverride(_) => 1,
