@@ -6,6 +6,7 @@
 //! - `heightmap` — Tiled, copy-on-write 16-bit heightmap.
 
 pub mod brushes;
+pub mod grass;
 pub mod heightmap;
 pub mod layers;
 pub mod map_size;
@@ -20,6 +21,7 @@ pub mod undo;
 pub mod water_presets;
 
 pub use brushes::{Brush, BrushRegistry, BrushStamp, DirtyRect};
+pub use grass::{GrassDensity, bake_grass_density};
 pub use heightmap::{DimMismatch, Heightmap};
 pub use layers::{
     BlendMode, ClosureSlotResolver, GcReport, LayerColor, LayerMask, LayerSource, LayerStack,
