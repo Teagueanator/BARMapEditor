@@ -66,27 +66,26 @@ const SPECULAR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 /// normal PNG uploads.
 const SLOT_NORMAL_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 
-/// Sprint 35 / R7 / ADR-044 — emission (self-illumination) map format.
+/// Sprint 35 / R7 / ADR-051 — emission (self-illumination) map format.
 /// Engine `lightEmissionTex`; `.rgb` glow colour, `.a` self-illumination
 /// mask. The 1×1 fallback packs `(0, 0, 0, 0)` (black, zero mask) so the
 /// shader's `lit*(1-a) + rgb` composite is a no-op until a real glow map
 /// uploads.
 const EMISSION_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 
-/// Sprint 35 / R7 / ADR-044 — sky-reflection modulation map format.
+/// Sprint 35 / R7 / ADR-051 — sky-reflection modulation map format.
 /// Engine `skyReflectModTex`; `.rgb` per-channel reflectivity. The 1×1
 /// fallback packs `(0, 0, 0, 0)` (no reflection) so the shader's
 /// `mix(diffuse, sky, reflectMod)` is a no-op until a real map uploads.
 const SKY_REFLECT_MOD_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 
-/// Sprint 35 / R7 / ADR-044 — parallax-height map format. Engine
+/// Sprint 35 / R7 / ADR-051 — parallax-height map format. Engine
 /// `parallaxHeightTex`; RG = 16-bit height, B = scale, A = bias-0.5
 /// (SMFFragProg.glsl:124-140). Unlike emission / sky-reflect, the
 /// "no-op" pixel is NOT all-zero (a zero A decodes to bias = -0.5), so
 /// the shader gates parallax on the `has_parallax` flag bit instead of
 /// relying on the fallback pixel. The 1×1 fallback packs `(0,0,0,128)`
 /// (height 0, scale 0, bias ≈ 0) as a belt-and-braces near-zero.
-#[allow(dead_code)] // Wired in Commit 3 (parallax UV offset).
 const PARALLAX_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 
 /// `SMF_INTENSITY_MULT` from the engine — `210/255 ≈ 0.8235`. Engine
@@ -450,6 +449,13 @@ pub struct SplatUniforms {
     ///   `SMF_DETAIL_NORMAL_TEXTURE_SPLATTING` gate per
     ///   `SMFRenderState.cpp:114` (FINDINGS §7.2) — note it does NOT
     ///   require bit 1.
+    ///   bit 3 = parallax-height texture bound (Sprint 35 / R7 /
+    ///   ADR-051). `1` ⇒ the shader applies the engine's parallax UV
+    ///   offset (mirrors `SMF_PARALLAX_MAPPING`, `SMFRenderState.cpp:
+    ///   120`); `0` ⇒ no offset. Gated on the flag, not the fallback
+    ///   pixel, because a zero parallax texel decodes to a non-zero
+    ///   bias. Emission (bit n/a) + sky-reflect (bit n/a) need NO bit —
+    ///   their black fallbacks self-gate.
     pub flags: [u32; 4],
     /// World-space to-sun direction. `.w` unused.
     pub sun_dir: [f32; 4],
@@ -1220,7 +1226,7 @@ struct SplatResources {
     specular_tex: wgpu::Texture,
     specular_view: wgpu::TextureView,
     specular_samp: wgpu::Sampler,
-    /// Sprint 35 / R7 / ADR-044 — emission / self-illumination map.
+    /// Sprint 35 / R7 / ADR-051 — emission / self-illumination map.
     /// Engine `lightEmissionTex`; `.rgb` glow colour, `.a` mask.
     /// Defaults to a 1×1 black `(0,0,0,0)` so an unbound map adds no
     /// glow (`lit*(1-0) + 0 = lit`). `upload_emission` swaps in a real
@@ -1229,7 +1235,7 @@ struct SplatResources {
     emission_tex: wgpu::Texture,
     emission_view: wgpu::TextureView,
     emission_samp: wgpu::Sampler,
-    /// Sprint 35 / R7 / ADR-044 — sky-reflection modulation map. Engine
+    /// Sprint 35 / R7 / ADR-051 — sky-reflection modulation map. Engine
     /// `skyReflectModTex`; `.rgb` per-channel reflectivity. Defaults to
     /// a 1×1 black `(0,0,0,0)` so `mix(diffuse, sky, 0) = diffuse` until
     /// `upload_sky_reflect_mod` binds a real wet-surface mask.
@@ -1237,6 +1243,16 @@ struct SplatResources {
     sky_reflect_mod_tex: wgpu::Texture,
     sky_reflect_mod_view: wgpu::TextureView,
     sky_reflect_mod_samp: wgpu::Sampler,
+    /// Sprint 35 / R7 / ADR-051 — parallax-height map. Engine
+    /// `parallaxHeightTex`; RG = 16-bit height, B = scale, A = bias−0.5.
+    /// Defaults to a 1×1 `(0,0,0,128)`, but the shader gates parallax on
+    /// the `has_parallax` flag bit (flags.w & 8), not the fallback
+    /// pixel — a zero texel still decodes to a non-zero bias.
+    /// `upload_parallax` binds a real height map.
+    #[allow(dead_code)]
+    parallax_tex: wgpu::Texture,
+    parallax_view: wgpu::TextureView,
+    parallax_samp: wgpu::Sampler,
     uniform_buf: wgpu::Buffer,
 }
 
@@ -1745,7 +1761,7 @@ fn bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
                 count: None,
             },
             // 17: emission / self-illumination map (Sprint 35 / R7 /
-            // ADR-044). Engine `lightEmissionTex`. Fragment-only.
+            // ADR-051). Engine `lightEmissionTex`. Fragment-only.
             wgpu::BindGroupLayoutEntry {
                 binding: 17,
                 visibility: wgpu::ShaderStages::FRAGMENT,
@@ -1765,7 +1781,7 @@ fn bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
                 count: None,
             },
             // 19: sky-reflection modulation map (Sprint 35 / R7 /
-            // ADR-044). Engine `skyReflectModTex`. Fragment-only.
+            // ADR-051). Engine `skyReflectModTex`. Fragment-only.
             wgpu::BindGroupLayoutEntry {
                 binding: 19,
                 visibility: wgpu::ShaderStages::FRAGMENT,
@@ -1783,11 +1799,30 @@ fn bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
                 ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                 count: None,
             },
+            // 21: parallax-height map (Sprint 35 / R7 / ADR-051). Engine
+            // `parallaxHeightTex`. Fragment-only.
+            wgpu::BindGroupLayoutEntry {
+                binding: 21,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            // 22: parallax sampler. Repeat — height map tiles.
+            wgpu::BindGroupLayoutEntry {
+                binding: 22,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
         ],
     })
 }
 
-#[allow(clippy::too_many_arguments)] // Mirrors the 21-binding terrain bind group; trimming would just hide layout coupling.
+#[allow(clippy::too_many_arguments)] // Mirrors the 23-binding terrain bind group; trimming would just hide layout coupling.
 fn make_bind_group(
     device: &wgpu::Device,
     bgl: &wgpu::BindGroupLayout,
@@ -1875,7 +1910,7 @@ fn make_bind_group(
                 binding: 16,
                 resource: shadow_sampling_uniform_buf.as_entire_binding(),
             },
-            // Sprint 35 / R7 / ADR-044 — emission map + sampler.
+            // Sprint 35 / R7 / ADR-051 — emission map + sampler.
             wgpu::BindGroupEntry {
                 binding: 17,
                 resource: wgpu::BindingResource::TextureView(&splat.emission_view),
@@ -1884,7 +1919,7 @@ fn make_bind_group(
                 binding: 18,
                 resource: wgpu::BindingResource::Sampler(&splat.emission_samp),
             },
-            // Sprint 35 / R7 / ADR-044 — sky-reflect-mod map + sampler.
+            // Sprint 35 / R7 / ADR-051 — sky-reflect-mod map + sampler.
             wgpu::BindGroupEntry {
                 binding: 19,
                 resource: wgpu::BindingResource::TextureView(&splat.sky_reflect_mod_view),
@@ -1892,6 +1927,15 @@ fn make_bind_group(
             wgpu::BindGroupEntry {
                 binding: 20,
                 resource: wgpu::BindingResource::Sampler(&splat.sky_reflect_mod_samp),
+            },
+            // Sprint 35 / R7 / ADR-051 — parallax-height map + sampler.
+            wgpu::BindGroupEntry {
+                binding: 21,
+                resource: wgpu::BindingResource::TextureView(&splat.parallax_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 22,
+                resource: wgpu::BindingResource::Sampler(&splat.parallax_samp),
             },
         ],
     })
@@ -2027,7 +2071,7 @@ fn install_splat_resources(device: &wgpu::Device, queue: &wgpu::Queue) -> SplatR
         wgpu::AddressMode::ClampToEdge,
     );
 
-    // Sprint 35 / R7 / ADR-044 — emission map. 1×1 black `(0,0,0,0)`:
+    // Sprint 35 / R7 / ADR-051 — emission map. 1×1 black `(0,0,0,0)`:
     // zero glow colour + zero mask, so `lit*(1-0) + 0 = lit` until
     // `upload_emission` binds a real lava-crack map.
     let (emission_tex, emission_view, emission_samp) = install_default_2d_texture(
@@ -2039,7 +2083,7 @@ fn install_splat_resources(device: &wgpu::Device, queue: &wgpu::Queue) -> SplatR
         wgpu::AddressMode::ClampToEdge,
     );
 
-    // Sprint 35 / R7 / ADR-044 — sky-reflect modulation map. 1×1 black
+    // Sprint 35 / R7 / ADR-051 — sky-reflect modulation map. 1×1 black
     // `(0,0,0,0)`: zero reflectivity, so `mix(diffuse, sky, 0) =
     // diffuse` until `upload_sky_reflect_mod` binds a real wet mask.
     let (sky_reflect_mod_tex, sky_reflect_mod_view, sky_reflect_mod_samp) =
@@ -2051,6 +2095,19 @@ fn install_splat_resources(device: &wgpu::Device, queue: &wgpu::Queue) -> SplatR
             &[0x00, 0x00, 0x00, 0x00],
             wgpu::AddressMode::ClampToEdge,
         );
+
+    // Sprint 35 / R7 / ADR-051 — parallax-height map. 1×1 `(0,0,0,128)`
+    // (height 0, scale 0, bias ≈ 0). The shader's `has_parallax` flag
+    // bit keeps the offset at zero until `upload_parallax` + the flag
+    // are set; Repeat address-mode matches the engine's tiling height.
+    let (parallax_tex, parallax_view, parallax_samp) = install_default_2d_texture(
+        device,
+        queue,
+        "terrain.parallax",
+        PARALLAX_FORMAT,
+        &[0x00, 0x00, 0x00, 0x80],
+        wgpu::AddressMode::Repeat,
+    );
 
     let uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("terrain.splat.uniforms"),
@@ -2084,6 +2141,9 @@ fn install_splat_resources(device: &wgpu::Device, queue: &wgpu::Queue) -> SplatR
         sky_reflect_mod_tex,
         sky_reflect_mod_view,
         sky_reflect_mod_samp,
+        parallax_tex,
+        parallax_view,
+        parallax_samp,
         uniform_buf,
     }
 }
@@ -4585,7 +4645,7 @@ pub fn upload_specular(
 }
 
 /// Upload a full emission / self-illumination map into the terrain bind
-/// group (Sprint 35 / R7 / ADR-044). Engine `lightEmissionTex`:
+/// group (Sprint 35 / R7 / ADR-051). Engine `lightEmissionTex`:
 /// `Rgba8Unorm` where `.rgb` is the glow colour and `.a` is the
 /// self-illumination mask (SMFFragProg.glsl:395-398). Same shape
 /// contract as [`upload_specular`]. Emission has NO presence-bit gate —
@@ -4629,7 +4689,7 @@ pub fn upload_emission(
 }
 
 /// Upload a sky-reflection modulation map into the terrain bind group
-/// (Sprint 35 / R7 / ADR-044). Engine `skyReflectModTex`: `Rgba8Unorm`
+/// (Sprint 35 / R7 / ADR-051). Engine `skyReflectModTex`: `Rgba8Unorm`
 /// where `.rgb` is the per-channel reflectivity weight
 /// (SMFFragProg.glsl:346). Same shape contract as [`upload_emission`].
 /// No presence-bit gate — the 1×1 black fallback self-gates
@@ -4671,9 +4731,54 @@ pub fn upload_sky_reflect_mod(
     info!(width, height, "upload_sky_reflect_mod: bound");
 }
 
+/// Upload a parallax-height map into the terrain bind group (Sprint 35 /
+/// R7 / ADR-051). Engine `parallaxHeightTex`: `Rgba8Unorm` where RG =
+/// 16-bit height, B = scale, A = bias−0.5 (SMFFragProg.glsl:124-141).
+/// Same shape contract as [`upload_emission`]. UNLIKE emission /
+/// sky-reflect, the caller MUST also set `SplatUniforms.flags.w |= 8`
+/// (the `has_parallax` bit) — the fallback texel is not a clean zero
+/// (a zero A decodes to bias = −0.5), so the shader masks the offset on
+/// the flag, not the pixel.
+#[allow(dead_code)] // Wired by the parity-fixture loader.
+pub fn upload_parallax(
+    render_state: &egui_wgpu::RenderState,
+    width: u32,
+    height: u32,
+    rgba: &[u8],
+) {
+    let expected = (width as usize) * (height as usize) * 4;
+    if rgba.len() != expected {
+        warn!(
+            got = rgba.len(),
+            expected, "upload_parallax: byte length mismatch"
+        );
+        return;
+    }
+    let device = &render_state.device;
+    let queue = &render_state.queue;
+    let mut renderer = render_state.renderer.write();
+    let Some(res) = renderer.callback_resources.get_mut::<RenderResources>() else {
+        warn!("upload_parallax: no RenderResources (install() not run)");
+        return;
+    };
+    let (tex, view) = make_rgba8_terrain_texture(
+        device,
+        queue,
+        "terrain.parallax",
+        PARALLAX_FORMAT,
+        width,
+        height,
+        rgba,
+    );
+    res.splat.parallax_tex = tex;
+    res.splat.parallax_view = view;
+    res.rebind(device);
+    info!(width, height, "upload_parallax: bound");
+}
+
 /// Allocate an `Rgba8Unorm`-family 2D texture sized to `(width,
 /// height)`, write `rgba` into mip 0, and return the kept-alive
-/// `Texture` + its default view. Sprint 35 / R7 / ADR-044 factored this
+/// `Texture` + its default view. Sprint 35 / R7 / ADR-051 factored this
 /// out of the per-map upload helpers (`upload_emission` /
 /// `upload_sky_reflect_mod` / `upload_parallax`) since they share an
 /// identical create-write-view body. The pre-existing

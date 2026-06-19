@@ -194,7 +194,7 @@ struct AtmosphereU {
 @group(0) @binding(14) var shadow_map: texture_depth_2d;
 @group(0) @binding(15) var shadow_sampler: sampler_comparison;
 @group(0) @binding(16) var<uniform> shadow: ShadowU;
-// Sprint 35 / R7 / ADR-044 — emission (self-illumination) texture.
+// Sprint 35 / R7 / ADR-051 — emission (self-illumination) texture.
 // Engine `lightEmissionTex` (SMFFragProg.glsl:106, sampled :395). The
 // `.rgb` is the glow colour; `.a` is the self-illumination mask. The
 // 1×1 black fallback (0,0,0,0) self-gates: `lit*(1-0) + 0 = lit`, so
@@ -202,7 +202,7 @@ struct AtmosphereU {
 // self-illumination is NOT masked by shadow (pitfall #1).
 @group(0) @binding(17) var emission_tex: texture_2d<f32>;
 @group(0) @binding(18) var emission_samp: sampler;
-// Sprint 35 / R7 / ADR-044 — sky-reflection modulation texture.
+// Sprint 35 / R7 / ADR-051 — sky-reflection modulation texture.
 // Engine `skyReflectModTex` (SMFFragProg.glsl:98, sampled :346). The
 // `.rgb` is a per-channel reflectivity weight: 0 = matte (no sky in
 // the surface), 1 = mirror. The 1×1 black fallback (0,0,0,0) self-
@@ -212,13 +212,30 @@ struct AtmosphereU {
 // (pitfall #7). No sampler/texture of its own beyond the mod map.
 @group(0) @binding(19) var sky_reflect_mod_tex: texture_2d<f32>;
 @group(0) @binding(20) var sky_reflect_mod_samp: sampler;
+// Sprint 35 / R7 / ADR-051 — parallax-height texture. Engine
+// `parallaxHeightTex` (SMFFragProg.glsl:110, sampled :125). The engine
+// DOES consume this (`SMF_PARALLAX_MAPPING` set whenever the texture is
+// bound — SMFRenderState.cpp:120), so this is a real port, not a
+// deferred lint-only field. Channel layout: RG = 16-bit height, B =
+// scale, A = bias−0.5. Gated by the `has_parallax` flag bit (flags.w &
+// 8) rather than a fallback pixel, because a zero texel decodes to a
+// non-zero bias (A−0.5 = −0.5), which would shift the UV even with an
+// "empty" map.
+@group(0) @binding(21) var parallax_tex: texture_2d<f32>;
+@group(0) @binding(22) var parallax_samp: sampler;
+
+// Editor-side parallax-depth scalar. Engine encodes scale/bias IN the
+// texture (B/A channels), so a global multiplier of 1.0 is exact
+// parity. Shader constant for the same reason as EMISSION_STRENGTH
+// (ADR-051): no engine equivalent, avoids threading a uniform.
+const PARALLAX_SCALE: f32 = 1.0;
 
 // Editor-side tuning scalar for emission. The engine has NO
 // emission-strength uniform — emission is a straight `rgb*(1-a)+rgb`
 // composite (SMFFragProg.glsl:398). Keeping this a shader constant at
 // 1.0 is therefore EXACT engine parity by default; the knob exists so
 // a future sprint can amplify lava glow per-map (promoting it to a
-// uniform + F9 field) without touching the composite math. ADR-044
+// uniform + F9 field) without touching the composite math. ADR-051
 // records why this is a const, not a uniform.
 const EMISSION_STRENGTH: f32 = 1.0;
 
@@ -380,6 +397,40 @@ fn biome_ramp(t: f32) -> vec3<f32> {
     return vec3<f32>(0.863, 0.878, 0.902);
 }
 
+// Sprint 35 / R7 / ADR-051 — parallax UV offset. Direct port of the
+// engine's `GetParallaxUVOffset` (SMFFragProg.glsl:124-141).
+//
+// `uv`  — the (unparallaxed) sample coordinate to look the height up at.
+// `dir` — the camera/view ray expressed in TANGENT space
+//         (`transpose(stn) * cameraDir`), so `.z` is the component
+//         along the surface normal and `.xy` the in-plane skew.
+//
+// Channel decode (engine comment verbatim):
+//   RG: height in [0,1] (256² strata) — `dot(rg, (255*256, 256)) / 65536`
+//    B: scale  in [0,1]
+//    A: bias   in [-0.5, 0.5] — stored as `A - 0.5`
+// The offset is `(dir.xy / dir.z) * heightOffset`, i.e. the classic
+// parallax-mapping skew: steeper view angles (small |dir.z|) push the
+// apparent surface further.
+fn get_parallax_uv_offset(uv: vec2<f32>, dir: vec3<f32>) -> vec2<f32> {
+    let texel = textureSample(parallax_tex, parallax_samp, uv);
+    let RMUL = 255.0 * 256.0;
+    let GMUL = 256.0;
+    let HDIV = 65536.0;
+    let height_value = dot(texel.rg, vec2<f32>(RMUL, GMUL)) / HDIV;
+    let height_scale = texel.b;
+    let height_bias = texel.a - 0.5;
+    let height_offset = height_value * height_scale + height_bias;
+    // Guard the divide: at grazing angles `dir.z → 0` the engine's raw
+    // `dir.xy / dir.z` explodes / NaNs. Clamp |dir.z| to a small floor
+    // while preserving sign (the offset direction). Not in the engine,
+    // which relies on small in-texture scales; harmless when |dir.z| is
+    // already large (the common case) and prevents a viewport blow-up
+    // at silhouettes.
+    let dz = sign(dir.z) * max(abs(dir.z), 1e-3);
+    return (dir.xy / dz) * height_offset;
+}
+
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let max_h = u.params.x;
@@ -406,6 +457,11 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let has_base_normal = f32(tex_bits & 1u);
     let has_specular   = f32((tex_bits >> 1u) & 1u);
     let has_dnts_norm  = f32((tex_bits >> 2u) & 1u);
+    // Sprint 35 / R7 / ADR-051 — bit 3 gates parallax. Unlike emission
+    // / sky-reflect (whose black fallbacks self-gate), a zero parallax
+    // texel decodes to a non-zero bias, so the offset must be masked to
+    // zero by this flag when no real map is bound.
+    let has_parallax   = f32((tex_bits >> 3u) & 1u);
 
     // ─── 2. Base normal (FINDINGS §7.5) ──────────────────────────
     // `vec3 normal = GetFragmentNormal(normTexCoords);` —
@@ -436,15 +492,32 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let s_tangent = cross(normal, t_tangent);
     let stn = mat3x3<f32>(s_tangent, t_tangent, normal);
 
-    // ─── 3.5 Parallax surface UV (Sprint 35 / R7 / ADR-044) ──────
-    // `surf_uv` is the texture coordinate the post-TBN samples (base
-    // normal re-fetch, composite diffuse, specular, emission,
-    // sky-reflect-mod) read from. It starts equal to the raw
-    // map-normalized UV; Commit 3 replaces this line with the engine's
-    // parallax-height UV offset (SMFFragProg.glsl:282-296) so a bound
-    // `parallaxHeightTex` shifts the samples toward the apparent
-    // surface. Until then it is a no-op alias.
-    var surf_uv = in.uv_norm;
+    // ─── 3.5 Parallax surface UV (Sprint 35 / R7 / ADR-051) ──────
+    // Engine `SMFFragProg.glsl:282-296`: with the TBN built from the
+    // un-offset normal, transform the camera ray into tangent space,
+    // look up the parallax height, and skew the texture coordinate
+    // toward the apparent surface. `cameraDir` in the engine is the
+    // view RAY (camera → fragment) = `-view_dir` here (our `view_dir`
+    // points toward the eye). The result feeds every post-TBN sample:
+    // base-normal re-fetch (below), composite diffuse (§6), specular
+    // (§7), emission + sky-reflect-mod. `has_parallax` masks the offset
+    // to zero when no map is bound (the fallback texel is not a clean
+    // zero — see §1). `PARALLAX_SCALE` is a 1.0 editor knob.
+    let cam_tangent = transpose(stn) * (-view_dir);
+    let parallax_offset =
+        get_parallax_uv_offset(in.uv_norm, cam_tangent) * (PARALLAX_SCALE * has_parallax);
+    let surf_uv = in.uv_norm + parallax_offset;
+
+    // Engine `SMFFragProg.glsl:295` re-fetches the base normal at the
+    // parallaxed coordinate (the STN above stays built from the
+    // un-offset normal, matching the engine). Re-decode with the same
+    // R+A math as §2; when `has_parallax = 0` the UV is unchanged so
+    // this reproduces §2's `normal` exactly.
+    let pn = textureSample(normals_tex, normals_samp, surf_uv);
+    let pn_x = pn.r * 2.0 - 1.0;
+    let pn_z = pn.a * 2.0 - 1.0;
+    let pn_y = sqrt(max(0.0, 1.0 - pn_x * pn_x - pn_z * pn_z));
+    normal = normalize(mix(vertex_normal, vec3<f32>(pn_x, pn_y, pn_z), has_base_normal));
 
     // ─── 4. DNTS composite (FINDINGS §7.3 / SMFFragProg.glsl:174-198)
     // `splatCofac = texture2D(splatDistrTex, uv) * splatTexMults`,
@@ -527,11 +600,13 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let range = max(max_h - min_h, 1.0);
     let height_t = clamp((in.world_pos.y - min_h) / range, 0.0, 1.0);
     let fallback_rgb = biome_ramp(height_t);
-    let composite_rgb = textureSample(composite_rt, composite_samp, in.uv_norm).rgb;
+    // Parallaxed UV (§3.5) — equals `in.uv_norm` when no parallax map
+    // is bound. Engine offsets diffTexCoords too (SMFFragProg.glsl:291).
+    let composite_rgb = textureSample(composite_rt, composite_samp, surf_uv).rgb;
     let use_composite = step(0.5, u.params2.y);
     var diffuse_rgb = mix(fallback_rgb, composite_rgb, use_composite);
 
-    // ─── 6.5 Sky-reflection modulation (Sprint 35 / R7 / ADR-044) ─
+    // ─── 6.5 Sky-reflection modulation (Sprint 35 / R7 / ADR-051) ─
     // Engine `SMFFragProg.glsl:341-350`:
     //   reflectDir = reflect(cameraDir, normal);
     //   reflectCol = textureCube(skyReflectTex, reflectDir).rgb;   // slot 9
@@ -577,7 +652,9 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // engine falls back to `vec4(groundSpecularColor, 1.0)` and the
     // global `groundSpecularExponent` uniform — we stash both in
     // `sp.ground_specular` (`.xyz` = colour, `.w` = exponent).
-    let spec_sample = textureSample(specular_tex, specular_samp, in.uv_norm);
+    // Parallaxed UV (§3.5) — engine offsets specTexCoords
+    // (SMFFragProg.glsl:293); equals `in.uv_norm` when no parallax map.
+    let spec_sample = textureSample(specular_tex, specular_samp, surf_uv);
     let spec_col = mix(sp.ground_specular.xyz, spec_sample.rgb, has_specular);
     let spec_exp = mix(sp.ground_specular.w, spec_sample.a * 16.0, has_specular);
     let spec_pow = pow(cos_specular, max(spec_exp, 1.0));
@@ -635,7 +712,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         }
     }
 
-    // ─── Emission / self-illumination (Sprint 35 / R7 / ADR-044) ──
+    // ─── Emission / self-illumination (Sprint 35 / R7 / ADR-051) ──
     // Engine `SMFFragProg.glsl:392-401`:
     //   emissionCol = texture2D(lightEmissionTex, specTexCoords);
     //   fragColor.rgb = fragColor.rgb * (1 - emissionCol.a) + emissionCol.rgb;
