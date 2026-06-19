@@ -539,6 +539,13 @@ pub struct TerrainMoveSpeeds {
 
 /// `grass.*` sub-table — bladed-grass shader params. BAR mostly uses
 /// the `map_grass_gl4.lua` widget so this is rarely populated.
+///
+/// Field set mirrors the engine's `CMapInfo::grass` table
+/// (`rts/Map/MapInfo.{h,cpp}` `ReadGrass`): `bladeWaveScale`,
+/// `bladeWidth`, `bladeHeight`, `bladeAngle`, `maxStrawsPerTurf`,
+/// `bladeColor`. Sprint 34 / R6 added `blade_wave_scale` +
+/// `max_straws_per_turf` (the renderer needs wind amplitude and a
+/// density cap); the editor's grass renderer reads all six.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct GrassBlock {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -549,6 +556,54 @@ pub struct GrassBlock {
     pub blade_angle: Option<f32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blade_color: Option<Rgb>,
+    /// How strongly wind sways a blade. Engine default `1.0`; `0.0`
+    /// disables vertex animation (`MapInfo.cpp:190`). Drives the grass
+    /// shader's `wind_amplitude`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blade_wave_scale: Option<f32>,
+    /// Upper bound on blades sampled per grass turf. Engine default
+    /// `150` (`MapInfo.cpp:194`). The editor uses it both as the
+    /// density-bake normaliser and the per-turf instance cap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_straws_per_turf: Option<u32>,
+}
+
+impl GrassBlock {
+    /// Engine `ReadGrass` default (`MapInfo.cpp:190-195`): the values
+    /// the engine substitutes for any key omitted from the Lua table.
+    /// The renderer falls back to these when `mapinfo.grass` is absent
+    /// so a project with no explicit grass block still renders a
+    /// stock-BAR field.
+    pub const DEFAULT_BLADE_WIDTH: f32 = 0.7;
+    pub const DEFAULT_BLADE_HEIGHT: f32 = 4.5;
+    pub const DEFAULT_BLADE_ANGLE: f32 = 1.0;
+    pub const DEFAULT_BLADE_WAVE_SCALE: f32 = 1.0;
+    pub const DEFAULT_MAX_STRAWS_PER_TURF: u32 = 150;
+    /// `float3(0.10, 0.40, 0.10)` — the engine's grass green.
+    pub const DEFAULT_BLADE_COLOR: Rgb = [0.10, 0.40, 0.10];
+
+    /// `blade_width` or the engine default.
+    pub fn blade_width_or_default(&self) -> f32 {
+        self.blade_width.unwrap_or(Self::DEFAULT_BLADE_WIDTH)
+    }
+    /// `blade_height` or the engine default.
+    pub fn blade_height_or_default(&self) -> f32 {
+        self.blade_height.unwrap_or(Self::DEFAULT_BLADE_HEIGHT)
+    }
+    /// `blade_wave_scale` or the engine default.
+    pub fn blade_wave_scale_or_default(&self) -> f32 {
+        self.blade_wave_scale
+            .unwrap_or(Self::DEFAULT_BLADE_WAVE_SCALE)
+    }
+    /// `max_straws_per_turf` or the engine default.
+    pub fn max_straws_per_turf_or_default(&self) -> u32 {
+        self.max_straws_per_turf
+            .unwrap_or(Self::DEFAULT_MAX_STRAWS_PER_TURF)
+    }
+    /// `blade_color` or the engine default.
+    pub fn blade_color_or_default(&self) -> Rgb {
+        self.blade_color.unwrap_or(Self::DEFAULT_BLADE_COLOR)
+    }
 }
 
 /// One entry in `teams[]`. **Carries ONLY `start_pos`.** No

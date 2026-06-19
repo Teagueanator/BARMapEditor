@@ -417,6 +417,12 @@ fn grass_block(b: &barme_core::GrassBlock) -> LuaValue {
     push_f32(&mut t, "bladeWidth", b.blade_width);
     push_f32(&mut t, "bladeHeight", b.blade_height);
     push_f32(&mut t, "bladeAngle", b.blade_angle);
+    push_f32(&mut t, "bladeWaveScale", b.blade_wave_scale);
+    push_int(
+        &mut t,
+        "maxStrawsPerTurf",
+        b.max_straws_per_turf.map(|v| v as i64),
+    );
     push_rgb(&mut t, "bladeColor", b.blade_color);
     sort_table_by_key(&mut t);
     LuaValue::Table(t)
@@ -472,6 +478,12 @@ fn push_f32(t: &mut Vec<(LuaKey, LuaValue)>, key: &str, v: Option<f32>) {
     }
 }
 
+fn push_int(t: &mut Vec<(LuaKey, LuaValue)>, key: &str, v: Option<i64>) {
+    if let Some(i) = v {
+        t.push((LuaKey::str(key), LuaValue::Int(i)));
+    }
+}
+
 fn push_str_opt(t: &mut Vec<(LuaKey, LuaValue)>, key: &str, v: Option<&str>) {
     if let Some(s) = v {
         t.push((LuaKey::str(key), LuaValue::str(s)));
@@ -511,6 +523,28 @@ mod tests {
         g.start_positions = positions;
         p.ally_groups.push(g);
         p
+    }
+
+    #[test]
+    fn grass_block_emits_wave_scale_and_max_straws() {
+        // Sprint 34 / R6 — the two fields added so the editor's grass
+        // renderer can drive wind amplitude + a density cap. They must
+        // reach mapinfo.lua under the engine's camelCase keys.
+        let p = Project::new("meadow", 4);
+        let mut info: MapInfo = (&p).into();
+        info.grass = Some(barme_core::GrassBlock {
+            blade_width: Some(0.7),
+            blade_height: Some(4.5),
+            blade_angle: Some(1.0),
+            blade_color: Some([0.1, 0.4, 0.1]),
+            blade_wave_scale: Some(1.5),
+            max_straws_per_turf: Some(64),
+        });
+        let s = render_mapinfo(&info);
+        assert!(s.contains("grass = {"), "grass block missing; got:\n{s}");
+        assert!(s.contains("bladeWaveScale = 1.5"), "got:\n{s}");
+        // maxStrawsPerTurf is an integer key, not a float.
+        assert!(s.contains("maxStrawsPerTurf = 64,"), "got:\n{s}");
     }
 
     #[test]
