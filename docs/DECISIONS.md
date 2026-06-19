@@ -5021,6 +5021,83 @@ vs re-compressing. (2) `SOURCE_DATE_EPOCH` — 7z doesn't honour it.
 **ADR-049**. Devlogs: `devlog/sprint-33-ci-gates/`,
 `devlog/sprint-33-windows-appimage/`.
 
+## ADR-050 — Grass rendering: instanced billboards, CPU density bake, deterministic scatter (Sprint 34 / R6)
+
+**Status:** Accepted
+
+**Context.** Grass was the last common BAR aesthetic the editor's
+preview didn't match (terrain, water, atmosphere, features, shadows all
+shipped Sprints 25–30). The engine draws grass as wind-swayed blades on
+flat terrain-type-0 ground (`rts/Rendering/Env/GrassDrawer.cpp` +
+`GrassVertProg.glsl`), gated by `mapinfo.grass`.
+
+**Two schema fields were missing (flagged per house rule #1).** The
+engine's `ReadGrass` (`MapInfo.cpp:190-195`) carries six grass keys;
+`GrassBlock` modelled only four. `maxStrawsPerTurf` (default 150) and
+`bladeWaveScale` (default 1.0) — both load-bearing for a renderer
+(density cap + wind amplitude) — were absent. Added with engine-default
+constants + `*_or_default()` accessors and emitter coverage
+(`maxStrawsPerTurf` emits as an int). This completes the schema toward
+the engine; it does not contradict the SRS, which lists `grass`
+generically.
+
+**Decision.**
+- **CPU density bake** (`barme-core::grass`). One normalised `0..=1`
+  coverage byte per heightmap texel from a logistic slope falloff
+  (`1/(1+e^{k(slope−0.5)})`, k=8) — ~full on flats, fading on cliffs.
+  The terrain-type-0 mask is uniformly `1.0` until F15 (Sprint 36)
+  ships the type-map editor; the bake takes no type-map argument yet
+  (documented). `maxStrawsPerTurf == 0` zeroes the field. Persists to
+  `<project>/.barme-cache/grass-density.png`; re-baked on a dims change
+  or structural heightmap replace (load / procgen / new). The texture
+  stays a pure coverage map so a `maxStrawsPerTurf` edit needs no
+  re-bake — the straw magnitude is applied per-blade downstream.
+- **Deterministic instance scatter** (`barme-app::grass`). Blades are
+  scattered per **16-elmo turf** (the engine's grass-map resolution),
+  NOT per heightmap texel — `count = coverage × maxStrawsPerTurf ×
+  density_scale`. A turf is the right granularity; per-texel would be
+  ~150× over budget. Per-blade jitter (offset / orientation / height /
+  colour) is a pure `fmix32` hash of the turf cell + blade index, so a
+  blade is byte-identical frame to frame as the camera moves (pitfall
+  #4 — no shimmer). A two-pass global scale keeps the field under the
+  100k-blade Vega 8 budget without spatial bias.
+- **LOD.** Blades only generate within 200 elmos of the camera; the
+  shader fades alpha across the outer quarter so they dissolve instead
+  of popping (pitfall #9). The `View > Grass density` slider throttles
+  COUNT, not radius.
+- **Shader** (`grass.wgsl`). Camera-billboarded TriangleStrip quad,
+  base on the terrain (bilinear height sample matching the terrain
+  shader's `min_h + raw/65535·(max_h−min_h)`). Wind sway reads the
+  SHARED `atmosphere.wind` block + the SHARED `water_time_seconds`, so
+  grass and water animate together (pitfall #3). 3×3 PCF shadow
+  RECEIVE via the shared Sprint-30 shadow map (same `sample_shadow`
+  math as terrain). Leaf-edge taper via wide smoothstep (pitfall #5 —
+  Vega banding). Pipeline: depth-test on / write off, `ALPHA_BLENDING`,
+  cull None; drawn first in the overlay pass
+  (terrain → grass → water → lines → markers).
+
+**Grass does NOT cast shadows.** The shadow-gen pass renders only the
+terrain mesh; adding 100k blades to it would blow the depth-pass budget
+for a sub-pixel contribution. Documented; revisit if a future sprint
+finds it matters.
+
+**Alternatives.** (1) GPU-driven culling / vertex generation — deferred
+for CPU simplicity (out of scope). (2) Per-texel scatter — over budget.
+(3) Camera-relative (non-hashed) jitter — rejected; shimmers. (4)
+Loading the engine's `grassBladeTex` silhouette — Sprint 35's resource
+pass; Sprint 34 ships a procedural quad.
+
+**Validation.** Density bake + instance scatter + WGSL (naga) + CPU/GPU
+layout contract are unit-tested (headless CI). The live visual match
+and the 100k-blade <4 ms Vega 8 frame budget need a GPU session and are
+NOT verified in headless CI — tracked in the devlog as hardware-pending.
+
+**Consequence.** Renderer parity reaches 7/8 (grass done; emission +
+sky-reflect + parallax remain → Sprint 35). The prompt called this
+"ADR-043", but ADR-043 is taken (Sprint 25 terrain shader) and ADR-049
+is the latest; grass ships as **ADR-050**. Devlog:
+`devlog/sprint-34-grass-rendering/`.
+
 ## ADR template
 
 ```
