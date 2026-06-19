@@ -22,3 +22,6 @@ sha2.workspace = true
 # Atomic cache writes (write-to-temp + rename) so two parallel
 # bakes on the same key never leave a half-written file behind.
 tempfile.workspace = true
+
+[lints]
+workspace = true

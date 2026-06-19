@@ -75,6 +75,16 @@ barme-core = { path = "crates/barme-core" }
 barme-pipeline = { path = "crates/barme-pipeline" }
 barme-render-s3o = { path = "crates/barme-render-s3o" }
 
+# Sprint 33 (T6 / ADR-049): register the `ci_without_gpu` cfg. CI sets
+# `RUSTFLAGS=--cfg ci_without_gpu` on runners that lack a real GPU device
+# so GPU-touching tests can opt out via `#[cfg_attr(ci_without_gpu,
+# ignore)]` (pitfall #9 — one dedicated flag, not a proliferation of
+# `cfg(target_os=...)` gates). Registering it here keeps the
+# `unexpected_cfgs` lint quiet when a future test references it. Crates
+# inherit via `[lints] workspace = true`.
+[workspace.lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(ci_without_gpu)'] }
+
 [profile.dev]
 opt-level = 1            # debug builds are too slow with image/wgpu at opt-level 0
 

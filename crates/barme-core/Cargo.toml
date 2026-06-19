@@ -54,3 +54,6 @@ harness = false
 [[bench]]
 name = "procgen_apply"
 harness = false
+
+[lints]
+workspace = true
