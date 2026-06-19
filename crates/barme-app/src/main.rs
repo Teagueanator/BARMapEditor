@@ -1,6 +1,11 @@
 mod build_runner;
 mod config;
 mod feature_decals;
+// Consumed by the render-side grass pipeline in the next chunk; the
+// instance generator + GrassInstance land first so they can be unit
+// tested in isolation. Remove the allow once `render` wires the draw.
+#[allow(dead_code)]
+mod grass;
 mod launcher;
 mod parity_fixtures;
 mod render;
