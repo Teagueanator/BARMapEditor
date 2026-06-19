@@ -1186,6 +1186,17 @@ struct GrassResources {
     /// [`GRASS_INSTANCE_CAPACITY`]. Re-written each frame with the
     /// current camera's blade list.
     instance_buf: wgpu::Buffer,
+    /// Sprint 35 / R7 / ADR-051 — blade silhouette texture. Engine
+    /// `grassBladeTex`; sampled for the `.a` mask so a real blade PNG
+    /// shapes the quad. Defaults to a 1×1 white `(255,255,255,255)`,
+    /// which yields `alpha *= 1.0` — i.e. the Sprint-34 procedural taper
+    /// is the fallback. `upload_grass_blade` swaps in a real texture.
+    #[allow(dead_code)]
+    blade_tex: wgpu::Texture,
+    #[allow(dead_code)]
+    blade_view: wgpu::TextureView,
+    #[allow(dead_code)]
+    blade_samp: wgpu::Sampler,
 }
 
 struct SplatResources {
@@ -1531,6 +1542,48 @@ impl RenderResources {
                 wgpu::BindGroupEntry {
                     binding: 5,
                     resource: self.atmosphere_uniform_buf.as_entire_binding(),
+                },
+            ],
+        });
+    }
+
+    /// Sprint 35 / R7 / ADR-051 — rebuild the grass bind group after the
+    /// blade silhouette texture is swapped by [`upload_grass_blade`].
+    /// Every other binding (grass uniform, shared atmosphere, shared
+    /// shadow map + sampler + uniform) is stable; only bindings 5/6
+    /// (blade texture + sampler) change.
+    pub fn rebind_grass(&mut self, device: &wgpu::Device) {
+        self.grass.bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("grass.bg.rebound"),
+            layout: &self.grass.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.grass.uniform_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: self.atmosphere_uniform_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&self.shadow.depth_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::Sampler(&self.shadow.sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: self.shadow.sampling_uniform_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::TextureView(&self.grass.blade_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: wgpu::BindingResource::Sampler(&self.grass.blade_samp),
                 },
             ],
         });
@@ -2775,9 +2828,23 @@ fn grass_instance_layout() -> wgpu::VertexBufferLayout<'static> {
 /// [`install`] before this runs, so the bind group builds once.
 fn install_grass_resources(
     device: &wgpu::Device,
+    queue: &wgpu::Queue,
     atmosphere_uniform_buf: &wgpu::Buffer,
     shadow: &ShadowResources,
 ) -> GrassResources {
+    // Sprint 35 / R7 / ADR-051 — blade silhouette texture. 1×1 white
+    // `(255,255,255,255)` so `alpha *= blade.a = 1.0` keeps the
+    // Sprint-34 procedural taper until `upload_grass_blade` binds a real
+    // PNG. Repeat address-mode (the blade UV is the unit quad, but a
+    // real silhouette atlas may tile).
+    let (blade_tex, blade_view, blade_samp) = install_default_2d_texture(
+        device,
+        queue,
+        "grass.blade",
+        wgpu::TextureFormat::Rgba8UnormSrgb,
+        &[0xFF, 0xFF, 0xFF, 0xFF],
+        wgpu::AddressMode::ClampToEdge,
+    );
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("grass.wgsl"),
         source: wgpu::ShaderSource::Wgsl(include_str!("grass.wgsl").into()),
@@ -2854,6 +2921,26 @@ fn install_grass_resources(
                 },
                 count: None,
             },
+            // 5: blade silhouette texture (Sprint 35 / R7 / ADR-051).
+            // Engine `grassBladeTex`. Fragment-only — shapes the quad
+            // alpha.
+            wgpu::BindGroupLayoutEntry {
+                binding: 5,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            // 6: blade texture sampler.
+            wgpu::BindGroupLayoutEntry {
+                binding: 6,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
         ],
     });
 
@@ -2880,6 +2967,15 @@ fn install_grass_resources(
             wgpu::BindGroupEntry {
                 binding: 4,
                 resource: shadow.sampling_uniform_buf.as_entire_binding(),
+            },
+            // Sprint 35 / R7 / ADR-051 — blade silhouette texture + sampler.
+            wgpu::BindGroupEntry {
+                binding: 5,
+                resource: wgpu::BindingResource::TextureView(&blade_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 6,
+                resource: wgpu::BindingResource::Sampler(&blade_samp),
             },
         ],
     });
@@ -2934,6 +3030,9 @@ fn install_grass_resources(
         bind_group,
         uniform_buf,
         instance_buf,
+        blade_tex,
+        blade_view,
+        blade_samp,
     }
 }
 
@@ -3663,7 +3762,7 @@ pub fn install(render_state: &egui_wgpu::RenderState) {
     // Sprint 34 / R6 / ADR-050 — grass pipeline. Built after the shadow
     // resources (binds the shadow map + comparison sampler) and after
     // the atmosphere buffer (binds wind for sway sync with water).
-    let grass = install_grass_resources(device, &atmosphere_uniform_buf, &shadow);
+    let grass = install_grass_resources(device, queue, &atmosphere_uniform_buf, &shadow);
 
     // ─── Sprint 26 / R3 / ADR-044 — reflection pass resources ──────
     let reflection = install_reflection_target(device);
@@ -4774,6 +4873,52 @@ pub fn upload_parallax(
     res.splat.parallax_view = view;
     res.rebind(device);
     info!(width, height, "upload_parallax: bound");
+}
+
+/// Upload a grass blade silhouette texture (Sprint 35 / R7 / ADR-051).
+/// Engine `grassBladeTex`; sampled for its `.a` mask to shape the blade
+/// quad (`grass.wgsl::fs_main`). `Rgba8UnormSrgb`, `width × height × 4`
+/// bytes. Rebuilds the grass bind group to point at the new texture
+/// (the grass bind group is otherwise stable — same shared shadow +
+/// atmosphere handles). Missing / renamed textures must NOT reach here
+/// as a pink map — the caller resolves the path per PITFALLS §11 and
+/// simply skips the upload (leaving the white procedural fallback) when
+/// the file is absent.
+#[allow(dead_code)] // Wired by the parity-fixture loader (grass-field).
+pub fn upload_grass_blade(
+    render_state: &egui_wgpu::RenderState,
+    width: u32,
+    height: u32,
+    rgba: &[u8],
+) {
+    let expected = (width as usize) * (height as usize) * 4;
+    if rgba.len() != expected {
+        warn!(
+            got = rgba.len(),
+            expected, "upload_grass_blade: byte length mismatch"
+        );
+        return;
+    }
+    let device = &render_state.device;
+    let queue = &render_state.queue;
+    let mut renderer = render_state.renderer.write();
+    let Some(res) = renderer.callback_resources.get_mut::<RenderResources>() else {
+        warn!("upload_grass_blade: no RenderResources (install() not run)");
+        return;
+    };
+    let (tex, view) = make_rgba8_terrain_texture(
+        device,
+        queue,
+        "grass.blade",
+        wgpu::TextureFormat::Rgba8UnormSrgb,
+        width,
+        height,
+        rgba,
+    );
+    res.grass.blade_tex = tex;
+    res.grass.blade_view = view;
+    res.rebind_grass(device);
+    info!(width, height, "upload_grass_blade: bound");
 }
 
 /// Allocate an `Rgba8Unorm`-family 2D texture sized to `(width,

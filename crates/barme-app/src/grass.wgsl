@@ -66,6 +66,14 @@ struct ShadowU {
 @group(0) @binding(2) var shadow_map: texture_depth_2d;
 @group(0) @binding(3) var shadow_sampler: sampler_comparison;
 @group(0) @binding(4) var<uniform> shadow: ShadowU;
+// Sprint 35 / R7 / ADR-051 — blade silhouette texture. Engine
+// `grassBladeTex`. Sampled for its `.a` mask to shape the quad; the
+// 1×1 white fallback gives `a = 1.0`, leaving Sprint 34's procedural
+// edge taper as the silhouette. Path resolution shares the DNTS-slot
+// texture-load path (pitfall #8); per PITFALLS §11 a renamed/missing
+// blade texture must fall back to white, never a pink map.
+@group(0) @binding(5) var blade_tex: texture_2d<f32>;
+@group(0) @binding(6) var blade_samp: sampler;
 
 struct VsOut {
     @builtin(position) clip_pos: vec4<f32>,
@@ -165,7 +173,14 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let dist = distance(g.camera_pos.xyz, in.world_pos);
     let lod_fade = 1.0 - smoothstep(g.lod.y, g.lod.x, dist);
 
-    let alpha = edge * lod_fade;
+    // Sprint 35 / R7 / ADR-051 — blade silhouette texture. Engine
+    // `grassBladeTex`; we multiply the quad alpha by the texture's `.a`
+    // so a real blade PNG carves the leaf shape. The 1×1 white fallback
+    // yields `blade_alpha = 1.0`, so the procedural `edge` taper above
+    // remains the silhouette when no texture is bound.
+    let blade_alpha = textureSample(blade_tex, blade_samp, in.blade_uv).a;
+
+    let alpha = edge * lod_fade * blade_alpha;
     if (alpha < 0.01) {
         discard;
     }
