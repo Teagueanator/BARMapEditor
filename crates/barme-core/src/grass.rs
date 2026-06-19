@@ -232,7 +232,7 @@ mod tests {
         for y in 0..h {
             for x in 0..w {
                 // Steep diagonal: each texel step adds a big delta.
-                let v = ((x + y) as u32 * (u16::MAX as u32) / (w + h)) as u16;
+                let v = ((x + y) * (u16::MAX as u32) / (w + h)) as u16;
                 data[(y as usize) * (w as usize) + (x as usize)] = v;
             }
         }
