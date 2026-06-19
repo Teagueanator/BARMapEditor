@@ -309,7 +309,35 @@ visible on the playable terrain.
 
 ### Sprint 22 — Emission + skybox + parallax
 
-**Goal:** close the remaining shader features.
+**Status:** **SHIPPED** as Sprint 35 / R7 / ADR-051 (the live
+sprint-prompt sequence renumbered; the prompt's "ADR-044" was taken by
+Sprint 26 water polish, ADR-050 by Sprint 34 grass — 051 is next free).
+2026-06-18.
+
+**Shipped scope:**
+- **Emission** (`lightEmissionTex`) — engine's alpha-masked composite
+  `lit·(1−a) + rgb` (`SMFFragProg.glsl:392-401`), NOT the prompt's
+  additive form. Applied post-lighting so it's not shadow-masked
+  (pitfall #1) and has no day/night ramp (pitfall #6).
+- **Sky-reflect** (`skyReflectModTex`) — `mix(diffuse, sky, reflectMod)`
+  on the diffuse base before lighting (`:341-350`). The engine's
+  reflected colour is a `skyReflectTex` CUBEMAP; Sprint 28 / ADR-045
+  DEFERRED the cubemap, so per pitfall #7 we reflect the uniform
+  `atmosphere.skyColor` (forward-compatible with a real cubemap).
+- **Parallax** (`parallaxHeightTex`) — **engine DOES consume it**
+  (`SMF_PARALLAX_MAPPING`, `SMFRenderState.cpp:120`;
+  `SMFFragProg.glsl:124-141 + 282-296`), so it's a real port, not the
+  deferred/lint-only outcome the original plan hedged on. Gated by a
+  `has_parallax` flag bit.
+- **Grass blade** (`grassBladeTex`) — wired into `grass.wgsl` (the
+  Sprint-34 deferral). 1×1 white = procedural fallback.
+- F9 `grassBladeTex` form gap closed; ADR-051; `lava-emission` +
+  `wet-rocks` parity fixtures. Live visual smoke GPU-session-pending.
+
+The renderer-parity arc is now **8 / 8 feature-complete**; Sprint 23
+(= Sprint 36) is parity validation + SRS §2.1 #11 closeout only.
+
+**Goal (original):** close the remaining shader features.
 
 - **Emission** — `mapinfo.resources.lightEmissionTex` modulates fragment
   output with self-illumination (lava maps glow even at night).

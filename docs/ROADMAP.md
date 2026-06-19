@@ -1297,6 +1297,31 @@ Implements SRS F1–F12. Ships a Windows `.exe` and a Linux AppImage.
       `sprint-34-grass-rendering/`). The prompt called this "ADR-043"
       but that's taken; grass ships as ADR-050. Next arc sprint:
       Sprint 35 (emission + sky-reflect + parallax).
+- [x] **STATUS UPDATE 2026-06-18 (Sprint 35 / R7 — ADR-051 — emission +
+      sky-reflect + parallax + grass-blade).** The renderer-parity arc's
+      LAST feature sprint; the arc is now **8 / 8 feature-complete**. The
+      four remaining `mapinfo.resources` texture bindings are wired in
+      `terrain.wgsl` (emission, sky-reflect-mod, parallax — bind group 17
+      → 23 bindings) + `grass.wgsl` (blade silhouette). Emission ships
+      the engine's alpha-masked composite (`lit·(1−a)+rgb`), applied
+      post-lighting so it isn't shadow-masked and has no day/night ramp.
+      Sky-reflect mixes the diffuse toward the reflected sky; the
+      Sprint-28 skybox cubemap is DEFERRED (ADR-045), so it reflects the
+      uniform `atmosphere.skyColor` (pitfall #7). Parallax is a REAL port
+      — verified the engine consumes `parallaxHeightTex`
+      (`SMF_PARALLAX_MAPPING`) — gated by a `has_parallax` flag bit.
+      Strength/scale are shader consts (=1.0, exact parity), not
+      uniforms. Closed an F9 gap: `grassBladeTex` had schema + emitter
+      but no form field / patch variant. New fixtures
+      `assets/parity-fixtures/{lava-emission,wet-rocks}/`. **Validation
+      boundary:** all four WGSL shaders pass naga validation + `fmt /
+      clippy --workspace --all-targets -D warnings / test --workspace`
+      green (928 tests); the live visual smoke (cracks glow, wet rocks
+      reflect, grass blade tex) is GPU-session-pending (devlog
+      `sprint-35-emission-skybox-reflect-parallax/`). The prompt called
+      this "ADR-044" but that's taken (Sprint 26 water); ships as
+      **ADR-051**. Next — and FINAL — arc sprint: **Sprint 36** (parity
+      validation + SRS §2.1 #11 closeout).
 - [ ] Beherith (or active mapper) reviews `.sd7` byte-for-byte against PyMapConv
       reference output on three test maps
 - [ ] Listed on `beyondallreason.info/guide/mapmaking-resources` as beta

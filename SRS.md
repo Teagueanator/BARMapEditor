@@ -499,6 +499,37 @@ PA's in-game system designer is the cited gold standard. It does the following w
     > this "ADR-043" but that's taken (Sprint 25 terrain shader); grass
     > ships as **ADR-050**. Next arc sprint is Sprint 35 (emission +
     > sky-reflect + parallax).
+    >
+    > **STATUS UPDATE 2026-06-18 (Sprint 35 / R7 / ADR-051 — final
+    > shader bindings shipped):** the renderer-parity arc's last
+    > FEATURE sprint. The four remaining `mapinfo.resources` texture
+    > bindings are wired: `lightEmissionTex` (alpha-masked
+    > self-illumination, NOT shadow-masked, no day/night ramp —
+    > `SMFFragProg.glsl:392-401`), `skyReflectModTex` (diffuse mixed
+    > toward the reflected sky — `:341-350`), `parallaxHeightTex` (UV
+    > offset — VERIFIED the engine consumes it via `SMF_PARALLAX_MAPPING`,
+    > `:124-141 + 282-296`), and `grassBladeTex` (blade silhouette `.a`
+    > mask in `grass.wgsl`). Three contradictions flagged per house
+    > rule #1: (a) the prompt's additive emission vs the engine's
+    > alpha-masked composite — shipped the engine form; (b) the prompt's
+    > "Sprint 28 skybox cubemap" prerequisite vs ADR-045 having DEFERRED
+    > the cubemap — used the prompt's own pitfall-#7 uniform-sky
+    > fallback (`atmosphere.skyColor`); (c) the prompt's "ADR-044" vs
+    > ADR-044 being taken (Sprint 26 water) — ships as **ADR-051**.
+    > Strength/scale knobs are shader consts (= 1.0, exact parity), not
+    > uniforms. Closed an F9 gap: `grassBladeTex` had schema + emitter
+    > but no form field. Terrain bind group 17 → 23 bindings (10 sampled
+    > textures, under the wgpu 16 limit — pitfall #5 checked). All four
+    > WGSL shaders pass naga validation; `cargo fmt && clippy
+    > --workspace --all-targets -D warnings && test --workspace` green
+    > (928 tests). The live visual smoke (lava cracks glow; wet rocks
+    > reflect sky; grass blade texture) is GPU-session-pending —
+    > `assets/parity-fixtures/{lava-emission,wet-rocks}` carry the
+    > procedures; devlog `sprint-35-emission-skybox-reflect-parallax`.
+    > The renderer-parity arc is now **8 / 8 feature-complete**. Next —
+    > and FINAL — arc sprint is **Sprint 36** (parity validation + this
+    > §2.1 #11 closeout: replace "do not pretend WYSIWYG" with the
+    > measured mean-ΔE parity claim).
 12. **Decompilation fidelity.** Round-tripping an existing `.sd7` loses information: the recovered diffuse PNG has been through DXT1 (color precision loss); heightmap, metal, and type maps are exact; mapinfo.lua is exact; auxiliary splat textures survive untouched. Reuse PyMapConv's decompile path.
 13. **GPU brush latency.** Spring/Recoil maps can theoretically reach 96×96 SMUs. Sub-millisecond brush response at 32×32+ requires the heightmap to live on the GPU as a storage texture, edited by compute shaders. Read-back to CPU happens only at save.
 
