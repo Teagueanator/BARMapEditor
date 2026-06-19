@@ -3809,7 +3809,9 @@ impl OrbitCamera {
         }
     }
 
-    fn eye(&self) -> Vec3 {
+    /// World-space camera eye. Public so the App can scatter grass
+    /// blades around the camera (Sprint 34 / R6 / ADR-050 LOD).
+    pub fn eye(&self) -> Vec3 {
         let (sy, cy) = self.yaw.sin_cos();
         let (sp, cp) = self.pitch.sin_cos();
         let dir = Vec3::new(cp * sy, sp, cp * cy);

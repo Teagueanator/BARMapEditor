@@ -1,10 +1,6 @@
 mod build_runner;
 mod config;
 mod feature_decals;
-// Consumed by the render-side grass pipeline in the next chunk; the
-// instance generator + GrassInstance land first so they can be unit
-// tested in isolation. Remove the allow once `render` wires the draw.
-#[allow(dead_code)]
 mod grass;
 mod launcher;
 mod parity_fixtures;
@@ -36,8 +32,8 @@ use eframe::egui_wgpu;
 use tracing::{error, info, trace, warn};
 
 use crate::render::{
-    AtmosphereUniforms, CompositeLayerU, CompositeU, OrbitCamera, SHADOW_DEPTH_BIAS,
-    ShadowUniforms, SplatUniforms, TerrainCallback, WaterDraw,
+    AtmosphereUniforms, CompositeLayerU, CompositeU, GrassDraw, GrassUniforms, OrbitCamera,
+    SHADOW_DEPTH_BIAS, ShadowUniforms, SplatUniforms, TerrainCallback, WaterDraw,
 };
 
 /// wgpu/vulkan/naga emit a lot of INFO-level chatter at startup (adapter
@@ -61,6 +57,13 @@ const DEFAULT_TRACING_FILTER: &str = "info,wgpu=warn,wgpu_core=warn,wgpu_hal=war
 /// Side of the square Procgen Inspector thumbnail (B7). 256 pixels →
 /// ~65k evalexpr samples per rebake, well inside the 50 ms debounce.
 const PROCGEN_THUMBNAIL_PX: usize = 256;
+
+/// Sprint 34 / R6 / ADR-050 — grass LOD radius (elmos). Blades only
+/// render within this distance of the camera; the shader fades alpha
+/// across the outer quarter so they don't pop (pitfall #9). 200 elmos
+/// matches the engine's grass draw distance order; the `View > Grass
+/// density` slider throttles count, not radius.
+const GRASS_MAX_DISTANCE: f32 = 200.0;
 
 /// Debounce window before a `(expr, domain)` change triggers a
 /// thumbnail rebake (B7). 50 ms is short enough to feel live and long
@@ -572,6 +575,27 @@ struct App {
     /// on iGPUs can disable to recover ~3 ms terrain-pass cost via the
     /// inspector's Polish section / `View > Reflections` chord.
     water_reflections: bool,
+    /// Sprint 34 / R6 / ADR-050 — master grass-render toggle. When off,
+    /// `grass_draw_for_frame` returns `None` and no blades draw.
+    /// Per-session preference (NOT persisted). Defaults ON; users on
+    /// weak iGPUs can disable via `View > Grass` to recover the per-
+    /// frame instance cost (pitfall #8).
+    grass_enabled: bool,
+    /// Sprint 34 / R6 / ADR-050 — global density throttle `0.0..=1.0`
+    /// multiplying every turf's blade count (pitfall #1). `1.0` = full
+    /// `maxStrawsPerTurf`. Surfaced as a `View > Grass density` slider.
+    grass_density_scale: f32,
+    /// Sprint 34 / R6 / ADR-050 — cached CPU density bake. `None` until
+    /// the first grass frame; re-baked when the heightmap dims change or
+    /// [`App::grass_density_dirty`] is set. Kept off the project model
+    /// (derived data; persisted only as the `.barme-cache` PNG).
+    grass_density: Option<barme_core::GrassDensity>,
+    /// Sprint 34 / R6 / ADR-050 — re-bake request. Set when the
+    /// heightmap is structurally replaced (load / procgen / new). Live
+    /// brush strokes update the surface but defer the density re-bake to
+    /// avoid a per-frame full-map bake; the perf sprint can add an
+    /// incremental bake.
+    grass_density_dirty: bool,
 }
 
 /// View-state for the F7 feature picker + placed-list inspector.
@@ -1938,6 +1962,12 @@ impl App {
             // 16 ms frame target leaves headroom. Inspector lets the
             // user disable on lower-end hardware.
             water_reflections: true,
+            // Sprint 34 / R6 — grass ON by default; first frame bakes
+            // density lazily.
+            grass_enabled: true,
+            grass_density_scale: 1.0,
+            grass_density: None,
+            grass_density_dirty: true,
         };
         // D9 / Sprint 16 — push the default biome stack's source
         // diffuse to the composite slot array so the first central()
@@ -2003,6 +2033,8 @@ impl App {
                     max,
                     validated_against,
                 });
+                // Sprint 34 / R6 — new terrain → re-bake grass density.
+                self.grass_density_dirty = true;
             }
             Err(e) => {
                 error!(path = %path.display(), error = %format!("{e:#}"), "heightmap load failed");
@@ -2670,6 +2702,8 @@ impl App {
             max,
             validated_against: Some(size),
         });
+        // Sprint 34 / R6 — synthesised terrain → re-bake grass density.
+        self.grass_density_dirty = true;
     }
 
     /// Apply one brush stamp at the cursor position. Resolves cursor →
@@ -3171,6 +3205,112 @@ impl App {
             // sprint will set bit 0 when a `.dds` cubemap loads.
             flags: [0, 0, 0, 0],
         }
+    }
+
+    /// Sprint 34 / R6 / ADR-050 — build the frame's grass draw.
+    ///
+    /// Returns `None` when grass is disabled, there's no heightmap, or
+    /// the field comes out empty (no coverage / off-screen). Bakes the
+    /// density on demand — cached, re-baked on a dims change or when
+    /// `grass_density_dirty` is set — then scatters blades for the
+    /// current camera via `crate::grass::generate_grass_instances`.
+    ///
+    /// Wind + time come from the SAME sources the water plane uses
+    /// (`atmosphere_uniforms_for_render` wind, `water_time_seconds`) so
+    /// the two animate in lock-step (pitfall #3).
+    fn grass_draw_for_frame(&mut self) -> Option<GrassDraw> {
+        if !self.grass_enabled || self.heightmap.is_none() {
+            return None;
+        }
+
+        let project = self.snapshot_project();
+        let info: barme_core::MapInfo = (&project).into();
+        let grass = info.grass.clone().unwrap_or_default();
+
+        // Vertical span the heightmap's full u16 range maps onto — the
+        // same band the terrain shader uses (y = min_h + t·(max_h−min_h)).
+        let vertical_scale = (self.height_scale - self.min_height).max(0.0);
+
+        // (Re)bake density when stale or the map resized. The bake reads
+        // the heightmap immutably; we drop that borrow before storing.
+        let dims = self.heightmap.as_ref().unwrap().dims;
+        let needs_bake =
+            self.grass_density_dirty || self.grass_density.as_ref().map(|d| d.dim) != Some(dims);
+        if needs_bake {
+            let hm = &self.heightmap.as_ref().unwrap().data;
+            let density = barme_core::bake_grass_density(hm, &grass, vertical_scale);
+            // Best-effort persist to the project's cache dir; a failure
+            // (read-only fs, unsaved project) is non-fatal — we keep the
+            // in-memory bake.
+            if let Some(path) = self.grass_density_cache_path()
+                && let Err(e) = density.save_png(&path)
+            {
+                tracing::debug!(error = %e, path = %path.display(), "grass density cache write failed");
+            }
+            info!(dim = ?density.dim, "grass density baked");
+            self.grass_density = Some(density);
+            self.grass_density_dirty = false;
+        }
+
+        let density = self.grass_density.as_ref().unwrap();
+        let hm = &self.heightmap.as_ref().unwrap().data;
+        let cam = self.camera.eye();
+
+        // LOD band (pitfall #9). 200 elmos default; fade across the
+        // outer quarter so blades dissolve instead of popping.
+        let max_distance = GRASS_MAX_DISTANCE;
+        let fade_start = max_distance * 0.75;
+
+        let instances = crate::grass::generate_grass_instances(
+            density,
+            hm,
+            &grass,
+            (self.min_height, self.height_scale),
+            cam,
+            max_distance,
+            self.grass_density_scale,
+        );
+        if instances.is_empty() {
+            return None;
+        }
+
+        // Lighting: match the terrain's baseline ground colours
+        // (SplatUniforms::default already has SMF_INTENSITY pre-applied)
+        // but light from the project's sun direction so grass NdotL +
+        // shadow direction agree with the shadow camera (which is also
+        // derived from the atmosphere sun_dir).
+        let splat_base = SplatUniforms::default();
+        let atmos = self.atmosphere_uniforms_for_render();
+        let bc = grass.blade_color_or_default();
+
+        let uniforms = GrassUniforms {
+            // view_proj + camera_pos are injected in prepare().
+            blade_color: [bc[0], bc[1], bc[2], 1.0],
+            blade_params: [
+                grass.blade_width_or_default(),
+                grass.blade_height_or_default(),
+                grass.blade_wave_scale_or_default(),
+                self.water_time_seconds(),
+            ],
+            lod: [max_distance, fade_start, 0.0, 0.0],
+            sun_dir: atmos.sun_dir,
+            ground_ambient: splat_base.ground_ambient,
+            ground_diffuse: splat_base.ground_diffuse,
+            ..GrassUniforms::default()
+        };
+
+        Some(GrassDraw {
+            instances,
+            uniforms,
+        })
+    }
+
+    /// Path of the persisted grass-density PNG under the project's
+    /// `.barme-cache/` dir, or `None` for an unsaved project (nothing to
+    /// anchor the cache to — we keep the bake in memory only).
+    fn grass_density_cache_path(&self) -> Option<PathBuf> {
+        let project_root = self.current_project_path.as_ref()?.parent()?;
+        Some(project_root.join(".barme-cache").join("grass-density.png"))
     }
 
     /// Sprint 30 / R4 / ADR-048 — produce the sampling-side shadow
@@ -7642,6 +7782,19 @@ impl App {
             {
                 ui.close();
             }
+            // Sprint 34 / R6 / ADR-050 — grass master toggle + density
+            // throttle. Off recovers the per-frame instance cost on weak
+            // iGPUs (pitfall #1 / #8). The slider scales blade COUNT, not
+            // the LOD radius.
+            ui.separator();
+            ui.checkbox(&mut self.grass_enabled, "Grass (preview only)")
+                .on_hover_text("Toggle the bladed-grass preview. Preview-only — the in-game grass is governed by mapinfo.grass + the map_grass widget.");
+            ui.add_enabled(
+                self.grass_enabled,
+                egui::Slider::new(&mut self.grass_density_scale, 0.0..=1.0)
+                    .text("Grass density"),
+            )
+            .on_hover_text("Throttle the number of grass blades scattered per frame. Lower this if the preview stutters on an integrated GPU.");
         });
         ui.menu_button("Build", |ui| {
             let enabled = self.heightmap.is_some();
@@ -11475,7 +11628,7 @@ impl App {
                 }
 
                 let shadow_u = self.shadow_uniforms_for_render();
-                let cb = TerrainCallback::new(
+                let mut cb = TerrainCallback::new(
                     &self.camera,
                     rect,
                     self.height_scale,
@@ -11492,6 +11645,9 @@ impl App {
                     atmos_u,
                     shadow_u,
                 );
+                // Sprint 34 / R6 / ADR-050 — attach the frame's grass.
+                // `None` (disabled / empty) leaves the grass pass skipped.
+                cb.grass = self.grass_draw_for_frame();
                 ui.painter()
                     .add(egui_wgpu::Callback::new_paint_callback(rect, cb));
 
@@ -12356,6 +12512,10 @@ mod tests {
             lava_atmosphere: false,
             water_carve_depth: -80.0,
             water_reflections: true,
+            grass_enabled: true,
+            grass_density_scale: 1.0,
+            grass_density: None,
+            grass_density_dirty: true,
         }
     }
 
