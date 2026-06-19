@@ -66,6 +66,30 @@ const SPECULAR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 /// normal PNG uploads.
 const SLOT_NORMAL_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 
+/// Sprint 35 / R7 / ADR-044 — emission (self-illumination) map format.
+/// Engine `lightEmissionTex`; `.rgb` glow colour, `.a` self-illumination
+/// mask. The 1×1 fallback packs `(0, 0, 0, 0)` (black, zero mask) so the
+/// shader's `lit*(1-a) + rgb` composite is a no-op until a real glow map
+/// uploads.
+const EMISSION_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+
+/// Sprint 35 / R7 / ADR-044 — sky-reflection modulation map format.
+/// Engine `skyReflectModTex`; `.rgb` per-channel reflectivity. The 1×1
+/// fallback packs `(0, 0, 0, 0)` (no reflection) so the shader's
+/// `mix(diffuse, sky, reflectMod)` is a no-op until a real map uploads.
+#[allow(dead_code)] // Wired in Commit 2 (sky-reflect modulation).
+const SKY_REFLECT_MOD_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+
+/// Sprint 35 / R7 / ADR-044 — parallax-height map format. Engine
+/// `parallaxHeightTex`; RG = 16-bit height, B = scale, A = bias-0.5
+/// (SMFFragProg.glsl:124-140). Unlike emission / sky-reflect, the
+/// "no-op" pixel is NOT all-zero (a zero A decodes to bias = -0.5), so
+/// the shader gates parallax on the `has_parallax` flag bit instead of
+/// relying on the fallback pixel. The 1×1 fallback packs `(0,0,0,128)`
+/// (height 0, scale 0, bias ≈ 0) as a belt-and-braces near-zero.
+#[allow(dead_code)] // Wired in Commit 3 (parallax UV offset).
+const PARALLAX_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+
 /// `SMF_INTENSITY_MULT` from the engine — `210/255 ≈ 0.8235`. Engine
 /// definition: `cont/base/springcontent/shaders/GLSL/SMFFragProg.glsl:4`.
 /// Per FINDINGS §7.1 we pre-apply this CPU-side to `ground_ambient`
@@ -1197,6 +1221,15 @@ struct SplatResources {
     specular_tex: wgpu::Texture,
     specular_view: wgpu::TextureView,
     specular_samp: wgpu::Sampler,
+    /// Sprint 35 / R7 / ADR-044 — emission / self-illumination map.
+    /// Engine `lightEmissionTex`; `.rgb` glow colour, `.a` mask.
+    /// Defaults to a 1×1 black `(0,0,0,0)` so an unbound map adds no
+    /// glow (`lit*(1-0) + 0 = lit`). `upload_emission` swaps in a real
+    /// map (e.g. a lava-crack mask).
+    #[allow(dead_code)]
+    emission_tex: wgpu::Texture,
+    emission_view: wgpu::TextureView,
+    emission_samp: wgpu::Sampler,
     uniform_buf: wgpu::Buffer,
 }
 
@@ -1704,11 +1737,31 @@ fn bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
                 },
                 count: None,
             },
+            // 17: emission / self-illumination map (Sprint 35 / R7 /
+            // ADR-044). Engine `lightEmissionTex`. Fragment-only.
+            wgpu::BindGroupLayoutEntry {
+                binding: 17,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            // 18: emission sampler. ClampToEdge — one emission map per
+            // terrain.
+            wgpu::BindGroupLayoutEntry {
+                binding: 18,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
         ],
     })
 }
 
-#[allow(clippy::too_many_arguments)] // Mirrors the 17-binding terrain bind group; trimming would just hide layout coupling.
+#[allow(clippy::too_many_arguments)] // Mirrors the 19-binding terrain bind group; trimming would just hide layout coupling.
 fn make_bind_group(
     device: &wgpu::Device,
     bgl: &wgpu::BindGroupLayout,
@@ -1795,6 +1848,15 @@ fn make_bind_group(
             wgpu::BindGroupEntry {
                 binding: 16,
                 resource: shadow_sampling_uniform_buf.as_entire_binding(),
+            },
+            // Sprint 35 / R7 / ADR-044 — emission map + sampler.
+            wgpu::BindGroupEntry {
+                binding: 17,
+                resource: wgpu::BindingResource::TextureView(&splat.emission_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 18,
+                resource: wgpu::BindingResource::Sampler(&splat.emission_samp),
             },
         ],
     })
@@ -1930,6 +1992,18 @@ fn install_splat_resources(device: &wgpu::Device, queue: &wgpu::Queue) -> SplatR
         wgpu::AddressMode::ClampToEdge,
     );
 
+    // Sprint 35 / R7 / ADR-044 — emission map. 1×1 black `(0,0,0,0)`:
+    // zero glow colour + zero mask, so `lit*(1-0) + 0 = lit` until
+    // `upload_emission` binds a real lava-crack map.
+    let (emission_tex, emission_view, emission_samp) = install_default_2d_texture(
+        device,
+        queue,
+        "terrain.emission",
+        EMISSION_FORMAT,
+        &[0x00, 0x00, 0x00, 0x00],
+        wgpu::AddressMode::ClampToEdge,
+    );
+
     let uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("terrain.splat.uniforms"),
         size: std::mem::size_of::<SplatUniforms>() as u64,
@@ -1956,6 +2030,9 @@ fn install_splat_resources(device: &wgpu::Device, queue: &wgpu::Queue) -> SplatR
         specular_tex,
         specular_view,
         specular_samp,
+        emission_tex,
+        emission_view,
+        emission_samp,
         uniform_buf,
     }
 }
@@ -4454,6 +4531,104 @@ pub fn upload_specular(
     res.splat.specular_view = view;
     res.rebind(device);
     info!(width, height, "upload_specular: bound");
+}
+
+/// Upload a full emission / self-illumination map into the terrain bind
+/// group (Sprint 35 / R7 / ADR-044). Engine `lightEmissionTex`:
+/// `Rgba8Unorm` where `.rgb` is the glow colour and `.a` is the
+/// self-illumination mask (SMFFragProg.glsl:395-398). Same shape
+/// contract as [`upload_specular`]. Emission has NO presence-bit gate —
+/// the 1×1 black fallback self-gates (`lit*(1-0) + 0 = lit`), so binding
+/// a real map is sufficient; no `SplatUniforms.flags` change needed.
+#[allow(dead_code)] // Wired by the parity-fixture loader (lava-emission).
+pub fn upload_emission(
+    render_state: &egui_wgpu::RenderState,
+    width: u32,
+    height: u32,
+    rgba: &[u8],
+) {
+    let expected = (width as usize) * (height as usize) * 4;
+    if rgba.len() != expected {
+        warn!(
+            got = rgba.len(),
+            expected, "upload_emission: byte length mismatch"
+        );
+        return;
+    }
+    let device = &render_state.device;
+    let queue = &render_state.queue;
+    let mut renderer = render_state.renderer.write();
+    let Some(res) = renderer.callback_resources.get_mut::<RenderResources>() else {
+        warn!("upload_emission: no RenderResources (install() not run)");
+        return;
+    };
+    let (tex, view) = make_rgba8_terrain_texture(
+        device,
+        queue,
+        "terrain.emission",
+        EMISSION_FORMAT,
+        width,
+        height,
+        rgba,
+    );
+    res.splat.emission_tex = tex;
+    res.splat.emission_view = view;
+    res.rebind(device);
+    info!(width, height, "upload_emission: bound");
+}
+
+/// Allocate an `Rgba8Unorm`-family 2D texture sized to `(width,
+/// height)`, write `rgba` into mip 0, and return the kept-alive
+/// `Texture` + its default view. Sprint 35 / R7 / ADR-044 factored this
+/// out of the per-map upload helpers (`upload_emission` /
+/// `upload_sky_reflect_mod` / `upload_parallax`) since they share an
+/// identical create-write-view body. The pre-existing
+/// `upload_base_normal` / `upload_specular` keep their inline bodies to
+/// avoid churning the well-tested Sprint-25 path.
+fn make_rgba8_terrain_texture(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    label: &str,
+    format: wgpu::TextureFormat,
+    width: u32,
+    height: u32,
+    rgba: &[u8],
+) -> (wgpu::Texture, wgpu::TextureView) {
+    let tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &tex,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        rgba,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(width * 4),
+            rows_per_image: Some(height),
+        },
+        wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
+    let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+    (tex, view)
 }
 
 // ─── Composite pipeline API (Sprint 16 / D9 / ADR-039) ──────────────

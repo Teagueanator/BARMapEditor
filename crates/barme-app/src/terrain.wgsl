@@ -194,6 +194,23 @@ struct AtmosphereU {
 @group(0) @binding(14) var shadow_map: texture_depth_2d;
 @group(0) @binding(15) var shadow_sampler: sampler_comparison;
 @group(0) @binding(16) var<uniform> shadow: ShadowU;
+// Sprint 35 / R7 / ADR-044 — emission (self-illumination) texture.
+// Engine `lightEmissionTex` (SMFFragProg.glsl:106, sampled :395). The
+// `.rgb` is the glow colour; `.a` is the self-illumination mask. The
+// 1×1 black fallback (0,0,0,0) self-gates: `lit*(1-0) + 0 = lit`, so
+// an unbound map costs nothing. Applied AFTER lighting + shadow —
+// self-illumination is NOT masked by shadow (pitfall #1).
+@group(0) @binding(17) var emission_tex: texture_2d<f32>;
+@group(0) @binding(18) var emission_samp: sampler;
+
+// Editor-side tuning scalar for emission. The engine has NO
+// emission-strength uniform — emission is a straight `rgb*(1-a)+rgb`
+// composite (SMFFragProg.glsl:398). Keeping this a shader constant at
+// 1.0 is therefore EXACT engine parity by default; the knob exists so
+// a future sprint can amplify lava glow per-map (promoting it to a
+// uniform + F9 field) without touching the composite math. ADR-044
+// records why this is a const, not a uniform.
+const EMISSION_STRENGTH: f32 = 1.0;
 
 struct VsOut {
     @builtin(position) clip_pos: vec4<f32>,
@@ -396,6 +413,16 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let s_tangent = cross(normal, t_tangent);
     let stn = mat3x3<f32>(s_tangent, t_tangent, normal);
 
+    // ─── 3.5 Parallax surface UV (Sprint 35 / R7 / ADR-044) ──────
+    // `surf_uv` is the texture coordinate the post-TBN samples (base
+    // normal re-fetch, composite diffuse, specular, emission,
+    // sky-reflect-mod) read from. It starts equal to the raw
+    // map-normalized UV; Commit 3 replaces this line with the engine's
+    // parallax-height UV offset (SMFFragProg.glsl:282-296) so a bound
+    // `parallaxHeightTex` shifts the samples toward the apparent
+    // surface. Until then it is a no-op alias.
+    var surf_uv = in.uv_norm;
+
     // ─── 4. DNTS composite (FINDINGS §7.3 / SMFFragProg.glsl:174-198)
     // `splatCofac = texture2D(splatDistrTex, uv) * splatTexMults`,
     // then per-channel layer UVs `worldPos.xzxz * texScales.rrgg`
@@ -567,6 +594,23 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
             lit = mix(lit, too_steep, 0.55);
         }
     }
+
+    // ─── Emission / self-illumination (Sprint 35 / R7 / ADR-044) ──
+    // Engine `SMFFragProg.glsl:392-401`:
+    //   emissionCol = texture2D(lightEmissionTex, specTexCoords);
+    //   fragColor.rgb = fragColor.rgb * (1 - emissionCol.a) + emissionCol.rgb;
+    // This is an alpha-MASKED blend, NOT an additive `+= emission`
+    // (the Sprint-35 prompt's pseudocode said additive; the engine —
+    // the source of truth per house-rule #1 — masks by `.a`, so a
+    // crack with `a=1` fully replaces the lit colour with the glow
+    // while `a=0` leaves terrain untouched). Applied here, AFTER the
+    // `lit * shadow_factor` lighting compose, so the glow is NOT
+    // darkened by shadows (pitfall #1 + pitfall #6: volcanic ground
+    // glows independent of sun angle — there is no day/night ramp on
+    // terrain emission). `in.uv_norm` is overwritten to the parallaxed
+    // surface UV in §3.5 once Commit 3 lands.
+    let emission = textureSample(emission_tex, emission_samp, surf_uv);
+    lit = lit * (1.0 - emission.a) + emission.rgb * EMISSION_STRENGTH;
 
     // ─── 9. Exponential height fog (Sprint 28 / R2 / ADR-045) ────
     //
