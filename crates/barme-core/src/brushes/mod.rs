@@ -230,4 +230,37 @@ mod tests {
         assert_eq!(u.w, 15); // 25 - 10
         assert_eq!(u.h, 15);
     }
+
+    /// Sprint 33 (T6): CI-safe ceiling for NFR-Performance (≤ 8 ms per
+    /// brush stamp at 16 SMU). The hard 8 ms number is tracked by the
+    /// criterion bench `benches/brush_latency.rs` (regression-gated);
+    /// this test asserts a *generous* ceiling so it never flakes on a
+    /// noisy shared runner while still catching a gross regression —
+    /// same policy as `procgen::tests::generate_16_smu_*`.
+    #[test]
+    fn smooth_stamp_16_smu_under_budget() {
+        use std::time::Instant;
+
+        let mut hm = Heightmap::synth_ramp(MapSize::square(16));
+        let (w, h) = hm.dims();
+        let stamp = BrushStamp {
+            world_x: ((w - 1) as f32 * 8.0) * 0.5,
+            world_z: ((h - 1) as f32 * 8.0) * 0.5,
+            radius: 1024.0, // NFR-Performance reference radius
+            strength: 0.5,
+        };
+        // Warm caches; smooth is the worst case (3×3 read per write).
+        for _ in 0..3 {
+            let _ = Smooth.apply(&mut hm, stamp);
+        }
+        let t0 = Instant::now();
+        let _ = Smooth.apply(&mut hm, stamp);
+        let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        eprintln!("16 SMU smooth stamp (r=1024): {elapsed_ms:.3} ms");
+        assert!(
+            elapsed_ms < 80.0,
+            "16 SMU smooth stamp took {elapsed_ms:.1} ms; \
+             well past the ~8 ms NFR baseline — regression?"
+        );
+    }
 }

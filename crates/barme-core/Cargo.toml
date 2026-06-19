@@ -21,6 +21,8 @@ rayon.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+# Sprint 33 (T6): criterion-driven perf benches (see benches/).
+criterion.workspace = true
 
 # Sprint 23 (T1) — Linux-only RSS / VmPeak snapshots. Gated to Linux
 # so Windows / macOS builds stay clean. Used by
@@ -41,3 +43,14 @@ path = "examples/bench_brushes.rs"
 [[example]]
 name = "bench-procgen"
 path = "examples/bench_procgen.rs"
+
+# Sprint 33 (T6): criterion benches. `harness = false` hands `main` to
+# criterion instead of libtest. The example benches above stay as
+# human-readable one-shot reporters; these are the CI-gated versions.
+[[bench]]
+name = "brush_latency"
+harness = false
+
+[[bench]]
+name = "procgen_apply"
+harness = false
