@@ -135,7 +135,16 @@ pub fn package(
         .current_dir(staging_dir)
         .arg("a")
         .arg("-t7z")
-        .arg("-ms=off")
+        .arg("-ms=off") // PITFALL #9: non-solid, SpringFiles rejects solid
+        // NFR-Determinism: strip per-file timestamps so the same project
+        // yields a byte-identical .sd7. 7z stores last-modified by default
+        // (-mtm) and staging copies stamp mtime=now, which would make every
+        // build differ. `-mtm- -mtc- -mta-` drops modification / creation /
+        // access times. (Sprint 33 / T6 / ADR-049 — the Sprint-33 prompt's
+        // pitfall #3 wrongly claimed a `-mtime` flag was already present.)
+        .arg("-mtm-")
+        .arg("-mtc-")
+        .arg("-mta-")
         .arg("-mx=9")
         .arg(out_path)
         .arg("./");
@@ -236,5 +245,55 @@ mod tests {
         // Hosts without 7z installed should fail at the workspace level;
         // pass-through here documents that requirement.
         assert!(find_seven_zip().is_ok(), "no 7z binary on PATH");
+    }
+
+    /// NFR-Determinism at the packaging layer (Sprint 33 / T6 / ADR-049).
+    ///
+    /// Needs only a system 7-Zip (no vendored PyMapConv), so it runs in
+    /// the normal CI test lane — unlike the end-to-end build determinism
+    /// test in `tests/sd7_determinism.rs` which is `#[ignore]`d. Packages
+    /// the *same* staged bytes twice, a beat apart so the on-disk mtimes
+    /// differ, and asserts the two `.sd7`s are byte-identical. This is the
+    /// regression guard for the `-mtm- -mtc- -mta-` timestamp strip.
+    #[test]
+    fn package_is_byte_identical_on_repeat() {
+        if find_seven_zip().is_err() {
+            eprintln!("skipping: no 7z on PATH");
+            return;
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+
+        // Two independent staging dirs with identical content.
+        let stage_a = root.join("stage_a");
+        let stage_b = root.join("stage_b");
+        let src = root.join("payload.txt");
+        std::fs::write(&src, b"deterministic payload\n").unwrap();
+        std::fs::create_dir_all(&stage_a).unwrap();
+        std::fs::create_dir_all(&stage_b).unwrap();
+
+        let files = [StagedFile {
+            src: &src,
+            archive_rel: "maps/demo.txt",
+        }];
+
+        let out_a = root.join("a.sd7");
+        package(&out_a, &stage_a, &files).expect("package a");
+
+        // Re-write the payload so its on-disk mtime is "now + epsilon",
+        // proving the strip — not a coincidental same-mtime — is what
+        // makes the bytes match.
+        std::fs::write(&src, b"deterministic payload\n").unwrap();
+        let out_b = root.join("b.sd7");
+        package(&out_b, &stage_b, &files).expect("package b");
+
+        let bytes_a = std::fs::read(&out_a).unwrap();
+        let bytes_b = std::fs::read(&out_b).unwrap();
+        assert_eq!(
+            bytes_a, bytes_b,
+            "two packages of identical content differ — timestamp strip \
+             regressed (NFR-Determinism)"
+        );
     }
 }

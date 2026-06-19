@@ -4971,6 +4971,56 @@ Commits use `Sprint 30 / R4 / ADR-048` consistently.
 + sampler-state setup). Devlog:
 `devlog/sprint-30-directional-shadows/`.
 
+## ADR-049 — Beta-prep CI gates: MSRV matrix, perf benches, .sd7 determinism, multi-OS release (Sprint 33 / T6)
+
+**Status:** Accepted
+
+**Context.** The 2026-05-20 SRS audit found ~6 NFR commitments with no
+CI gate: NFR-Performance (≤ 8 ms brush latency), NFR-Determinism
+(byte-identical `.sd7`), NFR-Portability (Windows + Linux, AppImage),
+MSRV 1.90, a headless test runner for wgpu-touching tests, and
+log-collection on CI failure. Before this sprint there was no
+`.github/` at all.
+
+**Decision.**
+- `rust-toolchain.toml` pins the **dev stable** (1.96 — the prompt's
+  "1.95" guess was stale; the box runs 1.96). MSRV stays at 1.90 in
+  `Cargo.toml`. `ci.yml` runs both via a `rust: [stable, "1.90"]`
+  matrix; `RUSTUP_TOOLCHAIN` per-cell overrides the toml so the MSRV
+  cell really uses 1.90.
+- Promoted the Sprint-1 / Sprint-24 example benches into criterion
+  benches (`benches/brush_latency.rs`, `benches/procgen_apply.rs`).
+  CI fails on a **>1.5×** regression vs a cached baseline (runners are
+  noisy; 1.0× would flake). Hard absolute ceilings stay as CI-safe
+  unit tests.
+- Multi-OS release matrix (`release.yml`: ubuntu / windows / macos);
+  Linux also ships an AppImage (`scripts/build-appimage.sh`). macOS is
+  **experimental** (untested wgpu/Metal before this sprint).
+
+**The determinism fix (load-bearing).** NFR-Determinism promised
+"byte-identical `.sd7` (compile timestamps stripped)". The Sprint-33
+prompt's pitfall #3 asserted the pipeline "already passes `-mtime` to
+7z (verify)". **It did not** — `sd7::package()` ran
+`7z a -t7z -ms=off -mx=9` with no timestamp handling, and staging
+copies stamp mtime=now, so two builds of the same project differed in
+their stored per-file mtimes. This contradicted the SRS (flagged per
+house rule #1). Fix: add `-mtm- -mtc- -mta-` to the create command so
+no modification / creation / access times are stored. Guarded by
+`sd7::tests::package_is_byte_identical_on_repeat` (CI lane, 7z-only)
+plus the `#[ignore]`d end-to-end `tests/sd7_determinism.rs` (needs the
+vendored toolchain). Per pitfall #10, any remaining flake at the
+end-to-end layer with the packaging test green is PyMapConv/SMT-side
+and gets a recorded flake-rate, not a code chase.
+
+**Alternatives.** (1) Post-process the archive to zero mtimes — fragile
+vs re-compressing. (2) `SOURCE_DATE_EPOCH` — 7z doesn't honour it.
+(3) Leave determinism untested — rejected; it's an NFR.
+
+**Consequence.** Every NFR now has a gate. The prompt numbered this
+"ADR-042", but ADR-042 is taken (Water+Lava, Sprint 14); next free is
+**ADR-049**. Devlogs: `devlog/sprint-33-ci-gates/`,
+`devlog/sprint-33-windows-appimage/`.
+
 ## ADR template
 
 ```
