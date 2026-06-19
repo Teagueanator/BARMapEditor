@@ -592,6 +592,53 @@ impl Default for AtmosphereUniforms {
     }
 }
 
+/// Sprint 34 / R6 / ADR-050 — grass pipeline uniform block. CPU mirror
+/// of `grass.wgsl::GrassU`; field order MUST match the WGSL exactly
+/// (a size-pin test in `tests` guards drift). `view_proj` + `camera_pos`
+/// are overwritten per-frame in [`TerrainCallback::prepare`] (camera
+/// moves every frame); the rest come from the project's grass + lighting
+/// blocks via [`GrassDraw`].
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable)]
+pub struct GrassUniforms {
+    pub view_proj: [[f32; 4]; 4],
+    /// `[eye_x, eye_y, eye_z, _]` — world-space camera (billboard + LOD).
+    pub camera_pos: [f32; 4],
+    /// `[r, g, b, _]` — `mapinfo.grass.bladeColor`.
+    pub blade_color: [f32; 4],
+    /// `[blade_width, blade_height, blade_wave_scale, time_s]`.
+    pub blade_params: [f32; 4],
+    /// `[max_distance, fade_start, _, _]` — LOD fade band (elmos).
+    pub lod: [f32; 4],
+    /// `[x, y, z, _]` — world-space to-sun direction (normalised).
+    pub sun_dir: [f32; 4],
+    /// `[r, g, b, _]` — `lighting.groundAmbient` (intensity pre-applied).
+    pub ground_ambient: [f32; 4],
+    /// `[r, g, b, _]` — `lighting.groundDiffuse`.
+    pub ground_diffuse: [f32; 4],
+}
+
+impl Default for GrassUniforms {
+    fn default() -> Self {
+        Self {
+            view_proj: Mat4::IDENTITY.to_cols_array_2d(),
+            camera_pos: [0.0, 0.0, 0.0, 1.0],
+            blade_color: [0.10, 0.40, 0.10, 1.0],
+            blade_params: [0.7, 4.5, 1.0, 0.0],
+            lod: [200.0, 150.0, 0.0, 0.0],
+            sun_dir: default_sun_dir(),
+            ground_ambient: [0.5, 0.5, 0.5, 1.0],
+            ground_diffuse: [0.5, 0.5, 0.5, 1.0],
+        }
+    }
+}
+
+/// Pre-allocated grass instance-buffer capacity (blades). Matches the
+/// CPU generator's [`crate::grass::GRASS_MAX_BLADES`] budget so the
+/// buffer never has to grow at runtime; the generator already caps its
+/// output to this, and `prepare()` clamps defensively.
+pub const GRASS_INSTANCE_CAPACITY: u32 = crate::grass::GRASS_MAX_BLADES as u32;
+
 struct Grid {
     index_buf: wgpu::Buffer,
     index_count: u32,
@@ -1088,6 +1135,30 @@ struct WaterResources {
     dummy_refraction_view: wgpu::TextureView,
 }
 
+/// Sprint 34 / R6 / ADR-050 — instanced grass pipeline. One unit-quad
+/// billboard per blade, drawn after terrain and before water in the
+/// overlay pass. Depth-test on (terrain bumps occlude blades),
+/// depth-write off (translucent edges), `ALPHA_BLENDING`, cull None.
+///
+/// The bind group binds the SHARED atmosphere uniform (wind sync with
+/// water) + the SHARED shadow map / comparison sampler / shadow
+/// sampling uniform (blades receive shadows) — all created before the
+/// grass resources in [`install`], so the bind group builds once and
+/// never needs a rebind (the shadow map is fixed-size; the atmosphere
+/// buffer is stable).
+struct GrassResources {
+    pipeline: wgpu::RenderPipeline,
+    #[allow(dead_code)]
+    bind_group_layout: wgpu::BindGroupLayout,
+    bind_group: wgpu::BindGroup,
+    /// `GrassUniforms` block (binding 0). Written per frame.
+    uniform_buf: wgpu::Buffer,
+    /// Per-blade instance vertex buffer (step-mode Instance), sized to
+    /// [`GRASS_INSTANCE_CAPACITY`]. Re-written each frame with the
+    /// current camera's blade list.
+    instance_buf: wgpu::Buffer,
+}
+
 struct SplatResources {
     // `_tex` fields keep the GPU texture alive; only the views are
     // bound. Dead-code allowance is removed in D5 (Sprint 9) once
@@ -1255,6 +1326,10 @@ pub struct RenderResources {
     /// produce the shadow map terrain (and water, features) sample
     /// in Commit 3.
     shadow: ShadowResources,
+    /// Sprint 34 / R6 / ADR-050 — instanced grass pipeline. Drawn in
+    /// the overlay pass between terrain and water. The draw is skipped
+    /// when the frame carries no [`GrassDraw`] (grass disabled / empty).
+    grass: GrassResources,
 }
 
 impl RenderResources {
@@ -2489,6 +2564,191 @@ fn install_water_resources(
     }
 }
 
+/// Per-blade instance attributes — must mirror `crate::grass::
+/// GrassInstance`'s field order (position, orientation, color_jitter,
+/// height_scale). `vertex_attr_array!` packs offsets contiguously,
+/// which matches the struct's 32-byte layout exactly.
+const GRASS_INSTANCE_ATTRS: [wgpu::VertexAttribute; 4] =
+    wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32, 2 => Float32x3, 3 => Float32];
+
+fn grass_instance_layout() -> wgpu::VertexBufferLayout<'static> {
+    wgpu::VertexBufferLayout {
+        array_stride: std::mem::size_of::<crate::grass::GrassInstance>() as u64,
+        step_mode: wgpu::VertexStepMode::Instance,
+        attributes: &GRASS_INSTANCE_ATTRS,
+    }
+}
+
+/// Build the Sprint 34 / R6 / ADR-050 instanced grass pipeline.
+///
+/// Binds the shared atmosphere uniform (wind sync with water) + the
+/// shared shadow map / comparison sampler / shadow sampling uniform
+/// (blades receive shadows). All four shared resources are created in
+/// [`install`] before this runs, so the bind group builds once.
+fn install_grass_resources(
+    device: &wgpu::Device,
+    atmosphere_uniform_buf: &wgpu::Buffer,
+    shadow: &ShadowResources,
+) -> GrassResources {
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("grass.wgsl"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("grass.wgsl").into()),
+    });
+
+    let uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("grass.uniforms"),
+        size: std::mem::size_of::<GrassUniforms>() as u64,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
+    let instance_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("grass.instances"),
+        size: (GRASS_INSTANCE_CAPACITY as u64)
+            * std::mem::size_of::<crate::grass::GrassInstance>() as u64,
+        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
+    let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("grass.bgl"),
+        entries: &[
+            // 0: GrassU uniform (vertex builds the billboard; fragment
+            // reads lighting + LOD).
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            // 1: atmosphere uniform — vertex stage reads `wind` for the
+            // sway (shared with water; pitfall #3).
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            // 2: shadow depth map (Depth32Float from the shadow-gen pass).
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Depth,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            // 3: shadow comparison sampler.
+            wgpu::BindGroupLayoutEntry {
+                binding: 3,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
+                count: None,
+            },
+            // 4: shadow sampling uniform (VP + bias + density + enabled).
+            wgpu::BindGroupLayoutEntry {
+                binding: 4,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+        ],
+    });
+
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("grass.bg"),
+        layout: &bgl,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: uniform_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: atmosphere_uniform_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::TextureView(&shadow.depth_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::Sampler(&shadow.sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: shadow.sampling_uniform_buf.as_entire_binding(),
+            },
+        ],
+    });
+
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("grass.pl"),
+        bind_group_layouts: &[&bgl],
+        push_constant_ranges: &[],
+    });
+
+    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("grass.pipeline"),
+        layout: Some(&pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_main"),
+            compilation_options: Default::default(),
+            buffers: &[grass_instance_layout()],
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleStrip,
+            cull_mode: None,
+            ..Default::default()
+        },
+        // Depth-test against terrain (bumps occlude blades); no depth
+        // write (translucent edges; CPU order owns blending).
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: OFFSCREEN_DEPTH_FORMAT,
+            depth_write_enabled: false,
+            depth_compare: wgpu::CompareFunction::Less,
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        }),
+        multisample: wgpu::MultisampleState::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_main"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: OFFSCREEN_COLOR_FORMAT,
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        multiview: None,
+        cache: None,
+    });
+
+    GrassResources {
+        pipeline,
+        bind_group_layout: bgl,
+        bind_group,
+        uniform_buf,
+        instance_buf,
+    }
+}
+
 /// Build the Sprint 30 / R4 / ADR-048 directional shadow pass.
 ///
 /// Allocates the [`SHADOW_MAP_SIZE`]² `Depth32Float` shadow map, the
@@ -3212,6 +3472,10 @@ pub fn install(render_state: &egui_wgpu::RenderState) {
     let marker = install_marker_resources(device);
     let line = install_line_resources(device, &marker.uniform_buf);
     let water = install_water_resources(device, queue, &atmosphere_uniform_buf);
+    // Sprint 34 / R6 / ADR-050 — grass pipeline. Built after the shadow
+    // resources (binds the shadow map + comparison sampler) and after
+    // the atmosphere buffer (binds wind for sway sync with water).
+    let grass = install_grass_resources(device, &atmosphere_uniform_buf, &shadow);
 
     // ─── Sprint 26 / R3 / ADR-044 — reflection pass resources ──────
     let reflection = install_reflection_target(device);
@@ -3299,6 +3563,7 @@ pub fn install(render_state: &egui_wgpu::RenderState) {
             reflection_bind_group,
             atmosphere_uniform_buf,
             shadow,
+            grass,
         });
         // Sprint 26 / R3 / ADR-044 — finalize the water bind group now
         // that the reflection RT is owned by RenderResources. The
@@ -4666,6 +4931,19 @@ pub struct WaterDraw {
     pub polish_d: [f32; 4],
 }
 
+/// Sprint 34 / R6 / ADR-050 — per-frame grass draw payload. `None` on
+/// the callback skips grass entirely (disabled, off-screen, or empty
+/// field). `prepare()` overwrites `uniforms.view_proj` + `camera_pos`
+/// from the callback's camera before uploading.
+pub struct GrassDraw {
+    /// Blade list from [`crate::grass::generate_grass_instances`]. Capped
+    /// to [`GRASS_INSTANCE_CAPACITY`] before upload.
+    pub instances: Vec<crate::grass::GrassInstance>,
+    /// Blade params + lighting + LOD. `view_proj` / `camera_pos` are
+    /// filled per-frame; the App supplies the rest.
+    pub uniforms: GrassUniforms,
+}
+
 pub struct TerrainCallback {
     pub view_proj: [[f32; 4]; 4],
     /// Sprint 26 / R3 / ADR-044 — mirrored-Y view-projection used by
@@ -4735,6 +5013,11 @@ pub struct TerrainCallback {
     /// the WGSL doesn't have to reach into a separate buffer for the
     /// matrix.
     pub shadow: ShadowUniforms,
+    /// Sprint 34 / R6 / ADR-050 — optional grass draw. Built by the App
+    /// each frame from the density bake + camera; `None` skips the grass
+    /// pass. Set via the public field after [`TerrainCallback::new`]
+    /// (kept out of the constructor's already-long arg list).
+    pub grass: Option<GrassDraw>,
 }
 
 impl TerrainCallback {
@@ -4803,6 +5086,7 @@ impl TerrainCallback {
             atmosphere,
             shadow_view_proj,
             shadow: shadow_sampling,
+            grass: None,
         }
     }
 }
@@ -4967,9 +5251,45 @@ impl egui_wgpu::CallbackTrait for TerrainCallback {
                 bytemuck::cast_slice(&self.line_vertices[..line_vert_count as usize]),
             );
         }
+        // Sprint 34 / R6 / ADR-050 — grass instance + uniform upload.
+        // Camera-dependent fields (view_proj, eye) are injected here so
+        // the App's persistent grass params don't have to carry them.
+        // Capped to the pre-allocated instance buffer; tail dropped with
+        // a warn if a generator regression ever overshoots the budget.
+        let grass_count = if let Some(gd) = self.grass.as_ref() {
+            let count = (gd.instances.len() as u32).min(GRASS_INSTANCE_CAPACITY);
+            if (gd.instances.len() as u32) > GRASS_INSTANCE_CAPACITY {
+                warn!(
+                    requested = gd.instances.len(),
+                    capacity = GRASS_INSTANCE_CAPACITY,
+                    "grass instance buffer exceeded; tail dropped"
+                );
+            }
+            if count > 0 {
+                let mut gu = gd.uniforms;
+                gu.view_proj = self.view_proj;
+                gu.camera_pos = [
+                    self.camera_pos[0],
+                    self.camera_pos[1],
+                    self.camera_pos[2],
+                    1.0,
+                ];
+                queue.write_buffer(&res.grass.uniform_buf, 0, bytemuck::bytes_of(&gu));
+                queue.write_buffer(
+                    &res.grass.instance_buf,
+                    0,
+                    bytemuck::cast_slice(&gd.instances[..count as usize]),
+                );
+            }
+            count
+        } else {
+            0
+        };
+
         trace!(
             markers = marker_count,
             line_verts = line_vert_count,
+            grass_blades = grass_count,
             "TerrainCallback::prepare"
         );
 
@@ -5208,6 +5528,20 @@ impl egui_wgpu::CallbackTrait for TerrainCallback {
             timestamp_writes: None,
             occlusion_query_set: None,
         });
+
+        // Sprint 34 / R6 / ADR-050 — grass blades. Drawn FIRST in the
+        // overlay pass (terrain → grass → water → lines → markers) so
+        // water blends over any blades standing in shallows. Depth-test
+        // on / write off; instanced TriangleStrip quad, 4 verts ×
+        // `grass_count` blades. Uniforms + instance buffer were written
+        // above (queue writes commit before any encoder command).
+        if grass_count > 0 {
+            pass.set_pipeline(&res.grass.pipeline);
+            pass.set_bind_group(0, &res.grass.bind_group, &[]);
+            pass.set_vertex_buffer(0, res.grass.instance_buf.slice(..));
+            pass.draw(0..4, 0..grass_count);
+            trace!(blades = grass_count, "grass drawn");
+        }
 
         // Sprint-14 / C9 — Water plane (Sprint 26 — sampling refraction
         // + reflection). Depth-tests against terrain (cliffs above Y=0
@@ -5573,6 +5907,43 @@ mod tests {
         if let Err(e) = validator.validate(&module) {
             panic!("water.wgsl validate failed:\n{e:?}");
         }
+    }
+
+    /// Sprint 34 / R6 / ADR-050 — naga validation for grass.wgsl.
+    /// Catches WGSL drift in the billboard vertex stage, wind sway,
+    /// shadow PCF, and leaf-taper fragment math at `cargo test` time.
+    #[test]
+    fn grass_wgsl_parses_and_validates() {
+        use wgpu::naga::front::wgsl;
+        use wgpu::naga::valid::{Capabilities, ValidationFlags, Validator};
+
+        let src = include_str!("grass.wgsl");
+        let module = match wgsl::parse_str(src) {
+            Ok(m) => m,
+            Err(e) => panic!("grass.wgsl parse failed:\n{}", e.emit_to_string(src)),
+        };
+        let mut validator = Validator::new(ValidationFlags::all(), Capabilities::all());
+        if let Err(e) = validator.validate(&module) {
+            panic!("grass.wgsl validate failed:\n{e:?}");
+        }
+    }
+
+    /// Sprint 34 / R6 / ADR-050 — pin the CPU/GPU layout contract. The
+    /// `GrassUniforms` mirror must equal `grass.wgsl::GrassU` (mat4 + 7
+    /// vec4 = 176 B) and `GrassInstance` must be the 32-byte stride the
+    /// `vertex_attr_array!` in `grass_instance_layout` assumes.
+    #[test]
+    fn grass_gpu_layouts_are_pinned() {
+        assert_eq!(
+            std::mem::size_of::<GrassUniforms>(),
+            64 + 7 * 16,
+            "GrassUniforms must match grass.wgsl::GrassU (mat4 + 7 vec4)"
+        );
+        assert_eq!(
+            std::mem::size_of::<crate::grass::GrassInstance>(),
+            32,
+            "GrassInstance stride must stay 32 B (grass_instance_layout attrs)"
+        );
     }
 
     // ---- Phase 1 (Sprint 13 / ADR-037): offscreen RT size resolution ----
