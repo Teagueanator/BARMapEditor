@@ -1,0 +1,132 @@
+# BAR Map Editor — continuous integration (Sprint 33 / T6).
+#
+# Gates every NFR that previously had no CI check:
+#   - MSRV 1.90 + current stable both compile        (job: check)
+#   - rustfmt + clippy -D warnings                    (jobs: fmt, clippy)
+#   - workspace tests under headless software Vulkan  (job: test)
+#   - brush + procgen perf budgets via criterion      (job: bench)
+#
+# IMPORTANT (pitfall #1): `rust-toolchain.toml` pins the dev stable
+# (1.96). Left alone, that file overrides the matrix and every cell
+# would run 1.96. We force the matrix toolchain with RUSTUP_TOOLCHAIN,
+# which takes precedence over rust-toolchain.toml.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel superseded runs on the same ref to save runner minutes.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  # --- compile on both stable and the MSRV --------------------------------
+  check:
+    name: check (${{ matrix.rust }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        rust: [stable, "1.90"] # current stable + MSRV (NFR-Toolchain)
+    env:
+      # Override rust-toolchain.toml so the MSRV cell really uses 1.90.
+      RUSTUP_TOOLCHAIN: ${{ matrix.rust }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Bust the target/ cache whenever the pinned toolchain moves,
+          # so a stale cache can't mask an MSRV break (pitfall #8).
+          key: ${{ matrix.rust }}-${{ hashFiles('rust-toolchain.toml') }}
+      - run: cargo check --workspace --all-targets
+
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  # --- workspace tests under headless software Vulkan ---------------------
+  test:
+    name: test (headless)
+    runs-on: ubuntu-latest
+    env:
+      # Mesa Lavapipe = CPU Vulkan ICD. Lets the wgpu-touching tests get
+      # a device on a GPU-less runner (pitfall #7: correctness is "good
+      # enough" for sanity, not for the Sprint-36 parity gate).
+      WGPU_BACKEND: vulkan
+      LIBGL_ALWAYS_SOFTWARE: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install software Vulkan (Lavapipe) + xvfb
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            mesa-vulkan-drivers libvulkan1 vulkan-tools \
+            libgl1-mesa-dri xvfb 7zip
+      - name: cargo test --workspace
+        run: |
+          xvfb-run -a cargo test --workspace -- --nocapture 2>&1 \
+            | tee test-output.log
+      - name: Upload test logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs-ubuntu-stable
+          path: test-output.log
+
+  # --- perf budgets (NFR-Performance) -------------------------------------
+  # Criterion is noisy on shared runners (pitfall #2): we fail only on a
+  # >1.5x regression vs the cached baseline, and the bench harness itself
+  # reports the median of its sample set.
+  bench:
+    name: bench (perf)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Restore criterion baseline
+        uses: actions/cache@v4
+        with:
+          path: target/criterion
+          key: criterion-baseline-${{ runner.os }}
+      - name: Run benches (saves "ci-baseline" + checks regression)
+        run: |
+          cargo bench -p barme-core -- --save-baseline ci-baseline \
+            2>&1 | tee bench-output.log
+      - name: Upload bench report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: criterion-report
+          path: |
+            target/criterion
+            bench-output.log

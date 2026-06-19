@@ -1,0 +1,15 @@
+# Dev toolchain pin. This is the *current stable* used for local
+# development and the `stable` cell of the CI matrix — NOT the MSRV.
+#
+#   - MSRV (minimum supported) is pinned in Cargo.toml via
+#     `[workspace.package] rust-version = "1.90"` and tested as the
+#     second cell of the CI matrix (see .github/workflows/ci.yml).
+#   - This file pins the *upper* edge so every contributor formats and
+#     lints against the same stable. Bump it as new stable releases land.
+#
+# Sprint 33 (T6): pinned to the dev-box stable (1.96, 2026-05). The
+# Sprint-33 prompt guessed "1.95"; reality is 1.96 — pinning the
+# installed stable avoids a surprise rustup download on first `cargo`.
+[toolchain]
+channel = "1.96"
+components = ["rustfmt", "clippy"]
