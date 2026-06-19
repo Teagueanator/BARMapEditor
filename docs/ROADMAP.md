@@ -1242,6 +1242,33 @@ Implements SRS F1–F12. Ships a Windows `.exe` and a Linux AppImage.
       Next off-arc UX sprint is Sprint 32 (F12 Launch in BAR
       + autosave); the renderer-parity arc resumes at Sprint
       34 (grass).
+- [x] **STATUS UPDATE 2026-06-18 (Sprint 33 / T6 — ADR-049).** NFR CI
+      gates. The repo had no `.github/` at all; the 2026-05-20 audit
+      flagged ~6 NFR commitments with no test gate. Now in place:
+      (1) `rust-toolchain.toml` (dev stable 1.96) + a `[stable, "1.90"]`
+      MSRV `cargo check` matrix (`RUSTUP_TOOLCHAIN` per-cell so the toml
+      doesn't override the MSRV cell); (2) criterion benches
+      `brush_latency` + `procgen_apply` on a `perf` lane (>1.5× fails)
+      plus CI-safe ceiling tests — **NFR-Performance** honoured (16-SMU
+      smooth ≈ 1 ms); (3) **NFR-Determinism** honoured — fixed a silent
+      break where `sd7::package()` stored per-file mtimes (no
+      timestamp-strip flag despite the SRS promise); added
+      `-mtm- -mtc- -mta-` + a 7z-only CI test + an `#[ignore]`d
+      end-to-end test; (4) **NFR-Portability** honoured — a 3-OS release
+      matrix + Linux AppImage (`scripts/build-appimage.sh`), and fixed a
+      latent blocker where `repo_root()` used the compile-time
+      `CARGO_MANIFEST_DIR` (packaged binaries now resolve via
+      `BARME_ROOT`); macOS ships **experimental** (unsigned). Headless
+      wgpu via Mesa Lavapipe; `ci_without_gpu` cfg registered; failing
+      CI uploads test logs. New: `CONTRIBUTING.md`, `README.md`. Commits
+      `ci:`/`bench:`/`pipeline(sd7):`/`ci(release):`/`release(appimage):`
+      under `Sprint 33 / T6`. `cargo fmt && cargo clippy --workspace
+      --all-targets -- -D warnings && cargo test --workspace` green on
+      Linux. **Caveat:** Sprint 33's stated prerequisite — Sprint 32
+      (F12 + autosave / NFR-Crash safety) — is **not in the repo** (F12
+      is a disabled stub, no autosave). The CI gates are independent of
+      that feature work. The renderer-parity arc resumes at **Sprint 34
+      (grass rendering)**.
 - [ ] Beherith (or active mapper) reviews `.sd7` byte-for-byte against PyMapConv
       reference output on three test maps
 - [ ] Listed on `beyondallreason.info/guide/mapmaking-resources` as beta

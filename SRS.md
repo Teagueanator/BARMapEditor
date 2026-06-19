@@ -1189,6 +1189,36 @@ A single-window, single-executable desktop app that produces a *playable* BAR ma
 > 2026-05-20 UX audit identified — `?` chord was previously the only
 > help discovery channel.
 
+> **STATUS UPDATE 2026-06-18 (Sprint 33 / T6 — ADR-049).** The 2026-05-20
+> audit found ~6 NFR commitments with no CI gate; this sprint adds them
+> (the repo previously had no `.github/` at all):
+> - **NFR-Performance** — criterion benches (`brush_latency`,
+>   `procgen_apply`) on a CI `perf` lane (>1.5× regression fails the PR)
+>   + CI-safe ceiling tests. Dev-box: 16-SMU smooth stamp ≈ 1 ms (≤ 8 ms
+>   budget).
+> - **NFR-Determinism** — *now honoured, was silently broken.*
+>   `sd7::package()` previously ran `7z a -ms=off -mx=9` with **no**
+>   timestamp handling, so the stored per-file mtimes made every build
+>   differ — contradicting "byte-identical `.sd7` (compile timestamps
+>   stripped)". Fixed by `-mtm- -mtc- -mta-`; guarded by a 7z-only CI
+>   test + an `#[ignore]`d end-to-end test.
+> - **NFR-Portability** — 3-OS release matrix (Linux/Windows/macOS);
+>   Linux AppImage (`scripts/build-appimage.sh`). macOS ships
+>   experimental (unsigned, wgpu/Metal unattested). A latent blocker was
+>   fixed: `repo_root()` used the compile-time `CARGO_MANIFEST_DIR`, so a
+>   packaged binary couldn't find its bundled `tools/`/`assets/`; it now
+>   honours a `BARME_ROOT` override.
+> - **MSRV 1.90** — `rust-toolchain.toml` (dev stable 1.96) + a
+>   `[stable, 1.90]` CI matrix.
+> - Headless wgpu tests run under Mesa Lavapipe; `ci_without_gpu` cfg
+>   registered for future GPU-only tests; failing CI uploads test logs.
+>
+> **Caveat:** the Sprint-33 prompt lists Sprint 32 (F12 Launch-in-BAR +
+> autosave / NFR-Crash safety) as a prerequisite, but that work is **not
+> present in the repo** — F12 remains a disabled stub and there is no
+> autosave. NFR-Crash safety therefore stays aspirational. The CI gates
+> above are independent of that feature work and stand on their own.
+
 ### 3.4 Architecture (conceptual)
 
 ```
